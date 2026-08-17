@@ -1,0 +1,25 @@
+{
+  "name": "company-api-platform",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:gateway\" \"npm run dev:console\"",
+    "dev:gateway": "npm --workspace=services/api-gateway run dev",
+    "dev:console": "npm --workspace=apps/admin-console run dev",
+    "build:all": "npm run build --workspaces --if-present",
+    "type-check": "tsc --noEmit && npm --workspace=apps/admin-console run type-check",
+    "test": "vitest run",
+    "ci": "npm run type-check && npm run test && npm run build:all"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.5.3",
+    "vitest": "^2.1.8"
+  }
+}
