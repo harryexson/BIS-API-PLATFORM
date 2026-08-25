@@ -13,9 +13,13 @@
       "@company/shared": ["packages/shared/src/index.ts"],
       "@company/schemas": ["packages/schemas/src/index.ts"],
       "@company/events": ["packages/events/src/index.ts"],
+      "@company/observability": ["packages/observability/src/index.ts"],
       "@company/database": ["packages/database/src/index.ts"],
       "@company/providers": ["packages/providers/src/index.ts"],
-      "@company/routing": ["packages/routing/src/index.ts"]
+      "@company/api-client": ["packages/api-client/src/index.ts"],
+      "@company/events-sdk": ["packages/events-sdk/src/index.ts"],
+      "@company/routing": ["packages/routing/src/index.ts"],
+      "@company/workers": ["packages/workers/src/index.ts"]
     }
   },
   "include": ["packages/**/*.ts", "services/**/*.ts"],

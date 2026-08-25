@@ -10,4 +10,5 @@ export { providers, type Provider, type NewProvider } from './providers';
 export { providerCapabilities, type ProviderCapability, type NewProviderCapability } from './provider-capabilities';
 export { providerConfigs, type ProviderConfig, type NewProviderConfig } from './provider-configs';
 export { providerHealth, type ProviderHealthRecord, type NewProviderHealthRecord } from './provider-health';
+export { events, type EventRecord, type NewEventRecord } from './events';
 export { auditLogs, type AuditLog, type NewAuditLog } from './audit-logs';

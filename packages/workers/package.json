@@ -1,0 +1,24 @@
+{
+  "name": "@company/workers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "src/index.ts",
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@company/database": "*",
+    "@company/events": "*",
+    "@company/providers": "*",
+    "@company/routing": "*",
+    "@company/schemas": "*",
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "typescript": "^5.5.3",
+    "vitest": "^2.1.8"
+  }
+}

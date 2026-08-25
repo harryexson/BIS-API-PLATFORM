@@ -1,4 +1,5 @@
 import { TransactionEvent } from '@company/schemas';
+import { metrics } from '@company/observability';
 
 type EventListener = (event: TransactionEvent) => void;
 
@@ -33,6 +34,7 @@ export class EventBus {
       try {
         listener(event);
       } catch (err) {
+        metrics.increment('queueFailures');
         console.error('Error executing event listener:', err);
       }
     });

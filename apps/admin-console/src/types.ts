@@ -1,6 +1,23 @@
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
 export type TransactionStatus = 'success' | 'failed';
+export type ProviderEnvironment = 'test' | 'live';
+export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
+
+export interface RoutingRule {
+  id: string;
+  match: string;
+  target: string;
+  description?: string;
+  enabled: boolean;
+}
+
+export interface ProviderSecretMeta {
+  id: string;
+  label: string;
+  masked: string;
+  lastUpdated?: string;
+}
 
 export interface ProviderConfig {
   id: string;
@@ -13,6 +30,35 @@ export interface ProviderConfig {
   transactionFeePercent?: number;
   transactionFeeFlat?: number;
   messageCost?: number;
+  environment?: ProviderEnvironment;
+  countries?: string[];
+  currencies?: string[];
+  capabilities?: string[];
+  priority?: number;
+  health?: ProviderHealthStatus;
+  lastSuccessfulRequest?: string | null;
+  errorRate?: number;
+  routingRules?: RoutingRule[];
+}
+
+export interface ProviderManagement extends ProviderConfig {
+  environment: ProviderEnvironment;
+  countries: string[];
+  currencies: string[];
+  capabilities: string[];
+  priority: number;
+  health: ProviderHealthStatus;
+  lastSuccessfulRequest: string | null;
+  errorRate: number;
+  routingRules: RoutingRule[];
+}
+
+export interface HealthCheckSummary {
+  providerId: string;
+  status: ProviderHealthStatus;
+  latencyMs: number;
+  checkedAt: string;
+  errorMessage?: string;
 }
 
 export interface TransactionEvent {

@@ -1,4 +1,12 @@
-import { ProviderConfig } from '@company/schemas';
+import {
+  ProviderConfig,
+  ProviderManagement,
+  ProviderEnvironment,
+  ProviderHealthStatus,
+  ProviderSecretMeta,
+  RoutingRule,
+  HealthCheckSummary,
+} from '@company/schemas';
 import { BaseProvider } from './base';
 
 import { StripeProvider } from './adapters/payments/stripe';
@@ -17,9 +25,30 @@ import { MapsProvider } from './adapters/other/maps';
 import { IdentityProvider } from './adapters/other/identity';
 import { AIProvider } from './adapters/other/ai';
 
+// A stored secret keeps the plaintext value private to the registry.
+// Only masked metadata is ever returned to callers.
+interface StoredSecret {
+  meta: ProviderSecretMeta;
+  value: string;
+}
+
+export interface ManagementState {
+  environment: ProviderEnvironment;
+  countries: string[];
+  currencies: string[];
+  capabilities: string[];
+  priority: number;
+  health: ProviderHealthStatus;
+  lastSuccessfulRequest: string | null;
+  errorRate: number;
+  routingRules: RoutingRule[];
+  secrets: StoredSecret[];
+}
+
 export class ProviderRegistry {
   private static instance: ProviderRegistry;
   private providers: Map<string, BaseProvider> = new Map();
+  private management: Map<string, ManagementState> = new Map();
 
   private constructor() {
     this.initializeProviders();
@@ -43,7 +72,7 @@ export class ProviderRegistry {
       latencyMax: 160,
       transactionFeePercent: 2.9,
       transactionFeeFlat: 0.30
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP'], capabilities: ['card'] });
 
     this.register(new NMIProvider({
       id: 'nmi',
@@ -55,7 +84,7 @@ export class ProviderRegistry {
       latencyMax: 190,
       transactionFeePercent: 2.2,
       transactionFeeFlat: 0.20
-    }));
+    }), { environment: 'live', countries: ['US', 'CA'], currencies: ['USD', 'CAD'], capabilities: ['card'] });
 
     this.register(new FlutterwaveProvider({
       id: 'flutterwave',
@@ -67,7 +96,7 @@ export class ProviderRegistry {
       latencyMax: 260,
       transactionFeePercent: 1.4,
       transactionFeeFlat: 0.0
-    }));
+    }), { environment: 'live', countries: ['NG', 'GH', 'KE'], currencies: ['NGN', 'GHS', 'KES', 'USD'], capabilities: ['card', 'mobile_money'] });
 
     this.register(new PawaPayProvider({
       id: 'pawapay',
@@ -79,7 +108,7 @@ export class ProviderRegistry {
       latencyMax: 280,
       transactionFeePercent: 1.0,
       transactionFeeFlat: 0.0
-    }));
+    }), { environment: 'live', countries: ['MW', 'ZM', 'TZ'], currencies: ['MWK', 'ZMW', 'TZS'], capabilities: ['mobile_money'] });
 
     this.register(new PayChanguProvider({
       id: 'paychangu',
@@ -91,7 +120,7 @@ export class ProviderRegistry {
       latencyMax: 320,
       transactionFeePercent: 1.5,
       transactionFeeFlat: 0.0
-    }));
+    }), { environment: 'test', countries: ['MW'], currencies: ['MWK', 'USD'], capabilities: ['mobile_money', 'card'] });
 
     this.register(new AirwallexProvider({
       id: 'airwallex',
@@ -103,7 +132,7 @@ export class ProviderRegistry {
       latencyMax: 220,
       transactionFeePercent: 2.0,
       transactionFeeFlat: 0.0
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'HKD', 'SGD'], capabilities: ['card', 'bank_transfer'] });
 
     this.register(new SignalHouseProvider({
       id: 'signalhouse',
@@ -114,7 +143,7 @@ export class ProviderRegistry {
       latencyMin: 80,
       latencyMax: 120,
       messageCost: 0.005
-    }));
+    }), { environment: 'live', countries: ['MW'], currencies: ['MWK'], capabilities: ['sms'] });
 
     this.register(new InfobipProvider({
       id: 'infobip',
@@ -125,7 +154,7 @@ export class ProviderRegistry {
       latencyMin: 90,
       latencyMax: 140,
       messageCost: 0.008
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
 
     this.register(new FutureSMSProvider({
       id: 'futuresms',
@@ -136,7 +165,7 @@ export class ProviderRegistry {
       latencyMin: 180,
       latencyMax: 250,
       messageCost: 0.002
-    }));
+    }), { environment: 'live', countries: ['MW', 'ZM'], currencies: ['MWK', 'ZMW'], capabilities: ['sms'] });
 
     this.register(new EmailProvider({
       id: 'email',
@@ -147,7 +176,7 @@ export class ProviderRegistry {
       latencyMin: 130,
       latencyMax: 180,
       messageCost: 0.0001
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['email'] });
 
     this.register(new MapsProvider({
       id: 'maps',
@@ -157,7 +186,7 @@ export class ProviderRegistry {
       weight: 50,
       latencyMin: 100,
       latencyMax: 150
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['geocoding', 'routes'] });
 
     this.register(new IdentityProvider({
       id: 'identity',
@@ -167,7 +196,7 @@ export class ProviderRegistry {
       weight: 50,
       latencyMin: 60,
       latencyMax: 100
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['kyc', 'verification'] });
 
     this.register(new AIProvider({
       id: 'ai',
@@ -177,11 +206,38 @@ export class ProviderRegistry {
       weight: 50,
       latencyMin: 300,
       latencyMax: 600
-    }));
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['completion', 'embeddings'] });
   }
 
-  private register(provider: BaseProvider) {
+  private register(provider: BaseProvider, managementDefaults: {
+    environment: ProviderEnvironment;
+    countries: string[];
+    currencies: string[];
+    capabilities: string[];
+  }) {
     this.providers.set(provider.config.id, provider);
+    const id = provider.config.id;
+    const generated = 'sk_' + Math.random().toString(36).slice(2, 18);
+    this.management.set(id, {
+      environment: managementDefaults.environment,
+      countries: managementDefaults.countries,
+      currencies: managementDefaults.currencies,
+      capabilities: managementDefaults.capabilities,
+      priority: provider.config.weight,
+      health: 'unknown',
+      lastSuccessfulRequest: null,
+      errorRate: 0,
+      routingRules: [],
+      secrets: [{
+        meta: {
+          id: `${id}_api_key`,
+          label: 'API Key',
+          masked: this.maskSecret(generated),
+          lastUpdated: new Date().toISOString()
+        },
+        value: generated
+      }]
+    });
   }
 
   public getProvider(id: string): BaseProvider | undefined {
@@ -201,5 +257,230 @@ export class ProviderRegistry {
       ...updates
     };
     return provider.config;
+  }
+
+  // ----------------------------------------------------
+  // MANAGEMENT SURFACE
+  // ----------------------------------------------------
+
+  public getManagementView(id: string): ProviderManagement | null {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return null;
+
+    return {
+      ...provider.config,
+      environment: state.environment,
+      countries: state.countries,
+      currencies: state.currencies,
+      capabilities: state.capabilities,
+      priority: state.priority,
+      health: state.health,
+      lastSuccessfulRequest: state.lastSuccessfulRequest,
+      errorRate: state.errorRate,
+      routingRules: state.routingRules
+    };
+  }
+
+  public getAllManagementViews(): ProviderManagement[] {
+    return Array.from(this.providers.keys())
+      .map(id => this.getManagementView(id))
+      .filter((v): v is ProviderManagement => v !== null);
+  }
+
+  public updateManagement(
+    id: string,
+    updates: Partial<Omit<ProviderManagement, 'id' | 'name' | 'category'>>
+  ): ProviderManagement | null {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return null;
+
+    if (updates.weight !== undefined) {
+      provider.config.weight = updates.weight;
+    }
+    if (updates.priority !== undefined) {
+      state.priority = updates.priority;
+      provider.config.weight = updates.priority;
+    }
+    if (updates.status !== undefined) {
+      provider.config.status = updates.status;
+    }
+    if (updates.latencyMin !== undefined) {
+      provider.config.latencyMin = updates.latencyMin;
+    }
+    if (updates.latencyMax !== undefined) {
+      provider.config.latencyMax = updates.latencyMax;
+    }
+    if (updates.transactionFeePercent !== undefined) {
+      provider.config.transactionFeePercent = updates.transactionFeePercent;
+    }
+    if (updates.transactionFeeFlat !== undefined) {
+      provider.config.transactionFeeFlat = updates.transactionFeeFlat;
+    }
+    if (updates.messageCost !== undefined) {
+      provider.config.messageCost = updates.messageCost;
+    }
+
+    if (updates.environment !== undefined) state.environment = updates.environment;
+    if (updates.countries !== undefined) state.countries = updates.countries;
+    if (updates.currencies !== undefined) state.currencies = updates.currencies;
+    if (updates.capabilities !== undefined) state.capabilities = updates.capabilities;
+    if (updates.priority !== undefined) state.priority = updates.priority;
+    if (updates.health !== undefined) state.health = updates.health;
+    if (updates.lastSuccessfulRequest !== undefined) state.lastSuccessfulRequest = updates.lastSuccessfulRequest;
+    if (updates.errorRate !== undefined) state.errorRate = updates.errorRate;
+    if (updates.routingRules !== undefined) state.routingRules = updates.routingRules;
+
+    return this.getManagementView(id);
+  }
+
+  // ----------------------------------------------------
+  // SECRETS (metadata only — plaintext is never exposed)
+  // ----------------------------------------------------
+
+  private maskSecret(value: string): string {
+    const visible = value.slice(0, Math.min(6, Math.max(0, value.length - 4)));
+    const tail = value.slice(-4);
+    return `${visible}${'•'.repeat(10)}${tail}`;
+  }
+
+  public getSecrets(id: string): ProviderSecretMeta[] | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+    return state.secrets.map(s => s.meta);
+  }
+
+  public addSecret(
+    id: string,
+    input: { label: string; value: string }
+  ): ProviderSecretMeta | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+
+    const meta: ProviderSecretMeta = {
+      id: 'sec_' + Math.random().toString(36).substring(2, 12),
+      label: input.label,
+      masked: this.maskSecret(input.value),
+      lastUpdated: new Date().toISOString()
+    };
+    state.secrets.push({ meta, value: input.value });
+    return meta;
+  }
+
+  public deleteSecret(id: string, secretId: string): boolean {
+    const state = this.management.get(id);
+    if (!state) return false;
+    const before = state.secrets.length;
+    state.secrets = state.secrets.filter(s => s.meta.id !== secretId);
+    return state.secrets.length < before;
+  }
+
+  // ----------------------------------------------------
+  // ROUTING RULES
+  // ----------------------------------------------------
+
+  public getRoutingRules(id: string): RoutingRule[] | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+    return state.routingRules;
+  }
+
+  public addRoutingRule(id: string, rule: Omit<RoutingRule, 'id'>): RoutingRule | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+
+    const created: RoutingRule = {
+      ...rule,
+      id: 'rule_' + Math.random().toString(36).substring(2, 12)
+    };
+    state.routingRules.push(created);
+    return created;
+  }
+
+  public updateRoutingRule(
+    id: string,
+    ruleId: string,
+    updates: Partial<Omit<RoutingRule, 'id'>>
+  ): RoutingRule | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+
+    const rule = state.routingRules.find(r => r.id === ruleId);
+    if (!rule) return null;
+
+    Object.assign(rule, updates);
+    return rule;
+  }
+
+  public deleteRoutingRule(id: string, ruleId: string): boolean {
+    const state = this.management.get(id);
+    if (!state) return false;
+    const before = state.routingRules.length;
+    state.routingRules = state.routingRules.filter(r => r.id !== ruleId);
+    return state.routingRules.length < before;
+  }
+
+  // ----------------------------------------------------
+  // HEALTH CHECKS
+  // ----------------------------------------------------
+
+  // Updates rolling error rate and last successful request based on live traffic.
+  public recordTraffic(id: string, success: boolean, latencyMs: number): void {
+    const state = this.management.get(id);
+    if (!state) return;
+
+    if (success) {
+      state.lastSuccessfulRequest = new Date().toISOString();
+      state.errorRate = Math.round(state.errorRate * 0.9 * 10) / 10;
+    } else {
+      state.errorRate = Math.min(100, Math.round((state.errorRate * 0.9 + 10) * 10) / 10);
+    }
+
+    if (latencyMs > 0) {
+      state.health = state.health === 'unknown' ? 'healthy' : state.health;
+    }
+  }
+
+  public async runHealthCheck(id: string): Promise<HealthCheckSummary | null> {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return null;
+
+    const checkedAt = new Date().toISOString();
+    let status: ProviderHealthStatus = 'healthy';
+    let latencyMs = 0;
+    let errorMessage: string | undefined;
+
+    try {
+      latencyMs = await provider.measureLatency();
+      if (provider.config.status === 'offline') {
+        status = 'down';
+        errorMessage = `${provider.config.name} is offline`;
+      } else if (provider.config.status === 'maintenance') {
+        status = 'degraded';
+        errorMessage = `${provider.config.name} is under maintenance`;
+      } else if (state.errorRate >= 50) {
+        status = 'degraded';
+        errorMessage = `Elevated error rate: ${state.errorRate}%`;
+      }
+    } catch (err: any) {
+      status = 'down';
+      errorMessage = err.message;
+    }
+
+    state.health = status;
+    if (status === 'healthy' || status === 'degraded') {
+      state.lastSuccessfulRequest = checkedAt;
+    }
+
+    return { providerId: id, status, latencyMs, checkedAt, errorMessage };
+  }
+
+  public async runHealthChecks(): Promise<HealthCheckSummary[]> {
+    const results = await Promise.all(
+      Array.from(this.providers.keys()).map(id => this.runHealthCheck(id))
+    );
+    return results.filter((s): s is HealthCheckSummary => s !== null);
   }
 }

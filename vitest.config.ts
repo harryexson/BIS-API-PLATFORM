@@ -12,7 +12,10 @@ export default defineConfig({
       '@company/database$': resolve('./packages/database/src/index.ts'),
       '@company/providers$': resolve('./packages/providers/src/index.ts'),
       '@company/providers/base$': resolve('./packages/providers/src/base.ts'),
-      '@company/routing$': resolve('./packages/routing/src/index.ts')
+      '@company/api-client$': resolve('./packages/api-client/src/index.ts'),
+      '@company/events-sdk$': resolve('./packages/events-sdk/src/index.ts'),
+      '@company/routing$': resolve('./packages/routing/src/index.ts'),
+      '@company/workers$': resolve('./packages/workers/src/index.ts')
     }
   },
   test: {

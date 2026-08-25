@@ -11,15 +11,21 @@
     "dev": "concurrently \"npm run dev:gateway\" \"npm run dev:console\"",
     "dev:gateway": "npm --workspace=services/api-gateway run dev",
     "dev:console": "npm --workspace=apps/admin-console run dev",
+    "dev:worker": "npm --workspace=worker run dev",
     "build:all": "npm run build --workspaces --if-present",
+    "lint": "eslint .",
     "type-check": "tsc --noEmit && npm --workspace=apps/admin-console run type-check",
     "test": "vitest run",
-    "ci": "npm run type-check && npm run test && npm run build:all"
+    "test:integration": "vitest run --config vitest.config.integration.ts",
+    "ci": "npm run lint && npm run type-check && npm run test && npm run build:all"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "concurrently": "^8.2.2",
     "drizzle-kit": "^0.31.10",
+    "eslint": "^10.9.1",
     "typescript": "^5.5.3",
+    "typescript-eslint": "^8.68.0",
     "vitest": "^2.1.8"
   }
 }

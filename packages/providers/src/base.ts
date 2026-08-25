@@ -16,6 +16,11 @@ export abstract class BaseProvider {
     return latency;
   }
 
+  // Public wrapper used by health checks to measure current latency.
+  public async measureLatency(): Promise<number> {
+    return this.simulateLatency();
+  }
+
   // Checks status, throwing error if not online
   protected verifyAvailability() {
     if (this.config.status === 'offline') {

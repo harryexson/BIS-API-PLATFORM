@@ -21,13 +21,13 @@ Before deploying the platform, ensure you have:
 # 3. Create three branches: main (production), staging, dev
 # 4. Copy connection strings for each branch
 
-# 5. Run migrations on each branch
-DATABASE_URL="<neon-dev-connection-string>" npx prisma migrate deploy
-DATABASE_URL="<neon-staging-connection-string>" npx prisma migrate deploy
-DATABASE_URL="<neon-prod-connection-string>" npx prisma migrate deploy
+# 5. Run migrations on each branch (using Drizzle Kit)
+DATABASE_URL="<neon-dev-connection-string>" npm run drizzle:migrate --workspace=@company/database
+DATABASE_URL="<neon-staging-connection-string>" npm run drizzle:migrate --workspace=@company/database
+DATABASE_URL="<neon-prod-connection-string>" npm run drizzle:migrate --workspace=@company/database
 
-# 6. Seed initial application records
-DATABASE_URL="<neon-dev-connection-string>" npx ts-node packages/database/seed.ts
+# 6. Validate schema matches code
+DATABASE_URL="<neon-dev-connection-string>" npm run drizzle:check --workspace=@company/database
 ```
 
 ### 2. Railway Setup (API Gateway + Webhook Service)
@@ -205,34 +205,84 @@ CNAME console.company.com    cname.vercel-dns.com
 
 ## Deployment Pipeline (GitHub Actions)
 
-On merge to `main`:
-1. CI runs: install → type-check → test
-2. If CI passes: build Docker images, push to GHCR
-3. Railway automatically pulls new image and redeploys
-4. Vercel automatically redeploys admin console
+### CI Pipeline (Every Pull Request)
 
-See `infrastructure/github/workflows/` for full workflow definitions.
+Every PR must pass all of the following gates before merge:
+
+| Gate | Command | Description |
+|------|---------|-------------|
+| Lint | `npm run lint` | ESLint with TypeScript rules |
+| Type Check | `npm run type-check` | TypeScript compiler (strict mode) |
+| Unit Tests | `npm test` | Vitest unit test suite |
+| Integration Tests | `npm run test:integration` | Vitest integration tests |
+| Build | `npm run build:all` | Build all workspaces |
+| Security Audit | `npm audit --audit-level=high` | Dependency vulnerability scan |
+| Migration Check | `npm run drizzle:check` | Validate schema matches code |
+
+All gates run in parallel for fast feedback. The `ci-gate` job requires all to pass.
+
+### Production Deployment (Merge to `main`)
+
+1. **Verify CI**: All CI gates must have passed on the PR
+2. **Build**: Compile all workspaces
+3. **Migration**: Validate then apply pending Drizzle migrations (requires `production` environment approval)
+4. **Deploy**: Deploy API Gateway, Worker, and Admin Console
+5. **Verify**: Health check and smoke tests
+
+### Safety Controls
+
+- **Never auto-destroy**: Database migrations use `drizzle-kit migrate` (forward-only)
+- **No force push**: `drizzle-kit push` is forbidden in CI/CD
+- **Human approval**: Production environment requires manual approval in GitHub
+- **Rollback available**: Manual rollback via workflow dispatch
+
+### Required GitHub Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `PRODUCTION_DATABASE_URL` | Neon PostgreSQL connection string |
+| `RAILWAY_TOKEN` | Railway deployment token |
+| `VERCEL_TOKEN` | Vercel deployment token |
+| `TEST_DATABASE_URL` | Neon staging/test database URL |
+
+### GitHub Environments
+
+Configure the `production` environment in GitHub repository settings with:
+- Required reviewers (at least 1)
+- Wait timer: 5 minutes (optional)
+- Deployment branches: `main` only
 
 ---
 
 ## Rollback Procedure
 
+> **CRITICAL:** Never run `drizzle-kit push --force` or `DROP` commands on production.
+> See `docs/operations/ROLLBACK.md` for detailed procedures.
+
 ### Code Rollback
 ```bash
 # Railway: redeploy previous build
 railway rollback --service api-gateway
+railway rollback --service worker
 
 # Vercel: revert to previous deployment
 vercel rollback --token $VERCEL_TOKEN
+
+# Or trigger via GitHub Actions
+gh workflow run deploy.yml -f target=rollback
 ```
 
 ### Database Rollback
 ```bash
-# NEVER run prisma migrate reset on production
-# Instead, create a new migration that reverses the problematic change
+# NEVER run drizzle-kit push --force on production
+# NEVER run DROP TABLE, DELETE FROM, or TRUNCATE on production
+
+# Preferred: Create a forward migration that reverses the change
+npm run drizzle:generate --workspace=@company/database
 
 # Emergency: PITR restore via Neon Dashboard
 # Neon → Project → Restore → Select timestamp
+# See docs/operations/ROLLBACK.md for step-by-step
 ```
 
 ---
