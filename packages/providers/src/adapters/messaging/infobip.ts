@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, MessageRequest } from '@company/schemas';
 
 export class InfobipProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: MessageRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { recipient = '+15005550006', content = 'Hello' } = payload;
-    const txId = 'ib-' + Math.random().toString(36).substring(2, 10) + '-' + Math.random().toString(36).substring(2, 6);
+    const txId = 'ib-' + randomUUID().replace(/-/g, '').slice(0, 8) + '-' + randomUUID().replace(/-/g, '').slice(0, 4);
     
     const cost = this.config.messageCost || 0.008;
 

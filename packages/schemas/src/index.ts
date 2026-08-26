@@ -91,3 +91,75 @@ export interface DashboardMetrics {
   volumePerProvider: Record<string, number>;
   volumePerApp: Record<string, number>;
 }
+
+// ----------------------------------------------------
+// TYPED PROVIDER CONTRACTS
+// ----------------------------------------------------
+
+export interface PaymentRequest {
+  amount: number;
+  currency: string;
+  paymentMethod: string;
+  phoneNumber?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PaymentResponse {
+  providerTransactionId: string;
+  status: string;
+  amount: number;
+  currency: string;
+  [key: string]: unknown;
+}
+
+export interface MessageRequest {
+  recipient: string;
+  content: string;
+  subject?: string;
+  [key: string]: unknown;
+}
+
+export interface MessageResponse {
+  providerMessageId: string;
+  status: string;
+  channel: string;
+  [key: string]: unknown;
+}
+
+export interface OtherRequest {
+  serviceType: string;
+  action?: string;
+  [key: string]: unknown;
+}
+
+export interface OtherResponse {
+  [key: string]: unknown;
+}
+
+// Capability-based routing query
+export interface ProviderCapabilityMatch {
+  id: string;
+  name: string;
+  category: ProviderCategory;
+  capabilities: string[];
+  currencies: string[];
+  countries: string[];
+  weight: number;
+  status: ProviderStatus;
+}
+
+// Transaction status tracking
+export interface TransactionStatusResponse {
+  id: string;
+  status: TransactionStatus;
+  providerId: string;
+  category: ProviderCategory;
+  amount?: number;
+  currency?: string;
+  messageType?: string;
+  cost: number;
+  latency: number;
+  timestamp: string;
+  providerTransactionId?: string;
+  error?: string;
+}

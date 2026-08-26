@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
 
 export class PayChanguProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { amount = 10, currency = 'MWK', phoneNumber = '265990000000' } = payload;
-    const txId = 'pc-' + Math.random().toString(36).substring(2, 15);
+    const txId = 'pc-' + randomUUID().replace(/-/g, '').slice(0, 24);
     
     const feePercent = this.config.transactionFeePercent || 1.5;
     const cost = (amount * feePercent) / 100;
@@ -24,7 +25,7 @@ export class PayChanguProvider extends BaseProvider {
         amount,
         charge_type: 'mobile_money',
         currency,
-        reference: 'pc-ref-' + Math.random().toString(36).substring(2, 8),
+        reference: 'pc-ref-' + randomUUID().replace(/-/g, '').slice(0, 12),
         provider: 'Airtel Money',
         phone: phoneNumber,
         created_at: new Date().toISOString()

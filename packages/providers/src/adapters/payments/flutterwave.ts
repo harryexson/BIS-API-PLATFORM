@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
 
 export class FlutterwaveProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { amount = 10, currency = 'NGN', paymentMethod = 'card' } = payload;
-    const txId = 'flw-tx-' + Math.random().toString(36).substring(2, 10).toUpperCase();
+    const txId = 'flw-tx-' + randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase();
 
     const isLocal = ['NGN', 'GHS', 'KES'].includes(currency);
     const feePercent = isLocal ? 1.4 : 3.8;
@@ -21,10 +22,10 @@ export class FlutterwaveProvider extends BaseProvider {
       status: 'success',
       message: 'Tx successful',
       data: {
-        id: Math.floor(Math.random() * 100000),
-        tx_ref: 'flw-' + Math.random().toString(36).substring(2, 12),
+        id: randomUUID().replace(/-/g, '').slice(0, 10),
+        tx_ref: 'flw-' + randomUUID().replace(/-/g, '').slice(0, 12),
         flw_ref: txId,
-        device_fingerprint: 'device_fp_' + Math.random().toString(36).substring(2, 6),
+        device_fingerprint: 'device_fp_' + randomUUID().replace(/-/g, '').slice(0, 6),
         amount,
         currency,
         charged_amount: amount,

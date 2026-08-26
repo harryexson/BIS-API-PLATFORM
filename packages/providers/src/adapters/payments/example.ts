@@ -2,7 +2,18 @@ import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
 import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
 
-export class AirwallexProvider extends BaseProvider {
+/**
+ * ExamplePaymentProvider — demonstrates how to add a new payment provider.
+ *
+ * To add a new payment provider, you ONLY need to:
+ * 1. Create a class extending BaseProvider
+ * 2. Implement processRequest()
+ * 3. Register it in ProviderRegistry with capabilities
+ * 4. Configure credentials via the management API
+ *
+ * NO changes to routing engine, gateway, or other providers required.
+ */
+export class ExamplePaymentProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
@@ -11,34 +22,19 @@ export class AirwallexProvider extends BaseProvider {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
-    const { amount = 10, currency = 'USD' } = payload;
-    const txId = 'evt_' + randomUUID().replace(/-/g, '').slice(0, 24);
-    
-    const feePercent = this.config.transactionFeePercent || 2.0;
+    const { amount = 10, currency = 'USD', paymentMethod = 'card' } = payload;
+    const txId = 'ex_pay_' + randomUUID().replace(/-/g, '').slice(0, 16);
+
+    const feePercent = this.config.transactionFeePercent || 2.5;
     const cost = (amount * feePercent) / 100;
 
     const responsePayload = {
-      id: 'int_' + randomUUID().replace(/-/g, '').slice(0, 16),
-      payment_intent_id: txId,
+      id: txId,
+      status: 'COMPLETED',
       amount,
       currency,
-      status: 'SUCCEEDED',
-      payment_method: {
-        type: 'card',
-        card: {
-          brand: 'mastercard',
-          last4: '9901'
-        }
-      },
-      charges: [
-        {
-          id: 'chg_' + randomUUID().replace(/-/g, '').slice(0, 16),
-          status: 'CAPTURED',
-          amount,
-          currency,
-          captured: true
-        }
-      ]
+      paymentMethod,
+      processedAt: new Date().toISOString(),
     };
 
     return {
@@ -54,7 +50,7 @@ export class AirwallexProvider extends BaseProvider {
       cost,
       decisionReason,
       payload,
-      response: responsePayload
+      response: responsePayload,
     };
   }
 }

@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
 
 export class NMIProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { amount = 10, currency = 'USD' } = payload;
-    const txId = 'nmi_' + Math.floor(Math.random() * 1000000000);
+    const txId = 'nmi_' + randomUUID().replace(/-/g, '').slice(0, 16);
     
     const feePercent = this.config.transactionFeePercent || 2.2;
     const feeFlat = this.config.transactionFeeFlat || 0.20;
@@ -20,7 +21,7 @@ export class NMIProvider extends BaseProvider {
     const responsePayload = {
       response: '1',
       responsetext: 'SUCCESS',
-      authcode: Math.floor(Math.random() * 900000 + 100000).toString(),
+      authcode: randomUUID().replace(/-/g, '').slice(0, 6),
       transactionid: txId,
       avsresponse: 'Y',
       cvvresponse: 'M',

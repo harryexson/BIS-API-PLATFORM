@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, OtherRequest } from '@company/schemas';
 
 export class MapsProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: OtherRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { action = 'geocode', address = '1600 Amphitheatre Pkwy', origin, destination } = payload;
-    const txId = 'map-' + Math.random().toString(36).substring(2, 12);
+    const txId = 'map-' + randomUUID().replace(/-/g, '').slice(0, 16);
     const cost = 0.005;
 
     let responsePayload: any = {};

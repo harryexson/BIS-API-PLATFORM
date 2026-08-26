@@ -4,7 +4,7 @@ import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine } from '@company/routing';
 import { EventBus } from '@company/events';
-import { TransactionEvent } from '@company/schemas';
+import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
 import {
   TenantRegistry,
@@ -394,6 +394,64 @@ app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: R
     observe(errorEvent);
     return res.status(503).json({ error: 'Service routing failed', id: errorEvent.id });
   }
+});
+
+// ----------------------------------------------------
+// TRANSACTION STATUS ENDPOINTS
+// ----------------------------------------------------
+// Consuming applications can poll for transaction status after submission.
+
+app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
+  const { id } = req.params;
+  const events = eventBus.getHistory();
+
+  // Find the most recent event with this transaction ID
+  const event = events.find((e: TransactionEvent) => e.id === id);
+
+  if (!event) {
+    return res.status(404).json({ error: `Transaction '${id}' not found` });
+  }
+
+  const statusResponse: TransactionStatusResponse = {
+    id: event.id,
+    status: event.status,
+    providerId: event.providerId,
+    category: event.category,
+    amount: event.amount,
+    currency: event.currency,
+    messageType: event.messageType,
+    cost: event.cost,
+    latency: event.latency,
+    timestamp: event.timestamp,
+    providerTransactionId: event.response?.id || event.response?.messageId || event.response?.transactionid,
+    error: event.error,
+  };
+
+  return res.json(statusResponse);
+});
+
+// ----------------------------------------------------
+// PROVIDER CAPABILITY QUERY API
+// ----------------------------------------------------
+// Consuming applications can discover available providers and their capabilities.
+
+app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
+  const { category, capability, currency } = req.query;
+
+  if (category && typeof category === 'string') {
+    const caps = capability ? [capability as string] : [];
+    const cur = currency ? currency as string : undefined;
+    const matches = registry.findByCategoryAndCapabilities(
+      category as 'payment' | 'messaging' | 'other',
+      caps,
+      cur,
+    );
+    return res.json({ providers: matches, count: matches.length });
+  }
+
+  // Return all providers with their management views
+  const views = registry.getAllManagementViews();
+  return res.json({ providers: views, count: views.length });
 });
 
 // P0-5: Inbound provider webhooks with HMAC signature verification.

@@ -1,10 +1,19 @@
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, PaymentResponse, MessageRequest, MessageResponse, OtherRequest, OtherResponse } from '@company/schemas';
 
 export abstract class BaseProvider {
   public config: ProviderConfig;
+  private _secrets: Record<string, string> = {};
 
   constructor(config: ProviderConfig) {
     this.config = config;
+  }
+
+  protected get secrets(): Record<string, string> {
+    return this._secrets;
+  }
+
+  public setSecrets(secrets: Record<string, string>): void {
+    this._secrets = secrets;
   }
 
   // Simulates provider processing delay
@@ -31,5 +40,9 @@ export abstract class BaseProvider {
     }
   }
 
-  abstract processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent>;
+  abstract processRequest(
+    appId: string,
+    payload: PaymentRequest | MessageRequest | OtherRequest,
+    decisionReason: string
+  ): Promise<TransactionEvent>;
 }

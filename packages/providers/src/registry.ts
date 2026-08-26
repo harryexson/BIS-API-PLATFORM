@@ -4,6 +4,7 @@ import {
   ProviderEnvironment,
   ProviderHealthStatus,
   ProviderSecretMeta,
+  ProviderCapabilityMatch,
   RoutingRule,
   HealthCheckSummary,
 } from '@company/schemas';
@@ -16,11 +17,13 @@ import { FlutterwaveProvider } from './adapters/payments/flutterwave';
 import { PawaPayProvider } from './adapters/payments/pawapay';
 import { PayChanguProvider } from './adapters/payments/paychangu';
 import { AirwallexProvider } from './adapters/payments/airwallex';
+import { ExamplePaymentProvider } from './adapters/payments/example';
 
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
 import { FutureSMSProvider } from './adapters/messaging/futuresms';
 import { EmailProvider } from './adapters/messaging/email';
+import { ExampleMessagingProvider } from './adapters/messaging/example';
 
 import { MapsProvider } from './adapters/other/maps';
 import { IdentityProvider } from './adapters/other/identity';
@@ -109,7 +112,7 @@ export class ProviderRegistry {
       latencyMax: 280,
       transactionFeePercent: 1.0,
       transactionFeeFlat: 0.0
-    }), { environment: 'live', countries: ['MW', 'ZM', 'TZ'], currencies: ['MWK', 'ZMW', 'TZS'], capabilities: ['mobile_money'] });
+    }), { environment: 'live', countries: ['MW', 'ZM', 'TZ', 'UG'], currencies: ['MWK', 'ZMW', 'TZS', 'UGX'], capabilities: ['mobile_money'] });
 
     this.register(new PayChanguProvider({
       id: 'paychangu',
@@ -208,6 +211,35 @@ export class ProviderRegistry {
       latencyMin: 300,
       latencyMax: 600
     }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['completion', 'embeddings'] });
+
+    // ----------------------------------------------------
+    // EXAMPLE PROVIDERS (demonstrate provider extensibility)
+    // ----------------------------------------------------
+    // Adding a new provider only requires: adapter class + registration here.
+    // No routing engine changes needed — capability-based routing handles it.
+
+    this.register(new ExamplePaymentProvider({
+      id: 'example-pay',
+      name: 'Example Payment Gateway',
+      category: 'payment',
+      status: 'online',
+      weight: 25,
+      latencyMin: 100,
+      latencyMax: 200,
+      transactionFeePercent: 2.5,
+      transactionFeeFlat: 0.0
+    }), { environment: 'test', countries: ['*'], currencies: ['USD', 'EUR'], capabilities: ['card'] });
+
+    this.register(new ExampleMessagingProvider({
+      id: 'example-msg',
+      name: 'Example Messaging Gateway',
+      category: 'messaging',
+      status: 'online',
+      weight: 25,
+      latencyMin: 70,
+      latencyMax: 130,
+      messageCost: 0.003
+    }), { environment: 'test', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'email'] });
   }
 
   private register(provider: BaseProvider, managementDefaults: {
@@ -247,6 +279,51 @@ export class ProviderRegistry {
 
   public getAllConfigs(): ProviderConfig[] {
     return Array.from(this.providers.values()).map(p => p.config);
+  }
+
+  // Capability-based routing: find providers by category + required capabilities + supported currencies
+  public findByCategoryAndCapabilities(
+    category: 'payment' | 'messaging' | 'other',
+    requiredCapabilities: string[],
+    currency?: string,
+  ): ProviderCapabilityMatch[] {
+    const matches: ProviderCapabilityMatch[] = [];
+
+    for (const [id, provider] of this.providers) {
+      const config = provider.config;
+      if (config.category !== category) continue;
+      if (config.status !== 'online') continue;
+
+      const state = this.management.get(id);
+      if (!state) continue;
+
+      // Check that provider supports all required capabilities
+      const hasAllCapabilities = requiredCapabilities.every(cap =>
+        state.capabilities.includes(cap)
+      );
+      if (!hasAllCapabilities) continue;
+
+      // Check currency support if specified
+      if (currency) {
+        const cur = currency.toUpperCase();
+        if (!state.currencies.includes(cur) && !state.currencies.includes('*')) continue;
+      }
+
+      matches.push({
+        id,
+        name: config.name,
+        category: config.category,
+        capabilities: state.capabilities,
+        currencies: state.currencies,
+        countries: state.countries,
+        weight: config.weight,
+        status: config.status,
+      });
+    }
+
+    // Sort by weight descending
+    matches.sort((a, b) => b.weight - a.weight);
+    return matches;
   }
 
   public updateProviderConfig(id: string, updates: Partial<ProviderConfig>): ProviderConfig | null {

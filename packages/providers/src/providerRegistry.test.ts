@@ -7,11 +7,11 @@ describe('ProviderRegistry', () => {
     const registry = ProviderRegistry.getInstance();
     registry.updateProviderConfig('stripe', { status: 'online' });
   });
-  it('registers exactly 13 providers across the three categories', () => {
+  it('registers exactly 15 providers across the three categories (13 original + 2 examples)', () => {
     const configs = ProviderRegistry.getInstance().getAllConfigs();
-    expect(configs).toHaveLength(13);
-    expect(configs.filter((c) => c.category === 'payment')).toHaveLength(6);
-    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(4);
+    expect(configs).toHaveLength(15);
+    expect(configs.filter((c) => c.category === 'payment')).toHaveLength(7);
+    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(5);
     expect(configs.filter((c) => c.category === 'other')).toHaveLength(3);
   });
 
@@ -107,6 +107,51 @@ describe('ProviderRegistry management surface', () => {
 
   it('runs health checks for all providers', async () => {
     const summaries = await registry.runHealthChecks();
-    expect(summaries.length).toBe(13);
+    expect(summaries.length).toBe(15);
+  });
+});
+
+describe('Provider Addition Dry Run (Phase 16)', () => {
+  const registry = ProviderRegistry.getInstance();
+
+  it('new ExamplePaymentProvider is found by capability-based routing', () => {
+    const matches = registry.findByCategoryAndCapabilities('payment', ['card'], 'USD');
+    const ids = matches.map(m => m.id);
+    expect(ids).toContain('example-pay');
+  });
+
+  it('new ExampleMessagingProvider is found by capability-based routing for SMS', () => {
+    const matches = registry.findByCategoryAndCapabilities('messaging', ['sms']);
+    const ids = matches.map(m => m.id);
+    expect(ids).toContain('example-msg');
+  });
+
+  it('new ExampleMessagingProvider is found by capability-based routing for email', () => {
+    const matches = registry.findByCategoryAndCapabilities('messaging', ['email']);
+    const ids = matches.map(m => m.id);
+    expect(ids).toContain('example-msg');
+  });
+
+  it('new providers return management views', () => {
+    const payView = registry.getManagementView('example-pay');
+    expect(payView).not.toBeNull();
+    expect(payView!.name).toBe('Example Payment Gateway');
+    expect(payView!.capabilities).toContain('card');
+
+    const msgView = registry.getManagementView('example-msg');
+    expect(msgView).not.toBeNull();
+    expect(msgView!.name).toBe('Example Messaging Gateway');
+    expect(msgView!.capabilities).toContain('sms');
+  });
+
+  it('new providers support secrets management', () => {
+    const meta = registry.addSecret('example-pay', { label: 'API Key', value: 'ex_test_key_12345' });
+    expect(meta).not.toBeNull();
+    expect(meta!.masked).toContain('••••');
+
+    const secrets = registry.getSecrets('example-pay');
+    expect(secrets!.some(s => s.id === meta!.id)).toBe(true);
+
+    expect(registry.deleteSecret('example-pay', meta!.id)).toBe(true);
   });
 });

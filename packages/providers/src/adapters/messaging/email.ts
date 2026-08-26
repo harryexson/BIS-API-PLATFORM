@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, MessageRequest } from '@company/schemas';
 
 export class EmailProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: MessageRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { recipient = 'user@example.com', subject = 'Notification', content = 'Hello' } = payload;
-    const txId = 'email-' + Math.random().toString(36).substring(2, 15);
+    const txId = 'email-' + randomUUID().replace(/-/g, '').slice(0, 20);
     
     const cost = this.config.messageCost || 0.0001;
 

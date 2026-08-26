@@ -13,7 +13,9 @@ export class RoutingEngine {
     this.conversationManager = new ConversationManager();
   }
 
-  // Routes a payment request
+  // Capability-based payment routing — selects providers by capabilities/currency
+  // rather than hardcoded provider IDs. Adding a new provider with the right
+  // capabilities automatically makes it eligible for routing.
   public async routePayment(appId: string, payload: any): Promise<TransactionEvent> {
     const { currency = 'USD', paymentMethod = 'card', providerOverride } = payload;
     let selectedProvider: BaseProvider | null = null;
@@ -37,82 +39,60 @@ export class RoutingEngine {
       }
     }
 
-    // 2. Routing Rules
+    // 2. Capability-based routing: find providers that support the currency + payment method
     if (!selectedProvider) {
       const cur = currency.toUpperCase();
-      
-      if (cur === 'MWK') {
-        const payChangu = this.registry.getProvider('paychangu');
-        if (payChangu && payChangu.config.status === 'online') {
-          selectedProvider = payChangu;
-          reason += `Malawi Kwacha currency detected. Routed to native gateway PayChangu.`;
-        } else {
-          const flw = this.registry.getProvider('flutterwave');
-          if (flw && flw.config.status === 'online') {
-            selectedProvider = flw;
-            reason += `PayChangu offline. Falling back to Flutterwave (supports international settlement for MWK).`;
-          } else {
-            reason += `PayChangu and Flutterwave offline. Attempting general payment routing. | `;
-          }
-        }
-      }
-      
-      else if (['KES', 'UGX', 'GHS', 'TZS'].includes(cur) && paymentMethod === 'mobile_money') {
-        const pawapay = this.registry.getProvider('pawapay');
-        if (pawapay && pawapay.config.status === 'online') {
-          selectedProvider = pawapay;
-          reason += `Mobile Money method for East/West African currency (${cur}) detected. Routed to PawaPay.`;
-        } else {
-          const flw = this.registry.getProvider('flutterwave');
-          if (flw && flw.config.status === 'online') {
-            selectedProvider = flw;
-            reason += `PawaPay offline. Falling back to Flutterwave Mobile Money rails.`;
-          } else {
-            reason += `Mobile Money channels offline. Attempting card payment rails. | `;
-          }
-        }
-      }
-      
-      else if (['NGN', 'GHS', 'ZAR', 'KES'].includes(cur) && paymentMethod === 'card') {
-        const flw = this.registry.getProvider('flutterwave');
-        if (flw && flw.config.status === 'online') {
-          selectedProvider = flw;
-          reason += `African card transaction (${cur}) detected. Routed to Flutterwave.`;
-        } else {
-          const airwallex = this.registry.getProvider('airwallex');
-          if (airwallex && airwallex.config.status === 'online') {
-            selectedProvider = airwallex;
-            reason += `Flutterwave offline. Falling back to Airwallex international regional cards.`;
-          } else {
-            reason += `Flutterwave and Airwallex offline. Attempting global processors. | `;
-          }
-        }
-      }
-    }
+      const capabilities = [paymentMethod];
 
-    // 3. Global Cards / Weight-based Routing (Stripe vs NMI)
-    if (!selectedProvider) {
-      const candidates = activePayments.filter(p => ['stripe', 'nmi', 'airwallex'].includes(p.id));
-      
-      if (candidates.length === 0) {
-        selectedProvider = this.registry.getProvider(activePayments[0].id) || null;
-        reason += `No primary global route online. Picked first available: '${selectedProvider?.config.name}'.`;
-      } else {
-        const totalWeight = candidates.reduce((sum, p) => sum + p.weight, 0);
+      // For mobile money in East/West Africa, also check mobile_money capability
+      if (paymentMethod === 'mobile_money') {
+        capabilities.push('mobile_money');
+      }
+
+      const candidates = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur);
+
+      if (candidates.length > 0) {
+        // Weight-based selection among capability-matched providers
+        const totalWeight = candidates.reduce((sum, c) => sum + c.weight, 0);
         let random = Math.random() * totalWeight;
-        let chosenConfig: ProviderConfig | null = null;
-        
+        let chosen = candidates[0];
+
         for (const c of candidates) {
           random -= c.weight;
           if (random <= 0) {
-            chosenConfig = c;
+            chosen = c;
             break;
           }
         }
-        
-        if (chosenConfig) {
-          selectedProvider = this.registry.getProvider(chosenConfig.id) || null;
-          reason += `Routed via global weight allocation (Stripe/NMI/Airwallex). Chosen: '${selectedProvider?.config.name}' (weight ${chosenConfig.weight}/${totalWeight}).`;
+
+        const provider = this.registry.getProvider(chosen.id);
+        if (provider) {
+          selectedProvider = provider;
+          reason = `Capability-based routing: Matched providers [${candidates.map(c => c.name).join(', ')}] for ${cur}/${paymentMethod}. Selected '${chosen.name}' (weight ${chosen.weight}/${totalWeight}).`;
+        }
+      }
+
+      // Fallback: if no capability match, use global weight-based routing
+      if (!selectedProvider) {
+        const candidates = activePayments.filter(p => ['stripe', 'nmi', 'airwallex'].includes(p.id));
+
+        if (candidates.length > 0) {
+          const totalWeight = candidates.reduce((sum, p) => sum + p.weight, 0);
+          let random = Math.random() * totalWeight;
+          let chosenConfig: ProviderConfig | null = null;
+
+          for (const c of candidates) {
+            random -= c.weight;
+            if (random <= 0) {
+              chosenConfig = c;
+              break;
+            }
+          }
+
+          if (chosenConfig) {
+            selectedProvider = this.registry.getProvider(chosenConfig.id) || null;
+            reason += `Global weight allocation fallback. Chosen: '${selectedProvider?.config.name}' (weight ${chosenConfig.weight}/${totalWeight}).`;
+          }
         }
       }
     }
@@ -135,7 +115,7 @@ export class RoutingEngine {
     }
   }
 
-  // Routes a messaging request
+  // Capability-based messaging routing
   public async routeMessage(appId: string, payload: any): Promise<TransactionEvent> {
     const { recipient = '', content = '', providerOverride, tenantId } = payload;
     let selectedProvider: BaseProvider | null = null;
@@ -171,53 +151,42 @@ export class RoutingEngine {
       }
     }
 
-    // 2. Channel logic
+    // 2. Channel detection + capability-based routing
     if (!selectedProvider) {
       const isEmail = recipient.includes('@');
-      
+      const isWhatsapp = content.toLowerCase().includes('wa:') || content.length > 300;
+
       if (isEmail) {
-        const email = this.registry.getProvider('email');
-        if (email && email.config.status === 'online') {
-          selectedProvider = email;
-          reason += `Email address format detected. Routed to Email SMTP Gateway.`;
-        } else {
-          const sh = this.registry.getProvider('signalhouse');
-          if (sh && sh.config.status === 'online') {
-            selectedProvider = sh;
-            reason += `Email SMTP offline. Falling back to SignalHouse Multi-Channel email dispatch.`;
-          }
+        const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['email']);
+        if (candidates.length > 0) {
+          selectedProvider = this.registry.getProvider(candidates[0].id) || null;
+          reason += `Email address format detected. Capability-based routing to '${selectedProvider?.config.name}'.`;
+        }
+      } else if (isWhatsapp) {
+        const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['whatsapp']);
+        if (candidates.length > 0) {
+          selectedProvider = this.registry.getProvider(candidates[0].id) || null;
+          reason += `WhatsApp format detected. Capability-based routing to '${selectedProvider?.config.name}'.`;
         }
       } else {
-        const isWhatsapp = content.toLowerCase().includes('wa:') || content.length > 300;
-        
-        if (isWhatsapp) {
-          const sh = this.registry.getProvider('signalhouse');
-          if (sh && sh.config.status === 'online') {
-            selectedProvider = sh;
-            reason += `Rich push / WhatsApp format detected. Routed to SignalHouse.`;
-          }
-        }
-        
-        if (!selectedProvider) {
-          const infobip = this.registry.getProvider('infobip');
-          const futuresms = this.registry.getProvider('futuresms');
-          
-          if (futuresms && futuresms.config.status === 'online' && (recipient.startsWith('+254') || recipient.startsWith('+265') || futuresms.config.weight > 60)) {
-            selectedProvider = futuresms;
-            reason += `Routed to Future SMS budget gateway (regional target or high weight rule matched).`;
-          } else if (infobip && infobip.config.status === 'online') {
-            selectedProvider = infobip;
-            reason += `Routed to Infobip Enterprise SMS (high reliability default).`;
-          } else if (futuresms && futuresms.config.status === 'online') {
-            selectedProvider = futuresms;
-            reason += `Infobip offline. Routed to Future SMS budget carrier fallback.`;
-          } else {
-            const sh = this.registry.getProvider('signalhouse');
-            if (sh && sh.config.status === 'online') {
-              selectedProvider = sh;
-              reason += `All SMS carriers offline. Falling back to SignalHouse WhatsApp proxy.`;
+        // SMS routing: try capability-based, then fallback to first available
+        const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['sms']);
+        if (candidates.length > 0) {
+          // Weight-based selection among SMS-capable providers
+          const totalWeight = candidates.reduce((sum, c) => sum + c.weight, 0);
+          let random = Math.random() * totalWeight;
+          let chosen = candidates[0];
+
+          for (const c of candidates) {
+            random -= c.weight;
+            if (random <= 0) {
+              chosen = c;
+              break;
             }
           }
+
+          selectedProvider = this.registry.getProvider(chosen.id) || null;
+          reason += `SMS routing: Matched providers [${candidates.map(c => c.name).join(', ')}]. Selected '${chosen.name}'.`;
         }
       }
     }

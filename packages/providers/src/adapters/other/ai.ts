@@ -1,17 +1,18 @@
+import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, OtherRequest } from '@company/schemas';
 
 export class AIProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
   }
 
-  async processRequest(appId: string, payload: any, decisionReason: string): Promise<TransactionEvent> {
+  async processRequest(appId: string, payload: OtherRequest, decisionReason: string): Promise<TransactionEvent> {
     const latency = await this.simulateLatency();
     this.verifyAvailability();
 
     const { prompt = 'Explain API Gateway', temperature = 0.7 } = payload;
-    const txId = 'ai-gemini-' + Math.random().toString(36).substring(2, 12);
+    const txId = 'ai-gemini-' + randomUUID().replace(/-/g, '').slice(0, 16);
     const cost = 0.02;
 
     const responses = [
@@ -36,9 +37,9 @@ export class AIProvider extends BaseProvider {
         }
       ],
       usageMetadata: {
-        promptTokenCount: Math.ceil(prompt.length / 4),
+        promptTokenCount: Math.ceil((typeof prompt === 'string' ? prompt.length : 0) / 4),
         candidatesTokenCount: 150,
-        totalTokenCount: Math.ceil(prompt.length / 4) + 150
+        totalTokenCount: Math.ceil((typeof prompt === 'string' ? prompt.length : 0) / 4) + 150
       }
     };
 
