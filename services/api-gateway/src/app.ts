@@ -47,11 +47,11 @@ app.use(
 app.use(express.json({ limit: '100kb' }));
 
 // ----------------------------------------------------
-// OBSERVABILITY
+// P3-1: REQUEST/RESPONSE LOGGING + TRACING
 // ----------------------------------------------------
-// Attaches a request/correlation id to every operation and emits structured,
-// redacted logs + latency/error metrics. Never logs secrets or PII — the
-// logger redacts sensitive fields by default.
+// Logs sanitized request details at start, response summary at finish.
+// Adds X-Request-Id to all responses for distributed tracing.
+// Never logs secrets or PII — the logger redacts sensitive fields by default.
 app.use((req: Request, res: Response, next: NextFunction) => {
   const requestId = randomUUID();
   const correlationId = (req.header('x-correlation-id') as string) || requestId;
@@ -62,6 +62,22 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   };
 
   runWithContext(ctx, () => {
+    // Log request start (debug level — noisy in production, useful in dev)
+    const bodySummary = req.body && Object.keys(req.body).length > 0
+      ? { fields: Object.keys(req.body), size: JSON.stringify(req.body).length }
+      : undefined;
+    logger.debug('request received', {
+      method: req.method,
+      path: req.path,
+      query: Object.keys(req.query).length > 0 ? req.query : undefined,
+      body: bodySummary,
+      ip: req.ip,
+      userAgent: req.header('user-agent'),
+    });
+
+    // Attach tracing header to response
+    res.setHeader('X-Request-Id', requestId);
+
     const start = Date.now();
     res.on('finish', () => {
       const c = getContext();
@@ -74,14 +90,27 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
       const latency = Date.now() - start;
       const status = res.statusCode;
-      logger.info('request completed', {
-        operation: `${req.method} ${req.path}`,
+
+      const logFields: Record<string, any> = {
+        method: req.method,
+        path: req.path,
         status,
         latency,
         providerId: c.providerId,
-      });
+        applicationId: c.applicationId,
+        tenantId: c.tenantId,
+      };
+
+      if (status >= 500) {
+        logger.error('request failed', logFields);
+        metrics.increment('apiErrors');
+      } else if (status >= 400) {
+        logger.warn('request rejected', logFields);
+      } else {
+        logger.info('request completed', logFields);
+      }
+
       metrics.recordLatency(latency);
-      if (status >= 500) metrics.increment('apiErrors');
     });
     next();
   });
