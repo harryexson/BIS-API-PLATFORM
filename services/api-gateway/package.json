@@ -10,14 +10,15 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "@company/events": "*",
     "@company/database": "*",
+    "@company/events": "*",
     "@company/providers": "*",
     "@company/routing": "*",
     "@company/schemas": "*",
     "@company/shared": "*",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "rate-limiter-flexible": "^11.2.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
@@ -25,5 +26,8 @@
     "@types/node": "^20.14.9",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.5.3"
+  },
+  "optionalDependencies": {
+    "ioredis": "^5.11.1"
   }
 }

@@ -219,10 +219,16 @@ app.get('/ready', async (req: Request, res: Response) => {
     deps.database = 'unreachable';
   }
 
+  // P2-4: Report rate limiter backend
+  const rlInfo = auth.getRateLimiterInfo();
+  deps.rateLimiter = rlInfo.storeBacked ? 'redis' : 'in-memory';
+
   // Provider registry is in-memory — always "ready" if process is up
   deps.providers = 'ready';
 
-  const allHealthy = Object.values(deps).every((v) => v === 'healthy' || v === 'ready');
+  const allHealthy = Object.values(deps).every(
+    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis',
+  );
   const status = allHealthy ? 'ready' : 'degraded';
 
   res.status(allHealthy ? 200 : 503).json({
