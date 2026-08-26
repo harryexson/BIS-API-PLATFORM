@@ -24,9 +24,8 @@ This document defines the platform's Recovery Time Objective (RTO), Recovery Poi
 ## Critical Data
 
 The only data that cannot be reconstructed is:
-- `transactions` table records
-- `webhook_events` table records
-- `api_keys` table (key hashes)
+- `events` table records (transaction and webhook event log)
+- `application_api_keys` table (key hashes)
 - `applications` table
 
 Provider configurations, circuit breaker state, and health logs are operational data that can be recreated.
@@ -77,13 +76,13 @@ Provider configurations, circuit breaker state, and health logs are operational 
 5. Verify: curl https://api.company.com/health → {"status":"ok"}
 ```
 
-**In-flight transactions**: Any transaction that was in `pending` state at crash time will be reconciled by the worker within 5 minutes.
+**In-flight transactions**: Any event that was in `pending` state at crash time will be reconciled by the worker within 5 minutes.
 
 ---
 
 ### Scenario 2: Database Outage (Neon)
 
-**Detection**: Prisma throws `P1001: Can't reach database server`. Logged + alerted.
+**Detection**: Neon serverless driver throws connection error. Logged + alerted.
 
 **Impact**: Gateway cannot process any requests (requires DB for auth, idempotency, and transaction recording). Returns 503 to all clients.
 
@@ -95,7 +94,7 @@ Provider configurations, circuit breaker state, and health logs are operational 
    a. Check DATABASE_URL environment variable in Railway
    b. Verify Neon project is not paused (free tier auto-pauses)
    c. Rotate database credentials in Neon dashboard, update Railway env var
-4. After connection restored: gateway auto-reconnects (Prisma reconnect enabled)
+4. After connection restored: gateway auto-reconnects (Neon serverless driver handles reconnection)
 5. Verify: GET /health returns healthy DB status
 6. Run reconciliation: trigger worker to process any pending transactions
 ```
@@ -138,7 +137,7 @@ PATCH /api/dashboard/providers/:id
 1. Railway auto-restarts webhook-service
 2. Providers retry missed webhooks automatically (no manual action needed for most)
 3. For PawaPay: if outage > 24 hours, manually trigger reconciliation via worker
-4. Verify: check webhook_events table for recently processed events
+4. Verify: check `events` table for recently processed webhooks
 ```
 
 ---
@@ -172,11 +171,11 @@ PATCH /api/dashboard/providers/:id
 **Recovery**:
 ```
 1. IMMEDIATE: Revoke compromised key
-   UPDATE api_keys SET revoked_at = NOW() WHERE key_hash = '<hash>';
+   UPDATE application_api_keys SET revoked_at = NOW() WHERE key_hash = '<hash>';
    # Or via admin dashboard if accessible
 
 2. Identify blast radius:
-   SELECT * FROM transactions WHERE application_id = '<id>' AND created_at > '<suspected_compromise_time>';
+   SELECT * FROM events WHERE application_id = '<id>' AND created_at > '<suspected_compromise_time>';
 
 3. Contact affected payment providers to review / reverse unauthorized charges
 

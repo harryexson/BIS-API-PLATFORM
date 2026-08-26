@@ -127,8 +127,12 @@ export class MemoryStore implements KVStore {
 
   async acquireLock(resource: string, ownerId: string, ttlMs: number): Promise<boolean> {
     const existing = this.locks.get(resource);
-    if (existing && existing.expiresAt > Date.now()) {
-      if (existing.owner !== ownerId) return false;
+    if (existing) {
+      if (existing.expiresAt <= Date.now()) {
+        this.locks.delete(resource);
+      } else if (existing.owner !== ownerId) {
+        return false;
+      }
     }
     this.locks.set(resource, { owner: ownerId, expiresAt: Date.now() + ttlMs });
     return true;
