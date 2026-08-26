@@ -83,7 +83,7 @@ export class AuthService {
       return header === this.opts.adminKey;
     }
     if (this.production) {
-      console.warn('[auth] PLATFORM_ADMIN_KEY is not set; admin endpoints are OPEN in production');
+      return false;
     }
     return true;
   }

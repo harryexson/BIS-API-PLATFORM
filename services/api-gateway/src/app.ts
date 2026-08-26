@@ -1,11 +1,16 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine } from '@company/routing';
 import { EventBus } from '@company/events';
 import { TransactionEvent } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
+import {
+  TenantRegistry,
+  tenantRepository,
+  tenantApplicationLinkRepository,
+} from '@company/database';
 import {
   logger,
   metrics,
@@ -15,8 +20,30 @@ import {
 } from '@company/observability';
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// P1-1: Restrict CORS to configured origins
+const allowedOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+  : [];
+app.use(
+  cors(
+    allowedOrigins.length > 0
+      ? {
+          origin: (origin, callback) => {
+            if (!origin || allowedOrigins.includes(origin)) {
+              callback(null, true);
+            } else {
+              callback(new Error('Not allowed by CORS'));
+            }
+          },
+          credentials: true,
+        }
+      : { origin: '*' },
+  ),
+);
+
+// P1-3: Explicit body size limit
+app.use(express.json({ limit: '100kb' }));
 
 // ----------------------------------------------------
 // OBSERVABILITY
@@ -107,15 +134,55 @@ const routingEngine = new RoutingEngine();
 const eventBus = EventBus.getInstance();
 
 // ----------------------------------------------------
+// P0-4: TENANT ISOLATION MIDDLEWARE
+// ----------------------------------------------------
+// Validates that the x-tenant-id header (if provided) belongs to the
+// authenticated application. Prevents cross-tenant access via IDOR.
+async function resolveTenantContext(req: Request, res: Response, next: NextFunction) {
+  const authed = req as Request & { appId?: string };
+  if (!authed.appId) return next();
+
+  const tenantId = req.header('x-tenant-id');
+  if (!tenantId) return next();
+
+  try {
+    const tenantRegistry = new TenantRegistry(tenantRepository, tenantApplicationLinkRepository);
+    await tenantRegistry.assertTenantAccess(authed.appId, tenantId);
+    next();
+  } catch {
+    logger.warn('tenant access denied', {
+      operation: 'tenant-resolution',
+      errorCode: 'TENANT_ACCESS_DENIED',
+      status: 'failed',
+    });
+    return res.status(403).json({ error: 'Access denied: tenant not linked to this application' });
+  }
+}
+
+// ----------------------------------------------------
 // ADMIN AUTHORIZATION
 // ----------------------------------------------------
 // Mutating provider-management endpoints require an admin token.
 // Token is provided via the `x-admin-token` header.
-// Configured via ADMIN_API_TOKEN (defaults to a dev token for local runs).
-const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || 'dev-admin-token';
+// In production, ADMIN_API_TOKEN must be explicitly set.
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+const isProduction = process.env.NODE_ENV === 'production';
+if (!ADMIN_API_TOKEN && isProduction) {
+  logger.error('ADMIN_API_TOKEN is not set in production — admin endpoints are INSECURE', {
+    operation: 'startup',
+    errorCode: 'MISSING_ADMIN_TOKEN',
+    status: 'failed',
+  });
+}
 
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const token = req.header('x-admin-token');
+  if (!ADMIN_API_TOKEN) {
+    if (isProduction) {
+      return res.status(503).json({ error: 'Admin access not configured' });
+    }
+    return next();
+  }
   if (!token || token !== ADMIN_API_TOKEN) {
     return res.status(403).json({ error: 'Forbidden: administrator authorization required' });
   }
@@ -153,8 +220,9 @@ app.get('/ready', (req: Request, res: Response) => {
 // GATEWAY TRAFFIC ENDPOINTS
 // ----------------------------------------------------
 
-app.post('/api/gateway/payment', mw.apiKey, async (req: Request, res: Response) => {
-  const { appId, amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
+app.post('/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
   
   if (!appId) {
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
@@ -174,7 +242,7 @@ app.post('/api/gateway/payment', mw.apiKey, async (req: Request, res: Response) 
     return res.json(event);
   } catch (err: any) {
     const errorEvent = {
-      id: 'err_' + Math.random().toString(36).substring(2, 12),
+      id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
       appId,
       category: 'payment' as const,
@@ -184,20 +252,21 @@ app.post('/api/gateway/payment', mw.apiKey, async (req: Request, res: Response) 
       currency: currency || 'USD',
       latency: 50,
       cost: 0,
-      decisionReason: err.message,
-      payload: req.body,
+      decisionReason: 'routing_failure',
+      payload: {},
       response: null,
-      error: err.message
+      error: 'Payment routing failed'
     };
     eventBus.emit(errorEvent);
     observeFailure('payment', errorEvent.providerId, 'ROUTING_FAILED');
     observe(errorEvent);
-    return res.status(503).json(errorEvent);
+    return res.status(503).json({ error: 'Payment routing failed', id: errorEvent.id });
   }
 });
 
-app.post('/api/gateway/messaging', mw.apiKey, async (req: Request, res: Response) => {
-  const { appId, recipient, content, providerOverride } = req.body;
+app.post('/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const { recipient, content, providerOverride } = req.body;
 
   if (!appId || !recipient || !content) {
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
@@ -215,7 +284,7 @@ app.post('/api/gateway/messaging', mw.apiKey, async (req: Request, res: Response
     return res.json(event);
   } catch (err: any) {
     const errorEvent = {
-      id: 'err_' + Math.random().toString(36).substring(2, 12),
+      id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
       appId,
       category: 'messaging' as const,
@@ -223,20 +292,21 @@ app.post('/api/gateway/messaging', mw.apiKey, async (req: Request, res: Response
       status: 'failed' as const,
       latency: 30,
       cost: 0,
-      decisionReason: err.message,
-      payload: req.body,
+      decisionReason: 'routing_failure',
+      payload: {},
       response: null,
-      error: err.message
+      error: 'Message routing failed'
     };
     eventBus.emit(errorEvent);
     observeFailure('messaging', errorEvent.providerId, 'ROUTING_FAILED');
     observe(errorEvent);
-    return res.status(503).json(errorEvent);
+    return res.status(503).json({ error: 'Message routing failed', id: errorEvent.id });
   }
 });
 
-app.post('/api/gateway/other', mw.apiKey, async (req: Request, res: Response) => {
-  const { appId, serviceType, payload, providerOverride } = req.body;
+app.post('/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const { serviceType, payload, providerOverride } = req.body;
 
   if (!appId || !serviceType) {
     return res.status(400).json({ error: 'Missing parameters: appId and serviceType are required' });
@@ -254,7 +324,7 @@ app.post('/api/gateway/other', mw.apiKey, async (req: Request, res: Response) =>
     return res.json(event);
   } catch (err: any) {
     const errorEvent = {
-      id: 'err_' + Math.random().toString(36).substring(2, 12),
+      id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
       appId,
       category: 'other' as const,
@@ -262,35 +332,76 @@ app.post('/api/gateway/other', mw.apiKey, async (req: Request, res: Response) =>
       status: 'failed' as const,
       latency: 20,
       cost: 0,
-      decisionReason: err.message,
-      payload: req.body,
+      decisionReason: 'routing_failure',
+      payload: {},
       response: null,
-      error: err.message
+      error: 'Service routing failed'
     };
     eventBus.emit(errorEvent);
     observeFailure('other', errorEvent.providerId, 'ROUTING_FAILED');
     observe(errorEvent);
-    return res.status(503).json(errorEvent);
+    return res.status(503).json({ error: 'Service routing failed', id: errorEvent.id });
   }
 });
 
-// Inbound provider webhooks. Missing/invalid signatures are recorded as webhook
-// failures. The signature/secret value is never logged.
-app.post('/api/webhooks/:provider', (req: Request, res: Response) => {
+// P0-5: Inbound provider webhooks with HMAC signature verification.
+// The signature is validated against WEBHOOK_HMAC_SECRET before processing.
+app.post('/api/webhooks/:provider', async (req: Request, res: Response) => {
   const provider = req.params.provider;
   setContextField('providerId', provider);
   const signature = req.header('x-webhook-signature');
   const known = registry.getProvider(provider);
 
-  if (!known || !signature) {
+  if (!known) {
     metrics.increment('webhookFailures');
     logger.error('webhook rejected', {
       operation: 'webhook',
       providerId: provider,
-      errorCode: !known ? 'UNKNOWN_PROVIDER' : 'MISSING_SIGNATURE',
+      errorCode: 'UNKNOWN_PROVIDER',
       status: 'failed',
     });
-    return res.status(401).json({ error: 'Missing or invalid webhook signature' });
+    return res.status(401).json({ error: 'Unknown provider' });
+  }
+
+  const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
+  if (!webhookSecret) {
+    metrics.increment('webhookFailures');
+    logger.error('webhook rejected — no secret configured', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'NO_WEBHOOK_SECRET',
+      status: 'failed',
+    });
+    return res.status(503).json({ error: 'Webhook verification not configured' });
+  }
+
+  if (!signature) {
+    metrics.increment('webhookFailures');
+    logger.error('webhook rejected', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'MISSING_SIGNATURE',
+      status: 'failed',
+    });
+    return res.status(401).json({ error: 'Missing webhook signature' });
+  }
+
+  // Timing-safe HMAC verification
+  const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+  const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signature, 'hex');
+  const valid = a.length === b.length && timingSafeEqual(a, b);
+
+  if (!valid) {
+    metrics.increment('webhookFailures');
+    logger.error('webhook rejected', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'INVALID_SIGNATURE',
+      status: 'failed',
+    });
+    return res.status(401).json({ error: 'Invalid webhook signature' });
   }
 
   logger.info('webhook received', {
@@ -494,12 +605,12 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.post('/api/dashboard/logs/clear', (req: Request, res: Response) => {
+app.post('/api/dashboard/logs/clear', requireAdmin, (req: Request, res: Response) => {
   eventBus.clearHistory();
   return res.json({ success: true });
 });
 
-app.get('/api/dashboard/metrics', (req: Request, res: Response) => {
+app.get('/api/dashboard/metrics', requireAdmin, (req: Request, res: Response) => {
   const history = eventBus.getHistory();
   const total = history.length;
   
@@ -536,7 +647,7 @@ app.get('/api/dashboard/metrics', (req: Request, res: Response) => {
   });
 });
 
-app.get('/api/dashboard/stream', (req: Request, res: Response) => {
+app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',

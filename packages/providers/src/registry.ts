@@ -7,6 +7,7 @@ import {
   RoutingRule,
   HealthCheckSummary,
 } from '@company/schemas';
+import { randomUUID } from 'crypto';
 import { BaseProvider } from './base';
 
 import { StripeProvider } from './adapters/payments/stripe';
@@ -217,7 +218,7 @@ export class ProviderRegistry {
   }) {
     this.providers.set(provider.config.id, provider);
     const id = provider.config.id;
-    const generated = 'sk_' + Math.random().toString(36).slice(2, 18);
+    const generated = 'sk_' + randomUUID().replace(/-/g, '').slice(0, 32);
     this.management.set(id, {
       environment: managementDefaults.environment,
       countries: managementDefaults.countries,
@@ -359,7 +360,7 @@ export class ProviderRegistry {
     if (!state) return null;
 
     const meta: ProviderSecretMeta = {
-      id: 'sec_' + Math.random().toString(36).substring(2, 12),
+      id: 'sec_' + randomUUID().replace(/-/g, '').slice(0, 12),
       label: input.label,
       masked: this.maskSecret(input.value),
       lastUpdated: new Date().toISOString()
@@ -392,7 +393,7 @@ export class ProviderRegistry {
 
     const created: RoutingRule = {
       ...rule,
-      id: 'rule_' + Math.random().toString(36).substring(2, 12)
+      id: 'rule_' + randomUUID().replace(/-/g, '').slice(0, 12)
     };
     state.routingRules.push(created);
     return created;

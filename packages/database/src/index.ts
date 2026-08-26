@@ -31,3 +31,15 @@ export {
   type ApplicationRepository,
   type ApiKeyRepository,
 } from './registry';
+
+// Tenant Registry
+export {
+  TenantRegistry,
+  type TenantRecord,
+  type TenantLinkRecord,
+  type CreateTenantInput,
+  type ResolveTenantResult,
+  type TenantRepository,
+  type TenantApplicationLinkRepository,
+  type TenantAccessContext,
+} from './tenant-registry';

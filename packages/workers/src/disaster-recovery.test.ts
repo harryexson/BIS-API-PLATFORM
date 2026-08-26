@@ -662,9 +662,9 @@ describe('DR Scenario 11: Event Bus Recovery', () => {
 describe('DR Scenario 12: Provider Failover', () => {
   it('simulates routing failover when primary provider is down', async () => {
     const providers = [
-      { id: 'stripe', status: 'online' as const, priority: 1 },
-      { id: 'nmi', status: 'online' as const, priority: 2 },
-      { id: 'flutterwave', status: 'online' as const, priority: 3 },
+      { id: 'stripe', status: 'online' as 'online' | 'offline', priority: 1 },
+      { id: 'nmi', status: 'online' as 'online' | 'offline', priority: 2 },
+      { id: 'flutterwave', status: 'online' as 'online' | 'offline', priority: 3 },
     ];
 
     // Normal: route to highest priority (stripe)

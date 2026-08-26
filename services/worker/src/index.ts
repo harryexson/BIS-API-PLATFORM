@@ -65,9 +65,7 @@ async function main(): Promise<void> {
 
   console.log('===============================================');
   console.log(`BIS WORKERS RUNNING (concurrency=${config.concurrency})`);
-  console.log(`Redis: ${config.redisUrl}`);
   console.log('===============================================');
-
   const shutdown = async () => {
     console.log('Shutting down workers...');
     clearInterval(healthTimer);
