@@ -12,3 +12,4 @@ export { providerConfigs, type ProviderConfig, type NewProviderConfig } from './
 export { providerHealth, type ProviderHealthRecord, type NewProviderHealthRecord } from './provider-health';
 export { events, type EventRecord, type NewEventRecord } from './events';
 export { auditLogs, type AuditLog, type NewAuditLog } from './audit-logs';
+export { conversations, type Conversation, type NewConversation } from './conversations';

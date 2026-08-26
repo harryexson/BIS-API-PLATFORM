@@ -1,11 +1,16 @@
 import { ProviderConfig, TransactionEvent } from '@company/schemas';
 import { ProviderRegistry, BaseProvider } from '@company/providers';
+import { ConversationManager, ConversationContext } from './conversation';
+
+export { ConversationManager, type ConversationContext } from './conversation';
 
 export class RoutingEngine {
   private registry: ProviderRegistry;
+  private conversationManager: ConversationManager;
 
   constructor() {
     this.registry = ProviderRegistry.getInstance();
+    this.conversationManager = new ConversationManager();
   }
 
   // Routes a payment request
@@ -132,14 +137,26 @@ export class RoutingEngine {
 
   // Routes a messaging request
   public async routeMessage(appId: string, payload: any): Promise<TransactionEvent> {
-    const { recipient = '', content = '', providerOverride } = payload;
+    const { recipient = '', content = '', providerOverride, tenantId } = payload;
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
+
+    // P2-8: Check conversation history for shared phone number routing
+    const conversationCtx: ConversationContext = { phoneNumber: recipient, appId, tenantId };
+    const conversation = await this.conversationManager.resolve(conversationCtx);
+
+    if (conversation && !providerOverride) {
+      const provider = this.registry.getProvider(conversation.providerId);
+      if (provider && provider.config.status === 'online') {
+        selectedProvider = provider;
+        reason = `Conversation continuity: Reusing ${conversation.channel} provider '${provider.config.name}' for ${recipient}.`;
+      }
+    }
 
     const allProviders = this.registry.getAllConfigs();
     const activeMsg = allProviders.filter(p => p.category === 'messaging' && p.status === 'online');
 
-    if (activeMsg.length === 0) {
+    if (activeMsg.length === 0 && !selectedProvider) {
       throw new Error('All messaging providers are currently OFFLINE / UNDER MAINTENANCE');
     }
 
@@ -215,7 +232,13 @@ export class RoutingEngine {
     }
 
     try {
-      return await selectedProvider.processRequest(appId, payload, reason);
+      const event = await selectedProvider.processRequest(appId, payload, reason);
+      // P2-8: Record conversation after successful delivery
+      const channel = recipient.includes('@') ? 'email'
+        : content.toLowerCase().includes('wa:') || content.length > 300 ? 'whatsapp'
+        : 'sms';
+      await this.conversationManager.record(conversationCtx, selectedProvider.config.id, channel);
+      return event;
     } catch (err: any) {
       const fallbackConfig = activeMsg.find(p => p.id !== selectedProvider!.config.id);
       if (fallbackConfig) {

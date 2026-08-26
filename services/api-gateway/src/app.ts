@@ -10,6 +10,7 @@ import {
   TenantRegistry,
   tenantRepository,
   tenantApplicationLinkRepository,
+  checkDatabaseHealth,
 } from '@company/database';
 import {
   logger,
@@ -127,7 +128,7 @@ const auth = new AuthService({
 });
 const mw = createMiddleware(auth);
 
-app.use('/api', mw.rateLimit);
+app.use('/v1/api', mw.rateLimit);
 
 const registry = ProviderRegistry.getInstance();
 const routingEngine = new RoutingEngine();
@@ -207,20 +208,36 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
-app.get('/ready', (req: Request, res: Response) => {
-  res.json({
-    status: 'ready',
+app.get('/ready', async (req: Request, res: Response) => {
+  const deps: Record<string, string> = {};
+
+  // P2-5: Check database connectivity
+  try {
+    const dbOk = await checkDatabaseHealth();
+    deps.database = dbOk ? 'healthy' : 'unhealthy';
+  } catch {
+    deps.database = 'unreachable';
+  }
+
+  // Provider registry is in-memory — always "ready" if process is up
+  deps.providers = 'ready';
+
+  const allHealthy = Object.values(deps).every((v) => v === 'healthy' || v === 'ready');
+  const status = allHealthy ? 'ready' : 'degraded';
+
+  res.status(allHealthy ? 200 : 503).json({
+    status,
     service: 'api-gateway',
-    dependencies: {},
+    dependencies: deps,
     timestamp: new Date().toISOString()
   });
 });
 
 // ----------------------------------------------------
-// GATEWAY TRAFFIC ENDPOINTS
+// GATEWAY TRAFFIC ENDPOINTS — P2-1: Versioned under /v1
 // ----------------------------------------------------
 
-app.post('/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
   
@@ -264,7 +281,7 @@ app.post('/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Re
   }
 });
 
-app.post('/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { recipient, content, providerOverride } = req.body;
 
@@ -304,7 +321,7 @@ app.post('/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: 
   }
 });
 
-app.post('/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { serviceType, payload, providerOverride } = req.body;
 
@@ -346,7 +363,7 @@ app.post('/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: Requ
 
 // P0-5: Inbound provider webhooks with HMAC signature verification.
 // The signature is validated against WEBHOOK_HMAC_SECRET before processing.
-app.post('/api/webhooks/:provider', async (req: Request, res: Response) => {
+app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
   const provider = req.params.provider;
   setContextField('providerId', provider);
   const signature = req.header('x-webhook-signature');
@@ -656,7 +673,13 @@ app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => 
 
   res.write(`data: ${JSON.stringify({ type: 'connected', timestamp: new Date().toISOString() })}\n\n`);
 
-  const unsubscribe = eventBus.subscribe((event) => {
+  // P2-3: Filter SSE events by tenantId + appId query params
+  const filterTenantId = req.query.tenantId as string | undefined;
+  const filterAppId = req.query.appId as string | undefined;
+
+  const unsubscribe = eventBus.subscribe((event: any) => {
+    if (filterTenantId && event.tenantId && event.tenantId !== filterTenantId) return;
+    if (filterAppId && event.appId && event.appId !== filterAppId) return;
     res.write(`data: ${JSON.stringify(event)}\n\n`);
   });
 

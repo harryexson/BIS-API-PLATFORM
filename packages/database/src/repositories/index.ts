@@ -9,3 +9,4 @@ export { providerConfigRepository } from './provider-configs';
 export { providerHealthRepository } from './provider-health';
 export { eventRepository } from './events';
 export { auditLogRepository } from './audit-logs';
+export { conversationRepository } from './conversations';
