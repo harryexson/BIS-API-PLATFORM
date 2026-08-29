@@ -14,6 +14,7 @@ export const events = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull(),
+    tenantId: text('tenant_id').default('default'),
     category: text('category').notNull(),
     providerId: text('provider_id'),
     status: text('status').notNull(),
@@ -25,12 +26,14 @@ export const events = pgTable(
     payload: jsonb('payload'),
     response: jsonb('response'),
     error: text('error'),
+    idempotencyKey: text('idempotency_key'),
     createdAt: timestamp('created_at', { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
   (t) => [
     index('idx_events_app_id').on(t.appId),
+    index('idx_events_tenant_id').on(t.tenantId),
     index('idx_events_category').on(t.category),
     index('idx_events_provider_id').on(t.providerId),
     index('idx_events_created_at').on(t.createdAt),

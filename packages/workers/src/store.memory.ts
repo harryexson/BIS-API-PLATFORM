@@ -165,4 +165,9 @@ export class MemoryStore implements KVStore {
       }
     };
   }
+
+  async keys(pattern: string): Promise<string[]> {
+    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+    return Array.from(this.kv.keys()).filter((k) => regex.test(k));
+  }
 }

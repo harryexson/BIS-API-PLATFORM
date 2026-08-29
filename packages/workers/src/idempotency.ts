@@ -21,11 +21,25 @@ export class IdempotencyStore {
       const rec = JSON.parse(existing) as IdempotencyRecord;
       return rec.status;
     }
+    // P1: Use setNx for atomic claim — prevents race condition where two
+    // workers both read 'no existing record' and both proceed to claim.
     const rec: IdempotencyRecord = {
       status: 'processing',
       updatedAt: Date.now(),
     };
-    await this.store.set(this.keys.idempotency(key), JSON.stringify(rec), this.ttlMs);
+    const claimed = await this.store.setNx(
+      this.keys.idempotency(key),
+      JSON.stringify(rec),
+      this.ttlMs,
+    );
+    if (!claimed) {
+      // Another worker claimed it between our get and setNx — re-read
+      const late = await this.store.get(this.keys.idempotency(key));
+      if (late) {
+        return (JSON.parse(late) as IdempotencyRecord).status;
+      }
+      return 'processing';
+    }
     return 'new';
   }
 

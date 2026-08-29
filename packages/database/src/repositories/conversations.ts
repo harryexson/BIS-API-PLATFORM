@@ -3,9 +3,14 @@ import { getDb } from '../connection';
 import { conversations, type Conversation, type NewConversation } from '../schema';
 
 export const conversationRepository = {
+  /**
+   * P0 FIX: Look up conversation by (phoneNumber, appId, tenantId).
+   * Previously this only used (phoneNumber, appId), causing cross-tenant bleed.
+   */
   async findByPhoneAndApp(
     phoneNumber: string,
     appId: string,
+    tenantId: string = 'default',
   ): Promise<Conversation | undefined> {
     const db = getDb();
     const rows = await db
@@ -13,7 +18,8 @@ export const conversationRepository = {
       .from(conversations)
       .where(
         eq(conversations.phoneNumber, phoneNumber) &&
-          eq(conversations.appId, appId),
+          eq(conversations.appId, appId) &&
+          eq(conversations.tenantId, tenantId),
       )
       .limit(1);
     return rows[0];
@@ -33,12 +39,16 @@ export const conversationRepository = {
       .orderBy(desc(conversations.lastMessageAt));
   },
 
+  /**
+   * P0 FIX: Upsert now includes tenantId in the lookup key.
+   * Two tenants sharing the same phone number within one app get separate conversations.
+   */
   async upsert(
     phoneNumber: string,
     appId: string,
-    data: { providerId: string; channel: string; tenantId?: string },
+    data: { providerId: string; channel: string; tenantId: string },
   ): Promise<Conversation> {
-    const existing = await this.findByPhoneAndApp(phoneNumber, appId);
+    const existing = await this.findByPhoneAndApp(phoneNumber, appId, data.tenantId);
     if (existing) {
       const db = getDb();
       const rows = await db
@@ -46,7 +56,6 @@ export const conversationRepository = {
         .set({
           providerId: data.providerId,
           channel: data.channel,
-          tenantId: data.tenantId ?? existing.tenantId,
           lastMessageAt: new Date(),
           updatedAt: new Date(),
         })
@@ -69,14 +78,18 @@ export const conversationRepository = {
     return rows[0];
   },
 
-  async close(phoneNumber: string, appId: string): Promise<boolean> {
+  /**
+   * P0 FIX: Close now includes tenantId to only close the correct tenant's conversation.
+   */
+  async close(phoneNumber: string, appId: string, tenantId: string = 'default'): Promise<boolean> {
     const db = getDb();
     const rows = await db
       .update(conversations)
       .set({ status: 'closed', updatedAt: new Date() })
       .where(
         eq(conversations.phoneNumber, phoneNumber) &&
-          eq(conversations.appId, appId),
+          eq(conversations.appId, appId) &&
+          eq(conversations.tenantId, tenantId),
       )
       .returning();
     return rows.length > 0;

@@ -10,6 +10,10 @@ const ALL_TYPES: JobType[] = [
   'event_processing',
   'retry_processing',
   'reconciliation',
+  'inbound_message',
+  'outbox_poller',
+  'receipt_pipeline',
+  'keyword_response_delivery',
 ];
 
 export function createRetryProcessingProcessor(

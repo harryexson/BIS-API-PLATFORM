@@ -44,6 +44,18 @@ export class WorkerManager {
     if (this.running) return;
     this.running = true;
     this.loops = [];
+
+    // P0: Rescue orphaned processing jobs from crashed workers on startup
+    const staleThresholdMs = 2 * 60_000; // 2 minutes
+    try {
+      const rescued = await this.queue.rescueStuckJobs(staleThresholdMs);
+      if (rescued > 0) {
+        console.log(`[worker] rescued ${rescued} orphaned processing job(s) on startup`);
+      }
+    } catch {
+      // Store may be unavailable — skip rescue, worker loop will handle errors
+    }
+
     for (let i = 0; i < this.config.concurrency; i++) {
       this.loops.push(this.workerLoop(i));
     }

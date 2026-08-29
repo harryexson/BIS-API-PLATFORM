@@ -5,8 +5,9 @@ import { eventRepository } from '@company/database';
 
 function verifySignature(secret: string, rawBody: string, signature: string): boolean {
   const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
-  const a = Buffer.from(expected);
-  const b = Buffer.from(signature);
+  // P1-5 FIX: Use hex encoding for both buffers to match the gateway's comparison.
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signature, 'hex');
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
 }
@@ -68,7 +69,10 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
         payload: clean,
       });
     } catch (err) {
-      console.error('[provider_webhook] Neon write failed', err);
+      // P0: Fail the job on DB error so it can be retried — previously this
+      // was silently swallowed and the job was marked complete.
+      console.error('[provider_webhook] Neon write failed — failing job for retry', err);
+      throw new Error('provider_webhook: database write failed — retrying');
     }
 
     deps.eventBus.emit({

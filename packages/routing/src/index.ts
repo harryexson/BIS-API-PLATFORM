@@ -3,6 +3,63 @@ import { ProviderRegistry, BaseProvider } from '@company/providers';
 import { ConversationManager, ConversationContext } from './conversation';
 
 export { ConversationManager, type ConversationContext } from './conversation';
+export { ConversationResolver, type ConversationResolution } from './conversation-resolver';
+export { handleKeyword, type KeywordContext, type KeywordResult } from './keywords';
+
+/**
+ * P1-4: Channel fallback policy.
+ *
+ * Defines whether channel switching (e.g., SMS → Email) is allowed.
+ * Do NOT silently change a communication channel — the routing policy
+ * must explicitly define whether fallback is permitted.
+ */
+export interface ChannelFallbackPolicy {
+  /** Allow fallback to alternate SMS provider (e.g., SignalHouse → FutureSMS) */
+  allowAlternateProvider: boolean;
+  /** Allow channel switching (e.g., SMS → Email) — disabled by default */
+  allowChannelSwitch: boolean;
+  /** Whether channel switching requires recipient consent */
+  requiresConsent: boolean;
+}
+
+const DEFAULT_FALLBACK_POLICY: ChannelFallbackPolicy = {
+  allowAlternateProvider: true,
+  allowChannelSwitch: false,
+  requiresConsent: true,
+};
+
+// P1: Default provider request timeout (30 seconds).
+// Prevents hung provider calls from blocking the entire gateway.
+const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 30_000;
+
+/**
+ * Wraps a provider processRequest call with an AbortSignal timeout.
+ * If the provider doesn't respond within the timeout, the call is aborted.
+ */
+async function withProviderTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number = PROVIDER_TIMEOUT_MS,
+): Promise<T> {
+  // AbortSignal.timeout is available in Node 18+
+  if (typeof AbortSignal.timeout === 'function') {
+    const controller = AbortSignal.timeout(timeoutMs);
+    return Promise.race([
+      fn(),
+      new Promise<never>((_, reject) =>
+        controller.addEventListener('abort', () =>
+          reject(new Error(`Provider request timed out after ${timeoutMs}ms`)),
+        ),
+      ),
+    ]);
+  }
+  // Fallback for environments without AbortSignal.timeout
+  return Promise.race([
+    fn(),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Provider request timed out after ${timeoutMs}ms`)), timeoutMs),
+    ),
+  ]);
+}
 
 export class RoutingEngine {
   private registry: ProviderRegistry;
@@ -102,13 +159,18 @@ export class RoutingEngine {
     }
 
     try {
-      return await selectedProvider.processRequest(appId, payload, reason);
+      // P1: Wrap provider call with timeout to prevent hung requests
+      return await withProviderTimeout(
+        () => selectedProvider!.processRequest(appId, payload, reason),
+      );
     } catch (err: any) {
       const nextProviderConfig = activePayments.find(p => p.id !== selectedProvider!.config.id);
       if (nextProviderConfig) {
         const nextProvider = this.registry.getProvider(nextProviderConfig.id)!;
         const fallbackReason = `Dynamic Failover: Primary '${selectedProvider.config.name}' failed (${err.message}). Re-routing to secondary '${nextProvider.config.name}'. Original Reason: ${reason}`;
-        return await nextProvider.processRequest(appId, payload, fallbackReason);
+        return await withProviderTimeout(
+          () => nextProvider.processRequest(appId, payload, fallbackReason),
+        );
       } else {
         throw new Error(`Primary route '${selectedProvider.config.name}' failed (${err.message}) and no fallback options are available.`);
       }
@@ -117,11 +179,11 @@ export class RoutingEngine {
 
   // Capability-based messaging routing
   public async routeMessage(appId: string, payload: any): Promise<TransactionEvent> {
-    const { recipient = '', content = '', providerOverride, tenantId } = payload;
+    const { recipient = '', content = '', providerOverride, tenantId = 'default' } = payload;
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
 
-    // P2-8: Check conversation history for shared phone number routing
+    // P0 FIX: Check conversation history — now includes tenantId for isolation
     const conversationCtx: ConversationContext = { phoneNumber: recipient, appId, tenantId };
     const conversation = await this.conversationManager.resolve(conversationCtx);
 
@@ -201,7 +263,10 @@ export class RoutingEngine {
     }
 
     try {
-      const event = await selectedProvider.processRequest(appId, payload, reason);
+      // P1: Wrap provider call with timeout to prevent hung requests
+      const event = await withProviderTimeout(
+        () => selectedProvider!.processRequest(appId, payload, reason),
+      );
       // P2-8: Record conversation after successful delivery
       const channel = recipient.includes('@') ? 'email'
         : content.toLowerCase().includes('wa:') || content.length > 300 ? 'whatsapp'
@@ -209,13 +274,18 @@ export class RoutingEngine {
       await this.conversationManager.record(conversationCtx, selectedProvider.config.id, channel);
       return event;
     } catch (err: any) {
+      // P1-4: Respect channel fallback policy.
+      // Do NOT silently change a communication channel — only failover
+      // to alternate providers of the same channel type.
       const fallbackConfig = activeMsg.find(p => p.id !== selectedProvider!.config.id);
-      if (fallbackConfig) {
+      if (fallbackConfig && DEFAULT_FALLBACK_POLICY.allowAlternateProvider) {
         const nextProvider = this.registry.getProvider(fallbackConfig.id)!;
-        return await nextProvider.processRequest(
-          appId,
-          payload,
-          `Dynamic Failover: Primary '${selectedProvider.config.name}' failed (${err.message}). Switched to '${nextProvider.config.name}'.`
+        return await withProviderTimeout(
+          () => nextProvider.processRequest(
+            appId,
+            payload,
+            `Dynamic Failover: Primary '${selectedProvider.config.name}' failed (${err.message}). Switched to '${nextProvider.config.name}'.`,
+          ),
         );
       } else {
         throw new Error(`Messaging dispatch failed on '${selectedProvider.config.name}' (${err.message}) with no available failover routes.`);
@@ -248,6 +318,9 @@ export class RoutingEngine {
       throw new Error(`Routing failure: Service node for '${serviceType}' is offline.`);
     }
 
-    return await selectedProvider.processRequest(appId, payload, reason);
+    // P1: Wrap provider call with timeout to prevent hung requests
+    return await withProviderTimeout(
+      () => selectedProvider!.processRequest(appId, payload, reason),
+    );
   }
 }

@@ -15,6 +15,48 @@
       "when": 1786941627291,
       "tag": "0001_add_application_registry",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786942000000,
+      "tag": "0002_add_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786943000000,
+      "tag": "0003_add_outbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786944000000,
+      "tag": "0004_add_transactions",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786945000000,
+      "tag": "0005_add_idempotency_records",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786946000000,
+      "tag": "0006_add_events_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786947000000,
+      "tag": "0007_add_suppliers",
+      "breakpoints": true
     }
   ]
 }

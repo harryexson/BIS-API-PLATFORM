@@ -155,6 +155,41 @@ export class JobQueue {
     return this.store.zcard(this.keys.delayed(type));
   }
 
+  /**
+   * P1: Rescues jobs stuck in 'processing' state (e.g., after worker crash).
+   * Scans all job keys, finds jobs with status 'processing' and updatedAt
+   * older than staleThresholdMs, resets them to 'pending' and re-enqueues.
+   */
+  async rescueStuckJobs(staleThresholdMs: number = 5 * 60_000): Promise<number> {
+    if (!this.store.keys) return 0;
+
+    const pattern = `${this.keys.job('*')}`;
+    const jobKeys = await this.store.keys(pattern);
+    let rescued = 0;
+
+    for (const key of jobKeys) {
+      const raw = await this.store.get(key);
+      if (!raw) continue;
+
+      const job = JSON.parse(raw) as Job;
+      if (job.status !== 'processing') continue;
+
+      const staleMs = Date.now() - job.updatedAt;
+      if (staleMs < staleThresholdMs) continue;
+
+      job.status = 'pending';
+      job.runAt = Date.now();
+      job.updatedAt = Date.now();
+      job.lastError = 'rescued from stuck processing state';
+
+      await this.store.set(key, JSON.stringify(job), this.jobTtl());
+      await this.store.rpush(this.keys.ready(job.type), job.id);
+      rescued++;
+    }
+
+    return rescued;
+  }
+
   private jobTtl(): number {
     return this.config.idempotencyTtlMs;
   }

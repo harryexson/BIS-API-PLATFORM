@@ -24,6 +24,7 @@ export interface KVStore {
   publish(channel: string, message: string): Promise<number>;
   subscribe(channel: string, handler: (message: string) => void): Promise<() => void>;
 
+  keys?(pattern: string): Promise<string[]>;
   ping?(): Promise<void>;
   quit?(): Promise<void>;
 }

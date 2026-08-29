@@ -8,7 +8,11 @@ export type JobType =
   | 'provider_health'
   | 'event_processing'
   | 'retry_processing'
-  | 'reconciliation';
+  | 'reconciliation'
+  | 'inbound_message'
+  | 'outbox_poller'
+  | 'receipt_pipeline'
+  | 'keyword_response_delivery';
 
 export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'dead';
 

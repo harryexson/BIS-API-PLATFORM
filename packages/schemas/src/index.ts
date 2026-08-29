@@ -163,3 +163,38 @@ export interface TransactionStatusResponse {
   providerTransactionId?: string;
   error?: string;
 }
+
+// ----------------------------------------------------
+// PROVIDER WEBHOOK EVENT CONTRACT
+// ----------------------------------------------------
+// The complete event payload that must flow through the webhook → receipt pipeline.
+// Every provider adapter must normalize its webhook into this shape.
+
+export interface ProviderWebhookEvent {
+  // Identification
+  providerEventId: string;        // Unique event ID from the provider
+  provider: string;               // Provider identifier (stripe, signalhouse, etc.)
+  eventType: string;              // e.g. charge.succeeded, charge.refunded, sms.delivered
+
+  // Ownership chain
+  applicationId: string;          // Owning application slug
+  tenantId?: string;              // Owning tenant ID
+  supplierId?: string;            // Owning supplier/hotel/church ID
+  organizationId?: string;        // Owning organization ID
+  resourceId?: string;            // Specific resource (donation, message, etc.)
+
+  // Correlation
+  correlationId?: string;         // Client-provided correlation ID
+  idempotencyKey?: string;        // Client-provided idempotency key
+
+  // Event data
+  status: TransactionStatus;      // Normalized status
+  amount?: number;                // Amount in minor units
+  currency?: string;              // ISO currency code
+  payload: unknown;               // Raw provider event payload
+  timestamp: string;              // ISO timestamp
+
+  // Webhook verification
+  rawBody?: string;               // Raw webhook body for HMAC verification
+  signature?: string;             // Webhook signature for verification
+}

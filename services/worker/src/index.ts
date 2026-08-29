@@ -33,6 +33,12 @@ async function main(): Promise<void> {
     queue,
   );
 
+  // P1: Rescue stuck processing jobs from previous crashes before starting
+  const rescued = await queue.rescueStuckJobs();
+  if (rescued > 0) {
+    console.log(`[reaper] rescued ${rescued} stuck processing jobs`);
+  }
+
   await manager.start();
 
   const providers = registry.getAllConfigs().map((c) => c.id);
@@ -63,6 +69,14 @@ async function main(): Promise<void> {
     () => queue.enqueue('reconciliation', {}).catch(() => undefined),
     config.reconciliationIntervalMs,
   );
+
+  // P1: Periodically rescue stuck processing jobs
+  const reaperTimer = setInterval(async () => {
+    const rescued = await queue.rescueStuckJobs();
+    if (rescued > 0) {
+      console.log(`[reaper] rescued ${rescued} stuck processing jobs`);
+    }
+  }, config.reconciliationIntervalMs);
 
   // P3-2: Worker health check HTTP server
   const HEALTH_PORT = Number(process.env.WORKER_HEALTH_PORT) || 3002;
@@ -109,6 +123,7 @@ async function main(): Promise<void> {
     clearInterval(healthTimer);
     clearInterval(retryTimer);
     clearInterval(reconTimer);
+    clearInterval(reaperTimer);
     healthServer.close();
 
     // Drain: wait for in-flight jobs to complete (max 30s)

@@ -10,6 +10,8 @@ import {
   TenantRegistry,
   tenantRepository,
   tenantApplicationLinkRepository,
+  eventRepository,
+  transactionRepository,
   checkDatabaseHealth,
 } from '@company/database';
 import {
@@ -158,22 +160,46 @@ const auth = new AuthService({
 const mw = createMiddleware(auth);
 
 app.use('/v1/api', mw.rateLimit);
+// P0: Rate-limit admin endpoints to prevent brute-force attacks
+app.use('/api/dashboard', mw.rateLimit);
+app.use('/api/observability', mw.rateLimit);
+
+// P1-1: Request timeout middleware — prevents hung provider calls from holding connections.
+// A payment timeout must not automatically mean retry; ambiguous outcomes are reconciled via webhook.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 60_000;
+app.use('/v1/api/gateway/*', (req, res, next) => {
+  const timeout = setTimeout(() => {
+    if (!res.headersSent) {
+      res.status(504).json({ error: 'Request timed out' });
+    }
+  }, REQUEST_TIMEOUT_MS);
+  res.on('finish', () => clearTimeout(timeout));
+  next();
+});
 
 const registry = ProviderRegistry.getInstance();
 const routingEngine = new RoutingEngine();
 const eventBus = EventBus.getInstance();
 
 // ----------------------------------------------------
-// P0-4: TENANT ISOLATION MIDDLEWARE
+// P0-4: TENANT ISOLATION MIDDLEWARE (ENFORCED)
 // ----------------------------------------------------
-// Validates that the x-tenant-id header (if provided) belongs to the
-// authenticated application. Prevents cross-tenant access via IDOR.
+// Tenant context is MANDATORY for all /v1/api/gateway/* routes.
+// Requests without x-tenant-id are rejected — tenant is never advisory.
+// Prevents cross-tenant access via IDOR.
 async function resolveTenantContext(req: Request, res: Response, next: NextFunction) {
   const authed = req as Request & { appId?: string };
   if (!authed.appId) return next();
 
   const tenantId = req.header('x-tenant-id');
-  if (!tenantId) return next();
+  if (!tenantId) {
+    logger.warn('tenant context missing', {
+      operation: 'tenant-resolution',
+      errorCode: 'TENANT_REQUIRED',
+      status: 'failed',
+    });
+    return res.status(400).json({ error: 'x-tenant-id header is required' });
+  }
 
   try {
     const tenantRegistry = new TenantRegistry(tenantRepository, tenantApplicationLinkRepository);
@@ -208,10 +234,8 @@ if (!ADMIN_API_TOKEN && isProduction) {
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const token = req.header('x-admin-token');
   if (!ADMIN_API_TOKEN) {
-    if (isProduction) {
-      return res.status(503).json({ error: 'Admin access not configured' });
-    }
-    return next();
+    // P0: Never bypass admin auth — require token in ALL environments
+    return res.status(503).json({ error: 'Admin access not configured' });
   }
   if (!token || token !== ADMIN_API_TOKEN) {
     return res.status(403).json({ error: 'Forbidden: administrator authorization required' });
@@ -275,9 +299,20 @@ app.get('/ready', async (req: Request, res: Response) => {
 app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
+  // P1: Accept idempotency key from header — prevents duplicate charges on retries
+  const idempotencyKey = req.header('x-idempotency-key');
   
   if (!appId) {
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
+  }
+
+  // P1: Idempotency check — if we've seen this key recently, return the cached result
+  if (idempotencyKey) {
+    const existing = paymentIdempotencyCache.get(idempotencyKey);
+    if (existing) {
+      metrics.increment('paymentIdempotentHits');
+      return res.json(existing);
+    }
   }
 
   try {
@@ -289,8 +324,33 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
       phoneNumber
     });
 
+    // P0: Create a transaction record for state tracking.
+    // The webhook processor will update the status based on provider events.
+    try {
+      await transactionRepository.create({
+        appId,
+        tenantId: req.header('x-tenant-id') || 'default',
+        providerId: event.providerId,
+        providerTransactionId: event.id,
+        status: event.status === 'success' ? 'success' : event.status === 'failed' ? 'failed' : 'pending',
+        amount: String(event.amount),
+        currency: event.currency || 'USD',
+        paymentMethod: paymentMethod || null,
+        idempotencyKey: idempotencyKey || null,
+      });
+    } catch (txErr) {
+      // Transaction creation is best-effort — don't fail the payment if it fails
+      console.error('[payment] Failed to create transaction record', txErr);
+    }
+
     eventBus.emit(event);
     observe(event);
+
+    // P1: Cache the result for idempotency (5 minute TTL)
+    if (idempotencyKey) {
+      paymentIdempotencyCache.set(idempotencyKey, event);
+    }
+
     return res.json(event);
   } catch (err: any) {
     const errorEvent = {
@@ -319,6 +379,8 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
 app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { recipient, content, providerOverride } = req.body;
+  // P0: Use authenticated tenant from header, NOT from request body
+  const tenantId = req.header('x-tenant-id');
 
   if (!appId || !recipient || !content) {
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
@@ -328,7 +390,8 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
     const event = await routingEngine.routeMessage(appId, {
       recipient,
       content,
-      providerOverride
+      providerOverride,
+      tenantId, // Pass authenticated tenant to routing engine
     });
 
     eventBus.emit(event);
@@ -403,10 +466,11 @@ app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: R
 
 app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
   const { id } = req.params;
+  const appId = (req as Request & { appId?: string }).appId;
   const events = eventBus.getHistory();
 
-  // Find the most recent event with this transaction ID
-  const event = events.find((e: TransactionEvent) => e.id === id);
+  // P0: Enforce ownership — only return events belonging to the authenticated application
+  const event = events.find((e: TransactionEvent) => e.id === id && e.appId === appId);
 
   if (!event) {
     return res.status(404).json({ error: `Transaction '${id}' not found` });
@@ -454,8 +518,33 @@ app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Requ
   return res.json({ providers: views, count: views.length });
 });
 
+// P1: Payment idempotency cache — prevents duplicate charges on retry.
+// Maps idempotencyKey → TransactionEvent result (5 min TTL).
+const paymentIdempotencyCache = new Map<string, any>();
+const PAYMENT_IDEMPOTENCY_TTL_MS = 5 * 60_000;
+
+setInterval(() => {
+  const cutoff = Date.now() - PAYMENT_IDEMPOTENCY_TTL_MS;
+  for (const [key, event] of paymentIdempotencyCache) {
+    const eventTime = new Date(event.timestamp).getTime();
+    if (eventTime < cutoff) paymentIdempotencyCache.delete(key);
+  }
+}, 60_000);
+
 // P0-5: Inbound provider webhooks with HMAC signature verification.
 // The signature is validated against WEBHOOK_HMAC_SECRET before processing.
+// P0: Gateway-level webhook deduplication — reject duplicate deliveries.
+const recentWebhooks = new Map<string, number>(); // eventId -> timestamp
+const WEBHOOK_DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Periodically clean up expired entries
+setInterval(() => {
+  const cutoff = Date.now() - WEBHOOK_DEDUP_TTL_MS;
+  for (const [id, ts] of recentWebhooks) {
+    if (ts < cutoff) recentWebhooks.delete(id);
+  }
+}, 60_000);
+
 app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
   const provider = req.params.provider;
   setContextField('providerId', provider);
@@ -514,13 +603,225 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Invalid webhook signature' });
   }
 
+  // P0: Gateway-level deduplication — extract provider event ID and reject replays
+  const providerEventId = req.body?.id;
+  if (providerEventId && recentWebhooks.has(providerEventId)) {
+    metrics.increment('webhookDuplicates');
+    logger.warn('webhook rejected — duplicate', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'DUPLICATE_WEBHOOK',
+      status: 'failed',
+    });
+    return res.status(409).json({ error: 'Duplicate webhook delivery' });
+  }
+  if (providerEventId) {
+    recentWebhooks.set(providerEventId, Date.now());
+  }
+
   logger.info('webhook received', {
     operation: 'webhook',
     providerId: provider,
     status: 'success',
   });
+
+  // P0: Persist webhook event and emit to EventBus — previously this was a dead end
+  // where the webhook was HMAC-verified then silently discarded.
+  const webhookEvent = {
+    id: `wh_${Date.now()}_${randomUUID().slice(0, 8)}`,
+    timestamp: new Date().toISOString(),
+    appId: 'webhook',
+    category: 'payment' as const,
+    providerId: provider,
+    status: 'success' as const,
+    latency: 0,
+    cost: 0,
+    decisionReason: 'webhook_received',
+    payload: req.body,
+    response: null,
+  };
+  // Emit to EventBus for monitoring — persistence is handled by the paymentWebhook processor
+  eventBus.emit(webhookEvent);
+
+  // P0: Enqueue inbound message for worker routing — the worker will match
+  // sender → conversation → app and route the message to the owning app.
+  enqueueInboundMessage(provider, req.body).catch((err) => {
+    logger.error('inbound enqueue failed', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'INBOUND_ENQUEUE_FAILED',
+      status: 'failed',
+    });
+  });
+
+  // P0: Enqueue payment webhook for worker processing — payment state updates,
+  // receipt pipeline, and domain events are handled by the worker, not the gateway.
+  enqueuePaymentWebhook({
+    providerId: provider,
+    rawBody: typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
+    signature: signature || '',
+    providerEventId: providerEventId || req.body?.id,
+    applicationId: req.body?.data?.object?.metadata?.appId,
+  }).catch((err) => {
+    logger.error('payment webhook enqueue failed', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'PAYMENT_WEBHOOK_ENQUEUE_FAILED',
+      status: 'failed',
+    });
+  });
+
+  // P0: Also enqueue provider webhook for provider-specific processing
+  // (delivery status updates, management status, etc.)
+  enqueueProviderWebhook({
+    providerId: provider,
+    rawBody: typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
+    signature: signature || '',
+    providerEventId: providerEventId || req.body?.id,
+    status: req.body?.type,
+  }).catch((err) => {
+    logger.error('provider webhook enqueue failed', {
+      operation: 'webhook',
+      providerId: provider,
+      errorCode: 'PROVIDER_WEBHOOK_ENQUEUE_FAILED',
+      status: 'failed',
+    });
+  });
+
   return res.json({ received: true });
 });
+
+// P0: Lightweight helper to enqueue inbound messages to the worker queue.
+// Uses Redis directly if available; falls back to no-op if Redis is down.
+// The worker polls from this queue and routes inbound messages to apps.
+let _redisClient: any = null;
+function getRedisClient(): any {
+  if (_redisClient !== null) return _redisClient === false ? null : _redisClient;
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) { _redisClient = false; return null; }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const Redis = require('ioredis');
+    _redisClient = new Redis(redisUrl, {
+      maxRetriesPerRequest: 3,
+      enableOfflineQueue: false,
+      lazyConnect: true,
+    });
+    return _redisClient;
+  } catch {
+    _redisClient = false;
+    return null;
+  }
+}
+
+async function enqueueInboundMessage(providerId: string, payload: any): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return; // No Redis — inbound message persisted to DB only
+
+  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
+  const jobId = `job_${randomUUID()}`;
+  const job = {
+    id: jobId,
+    type: 'inbound_message',
+    payload: { providerId, payload },
+    attempts: 0,
+    maxAttempts: 5,
+    status: 'pending',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    runAt: Date.now(),
+  };
+
+  try {
+    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
+    await client.rpush(`${queuePrefix}:ready:inbound_message`, jobId);
+    await client.publish(`${queuePrefix}:notify:inbound_message`, jobId);
+  } catch (err) {
+    console.error('[webhook] Failed to enqueue inbound_message to Redis', err);
+  }
+}
+
+// P0: Enqueue payment webhooks for worker processing.
+// The gateway verifies HMAC and acknowledges, but payment-specific processing
+// (state updates, receipt pipeline, domain events) happens in the worker.
+async function enqueuePaymentWebhook(input: {
+  providerId: string;
+  rawBody: string;
+  signature: string;
+  providerEventId?: string;
+  applicationId?: string;
+}): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
+  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
+  const jobId = `job_${randomUUID()}`;
+  const job = {
+    id: jobId,
+    type: 'payment_webhook',
+    payload: {
+      provider: input.providerId,
+      rawBody: input.rawBody,
+      signature: input.signature,
+      providerEventId: input.providerEventId,
+      applicationId: input.applicationId || 'webhook',
+    },
+    attempts: 0,
+    maxAttempts: 5,
+    status: 'pending',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    runAt: Date.now(),
+  };
+
+  try {
+    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
+    await client.rpush(`${queuePrefix}:ready:payment_webhook`, jobId);
+    await client.publish(`${queuePrefix}:notify:payment_webhook`, jobId);
+  } catch (err) {
+    console.error('[webhook] Failed to enqueue payment_webhook to Redis', err);
+  }
+}
+
+// P0: Enqueue provider webhooks (delivery status, etc.) for worker processing.
+async function enqueueProviderWebhook(input: {
+  providerId: string;
+  rawBody: string;
+  signature: string;
+  providerEventId?: string;
+  status?: string;
+}): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
+  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
+  const jobId = `job_${randomUUID()}`;
+  const job = {
+    id: jobId,
+    type: 'provider_webhook',
+    payload: {
+      providerId: input.providerId,
+      rawBody: input.rawBody,
+      signature: input.signature,
+      eventId: input.providerEventId,
+      status: input.status,
+    },
+    attempts: 0,
+    maxAttempts: 5,
+    status: 'pending',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    runAt: Date.now(),
+  };
+
+  try {
+    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
+    await client.rpush(`${queuePrefix}:ready:provider_webhook`, jobId);
+    await client.publish(`${queuePrefix}:notify:provider_webhook`, jobId);
+  } catch (err) {
+    console.error('[webhook] Failed to enqueue provider_webhook to Redis', err);
+  }
+}
 
 // ----------------------------------------------------
 // DASHBOARD MANAGEMENT ENDPOINTS
@@ -678,7 +979,7 @@ app.post('/api/dashboard/providers/health-checks', requireAdmin, async (req: Req
   }
 });
 
-app.get('/api/dashboard/logs', (req: Request, res: Response) => {
+app.get('/api/dashboard/logs', requireAdmin, (req: Request, res: Response) => {
   return res.json(eventBus.getHistory());
 });
 

@@ -89,10 +89,8 @@ export class AuthService {
   ): Promise<{ ok: boolean; appId?: string; error?: string }> {
     if (raw) {
       if (!this.registry) {
-        if (this.production) {
-          return { ok: false, error: 'Authentication service unavailable' };
-        }
-        return { ok: true, appId: fallbackAppId };
+        // P0: Fail closed — never trust client-supplied appId
+        return { ok: false, error: 'Authentication service unavailable' };
       }
       try {
         const res = await this.registry.authenticateApplication(raw);
@@ -101,17 +99,16 @@ export class AuthService {
         }
         return { ok: true, appId: res.application.slug };
       } catch {
-        if (this.production) {
-          return { ok: false, error: 'Authentication service unavailable' };
-        }
-        return { ok: true, appId: fallbackAppId };
+        // P0: Fail closed — never trust client-supplied appId
+        return { ok: false, error: 'Authentication service unavailable' };
       }
     }
 
     if (this.production) {
       return { ok: false, error: 'API key required' };
     }
-    return { ok: true, appId: fallbackAppId };
+    // P0: Fail closed — require API key in all environments
+    return { ok: false, error: 'API key required' };
   }
 
   checkAdmin(req: Request): boolean {
@@ -123,10 +120,8 @@ export class AuthService {
     if (configured) {
       return header === this.opts.adminKey;
     }
-    if (this.production) {
-      return false;
-    }
-    return true;
+    // P0: Never bypass admin auth — always reject when no key configured
+    return false;
   }
 
   // P2-4: Redis-backed rate limiting with in-memory fallback

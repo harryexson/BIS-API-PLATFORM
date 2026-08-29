@@ -27,7 +27,9 @@ export function createProviderHealthProcessor(deps: JobDeps): JobProcessor {
               errorMessage: summary.errorMessage,
             });
           } catch (err) {
-            console.error('[provider_health] Neon write failed', err);
+            // P1: Fail on DB error so health check data is not silently lost
+            console.error('[provider_health] Neon write failed — failing job for retry', err);
+            throw new Error('provider_health: database write failed — retrying');
           }
         }
 

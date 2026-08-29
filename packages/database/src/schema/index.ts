@@ -13,3 +13,7 @@ export { providerHealth, type ProviderHealthRecord, type NewProviderHealthRecord
 export { events, type EventRecord, type NewEventRecord } from './events';
 export { auditLogs, type AuditLog, type NewAuditLog } from './audit-logs';
 export { conversations, type Conversation, type NewConversation } from './conversations';
+export { outboxEvents, type OutboxEvent, type NewOutboxEvent } from './outbox-events';
+export { transactions, type Transaction, type NewTransaction } from './transactions';
+export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
+export { suppliers, type Supplier, type NewSupplier } from './suppliers';

@@ -17,3 +17,5 @@ export const CLIENT_APPS: ClientApp[] = [
 
 export const DEFAULT_PORT = 3001;
 export const DEFAULT_VITE_PORT = 5173;
+
+export { PlatformIdempotencyService } from './idempotency';

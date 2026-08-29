@@ -4,7 +4,7 @@ import { eventRepository } from '@company/database';
 
 export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
   return async (job) => {
-    const { appId, recipient, content, providerOverride } = job.payload;
+    const { appId, recipient, content, providerOverride, tenantId } = job.payload;
 
     if (!appId || !recipient || !content) {
       throw new Error('message_delivery requires appId, recipient and content');
@@ -15,10 +15,12 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
       throw new Error(`Rate limit exceeded for app "${appId}" (reset in ${rate.resetMs}ms)`);
     }
 
+    // P0 FIX: Pass tenantId to routing engine for conversation isolation
     const event = await deps.routing.routeMessage(appId, {
       recipient,
       content,
       providerOverride,
+      tenantId: tenantId || 'default',
     });
 
     try {
@@ -35,7 +37,10 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
         error: event.error,
       });
     } catch (err) {
-      console.error('[message_delivery] Neon write failed', err);
+      // P1: Fail the job on DB error so it can be retried — previously this
+      // was silently swallowed and the job was marked complete.
+      console.error('[message_delivery] Neon write failed — failing job for retry', err);
+      throw new Error('message_delivery: database write failed — retrying');
     }
 
     deps.eventBus.emit(event);
