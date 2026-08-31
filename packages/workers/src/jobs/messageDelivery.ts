@@ -43,6 +43,6 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
       throw new Error('message_delivery: database write failed — retrying');
     }
 
-    deps.eventBus.emit(event);
+    await deps.eventBus.emit(event);
   };
 }

@@ -278,21 +278,24 @@ export function installDatabaseMock(): Record<string, unknown> {
         dbState.events.push(row);
         return row;
       },
-      async countByCategory(): Promise<Record<string, number>> {
+      async countByCategory(appId?: string): Promise<Record<string, number>> {
         if (dbState.failEventWrites) {
           throw new Error('database unavailable (simulated): connection refused');
         }
         const out: Record<string, number> = {};
         for (const e of dbState.events) {
+          if (appId && e.appId !== appId) continue;
           out[e.category] = (out[e.category] ?? 0) + 1;
         }
         return out;
       },
-      async countSince(since: Date): Promise<number> {
-        return dbState.events.filter((e) => e.createdAt >= since).length;
+      async countSince(since: Date, appId?: string): Promise<number> {
+        return dbState.events.filter((e) => e.createdAt >= since && (!appId || e.appId === appId)).length;
       },
-      async findLatest(limit = 100): Promise<EventRow[]> {
-        return dbState.events.slice().sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);
+      async findLatest(limit = 100, appId?: string): Promise<EventRow[]> {
+        let events = dbState.events;
+        if (appId) events = events.filter((e) => e.appId === appId);
+        return events.slice().sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);
       },
       async findByAppId(appId: string, limit = 100): Promise<EventRow[]> {
         return dbState.events.filter((e) => e.appId === appId).slice(0, limit);
@@ -319,11 +322,13 @@ export function installDatabaseMock(): Record<string, unknown> {
       async count(): Promise<number> {
         return dbState.auditLogs.length;
       },
-      async findRecent(limit = 50): Promise<AuditLogRow[]> {
-        return dbState.auditLogs.slice(0, limit);
+      async findRecent(applicationId?: string, limit = 50): Promise<AuditLogRow[]> {
+        let logs = dbState.auditLogs;
+        if (applicationId) logs = logs.filter((a) => a.applicationId === applicationId);
+        return logs.slice(0, limit);
       },
-      async findByAction(action: string, limit = 100): Promise<AuditLogRow[]> {
-        return dbState.auditLogs.filter((a) => a.action === action).slice(0, limit);
+      async findByAction(applicationId: string, action: string, limit = 100): Promise<AuditLogRow[]> {
+        return dbState.auditLogs.filter((a) => a.applicationId === applicationId && a.action === action).slice(0, limit);
       },
       async findByApplicationId(applicationId: string, limit = 100): Promise<AuditLogRow[]> {
         return dbState.auditLogs.filter((a) => a.applicationId === applicationId).slice(0, limit);

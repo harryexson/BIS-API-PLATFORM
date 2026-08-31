@@ -329,7 +329,9 @@ export function enqueueReceipt(
   queue: JobQueue,
   input: { appId: string; recipient: string; content: string; providerOverride?: string },
 ): Promise<Job> {
-  return queue.enqueue('message_delivery', input);
+  return queue.enqueue('message_delivery', input, {
+    idempotencyKey: `receipt:${input.appId}:${input.recipient}:${input.content}`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +430,17 @@ export function wireReceiptPipeline(handle: WorkerHandle, runtime: SimRuntime): 
       webhookType === 'charge.succeeded'
     ) {
       const recipient = event.payload?.data?.object?.receipt_email ?? 'donor@reach.example';
-      void enqueueReceipt(handle.queue, {
+      const chargeId = event.payload?.data?.object?.id ?? randomUUID();
+      const p = enqueueReceipt(handle.queue, {
         appId: event.appId,
         recipient,
-        content: `Reach Church giving receipt for your gift of $${Math.round((event.payload?.data?.object?.amount ?? 0) / 100)}.00`,
-      }).catch((err) => console.error('[sim] receipt enqueue failed', err));
+        content: `Reach Church giving receipt for your gift of $${Math.round((event.payload?.data?.object?.amount ?? 0) / 100)}.00 (charge:${chargeId})`,
+      }).then(() => {}).catch((err) => console.error('[sim] receipt enqueue failed', err));
+      pendingBusEffects.push(p);
+      p.finally(() => {
+        const idx = pendingBusEffects.indexOf(p);
+        if (idx >= 0) pendingBusEffects.splice(idx, 1);
+      });
     }
   });
 }
@@ -442,6 +450,9 @@ export interface QueueCounts {
   delayed: number;
   dead: number;
 }
+
+// Track fire-and-forget promises from EventBus listeners so drain can wait for them.
+const pendingBusEffects: Array<Promise<void>> = [];
 
 export function counts(handle: WorkerHandle, type: string): Promise<QueueCounts> {
   const jobType = type as import('@company/workers').JobType;
@@ -457,6 +468,16 @@ export async function drain(
   types: string[],
   opts: { timeoutMs?: number } = {},
 ): Promise<void> {
+  // First: wait for any fire-and-forget EventBus side-effects to resolve
+  // (e.g. wireReceiptPipeline enqueueing a message_delivery job).
+  if (pendingBusEffects.length > 0) {
+    await waitFor(async () => pendingBusEffects.length === 0, {
+      timeoutMs: opts.timeoutMs ?? 15_000,
+      everyMs: 5,
+      label: 'drain pending bus effects',
+    });
+  }
+
   await waitFor(async () => {
     for (const type of types) {
       const c = await counts(handle, type);
@@ -464,7 +485,15 @@ export async function drain(
     }
     return true;
   }, { timeoutMs: opts.timeoutMs ?? 15_000, everyMs: 25, label: `drain ${types.join(',')}` });
-  // settle: let in-flight completions / emits finish
+
+  // Wait for in-flight jobs to complete so bus events are flushed.
+  await waitFor(async () => handle.manager.getInFlight() === 0, {
+    timeoutMs: opts.timeoutMs ?? 15_000,
+    everyMs: 5,
+    label: 'drain in-flight',
+  });
+
+  // settle: let any final emits / microtasks flush
   await sleep(60);
 }
 

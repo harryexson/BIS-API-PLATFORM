@@ -43,7 +43,7 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
       });
 
       // Emit for monitoring
-      deps.eventBus.emit(event);
+      await deps.eventBus.emit(event);
     } catch (err) {
       console.error('[keyword_response_delivery] Failed to send response', err);
       throw new Error('keyword_response_delivery: send failed — retrying');

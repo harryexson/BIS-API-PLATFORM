@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import Redis, { type RedisOptions } from 'ioredis';
 import { KVStore } from './store';
 
 const UNLOCK_LUA = `
@@ -27,7 +27,7 @@ export class RedisStore implements KVStore {
   private reconnectAttempts = 0;
 
   constructor(url: string) {
-    const baseOpts: Redis.RedisOptions = {
+    const baseOpts: RedisOptions = {
       maxRetriesPerRequest: 3,
       enableOfflineQueue: false,
       lazyConnect: true,
@@ -40,7 +40,7 @@ export class RedisStore implements KVStore {
       // Auto-resend commands after reconnection
       autoResendUnfulfilledCommands: true,
       // Reconnect on all error types
-      reconnectOnError(err) {
+      reconnectOnError(err: Error) {
         const targetError = 'READONLY';
         return err.message.includes(targetError);
       },

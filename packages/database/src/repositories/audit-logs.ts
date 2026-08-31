@@ -1,4 +1,4 @@
-import { eq, desc, count } from 'drizzle-orm';
+import { eq, and, desc, count } from 'drizzle-orm';
 import { getDb } from '../connection';
 import {
   auditLogs,
@@ -36,28 +36,35 @@ export const auditLogRepository = {
       .limit(limit);
   },
 
-  async findByAction(action: string, limit = 100): Promise<AuditLog[]> {
+  /**
+   * P0: Scoped to application. Never return audit logs across all apps.
+   */
+  async findByAction(applicationId: string, action: string, limit = 100): Promise<AuditLog[]> {
     const db = getDb();
     return db
       .select()
       .from(auditLogs)
-      .where(eq(auditLogs.action, action))
+      .where(and(eq(auditLogs.applicationId, applicationId), eq(auditLogs.action, action)))
       .orderBy(desc(auditLogs.createdAt))
       .limit(limit);
   },
 
-  async findRecent(limit = 50): Promise<AuditLog[]> {
+  /**
+   * P0: Scoped to application. Never return audit logs globally.
+   */
+  async findRecent(applicationId: string, limit = 50): Promise<AuditLog[]> {
     const db = getDb();
     return db
       .select()
       .from(auditLogs)
+      .where(eq(auditLogs.applicationId, applicationId))
       .orderBy(desc(auditLogs.createdAt))
       .limit(limit);
   },
 
-  async count(): Promise<number> {
+  async count(applicationId: string): Promise<number> {
     const db = getDb();
-    const rows = await db.select({ value: count() }).from(auditLogs);
+    const rows = await db.select({ value: count() }).from(auditLogs).where(eq(auditLogs.applicationId, applicationId));
     return rows[0]?.value ?? 0;
   },
 };

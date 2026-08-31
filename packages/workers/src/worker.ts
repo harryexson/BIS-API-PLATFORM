@@ -13,6 +13,7 @@ export class WorkerManager {
   private loops: Promise<void>[] = [];
   private sweepTimer?: ReturnType<typeof setInterval>;
   private ownerPrefix = `worker_${Math.random().toString(36).slice(2, 8)}`;
+  private _inFlight = 0;
 
   constructor(
     private store: KVStore,
@@ -38,6 +39,10 @@ export class WorkerManager {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  getInFlight(): number {
+    return this._inFlight;
   }
 
   async start(): Promise<void> {
@@ -108,6 +113,7 @@ export class WorkerManager {
 
     const ctx: WorkerContext = { store: this.store, signal: this.abort.signal };
 
+    this._inFlight++;
     try {
       await processor(job, ctx);
       if (job.idempotencyKey) {
@@ -119,6 +125,8 @@ export class WorkerManager {
         await this.idempotency.release(job.idempotencyKey);
       }
       await this.queue.fail(job, err);
+    } finally {
+      this._inFlight--;
     }
   }
 

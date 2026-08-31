@@ -8,9 +8,21 @@ import { outboxEventRepository } from '@company/database';
  * Picks up pending outbox events and emits them to EventBus.
  * This closes the durability gap between "event written to DB" and "event emitted to bus".
  * If the poller crashes between claiming and completing, the event is retried on next poll.
+ *
+ * Also rescues stuck outbox events that were claimed but never completed.
  */
 export function createOutboxPollerProcessor(deps: JobDeps): JobProcessor {
   return async (job, ctx: WorkerContext) => {
+    // P0: Rescue stuck outbox events (claimed but not completed within threshold)
+    try {
+      const rescued = await outboxEventRepository.rescueStuck(10);
+      if (rescued > 0) {
+        console.warn(`[outbox_poller] Rescued ${rescued} stuck outbox events`);
+      }
+    } catch (err) {
+      console.error('[outbox_poller] Failed to rescue stuck events', err);
+    }
+
     // Claim a batch of pending outbox events
     const events = await outboxEventRepository.claimBatch(10);
 
@@ -18,7 +30,7 @@ export function createOutboxPollerProcessor(deps: JobDeps): JobProcessor {
       try {
         // Emit to EventBus
         const payload = outboxEvent.payload as any;
-        deps.eventBus.emit({
+        await deps.eventBus.emit({
           id: outboxEvent.id,
           timestamp: outboxEvent.createdAt?.toISOString() || new Date().toISOString(),
           appId: outboxEvent.appId,

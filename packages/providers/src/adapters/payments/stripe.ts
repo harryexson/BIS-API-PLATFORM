@@ -54,7 +54,7 @@ export class StripeProvider extends BaseProvider {
       // The previous approach used Date.now() which defeated Stripe's dedup mechanism.
       const idempotencyKey = (payload as any).idempotencyKey
         ? `bis_${appId}_${(payload as any).idempotencyKey}`
-        : `charge_${appId}_${amount}_${currency}_${Date.now()}`;
+        : `charge_${appId}_${amount}_${currency}_${Math.floor(Date.now() / 60_000)}`;
 
       const res = await this.http_request({
         method: 'POST',

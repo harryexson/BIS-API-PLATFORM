@@ -32,6 +32,6 @@ export function createEventProcessingProcessor(deps: JobDeps): JobProcessor {
       console.error('[event_processing] Neon write failed — failing job for retry', err);
       throw new Error('event_processing: database write failed — retrying');
     }
-    deps.eventBus.emit(job.payload as any);
+    await deps.eventBus.emit(job.payload as any);
   };
 }

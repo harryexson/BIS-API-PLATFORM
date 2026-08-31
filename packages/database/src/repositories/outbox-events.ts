@@ -1,6 +1,12 @@
-import { eq, desc, count } from 'drizzle-orm';
+import { eq, desc, and, lt, count } from 'drizzle-orm';
 import { getDb } from '../connection';
 import { outboxEvents, type OutboxEvent, type NewOutboxEvent } from '../schema';
+
+/**
+ * Threshold for stuck outbox events — if claimed but not completed within this time,
+ * the event is reset to pending for retry.
+ */
+const STUCK_THRESHOLD_MS = 5 * 60_000; // 5 minutes
 
 export const outboxEventRepository = {
   async create(data: NewOutboxEvent): Promise<OutboxEvent> {
@@ -37,6 +43,35 @@ export const outboxEventRepository = {
       .update(outboxEvents)
       .set({ status: 'failed', error })
       .where(eq(outboxEvents.id, id));
+  },
+
+  /**
+   * P0: Rescues stuck outbox events that were claimed but never completed.
+   * Resets them to pending for retry.
+   */
+  async rescueStuck(batchLimit: number = 10): Promise<number> {
+    const db = getDb();
+    const stuckThreshold = new Date(Date.now() - STUCK_THRESHOLD_MS);
+    const stuckEvents = await db
+      .select()
+      .from(outboxEvents)
+      .where(
+        and(
+          eq(outboxEvents.status, 'processing'),
+          lt(outboxEvents.createdAt, stuckThreshold),
+        ),
+      )
+      .limit(batchLimit);
+
+    let rescued = 0;
+    for (const stuck of stuckEvents) {
+      await db
+        .update(outboxEvents)
+        .set({ status: 'pending', error: null })
+        .where(eq(outboxEvents.id, stuck.id));
+      rescued++;
+    }
+    return rescued;
   },
 
   async findPending(): Promise<OutboxEvent[]> {

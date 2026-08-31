@@ -45,9 +45,12 @@ export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
         throw new Error('payment_webhook signature verification failed');
       }
     } else {
-      console.warn(
-        '[payment_webhook] WEBHOOK_HMAC_SECRET not configured; processing UNVERIFIED webhook (insecure)',
+      // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
+      // Processing unverified webhooks is a security vulnerability.
+      console.error(
+        '[payment_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
       );
+      throw new Error('payment_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
     // Build clean event record (strip raw webhook data)
@@ -123,7 +126,7 @@ export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
     }
 
     // Emit normalized event to EventBus for downstream pipeline (receipt, outbox, etc.)
-    deps.eventBus.emit({
+    await deps.eventBus.emit({
       id: eventId || `wh_${Date.now()}`,
       timestamp: payload.timestamp || new Date().toISOString(),
       appId,

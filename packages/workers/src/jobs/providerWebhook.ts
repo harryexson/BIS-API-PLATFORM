@@ -41,9 +41,11 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
         throw new Error('provider_webhook signature verification failed');
       }
     } else {
-      console.warn(
-        '[provider_webhook] WEBHOOK_HMAC_SECRET not configured; processing UNVERIFIED webhook (insecure)',
+      // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
+      console.error(
+        '[provider_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
       );
+      throw new Error('provider_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
     const owner = `webhook_${providerId}_${Math.random().toString(36).slice(2, 8)}`;
@@ -75,7 +77,7 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
       throw new Error('provider_webhook: database write failed — retrying');
     }
 
-    deps.eventBus.emit({
+    await deps.eventBus.emit({
       id: id || `wh_${Date.now()}`,
       timestamp: new Date().toISOString(),
       appId: 'system',

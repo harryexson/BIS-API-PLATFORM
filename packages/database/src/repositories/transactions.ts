@@ -2,6 +2,21 @@ import { eq, and, desc } from 'drizzle-orm';
 import { getDb } from '../connection';
 import { transactions, type Transaction, type NewTransaction } from '../schema';
 
+/**
+ * Valid payment states and allowed transitions.
+ * Enforced to prevent invalid state mutations.
+ */
+const VALID_STATUSES = new Set(['pending', 'processing', 'success', 'failed', 'refunded', 'cancelled', 'unknown']);
+const VALID_TRANSITIONS: Record<string, string[]> = {
+  pending: ['processing', 'success', 'failed', 'cancelled', 'unknown'],
+  processing: ['success', 'failed', 'refunded', 'unknown'],
+  success: ['refunded'],
+  failed: ['pending'],  // allow retry from failed
+  refunded: [],
+  cancelled: [],
+  unknown: ['pending', 'success', 'failed', 'refunded'],  // reconciliation can resolve
+};
+
 export const transactionRepository = {
   async findById(id: string): Promise<Transaction | undefined> {
     const db = getDb();
@@ -25,8 +40,30 @@ export const transactionRepository = {
     return rows[0];
   },
 
+  /**
+   * P0: Updates transaction status with state machine validation.
+   * Rejects invalid transitions to prevent data corruption.
+   */
   async updateStatus(id: string, status: string): Promise<Transaction | undefined> {
+    if (!VALID_STATUSES.has(status)) {
+      throw new Error(`Invalid transaction status: ${status}`);
+    }
+
     const db = getDb();
+
+    // Fetch current status for transition validation
+    const current = await db.select().from(transactions).where(eq(transactions.id, id)).limit(1);
+    if (!current.length) return undefined;
+
+    const currentStatus = current[0].status;
+    const allowed = VALID_TRANSITIONS[currentStatus] || [];
+    if (!allowed.includes(status)) {
+      console.warn(
+        `[transactions] Ignoring invalid transition: ${currentStatus} → ${status} for tx ${id}`,
+      );
+      return current[0];
+    }
+
     const rows = await db
       .update(transactions)
       .set({ status, updatedAt: new Date() })

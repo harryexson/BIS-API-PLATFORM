@@ -30,15 +30,27 @@ export class ConversationResolver {
    * @param providerId - The provider that delivered the webhook
    * @param content - The message content (for keyword handling context)
    * @param recipientPhone - The phone number the message was sent TO (from webhook metadata)
+   * @param appId - Optional: filter to a specific application for stricter isolation
+   * @param tenantId - Optional: filter to a specific tenant for stricter isolation
    */
   async resolve(
     senderPhone: string,
     providerId: string,
     content: string,
     recipientPhone?: string,
+    appId?: string,
+    tenantId?: string,
   ): Promise<ConversationResolution> {
     // 1. Find all active conversations for this phone number
-    const allConversations = await conversationRepository.findActiveByPhone(senderPhone);
+    let allConversations = await conversationRepository.findActiveByPhone(senderPhone);
+
+    // P0: If appId is provided, filter for stricter isolation
+    if (appId) {
+      allConversations = allConversations.filter((c) => c.appId === appId);
+    }
+    if (tenantId) {
+      allConversations = allConversations.filter((c) => c.tenantId === tenantId);
+    }
 
     // 2. Filter by providerId
     let candidates = allConversations.filter(

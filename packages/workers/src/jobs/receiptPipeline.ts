@@ -65,7 +65,7 @@ export function createReceiptPipelineProcessor(deps: JobDeps): JobProcessor {
     }
 
     // Emit receipt event for monitoring
-    deps.eventBus.emit({
+    await deps.eventBus.emit({
       id: `receipt_${job.id}`,
       timestamp: new Date().toISOString(),
       appId: eventAppId,

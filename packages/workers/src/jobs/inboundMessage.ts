@@ -57,7 +57,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
 
     // Log ambiguous routing for monitoring
     if (resolution.confidence === 'ambiguous') {
-      deps.eventBus.emit({
+      await deps.eventBus.emit({
         id: `${job.id}_ambiguous`,
         timestamp: new Date().toISOString(),
         appId,
@@ -89,7 +89,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
 
       // Emit keyword response event for the app to send back
       if (keywordResult.response) {
-        deps.eventBus.emit({
+        await deps.eventBus.emit({
           id: `${job.id}_keyword_response`,
           timestamp: new Date().toISOString(),
           appId,
@@ -136,7 +136,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
     }
 
     // --- Step 5: Emit routed inbound event via EventBus ---
-    deps.eventBus.emit({
+    await deps.eventBus.emit({
       id: job.id,
       timestamp: new Date().toISOString(),
       appId,

@@ -26,7 +26,7 @@ export function createReconciliationProcessor(
     const ttl = deps.config.retry.maxDelayMs;
 
     await deps.lock.withLock('reconciliation', owner, ttl, async () => {
-      const eventsByCategory = await eventRepository.countByCategory().catch(() => ({}));
+      const eventsByCategory = await eventRepository.countByCategory('system').catch(() => ({}));
       const totalEvents = Object.values(eventsByCategory).reduce((a, b) => a + b, 0);
 
       const deadLetters: Record<string, number> = {};
@@ -52,7 +52,7 @@ export function createReconciliationProcessor(
         console.error('[reconciliation] Neon write failed', err);
       }
 
-      deps.eventBus.emit({
+      await deps.eventBus.emit({
         id: `recon_${Date.now()}`,
         timestamp: new Date().toISOString(),
         appId: 'system',

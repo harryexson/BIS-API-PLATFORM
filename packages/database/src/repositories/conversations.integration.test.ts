@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { and, eq, or, like } from 'drizzle-orm';
 import { conversationRepository } from './conversations';
 import { getDb } from '../connection';
 import { conversations } from '../schema';
@@ -31,9 +32,10 @@ describe.skipIf(!hasDb)('Conversation Repository — Integration Tests', () => {
     await db
       .delete(conversations)
       .where(
-        (c) =>
-          c.phoneNumber.startsWith('+1555') ||
-          c.appId.startsWith('test-app'),
+        or(
+          eq(conversations.phoneNumber, testPhone),
+          like(conversations.appId, 'test-app-%'),
+        ),
       );
   });
 
@@ -43,9 +45,10 @@ describe.skipIf(!hasDb)('Conversation Repository — Integration Tests', () => {
     await db
       .delete(conversations)
       .where(
-        (c) =>
-          c.phoneNumber.startsWith('+1555') ||
-          c.appId.startsWith('test-app'),
+        or(
+          eq(conversations.phoneNumber, testPhone),
+          like(conversations.appId, 'test-app-%'),
+        ),
       );
   });
 

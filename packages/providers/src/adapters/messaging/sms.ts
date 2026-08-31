@@ -66,22 +66,22 @@ export class SmsProvider extends BaseProvider {
         providerId: this.config.id,
         status: 'success',
         latency,
-        cost: this.config.costPerMessage || 0.0075,
-        decisionReason,
-        payload,
-        response: res.body,
-      };
-    } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'messaging',
-        providerId: this.config.id,
-        status: 'failed',
-        latency,
-        cost: 0,
+      cost: this.config.messageCost || 0.0075,
+      decisionReason,
+      payload,
+      response: res.body,
+    };
+  } catch (err: any) {
+    const latency = Date.now() - startTime;
+    return {
+      id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
+      timestamp: new Date().toISOString(),
+      appId,
+      category: 'messaging',
+      providerId: this.config.id,
+      status: 'failed',
+      latency,
+      cost: 0,
         decisionReason,
         payload,
         response: null,
@@ -108,7 +108,7 @@ export class SmsProvider extends BaseProvider {
       providerId: this.config.id,
       status: 'success',
       latency,
-      cost: this.config.costPerMessage || 0.0075,
+      cost: this.config.messageCost || 0.0075,
       decisionReason,
       payload,
       response: {

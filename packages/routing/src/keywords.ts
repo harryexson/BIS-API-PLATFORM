@@ -51,6 +51,11 @@ export async function handleKeyword(ctx: KeywordContext): Promise<KeywordResult>
     return handlePrayer(ctx);
   }
 
+  // Check for JOIN/START keywords (opt-in / re-subscribe)
+  if (isJoinKeyword(normalized)) {
+    return handleJoin(ctx);
+  }
+
   // Not a recognized keyword
   return { handled: false };
 }
@@ -63,6 +68,11 @@ function isStopKeyword(text: string): boolean {
 function isHelpKeyword(text: string): boolean {
   const helpPatterns = ['HELP', 'ASSIST', 'SUPPORT', 'INFO', '?'];
   return helpPatterns.some((p) => text === p || text.startsWith(p + ' '));
+}
+
+function isJoinKeyword(text: string): boolean {
+  const joinPatterns = ['JOIN', 'START', 'SUBSCRIBE', 'OPTIN', 'OPT IN', 'RESUBSCRIBE'];
+  return joinPatterns.some((p) => text === p || text.startsWith(p + ' '));
 }
 
 async function handleStop(ctx: KeywordContext): Promise<KeywordResult> {
@@ -179,5 +189,34 @@ async function handlePrayer(ctx: KeywordContext): Promise<KeywordResult> {
     action: 'prayer',
     response:
       'Your prayer request has been received. Our team will be praying for you. Reply STOP to unsubscribe.',
+  };
+}
+
+async function handleJoin(ctx: KeywordContext): Promise<KeywordResult> {
+  try {
+    // Log the opt-in event
+    await eventRepository.create({
+      appId: ctx.appId,
+      category: 'inbound',
+      providerId: ctx.providerId,
+      status: 'success',
+      decisionReason: 'keyword_join',
+      payload: {
+        sender: ctx.senderPhone,
+        content: ctx.content,
+        keyword: 'JOIN',
+        action: 'opt_in',
+        tenantId: ctx.tenantId,
+      },
+    });
+  } catch {
+    // Non-fatal
+  }
+
+  return {
+    handled: true,
+    action: 'opt_in',
+    response:
+      'You have been subscribed to this service. Reply STOP to unsubscribe at any time.',
   };
 }
