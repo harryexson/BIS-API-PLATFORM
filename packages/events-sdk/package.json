@@ -1,0 +1,9 @@
+{
+  "name": "@company/events-sdk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Application integration helpers for consuming normalized BIS platform events.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {}
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@company/loadtest",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/run.ts",
+  "scripts": {
+    "loadtest": "tsx src/run.ts",
+    "loadtest:health": "LOAD_DURATION_MS=10000 tsx src/run.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.0.0"
+  }
+}

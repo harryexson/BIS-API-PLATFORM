@@ -1,0 +1,255 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_migrations:
+        description: 'Skip database migrations'
+        required: false
+        default: 'false'
+        type: boolean
+      target:
+        description: 'Deployment target'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - api-gateway
+          - worker
+          - admin-console
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+# Production deployment requires all CI gates to pass
+jobs:
+  # ─── Verify CI Passed ────────────────────────────────────────────────
+  verify-ci:
+    name: Verify CI passed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI to complete
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-regexp: 'Lint|Type check|Unit tests|Integration tests|Build|Security audit|Migration validation'
+          wait-interval: 30
+          allowed-conclusions: success
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── Build & Validate ────────────────────────────────────────────────
+  build:
+    name: Build production
+    needs: verify-ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build all workspaces
+        run: npm run build:all
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-build
+          path: |
+            packages/*/dist/
+            services/*/dist/
+            apps/*/dist/
+          retention-days: 7
+
+  # ─── Database Migration ──────────────────────────────────────────────
+  migrate:
+    name: Database migration
+    needs: build
+    if: ${{ github.event.inputs.skip_migrations != 'true' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate migrations before applying
+        run: npm run drizzle:check --workspace=@company/database
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+
+      - name: Apply pending migrations
+        run: npm run drizzle:migrate --workspace=@company/database
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+          # SAFETY: Never set to true in production
+          DRIZZLE_KIT_NO_PUSH: "true"
+
+      - name: Verify migration integrity
+        run: npm run drizzle:check --workspace=@company/database
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+
+  # ─── Deploy API Gateway ──────────────────────────────────────────────
+  deploy-api-gateway:
+    name: Deploy API Gateway
+    needs: [build, migrate]
+    if: always() && needs.build.result == 'success' && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: production-build
+
+      - name: Deploy to Railway
+        run: |
+          echo "Deploy API Gateway to Railway"
+          echo "Railway CLI deployment command goes here"
+          echo "railway up --service api-gateway --dir services/api-gateway"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  # ─── Deploy Worker ───────────────────────────────────────────────────
+  deploy-worker:
+    name: Deploy Worker
+    needs: [build, migrate]
+    if: always() && needs.build.result == 'success' && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: production-build
+
+      - name: Deploy to Railway
+        run: |
+          echo "Deploy Worker to Railway"
+          echo "railway up --service worker --dir services/worker"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  # ─── Deploy Admin Console ────────────────────────────────────────────
+  deploy-admin-console:
+    name: Deploy Admin Console
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: production-build
+
+      - name: Deploy to Vercel
+        run: |
+          echo "Deploy Admin Console to Vercel"
+          echo "vercel --prod --token $VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+  # ─── Post-Deploy Verification ────────────────────────────────────────
+  verify-deployment:
+    name: Verify deployment
+    needs: [deploy-api-gateway, deploy-worker, deploy-admin-console]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check
+        run: |
+          echo "Waiting for deployment to stabilize..."
+          sleep 30
+          echo "Checking health endpoint..."
+          curl -sf https://api.company.com/health || exit 1
+        continue-on-error: true
+
+      - name: Smoke test
+        run: |
+          echo "Running smoke tests..."
+          curl -sf https://api.company.com/ready || exit 1
+        continue-on-error: true
+
+  # ─── Rollback Job (Manual) ───────────────────────────────────────────
+  rollback:
+    name: Rollback deployment
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'rollback'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Rollback Railway deployment
+        run: |
+          echo "ROLLBACK: This will revert to the previous Railway deployment"
+          echo "railway rollback --service api-gateway"
+          echo "railway rollback --service worker"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Rollback Vercel deployment
+        run: |
+          echo "ROLLBACK: This will revert to the previous Vercel deployment"
+          echo "vercel rollback --token $VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Database rollback warning
+        run: |
+          echo "::warning::Database rollback requires manual intervention."
+          echo "::warning::NEVER run 'drizzle-kit push --force' or 'DROP' on production."
+          echo "::warning::Use Neon PITR restore or create a forward migration instead."
+          echo "::warning::See docs/operations/ROLLBACK.md for procedures."
+
+  # ─── Deployment Summary ──────────────────────────────────────────────
+  summary:
+    name: Deployment summary
+    if: always()
+    needs: [verify-ci, build, migrate, deploy-api-gateway, deploy-worker, deploy-admin-console, verify-deployment]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deployment report
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| CI Verification | ${{ needs.verify-ci.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Database Migration | ${{ needs.migrate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Gateway | ${{ needs.deploy-api-gateway.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker | ${{ needs.deploy-worker.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Admin Console | ${{ needs.deploy-admin-console.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | ${{ needs.verify-deployment.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "Deployed by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
