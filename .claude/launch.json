@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "developer-portal",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--workspace=apps/developer-portal", "run", "dev"],
+      "port": 5175
+    },
+    {
+      "name": "checkout",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--workspace=apps/checkout", "run", "dev"],
+      "port": 5174
+    },
+    {
+      "name": "admin-console",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--workspace=apps/admin-console", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}
