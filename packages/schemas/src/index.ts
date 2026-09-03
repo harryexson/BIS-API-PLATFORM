@@ -126,6 +126,14 @@ export interface MessageResponse {
   [key: string]: unknown;
 }
 
+export interface RefundRequest {
+  originalTransactionId: string;
+  amount?: number;
+  currency?: string;
+  reason?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface OtherRequest {
   serviceType: string;
   action?: string;

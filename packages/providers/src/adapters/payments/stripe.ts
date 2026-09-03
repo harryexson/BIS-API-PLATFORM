@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, RefundRequest } from '@company/schemas';
 
 /**
  * Real Stripe payment provider adapter.
@@ -105,6 +105,73 @@ export class StripeProvider extends BaseProvider {
         status: 'failed',
         amount,
         currency,
+        latency,
+        cost: 0,
+        decisionReason,
+        payload,
+        response: null,
+        error: err.message,
+      };
+    }
+  }
+
+  async refund(appId: string, payload: RefundRequest, decisionReason: string): Promise<TransactionEvent> {
+    this.verifyAvailability();
+    const startTime = Date.now();
+
+    if (!this.apiKey) {
+      return super.refund(appId, payload, decisionReason);
+    }
+
+    try {
+      const body: Record<string, unknown> = { charge: payload.originalTransactionId };
+      if (payload.amount) body.amount = Math.round(payload.amount * 100);
+      if (payload.reason && ['duplicate', 'fraudulent', 'requested_by_customer'].includes(payload.reason)) {
+        body.reason = payload.reason;
+      }
+
+      const res = await this.http_request({
+        method: 'POST',
+        url: `${this.baseUrl}/refunds`,
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        body,
+        timeoutMs: 30_000,
+        maxAttempts: 2,
+      });
+
+      const latency = Date.now() - startTime;
+
+      if (res.status >= 400) {
+        throw new Error(`Stripe API error: ${res.status} - ${JSON.stringify(res.body)}`);
+      }
+
+      const refund = res.body;
+      return {
+        id: refund.id,
+        timestamp: new Date().toISOString(),
+        appId,
+        category: 'payment',
+        providerId: this.config.id,
+        status: refund.status === 'succeeded' ? 'success' : 'failed',
+        amount: payload.amount,
+        currency: payload.currency,
+        latency,
+        cost: 0,
+        decisionReason,
+        payload,
+        response: refund,
+      };
+    } catch (err: any) {
+      const latency = Date.now() - startTime;
+      return {
+        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
+        timestamp: new Date().toISOString(),
+        appId,
+        category: 'payment',
+        providerId: this.config.id,
+        status: 'failed',
+        amount: payload.amount,
+        currency: payload.currency,
         latency,
         cost: 0,
         decisionReason,

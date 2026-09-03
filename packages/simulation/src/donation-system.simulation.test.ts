@@ -543,13 +543,37 @@ describe('deliberate: worker restart', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: refund', () => {
-  it('no server refund endpoint exists (client resource only) — the charge can only be refunded in the provider panel', async () => {
-    const res = await runtime.request('POST', '/refunds', {
-      headers: { 'content-type': 'application/json', authorization: 'Bearer bap_test_reachchurch_0001' },
-      body: JSON.stringify({ amount: 50, charge: 'ch_xyz' }),
-    });
+  const AUTH = { authorization: 'Bearer bap_test_reachchurch_0001', 'x-tenant-id': TENANT_ID };
+
+  it('POST /refunds refunds a previously captured payment (FIXED)', async () => {
+    const donation = await createDonation(runtime, { amount: 50, currency: 'USD' }, AUTH);
+    expect(donation.status).toBe(200);
+    const paymentId = donation.body.id;
+
+    const res = await runtime.post('/refunds', { payment_id: paymentId, reason: 'customer_requested' }, AUTH);
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.object).toBe('refund');
+    expect(body.payment_id).toBe(paymentId);
+    expect(body.status).toBe('success');
+    expect(body.amount).toBe(50);
+    console.warn('[FIXED] POST /refunds now refunds a captured payment via BaseProvider.refund() (real Stripe API when configured, simulated otherwise)');
+  });
+
+  it('POST /refunds rejects a refund amount exceeding the captured amount', async () => {
+    const donation = await createDonation(runtime, { amount: 20, currency: 'USD' }, AUTH);
+    expect(donation.status).toBe(200);
+    const paymentId = donation.body.id;
+
+    const res = await runtime.post('/refunds', { payment_id: paymentId, amount: 5000 }, AUTH);
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error.code).toBe('invalid_operation');
+  });
+
+  it('POST /refunds 404s for a payment the caller does not own', async () => {
+    const res = await runtime.post('/refunds', { payment_id: 'ch_does_not_exist' }, AUTH);
     expect(res.status).toBe(404);
-    console.warn('[gap] POST /refunds has no gateway route; BaseProvider has no refund(); the api-client RefundsResource is unimplemented server-side');
   });
 
   it('the webhook pipeline handles a charge.refunded event end-to-end and notifies the donor', async () => {

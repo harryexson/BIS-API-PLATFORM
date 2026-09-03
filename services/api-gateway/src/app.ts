@@ -549,6 +549,107 @@ app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req
   return res.json(statusResponse);
 });
 
+// POST /refunds — refund a previously captured payment. See docs/openapi.yaml.
+app.post('/refunds', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { payment_id: paymentId, amount, currency, reason, metadata } = req.body;
+  const idempotencyKey: string | undefined = req.header('idempotency-key') || req.body.idempotency_key;
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing parameter: appId is required' });
+  }
+  if (!paymentId) {
+    return res.status(400).json({ error: { code: 'invalid_request', message: 'Missing required field: payment_id' } });
+  }
+
+  const requestFingerprint = JSON.stringify({ paymentId, amount, currency, reason });
+  let idempotencyRecordId: string | undefined;
+
+  if (idempotencyKey) {
+    const claim = await platformIdempotency.checkAndClaim(appId, tenantId, 'refund', idempotencyKey);
+    if (!claim.claimed) {
+      if (claim.existingResult) {
+        if (claim.existingResult.requestFingerprint !== requestFingerprint) {
+          return res.status(409).json({
+            error: {
+              code: 'idempotency_conflict',
+              message: 'Idempotency-Key already used with a different payload',
+              resource: claim.existingResult.refund,
+            },
+          });
+        }
+        return res.status(201).json(claim.existingResult.refund);
+      }
+      return res.status(409).json({
+        error: { code: 'idempotency_in_progress', message: 'A request with this Idempotency-Key is already being processed' },
+      });
+    }
+    idempotencyRecordId = claim.recordId;
+  }
+
+  // Ownership: only the application that made the original payment may refund it.
+  const original = eventBus
+    .getHistory()
+    .find((e: TransactionEvent) => e.id === paymentId && e.appId === appId && e.category === 'payment');
+
+  if (!original) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'payment not found').catch(() => undefined);
+    return res.status(404).json({ error: { code: 'not_found', message: `Payment '${paymentId}' not found` } });
+  }
+  if (original.status !== 'success') {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'payment not refundable').catch(() => undefined);
+    return res.status(422).json({
+      error: { code: 'invalid_operation', message: `Payment '${paymentId}' does not have a successful capture to refund` },
+    });
+  }
+  if (amount != null && original.amount != null && Number(amount) > Number(original.amount)) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'refund exceeds captured amount').catch(() => undefined);
+    return res.status(422).json({
+      error: { code: 'invalid_operation', message: 'Refund amount exceeds remaining captured amount' },
+    });
+  }
+
+  const provider = registry.getProvider(original.providerId);
+  if (!provider) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'provider unavailable').catch(() => undefined);
+    return res.status(503).json({ error: { code: 'provider_unavailable', message: `Provider '${original.providerId}' is unavailable` } });
+  }
+
+  try {
+    const refundEvent = await provider.refund(
+      appId,
+      { originalTransactionId: paymentId, amount, currency: currency || original.currency, reason, metadata },
+      'refund_requested',
+    );
+
+    eventBus.emit(refundEvent);
+    observe(refundEvent);
+
+    const refund = {
+      id: refundEvent.id,
+      object: 'refund' as const,
+      payment_id: paymentId,
+      status: refundEvent.status === 'success' ? 'success' : 'failed',
+      amount: amount ?? original.amount,
+      currency: currency || original.currency,
+      reason,
+      provider_refund_id: refundEvent.response?.id,
+      created_at: refundEvent.timestamp,
+    };
+
+    if (idempotencyRecordId) {
+      await platformIdempotency.complete(idempotencyRecordId, { requestFingerprint, refund }).catch(() => undefined);
+    }
+
+    return res.status(201).json(refund);
+  } catch (err: any) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, err.message).catch(() => undefined);
+    observeFailure('payment', original.providerId, 'REFUND_FAILED');
+    return res.status(503).json({ error: { code: 'refund_failed', message: 'Refund failed' } });
+  }
+});
+
 // ----------------------------------------------------
 // PROVIDER CAPABILITY QUERY API
 // ----------------------------------------------------

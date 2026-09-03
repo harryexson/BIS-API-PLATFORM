@@ -1,4 +1,5 @@
-import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, OtherRequest } from '@company/schemas';
+import { randomUUID } from 'crypto';
+import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, OtherRequest, RefundRequest } from '@company/schemas';
 
 export interface HttpRequestOptions {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
@@ -185,4 +186,39 @@ export abstract class BaseProvider {
     payload: PaymentRequest | MessageRequest | OtherRequest,
     decisionReason: string
   ): Promise<TransactionEvent>;
+
+  /**
+   * Refunds a previously captured payment.
+   *
+   * Default implementation simulates the refund — payment adapters with a
+   * real refund API (currently Stripe) override this to call it for real
+   * when credentials are configured, matching the same real-with-simulated-
+   * fallback pattern as processRequest().
+   */
+  async refund(appId: string, payload: RefundRequest, decisionReason: string): Promise<TransactionEvent> {
+    this.verifyAvailability();
+    const latency = await this.simulateLatency();
+    const refundId = 're_' + randomUUID().replace(/-/g, '').slice(0, 24);
+
+    return {
+      id: refundId,
+      timestamp: new Date().toISOString(),
+      appId,
+      category: 'payment',
+      providerId: this.config.id,
+      status: 'success',
+      amount: payload.amount,
+      currency: payload.currency,
+      latency,
+      cost: 0,
+      decisionReason,
+      payload,
+      response: {
+        id: refundId,
+        object: 'refund',
+        original_transaction_id: payload.originalTransactionId,
+        status: 'succeeded',
+      },
+    };
+  }
 }
