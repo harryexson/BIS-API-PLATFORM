@@ -1,6 +1,6 @@
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
-export type TransactionStatus = 'success' | 'failed';
+export type TransactionStatus = 'success' | 'failed' | 'pending';
 
 export type ProviderEnvironment = 'test' | 'live';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';

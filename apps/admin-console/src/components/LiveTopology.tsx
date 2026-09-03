@@ -13,8 +13,15 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
     appX: number;
     routerX: number;
     providerX: number;
-    status: 'success' | 'failed';
+    status: 'success' | 'failed' | 'pending';
   } | null>(null);
+
+  const flowColor = (status: 'success' | 'failed' | 'pending' | undefined) =>
+    status === 'success' ? 'var(--accent-green)' : status === 'pending' ? 'var(--accent-yellow)' : 'var(--accent-red)';
+  const flowDotColor = (status: 'success' | 'failed' | 'pending' | undefined) =>
+    status === 'success' ? '#34d399' : status === 'pending' ? '#fbbf24' : '#f87171';
+  const flowPulseAnimation = (status: 'success' | 'failed' | 'pending' | undefined) =>
+    status === 'success' ? 'pulse-green 1s infinite' : status === 'pending' ? 'pulse-cyan 1s infinite' : 'pulse-red 1s infinite';
 
   // App coordinates (X values out of 1000)
   const appMap: Record<string, { name: string, x: number }> = {
@@ -194,14 +201,14 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
               <path
                 d={`M ${activeFlow.appX} 40 L 500 160 L ${activeFlow.routerX} 280 L ${activeFlow.providerX} 420`}
                 fill="none"
-                stroke={activeFlow.status === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}
+                stroke={flowColor(activeFlow.status)}
                 strokeWidth="3.5"
                 filter="url(#glow)"
                 style={{ opacity: 0.8 }}
               />
 
               {/* Glowing animated packet */}
-              <circle r="7" fill={activeFlow.status === 'success' ? '#34d399' : '#f87171'} filter="url(#glow)">
+              <circle r="7" fill={flowDotColor(activeFlow.status)} filter="url(#glow)">
                 <animateMotion
                   key={activeFlow.id}
                   dur="1s"
@@ -297,8 +304,8 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
                   width: '36px',
                   height: '36px',
                   borderWidth: '2px',
-                  animation: isActive 
-                    ? (activeFlow?.status === 'success' ? 'pulse-green 1s infinite' : 'pulse-red 1s infinite')
+                  animation: isActive
+                    ? flowPulseAnimation(activeFlow?.status)
                     : undefined
                 }}
               >

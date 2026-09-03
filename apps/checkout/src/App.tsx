@@ -14,6 +14,7 @@ type ViewState =
   | { phase: 'ready'; session: SessionInfo }
   | { phase: 'paying'; session: SessionInfo }
   | { phase: 'success'; successUrl: string | null }
+  | { phase: 'awaiting-confirmation'; successUrl: string | null }
   | { phase: 'failed'; cancelUrl: string | null };
 
 function formatAmount(amount: number, currency: string): string {
@@ -61,6 +62,11 @@ export default function App() {
       const body = await res.json();
       if (res.ok && body.status === 'success') {
         setState({ phase: 'success', successUrl: body.successUrl ?? null });
+      } else if (res.ok && body.status === 'pending') {
+        // The provider (e.g. Paystack) only confirmed the session was
+        // created — real settlement arrives later via webhook, not in this
+        // response. Don't tell the customer it succeeded or failed yet.
+        setState({ phase: 'awaiting-confirmation', successUrl: body.successUrl ?? null });
       } else {
         setState({ phase: 'failed', cancelUrl: body.cancelUrl ?? null });
       }
@@ -104,6 +110,20 @@ export default function App() {
         <>
           <h2 style={{ marginTop: 0, color: 'var(--accent-green)' }}>Payment successful</h2>
           <p style={{ color: 'var(--text-secondary)' }}>Thank you — your payment has been processed.</p>
+          {state.successUrl && (
+            <button className="btn-primary" onClick={() => (window.location.href = state.successUrl!)}>
+              Continue
+            </button>
+          )}
+        </>
+      )}
+
+      {state.phase === 'awaiting-confirmation' && (
+        <>
+          <h2 style={{ marginTop: 0, color: 'var(--accent-cyan)' }}>Confirming your payment…</h2>
+          <p style={{ color: 'var(--text-secondary)' }}>
+            Your payment was submitted and is being confirmed by the payment provider. This can take a moment.
+          </p>
           {state.successUrl && (
             <button className="btn-primary" onClick={() => (window.location.href = state.successUrl!)}>
               Continue

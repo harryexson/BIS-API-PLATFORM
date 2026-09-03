@@ -314,7 +314,7 @@ function requirePortalAuth(req: Request, res: Response, next: NextFunction) {
 }
 
 // Records live traffic outcomes against the provider management stats.
-function recordTrafficResult(providerId: string | undefined, status: 'success' | 'failed', latency: number) {
+function recordTrafficResult(providerId: string | undefined, status: 'success' | 'failed' | 'pending', latency: number) {
   if (!providerId) return;
   registry.recordTraffic(providerId, status === 'success', latency);
 }
@@ -670,7 +670,7 @@ app.post('/refunds', mw.apiKey, resolveTenantContext, async (req: Request, res: 
       id: refundEvent.id,
       object: 'refund' as const,
       payment_id: paymentId,
-      status: refundEvent.status === 'success' ? 'success' : 'failed',
+      status: refundEvent.status === 'success' ? 'success' : refundEvent.status === 'failed' ? 'failed' : 'pending',
       amount: amount ?? original.amount,
       currency: currency || original.currency,
       reason,
@@ -939,7 +939,7 @@ app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response)
         tenantId: session.tenantId,
         providerId: event.providerId,
         providerTransactionId: event.id,
-        status: event.status === 'success' ? 'success' : 'failed',
+        status: event.status === 'success' ? 'success' : event.status === 'failed' ? 'failed' : 'pending',
         amount: String(event.amount),
         currency: event.currency || session.currency,
         paymentMethod: paymentMethod || null,

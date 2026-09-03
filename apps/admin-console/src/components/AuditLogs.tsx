@@ -92,6 +92,7 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
             <tbody>
               {logs.map((log) => {
                 const isSuccess = log.status === 'success';
+                const isPending = log.status === 'pending';
                 const timeStr = new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
                 return (
@@ -99,7 +100,7 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
                     key={log.id} 
                     style={{ 
                       borderBottom: '1px solid rgba(255,255,255,0.03)',
-                      background: isSuccess ? 'transparent' : 'rgba(239, 68, 68, 0.02)'
+                      background: isSuccess || isPending ? 'transparent' : 'rgba(239, 68, 68, 0.02)'
                     }}
                   >
                     <td style={{ padding: '10px 8px', color: 'var(--text-muted)' }}>{timeStr}</td>
@@ -151,12 +152,12 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
                           display: 'inline-flex',
                           alignItems: 'center',
                           gap: '3px',
-                          background: isSuccess ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-                          color: isSuccess ? 'var(--accent-green)' : 'var(--accent-red)'
+                          background: isSuccess ? 'rgba(16, 185, 129, 0.1)' : isPending ? 'rgba(245, 158, 11, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                          color: isSuccess ? 'var(--accent-green)' : isPending ? 'var(--accent-yellow)' : 'var(--accent-red)'
                         }}
                       >
-                        {!isSuccess && <AlertCircle className="w-3 h-3" />}
-                        {isSuccess ? 'SUCCESS' : 'FAILED'}
+                        {!isSuccess && !isPending && <AlertCircle className="w-3 h-3" />}
+                        {isSuccess ? 'SUCCESS' : isPending ? 'PENDING' : 'FAILED'}
                       </span>
                     </td>
                   </tr>

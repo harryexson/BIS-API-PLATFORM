@@ -395,7 +395,15 @@ describe('deliberate: webhook racing ahead of the client response', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: ambiguous provider response', () => {
-  it('a provider returning a non-terminal status is treated as "success" (documented gap: no pending state)', async () => {
+  // TransactionStatus now includes 'pending' (see @company/schemas and
+  // PaystackProvider, whose real /transaction/initialize call correctly
+  // returns it — that endpoint only confirms the checkout session was
+  // created, not that money changed hands). What's demonstrated below is a
+  // narrower, remaining concern: the platform has no way to detect an
+  // adapter that mislabels a non-terminal charge as 'success' rather than
+  // reporting 'pending' honestly — it can only trust what processRequest()
+  // returns.
+  it('the platform trusts whatever status an adapter reports, even if it mislabels a non-terminal charge as success', async () => {
     patchStripeProcessRequest(async (appId, payload, decisionReason) => {
       await sleep(5);
       return {

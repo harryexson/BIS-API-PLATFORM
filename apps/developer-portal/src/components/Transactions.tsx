@@ -40,7 +40,7 @@ export default function Transactions({ token }: { token: string }) {
                   <td>{t.providerId}</td>
                   <td>{t.amount} {t.currency}</td>
                   <td>{t.paymentMethod || '—'}</td>
-                  <td><span className={`status-dot ${t.status === 'success' ? 'success' : 'failed'}`} />{t.status}</td>
+                  <td><span className={`status-dot ${t.status}`} />{t.status}</td>
                   <td>{new Date(t.createdAt).toLocaleString()}</td>
                 </tr>
               ))}

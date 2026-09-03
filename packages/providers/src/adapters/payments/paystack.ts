@@ -69,7 +69,11 @@ export class PaystackProvider extends BaseProvider {
         appId,
         category: 'payment',
         providerId: this.config.id,
-        status: 'success',
+        // Initializing a transaction only creates the checkout session — it
+        // does not confirm the customer has actually paid. Real settlement
+        // arrives later via the charge.success webhook, same as Stripe's
+        // async confirmation path.
+        status: 'pending',
         amount,
         currency,
         latency,
