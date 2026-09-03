@@ -82,9 +82,11 @@ export const transactionRepository = {
       .select()
       .from(transactions)
       .where(
-        eq(transactions.appId, appId) &&
-        eq(transactions.tenantId, tenantId) &&
-        eq(transactions.idempotencyKey, idempotencyKey),
+        and(
+          eq(transactions.appId, appId),
+          eq(transactions.tenantId, tenantId),
+          eq(transactions.idempotencyKey, idempotencyKey),
+        ),
       )
       .limit(1);
     return rows[0];

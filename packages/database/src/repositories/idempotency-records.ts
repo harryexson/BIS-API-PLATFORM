@@ -14,11 +14,13 @@ export const idempotencyRecordRepository = {
       .select()
       .from(idempotencyRecords)
       .where(
-        eq(idempotencyRecords.appId, appId) &&
-        eq(idempotencyRecords.tenantId, tenantId) &&
-        eq(idempotencyRecords.operation, operation) &&
-        eq(idempotencyRecords.idempotencyKey, idempotencyKey) &&
-        gt(idempotencyRecords.expiresAt, new Date()),
+        and(
+          eq(idempotencyRecords.appId, appId),
+          eq(idempotencyRecords.tenantId, tenantId),
+          eq(idempotencyRecords.operation, operation),
+          eq(idempotencyRecords.idempotencyKey, idempotencyKey),
+          gt(idempotencyRecords.expiresAt, new Date()),
+        ),
       )
       .limit(1);
     return rows[0];

@@ -17,9 +17,11 @@ export const conversationRepository = {
       .select()
       .from(conversations)
       .where(
-        eq(conversations.phoneNumber, phoneNumber) &&
-          eq(conversations.appId, appId) &&
+        and(
+          eq(conversations.phoneNumber, phoneNumber),
+          eq(conversations.appId, appId),
           eq(conversations.tenantId, tenantId),
+        ),
       )
       .limit(1);
     return rows[0];
@@ -33,8 +35,10 @@ export const conversationRepository = {
       .select()
       .from(conversations)
       .where(
-        eq(conversations.phoneNumber, phoneNumber) &&
+        and(
+          eq(conversations.phoneNumber, phoneNumber),
           eq(conversations.status, 'active'),
+        ),
       )
       .orderBy(desc(conversations.lastMessageAt));
   },
@@ -87,9 +91,11 @@ export const conversationRepository = {
       .update(conversations)
       .set({ status: 'closed', updatedAt: new Date() })
       .where(
-        eq(conversations.phoneNumber, phoneNumber) &&
-          eq(conversations.appId, appId) &&
+        and(
+          eq(conversations.phoneNumber, phoneNumber),
+          eq(conversations.appId, appId),
           eq(conversations.tenantId, tenantId),
+        ),
       )
       .returning();
     return rows.length > 0;

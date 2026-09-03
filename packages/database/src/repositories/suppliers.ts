@@ -19,9 +19,11 @@ export const supplierRepository = {
       .select()
       .from(suppliers)
       .where(
-        eq(suppliers.applicationId, applicationId) &&
-        eq(suppliers.tenantId, tenantId) &&
-        eq(suppliers.slug, slug),
+        and(
+          eq(suppliers.applicationId, applicationId),
+          eq(suppliers.tenantId, tenantId),
+          eq(suppliers.slug, slug),
+        ),
       )
       .limit(1);
     return rows[0];
