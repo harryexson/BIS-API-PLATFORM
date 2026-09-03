@@ -10,6 +10,7 @@ import {
   TenantRegistry,
   tenantRepository,
   tenantApplicationLinkRepository,
+  applicationRepository,
   eventRepository,
   transactionRepository,
   checkDatabaseHealth,
@@ -21,6 +22,9 @@ import {
   getContext,
   setContextField,
 } from '@company/observability';
+import { PlatformIdempotencyService } from '@company/shared';
+
+const platformIdempotency = new PlatformIdempotencyService();
 
 const app = express();
 
@@ -213,8 +217,22 @@ async function resolveTenantContext(req: Request, res: Response, next: NextFunct
   }
 
   try {
+    // authed.appId is the application's slug (used consistently as the
+    // human-readable app identifier across transactions/conversations/events),
+    // but tenant_application_links.application_id is a UUID FK to
+    // applications.id. Resolve slug -> UUID before checking the link,
+    // otherwise this always fails against a real database.
+    const application = await applicationRepository.findBySlug(authed.appId);
+    if (!application) {
+      logger.warn('tenant access denied: application not found', {
+        operation: 'tenant-resolution',
+        errorCode: 'APPLICATION_NOT_FOUND',
+        status: 'failed',
+      });
+      return res.status(403).json({ error: 'Access denied: tenant not linked to this application' });
+    }
     const tenantRegistry = new TenantRegistry(tenantRepository, tenantApplicationLinkRepository);
-    await tenantRegistry.assertTenantAccess(authed.appId, tenantId);
+    await tenantRegistry.assertTenantAccess(application.id, tenantId);
     next();
   } catch {
     logger.warn('tenant access denied', {
@@ -310,20 +328,43 @@ app.get('/ready', async (req: Request, res: Response) => {
 app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
-  // P1: Accept idempotency key from header — prevents duplicate charges on retries
-  const idempotencyKey = req.header('x-idempotency-key');
-  
+  const tenantId = req.header('x-tenant-id') || 'default';
+  // Canonical header per docs/openapi.yaml is `Idempotency-Key`; `idempotency_key`
+  // in the body is the documented fallback. (The previous `x-idempotency-key`
+  // header name never matched what docs/SDK/clients actually send, so this
+  // safeguard was silently inert.)
+  const idempotencyKey: string | undefined = req.header('idempotency-key') || req.body.idempotency_key;
+
   if (!appId) {
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
   }
 
-  // P1: Idempotency check — if we've seen this key recently, return the cached result
+  // Fingerprint the mutating fields so a replayed key with a *different*
+  // payload is rejected instead of silently returning the wrong cached charge.
+  const requestFingerprint = JSON.stringify({ amount, currency, paymentMethod, providerOverride, phoneNumber });
+  let idempotencyRecordId: string | undefined;
+
   if (idempotencyKey) {
-    const existing = paymentIdempotencyCache.get(idempotencyKey);
-    if (existing) {
-      metrics.increment('paymentIdempotentHits');
-      return res.json(existing);
+    const claim = await platformIdempotency.checkAndClaim(appId, tenantId, 'payment', idempotencyKey);
+    if (!claim.claimed) {
+      if (claim.existingResult) {
+        if (claim.existingResult.requestFingerprint !== requestFingerprint) {
+          return res.status(409).json({
+            error: {
+              code: 'idempotency_conflict',
+              message: 'Idempotency-Key already used with a different payload',
+              resource: claim.existingResult.event,
+            },
+          });
+        }
+        metrics.increment('paymentIdempotentHits');
+        return res.json(claim.existingResult.event);
+      }
+      return res.status(409).json({
+        error: { code: 'idempotency_in_progress', message: 'A request with this Idempotency-Key is already being processed' },
+      });
     }
+    idempotencyRecordId = claim.recordId;
   }
 
   try {
@@ -340,7 +381,7 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     try {
       await transactionRepository.create({
         appId,
-        tenantId: req.header('x-tenant-id') || 'default',
+        tenantId,
         providerId: event.providerId,
         providerTransactionId: event.id,
         status: event.status === 'success' ? 'success' : event.status === 'failed' ? 'failed' : 'pending',
@@ -357,9 +398,8 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     eventBus.emit(event);
     observe(event);
 
-    // P1: Cache the result for idempotency (5 minute TTL)
-    if (idempotencyKey) {
-      paymentIdempotencyCache.set(idempotencyKey, event);
+    if (idempotencyRecordId) {
+      await platformIdempotency.complete(idempotencyRecordId, { requestFingerprint, event }).catch(() => undefined);
     }
 
     return res.json(event);
@@ -383,6 +423,9 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     eventBus.emit(errorEvent);
     observeFailure('payment', errorEvent.providerId, 'ROUTING_FAILED');
     observe(errorEvent);
+    if (idempotencyRecordId) {
+      await platformIdempotency.fail(idempotencyRecordId, errorEvent.error).catch(() => undefined);
+    }
     return res.status(503).json({ error: 'Payment routing failed', id: errorEvent.id });
   }
 });
@@ -528,19 +571,6 @@ app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Requ
   const views = registry.getAllManagementViews();
   return res.json({ providers: views, count: views.length });
 });
-
-// P1: Payment idempotency cache — prevents duplicate charges on retry.
-// Maps idempotencyKey → TransactionEvent result (5 min TTL).
-const paymentIdempotencyCache = new Map<string, any>();
-const PAYMENT_IDEMPOTENCY_TTL_MS = 5 * 60_000;
-
-setInterval(() => {
-  const cutoff = Date.now() - PAYMENT_IDEMPOTENCY_TTL_MS;
-  for (const [key, event] of paymentIdempotencyCache) {
-    const eventTime = new Date(event.timestamp).getTime();
-    if (eventTime < cutoff) paymentIdempotencyCache.delete(key);
-  }
-}, 60_000);
 
 // P0-5: Inbound provider webhooks with HMAC signature verification.
 // The signature is validated against WEBHOOK_HMAC_SECRET before processing.

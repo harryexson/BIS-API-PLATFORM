@@ -170,7 +170,10 @@ export function seedReachChurch(): void {
   });
   dbState.tenantLinks.push({
     tenantId: TENANT_ID,
-    applicationId: APP_SLUG,
+    // Real tenant_application_links.application_id is a UUID FK to
+    // applications.id, not the slug — match that here so isLinked() checks
+    // exercise the same appId-resolution path as production.
+    applicationId: `app_${APP_SLUG}`,
     status: 'active',
   });
 
@@ -200,7 +203,7 @@ export function seedReachChurch(): void {
   });
   dbState.tenantLinks.push({
     tenantId: OTHER_TENANT_ID_HAULPRO,
-    applicationId: OTHER_APP_SLUG,
+    applicationId: `app_${OTHER_APP_SLUG}`,
     status: 'active',
   });
 
@@ -230,7 +233,7 @@ export function seedReachChurch(): void {
   });
   dbState.tenantLinks.push({
     tenantId: AFRIBOOK_TENANT_ID,
-    applicationId: AFRIBOOK_SLUG,
+    applicationId: `app_${AFRIBOOK_SLUG}`,
     status: 'active',
   });
 }
