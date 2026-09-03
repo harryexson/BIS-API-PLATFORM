@@ -30,7 +30,7 @@ const DEFAULT_FALLBACK_POLICY: ChannelFallbackPolicy = {
 
 // P1: Default provider request timeout (30 seconds).
 // Prevents hung provider calls from blocking the entire gateway.
-const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 30_000;
+export const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 30_000;
 
 /**
  * Wraps a provider processRequest call with an AbortSignal timeout.

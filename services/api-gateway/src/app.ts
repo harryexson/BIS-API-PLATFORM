@@ -14,6 +14,12 @@ import {
   eventRepository,
   transactionRepository,
   webhookJobRepository,
+  userRepository,
+  apiKeyRepository,
+  checkoutSessionRepository,
+  hashPassword,
+  verifyPassword,
+  generateApiKey,
   checkDatabaseHealth,
 } from '@company/database';
 import {
@@ -24,6 +30,7 @@ import {
   setContextField,
 } from '@company/observability';
 import { PlatformIdempotencyService } from '@company/shared';
+import { signPortalToken, verifyPortalToken, PortalTokenPayload } from './jwt';
 
 const platformIdempotency = new PlatformIdempotencyService();
 
@@ -270,6 +277,37 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
   if (!token || token !== ADMIN_API_TOKEN) {
     return res.status(403).json({ error: 'Forbidden: administrator authorization required' });
   }
+  return next();
+}
+
+// ----------------------------------------------------
+// DEVELOPER PORTAL AUTHORIZATION
+// ----------------------------------------------------
+// Per-user JWT session auth for the developer portal (apps/developer-portal),
+// distinct from the API-key auth used by server-to-server traffic routes and
+// the shared-passcode admin auth above. In production PORTAL_JWT_SECRET must
+// be explicitly set — falls back to a random per-process secret otherwise
+// (fine for local dev; existing sessions just don't survive a restart).
+const PORTAL_JWT_SECRET = process.env.PORTAL_JWT_SECRET || randomUUID() + randomUUID();
+if (!process.env.PORTAL_JWT_SECRET && isProduction) {
+  logger.error('PORTAL_JWT_SECRET is not set in production — portal sessions will not survive a restart', {
+    operation: 'startup',
+    errorCode: 'MISSING_PORTAL_SECRET',
+    status: 'failed',
+  });
+}
+
+function requirePortalAuth(req: Request, res: Response, next: NextFunction) {
+  const header = req.header('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : undefined;
+  if (!token) {
+    return res.status(401).json({ error: 'Missing bearer token' });
+  }
+  const payload = verifyPortalToken(token, PORTAL_JWT_SECRET);
+  if (!payload) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+  (req as Request & { portalUser?: PortalTokenPayload }).portalUser = payload;
   return next();
 }
 
@@ -647,6 +685,277 @@ app.post('/refunds', mw.apiKey, resolveTenantContext, async (req: Request, res: 
     if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, err.message).catch(() => undefined);
     observeFailure('payment', original.providerId, 'REFUND_FAILED');
     return res.status(503).json({ error: { code: 'refund_failed', message: 'Refund failed' } });
+  }
+});
+
+// ----------------------------------------------------
+// DEVELOPER PORTAL — self-service account, API keys, transaction history.
+// Consumed by apps/developer-portal. Session auth (Bearer JWT), not the
+// server-to-server API-key auth the traffic routes above use.
+// ----------------------------------------------------
+
+function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 60) || 'app';
+}
+
+app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
+  const { companyName, email, password } = req.body;
+  if (!companyName || !email || !password) {
+    return res.status(400).json({ error: 'companyName, email, and password are required' });
+  }
+  if (String(password).length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+
+  try {
+    const baseSlug = slugify(companyName);
+    let slug = baseSlug;
+    let suffix = 1;
+    while (await applicationRepository.findBySlug(slug)) {
+      slug = `${baseSlug}-${++suffix}`;
+    }
+
+    const application = await applicationRepository.create({
+      name: companyName,
+      slug,
+      environment: 'development',
+    });
+
+    const existingUser = await userRepository.findByApplicationAndEmail(application.id, email);
+    if (existingUser) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+
+    const user = await userRepository.create({
+      applicationId: application.id,
+      email,
+      passwordHash: hashPassword(password),
+    });
+
+    const apiKey = generateApiKey();
+    await apiKeyRepository.create({
+      applicationId: application.id,
+      keyHash: apiKey.hash,
+      prefix: apiKey.prefix,
+      environment: 'test',
+    });
+
+    const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
+
+    return res.status(201).json({
+      token,
+      application: { id: application.id, name: application.name, slug: application.slug },
+      apiKey: { prefix: apiKey.prefix, raw: apiKey.raw },
+    });
+  } catch (err: any) {
+    logger.error('portal signup failed', { operation: 'portal-signup', errorCode: 'SIGNUP_FAILED', status: 'failed' });
+    return res.status(500).json({ error: 'Signup failed' });
+  }
+});
+
+app.post('/v1/portal/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
+
+  const candidates = await userRepository.findByEmail(email);
+  for (const user of candidates) {
+    if (user.passwordHash && verifyPassword(password, user.passwordHash)) {
+      const application = await applicationRepository.findById(user.applicationId);
+      if (!application) continue;
+      const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
+      return res.json({
+        token,
+        application: { id: application.id, name: application.name, slug: application.slug },
+      });
+    }
+  }
+
+  return res.status(401).json({ error: 'Invalid email or password' });
+});
+
+app.get('/v1/portal/me', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const application = await applicationRepository.findById(portalUser.applicationId);
+  if (!application) {
+    return res.status(404).json({ error: 'Application not found' });
+  }
+  return res.json({
+    user: { id: portalUser.userId, email: portalUser.email },
+    application: { id: application.id, name: application.name, slug: application.slug, environment: application.environment },
+  });
+});
+
+app.get('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const keys = await apiKeyRepository.findByApplicationId(portalUser.applicationId);
+  return res.json({
+    apiKeys: keys.map((k) => ({
+      id: k.id,
+      prefix: k.prefix,
+      environment: k.environment,
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt,
+      revokedAt: k.revokedAt,
+    })),
+  });
+});
+
+app.post('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const environment = req.body?.environment === 'live' ? 'live' : 'test';
+  const apiKey = generateApiKey();
+  const created = await apiKeyRepository.create({
+    applicationId: portalUser.applicationId,
+    keyHash: apiKey.hash,
+    prefix: apiKey.prefix,
+    environment,
+  });
+  // The raw key is only ever shown here, once, at creation time.
+  return res.status(201).json({ id: created.id, prefix: apiKey.prefix, raw: apiKey.raw, environment });
+});
+
+app.delete('/v1/portal/api-keys/:id', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const key = await apiKeyRepository.findById(req.params.id);
+  if (!key || key.applicationId !== portalUser.applicationId) {
+    return res.status(404).json({ error: 'API key not found' });
+  }
+  await apiKeyRepository.revoke(req.params.id);
+  return res.status(204).send();
+});
+
+app.get('/v1/portal/transactions', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const application = await applicationRepository.findById(portalUser.applicationId);
+  if (!application) {
+    return res.status(404).json({ error: 'Application not found' });
+  }
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const transactions = await transactionRepository.findByAppId(application.slug, limit);
+  return res.json({ transactions });
+});
+
+// ----------------------------------------------------
+// HOSTED CHECKOUT SESSIONS
+// A business creates a session server-side with its real API key; the
+// customer's browser (apps/checkout) only ever sees the opaque public token
+// below, never the API key. See packages/database/src/schema/checkout-sessions.ts.
+// ----------------------------------------------------
+
+const CHECKOUT_SESSION_TTL_MS = 30 * 60_000; // 30 minutes
+const CHECKOUT_BASE_URL = process.env.CHECKOUT_BASE_URL || 'http://localhost:5174';
+
+app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { amount, currency, successUrl, cancelUrl, metadata } = req.body;
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing parameter: appId is required' });
+  }
+  if (!amount || !currency) {
+    return res.status(400).json({ error: 'amount and currency are required' });
+  }
+
+  const token = randomUUID().replace(/-/g, '');
+  const session = await checkoutSessionRepository.create({
+    token,
+    appId,
+    tenantId,
+    amount: String(amount),
+    currency,
+    successUrl: successUrl || null,
+    cancelUrl: cancelUrl || null,
+    metadata: metadata ? JSON.stringify(metadata) : null,
+    expiresAt: new Date(Date.now() + CHECKOUT_SESSION_TTL_MS),
+  });
+
+  return res.status(201).json({
+    id: session.id,
+    token: session.token,
+    checkoutUrl: `${CHECKOUT_BASE_URL}/?session=${session.token}`,
+    expiresAt: session.expiresAt,
+  });
+});
+
+// Public — no API key. The session token is itself the capability: it's
+// single-use, expiring, and scoped to exactly the amount/currency/app it
+// was created for, so the browser never needs the application's secret key.
+app.get('/v1/checkout/sessions/:token', async (req: Request, res: Response) => {
+  await checkoutSessionRepository.markExpiredIfPast(req.params.token);
+  const session = await checkoutSessionRepository.findByToken(req.params.token);
+  if (!session) {
+    return res.status(404).json({ error: 'Checkout session not found' });
+  }
+  const application = await applicationRepository.findBySlug(session.appId);
+  return res.json({
+    id: session.id,
+    status: session.status,
+    amount: Number(session.amount),
+    currency: session.currency,
+    applicationName: application?.name || session.appId,
+  });
+});
+
+app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response) => {
+  await checkoutSessionRepository.markExpiredIfPast(req.params.token);
+  const session = await checkoutSessionRepository.findByToken(req.params.token);
+  if (!session) {
+    return res.status(404).json({ error: 'Checkout session not found' });
+  }
+  if (session.status !== 'pending') {
+    return res.status(409).json({ error: `Checkout session is already ${session.status}` });
+  }
+
+  const { paymentMethod, phoneNumber } = req.body;
+
+  try {
+    const event = await routingEngine.routePayment(session.appId, {
+      amount: Number(session.amount),
+      currency: session.currency,
+      paymentMethod: paymentMethod || 'card',
+      phoneNumber,
+    });
+
+    // Single-use: only the first payment attempt against this session can
+    // mark it completed, so a retried/duplicated pay request can't charge twice.
+    const completed = await checkoutSessionRepository.markCompleted(session.token, event.id);
+    if (!completed) {
+      return res.status(409).json({ error: 'Checkout session was already completed' });
+    }
+
+    try {
+      await transactionRepository.create({
+        appId: session.appId,
+        tenantId: session.tenantId,
+        providerId: event.providerId,
+        providerTransactionId: event.id,
+        status: event.status === 'success' ? 'success' : 'failed',
+        amount: String(event.amount),
+        currency: event.currency || session.currency,
+        paymentMethod: paymentMethod || null,
+      });
+    } catch (txErr) {
+      console.error('[checkout] Failed to create transaction record', txErr);
+    }
+
+    eventBus.emit(event);
+    observe(event);
+
+    return res.json({
+      status: event.status,
+      id: event.id,
+      successUrl: session.successUrl,
+    });
+  } catch (err: any) {
+    return res.status(503).json({ error: 'Payment failed', cancelUrl: session.cancelUrl });
   }
 });
 

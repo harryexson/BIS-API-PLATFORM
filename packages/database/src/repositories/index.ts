@@ -15,3 +15,4 @@ export { transactionRepository } from './transactions';
 export { idempotencyRecordRepository } from './idempotency-records';
 export { supplierRepository } from './suppliers';
 export { webhookJobRepository } from './webhook-jobs';
+export { checkoutSessionRepository } from './checkout-sessions';

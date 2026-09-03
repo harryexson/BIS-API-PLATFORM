@@ -35,6 +35,7 @@ import {
   type WorkerHandle,
 } from './harness';
 import { MemoryStore, createKeys, type KVStore, type Keys } from '@company/workers';
+import { PROVIDER_TIMEOUT_MS } from '@company/routing';
 
 console.warn(
   `\n[simulation] REACH CHURCH donation platform — end-to-end simulation + deliberate failure tests\n`,
@@ -253,22 +254,34 @@ describe('deliberate: provider timeout', () => {
     expect(String(donation.body.decisionReason)).toContain('Dynamic Failover');
   });
 
-  it('documents the gap when a provider hangs forever: gateway has no per-request timeout', async () => {
-    patchStripeProcessRequest(() => new Promise(() => undefined));
-    const controller = new AbortController();
-    const pending = runtime.request('POST', '/v1/api/gateway/payment', {
-      headers: {
-        'content-type': 'application/json',
-        authorization: 'Bearer bap_test_reachchurch_0001',
-        'x-tenant-id': TENANT_ID,
-      },
-      body: JSON.stringify({ amount: 50, currency: 'USD', paymentMethod: 'card', providerOverride: 'stripe' }),
-      signal: controller.signal,
-    });
-    await expect(withTimeout(pending, 1200, 'gateway response to hanging provider')).rejects.toThrow('timed out');
-    controller.abort();
-    console.warn('[gap] no request-level timeout around provider calls: hangs tie up gateway + DB-free HTTP connections');
-  });
+  it(
+    'a hung provider is timed out and fails over instead of hanging forever (FIXED)',
+    async () => {
+      patchStripeProcessRequest(() => new Promise(() => undefined));
+      const pending = runtime.request('POST', '/v1/api/gateway/payment', {
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer bap_test_reachchurch_0001',
+          'x-tenant-id': TENANT_ID,
+        },
+        body: JSON.stringify({ amount: 50, currency: 'USD', paymentMethod: 'card', providerOverride: 'stripe' }),
+      });
+
+      // packages/routing/src/index.ts wraps every provider call in
+      // withProviderTimeout() (PROVIDER_TIMEOUT_MS, 30s default) and fails
+      // over on timeout — this was never actually being exercised by a
+      // 1200ms local race, which can't distinguish "hung" from "just slow
+      // so far". See the equivalent fix in resilience-failure's R6 test.
+      const res = await withTimeout(pending, PROVIDER_TIMEOUT_MS + 5000, 'gateway response to hanging provider');
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.providerId).not.toBe('stripe');
+      console.warn(
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and failed over to '${body.providerId}'`,
+      );
+    },
+    PROVIDER_TIMEOUT_MS + 15_000,
+  );
 });
 
 // ---------------------------------------------------------------------------

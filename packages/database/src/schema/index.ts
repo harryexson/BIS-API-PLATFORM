@@ -18,3 +18,4 @@ export { transactions, type Transaction, type NewTransaction } from './transacti
 export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
 export { webhookJobs, type WebhookJob, type NewWebhookJob } from './webhook-jobs';
+export { checkoutSessions, type CheckoutSession, type NewCheckoutSession } from './checkout-sessions';

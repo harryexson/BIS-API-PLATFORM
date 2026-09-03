@@ -31,6 +31,7 @@ import {
   type SimRuntime,
   type WorkerHandle,
 } from './harness';
+import { PROVIDER_TIMEOUT_MS } from '@company/routing';
 
 console.warn('\n[audit] AUDIT 5 — Resilience, Load & Failure Engineering\n');
 
@@ -266,29 +267,38 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
 // R6) Stripe timeout / hang — no server-side timeout (DEFECT)
 // ---------------------------------------------------------------------------
 
-describe('R6 — provider hang: no gateway request timeout (DEFECT)', () => {
-  it('a hung provider stalls the gateway request indefinitely', async () => {
-    const stripe = runtime.registry.getProvider('stripe') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const orig = stripe.processRequest.bind(stripe);
-    stripe.processRequest = async () => new Promise(() => {}); // never resolves
-    patches.push(() => {
-      stripe.processRequest = orig;
-    });
+describe('R6 — provider hang: gateway request timeout + failover (FIXED)', () => {
+  it(
+    'a hung provider is timed out after PROVIDER_TIMEOUT_MS and the request fails over to a healthy provider',
+    async () => {
+      const stripe = runtime.registry.getProvider('stripe') as unknown as {
+        processRequest: (...a: any[]) => Promise<any>;
+      };
+      const orig = stripe.processRequest.bind(stripe);
+      stripe.processRequest = async () => new Promise(() => {}); // never resolves
+      patches.push(() => {
+        stripe.processRequest = orig;
+      });
 
-    const result = await Promise.race([
-      createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then(() => 'done'),
-      sleep(1500).then(() => 'hung'),
-    ]);
+      // packages/routing/src/index.ts already wraps every provider call in
+      // withProviderTimeout(), which was never actually being exercised by
+      // this test — 1500ms is far shorter than the real PROVIDER_TIMEOUT_MS
+      // (30s default), so it always looked "hung" without ever reaching the
+      // real timeout. Race against the real value instead of an arbitrary
+      // short window that can't distinguish "hung" from "just slow so far".
+      const result = await Promise.race([
+        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, providerId: r.body.providerId as string | undefined })),
+        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, providerId: undefined as string | undefined })),
+      ]);
 
-    // DEFECT: no request timeout around provider call. A hung provider stalls
-    // the gateway request indefinitely. Documenting current behavior.
-    expect(result).toBe('hung');
-    console.warn(
-      '[DEFECT] no request timeout around provider call: a hung provider stalls the gateway request indefinitely',
-    );
-  });
+      expect(result.done).toBe(true);
+      expect(result.providerId).not.toBe('stripe');
+      console.warn(
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and failed over to '${result.providerId}' instead of stalling indefinitely`,
+      );
+    },
+    PROVIDER_TIMEOUT_MS + 15_000,
+  );
 });
 
 // ---------------------------------------------------------------------------

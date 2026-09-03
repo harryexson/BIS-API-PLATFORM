@@ -71,6 +71,13 @@
       "when": 1788480000000,
       "tag": "0009_add_webhook_jobs",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788500000000,
+      "tag": "0010_add_checkout_sessions",
+      "breakpoints": true
     }
   ]
 }
