@@ -13,6 +13,7 @@ import {
   applicationRepository,
   eventRepository,
   transactionRepository,
+  webhookJobRepository,
   checkDatabaseHealth,
 } from '@company/database';
 import {
@@ -757,7 +758,16 @@ function getRedisClient(): any {
 
 async function enqueueInboundMessage(providerId: string, payload: any): Promise<void> {
   const client = getRedisClient();
-  if (!client) return; // No Redis — inbound message persisted to DB only
+  if (!client) {
+    // No Redis — gateway and worker are separate processes with no shared
+    // memory, so write a durable row the worker's webhook_job_poller will
+    // pick up and bridge into its own live queue. See
+    // packages/database/src/schema/webhook-jobs.ts.
+    await webhookJobRepository
+      .create({ jobType: 'inbound_message', payload: { providerId, payload } })
+      .catch((err) => console.error('[webhook] Failed to enqueue inbound_message to DB fallback', err));
+    return;
+  }
 
   const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
   const jobId = `job_${randomUUID()}`;
@@ -792,21 +802,28 @@ async function enqueuePaymentWebhook(input: {
   providerEventId?: string;
   applicationId?: string;
 }): Promise<void> {
+  const jobPayload = {
+    provider: input.providerId,
+    rawBody: input.rawBody,
+    signature: input.signature,
+    providerEventId: input.providerEventId,
+    applicationId: input.applicationId || 'webhook',
+  };
+
   const client = getRedisClient();
-  if (!client) return;
+  if (!client) {
+    await webhookJobRepository
+      .create({ jobType: 'payment_webhook', payload: jobPayload })
+      .catch((err) => console.error('[webhook] Failed to enqueue payment_webhook to DB fallback', err));
+    return;
+  }
 
   const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
   const jobId = `job_${randomUUID()}`;
   const job = {
     id: jobId,
     type: 'payment_webhook',
-    payload: {
-      provider: input.providerId,
-      rawBody: input.rawBody,
-      signature: input.signature,
-      providerEventId: input.providerEventId,
-      applicationId: input.applicationId || 'webhook',
-    },
+    payload: jobPayload,
     attempts: 0,
     maxAttempts: 5,
     status: 'pending',
@@ -832,21 +849,28 @@ async function enqueueProviderWebhook(input: {
   providerEventId?: string;
   status?: string;
 }): Promise<void> {
+  const jobPayload = {
+    providerId: input.providerId,
+    rawBody: input.rawBody,
+    signature: input.signature,
+    eventId: input.providerEventId,
+    status: input.status,
+  };
+
   const client = getRedisClient();
-  if (!client) return;
+  if (!client) {
+    await webhookJobRepository
+      .create({ jobType: 'provider_webhook', payload: jobPayload })
+      .catch((err) => console.error('[webhook] Failed to enqueue provider_webhook to DB fallback', err));
+    return;
+  }
 
   const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
   const jobId = `job_${randomUUID()}`;
   const job = {
     id: jobId,
     type: 'provider_webhook',
-    payload: {
-      providerId: input.providerId,
-      rawBody: input.rawBody,
-      signature: input.signature,
-      eventId: input.providerEventId,
-      status: input.status,
-    },
+    payload: jobPayload,
     attempts: 0,
     maxAttempts: 5,
     status: 'pending',

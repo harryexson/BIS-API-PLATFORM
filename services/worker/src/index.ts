@@ -70,6 +70,24 @@ async function main(): Promise<void> {
     config.reconciliationIntervalMs,
   );
 
+  // outbox_poller and webhook_job_poller were registered as processors but
+  // never actually scheduled — they'd sit idle forever without this.
+  queue
+    .enqueue('outbox_poller', {})
+    .catch((e) => console.error('[scheduler] outbox_poller enqueue failed', e));
+  const outboxTimer = setInterval(
+    () => queue.enqueue('outbox_poller', {}).catch(() => undefined),
+    config.pollIntervalMs,
+  );
+
+  queue
+    .enqueue('webhook_job_poller', {})
+    .catch((e) => console.error('[scheduler] webhook_job_poller enqueue failed', e));
+  const webhookJobPollerTimer = setInterval(
+    () => queue.enqueue('webhook_job_poller', {}).catch(() => undefined),
+    config.pollIntervalMs,
+  );
+
   // P1: Periodically rescue stuck processing jobs
   const reaperTimer = setInterval(async () => {
     const rescued = await queue.rescueStuckJobs();
@@ -124,6 +142,8 @@ async function main(): Promise<void> {
     clearInterval(retryTimer);
     clearInterval(reconTimer);
     clearInterval(reaperTimer);
+    clearInterval(outboxTimer);
+    clearInterval(webhookJobPollerTimer);
     healthServer.close();
 
     // Drain: wait for in-flight jobs to complete (max 30s)

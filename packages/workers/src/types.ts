@@ -12,7 +12,8 @@ export type JobType =
   | 'inbound_message'
   | 'outbox_poller'
   | 'receipt_pipeline'
-  | 'keyword_response_delivery';
+  | 'keyword_response_delivery'
+  | 'webhook_job_poller';
 
 export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'dead';
 

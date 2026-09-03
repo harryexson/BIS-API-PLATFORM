@@ -15,6 +15,7 @@ const ALL_TYPES: JobType[] = [
   'outbox_poller',
   'receipt_pipeline',
   'keyword_response_delivery',
+  'webhook_job_poller',
 ];
 
 export function createReconciliationProcessor(

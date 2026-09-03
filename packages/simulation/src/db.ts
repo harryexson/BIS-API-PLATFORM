@@ -36,6 +36,17 @@ export interface AuditLogRow {
   createdAt: Date;
 }
 
+export interface WebhookJobRow {
+  id: string;
+  jobType: string;
+  payload: unknown;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  attempts: number;
+  createdAt: Date;
+  processedAt: Date | null;
+  error: string | null;
+}
+
 export interface ConversationRow {
   id: string;
   phoneNumber: string;
@@ -78,6 +89,7 @@ export interface DbState {
   }>;
   tenantLinks: Array<{ tenantId: string; applicationId: string; status: string }>;
   conversations: ConversationRow[];
+  webhookJobs: WebhookJobRow[];
 }
 
 export const dbState: DbState = {
@@ -88,6 +100,7 @@ export const dbState: DbState = {
   applications: [],
   apiKeys: [],
   tenants: [],
+  webhookJobs: [],
   tenantLinks: [],
   conversations: [],
 };
@@ -134,6 +147,7 @@ export function clearDb(): void {
   dbState.tenants = [];
   dbState.tenantLinks = [];
   dbState.conversations = [];
+  dbState.webhookJobs = [];
 }
 
 export function seedReachChurch(): void {
@@ -551,6 +565,54 @@ export function installDatabaseMock(): Record<string, unknown> {
       },
       async count() {
         return 0;
+      },
+    },
+    // Stateful mock for webhookJobRepository — unlike outboxEventRepository
+    // above, this one really stores rows so simulation tests can exercise the
+    // Redis-unavailable fallback path end-to-end (gateway writes a row,
+    // webhookJobPoller claims and bridges it).
+    webhookJobRepository: {
+      async create(data: Record<string, unknown>) {
+        const row: WebhookJobRow = {
+          id: `whj_${randomUUID().slice(0, 12)}`,
+          jobType: String(data.jobType ?? ''),
+          payload: data.payload ?? {},
+          status: 'pending',
+          attempts: 0,
+          createdAt: new Date(),
+          processedAt: null,
+          error: null,
+        };
+        dbState.webhookJobs.push(row);
+        return row;
+      },
+      async claimBatch(limit = 10) {
+        const pending = dbState.webhookJobs.filter((j) => j.status === 'pending').slice(0, limit);
+        for (const row of pending) row.status = 'processing';
+        return pending;
+      },
+      async complete(id: string) {
+        const row = dbState.webhookJobs.find((j) => j.id === id);
+        if (row) {
+          row.status = 'completed';
+          row.processedAt = new Date();
+        }
+      },
+      async fail(id: string, error: string) {
+        const row = dbState.webhookJobs.find((j) => j.id === id);
+        if (row) {
+          row.status = 'failed';
+          row.error = error;
+        }
+      },
+      async rescueStuck(_limit = 10) {
+        return 0;
+      },
+      async findPending() {
+        return dbState.webhookJobs.filter((j) => j.status === 'pending');
+      },
+      async count() {
+        return dbState.webhookJobs.length;
       },
     },
     // P0: Mock idempotency record repository
