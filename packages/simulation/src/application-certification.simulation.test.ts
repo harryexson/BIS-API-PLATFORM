@@ -48,7 +48,7 @@ const AUTH_REACH = { authorization: 'Bearer ' + API_KEY, 'x-tenant-id': TENANT_I
 const AUTH_HAUL = { authorization: 'Bearer ' + OTHER_API_KEY, 'x-tenant-id': OTHER_TENANT_ID_HAULPRO };
 const AUTH_AFRI = { authorization: 'Bearer ' + AFRIBOOK_API_KEY, 'x-tenant-id': AFRIBOOK_TENANT_ID };
 
-const SMS_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg'];
+const SMS_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
 const ALL_PROVIDERS = [...SMS_PROVIDERS, 'email'];
 
 let runtime: SimRuntime;

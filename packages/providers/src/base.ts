@@ -70,7 +70,10 @@ export abstract class BaseProvider {
         };
 
         if (body && method !== 'GET') {
-          fetchOpts.body = JSON.stringify(body);
+          // A pre-serialized string body (e.g. a URLSearchParams-encoded form
+          // body, as Twilio's API requires) is sent as-is; anything else is
+          // assumed to be a JSON-serializable object.
+          fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
         }
 
         const res = await fetch(url, fetchOpts);

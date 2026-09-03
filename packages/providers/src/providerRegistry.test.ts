@@ -7,11 +7,11 @@ describe('ProviderRegistry', () => {
     const registry = ProviderRegistry.getInstance();
     registry.updateProviderConfig('stripe', { status: 'online' });
   });
-  it('registers exactly 15 providers across the three categories (13 original + 2 examples)', () => {
+  it('registers exactly 19 providers across the three categories (17 original + 2 examples)', () => {
     const configs = ProviderRegistry.getInstance().getAllConfigs();
-    expect(configs).toHaveLength(15);
-    expect(configs.filter((c) => c.category === 'payment')).toHaveLength(7);
-    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(5);
+    expect(configs).toHaveLength(19);
+    expect(configs.filter((c) => c.category === 'payment')).toHaveLength(10);
+    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(6);
     expect(configs.filter((c) => c.category === 'other')).toHaveLength(3);
   });
 
@@ -107,7 +107,7 @@ describe('ProviderRegistry management surface', () => {
 
   it('runs health checks for all providers', async () => {
     const summaries = await registry.runHealthChecks();
-    expect(summaries.length).toBe(15);
+    expect(summaries.length).toBe(19);
   });
 });
 

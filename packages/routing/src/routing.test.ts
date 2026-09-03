@@ -60,8 +60,8 @@ describe('RoutingEngine', () => {
         });
         expect(result.category).toBe('payment');
         expect(result.status).toBe('success');
-        // PawaPay and Flutterwave both support mobile_money for these currencies
-        expect(['pawapay', 'flutterwave']).toContain(result.providerId);
+        // PawaPay, Flutterwave, and Paystack all support mobile_money for these currencies
+        expect(['pawapay', 'flutterwave', 'paystack']).toContain(result.providerId);
       }
     });
 
@@ -76,7 +76,7 @@ describe('RoutingEngine', () => {
         expect(result.status).toBe('success');
         // Multiple providers support card for these currencies (including example-pay)
         // Stripe may be selected as fallback for unsupported currencies like ZAR
-        expect(['flutterwave', 'nmi', 'airwallex', 'example-pay', 'stripe']).toContain(result.providerId);
+        expect(['flutterwave', 'nmi', 'airwallex', 'example-pay', 'stripe', 'paystack']).toContain(result.providerId);
       }
     });
 
@@ -130,6 +130,9 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('pawapay', { status: 'offline' });
       registry.updateProviderConfig('paychangu', { status: 'offline' });
       registry.updateProviderConfig('airwallex', { status: 'offline' });
+      registry.updateProviderConfig('authorizenet', { status: 'offline' });
+      registry.updateProviderConfig('checkout', { status: 'offline' });
+      registry.updateProviderConfig('paystack', { status: 'offline' });
       registry.updateProviderConfig('example-pay', { status: 'offline' });
 
       await expect(
@@ -158,7 +161,7 @@ describe('RoutingEngine', () => {
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
       // Multiple providers have SMS capability
-      expect(['infobip', 'futuresms', 'signalhouse']).toContain(result.providerId);
+      expect(['infobip', 'futuresms', 'signalhouse', 'twilio', 'example-msg']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
@@ -167,7 +170,7 @@ describe('RoutingEngine', () => {
         content: 'wa: Hello this is a WhatsApp message'
       });
       // Both infobip and signalhouse have whatsapp capability
-      expect(['infobip', 'signalhouse']).toContain(result.providerId);
+      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
     });
 
     it('routes long messages to a whatsapp-capable provider', async () => {
@@ -176,7 +179,7 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: longContent
       });
-      expect(['infobip', 'signalhouse']).toContain(result.providerId);
+      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
     });
 
     it('respects manual override for messaging', async () => {
@@ -206,6 +209,7 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('futuresms', { status: 'offline' });
       registry.updateProviderConfig('signalhouse', { status: 'offline' });
       registry.updateProviderConfig('email', { status: 'offline' });
+      registry.updateProviderConfig('twilio', { status: 'offline' });
       registry.updateProviderConfig('example-msg', { status: 'offline' });
 
       await expect(

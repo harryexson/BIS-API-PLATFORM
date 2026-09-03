@@ -45,7 +45,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'stripe', 'nmi', 'email'];
+const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'stripe', 'nmi', 'email'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -199,7 +199,7 @@ describe('R3 — primary SMS provider offline: failover works (OK)', () => {
 
 describe('R4 — all SMS providers offline: silent channel change (GAP)', () => {
   it('an SMS is silently routed over email when no SMS provider is available', async () => {
-    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg'];
+    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
       const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);
