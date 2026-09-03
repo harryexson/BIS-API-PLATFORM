@@ -4,13 +4,19 @@ import { ProviderConfig } from '../types';
 
 interface RequestPlaygroundProps {
   providers: ProviderConfig[];
-  onRequestSent: (category: 'payment' | 'messaging' | 'other', payload: any) => Promise<void>;
+  onRequestSent: (category: 'payment' | 'messaging' | 'other', payload: any, auth: { apiKey: string; tenantId: string }) => Promise<void>;
   lastEvent: any;
   loading: boolean;
 }
 
 export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers, onRequestSent, lastEvent, loading }) => {
   const [appId, setAppId] = useState('reachchurch');
+  // The gateway derives the real appId from this key (mw.apiKey) — the "Select
+  // Client Application" dropdown below is sent along but has no effect on
+  // its own. Get a key from the Developer Portal's API Keys tab, and a
+  // tenant ID for that same application (it must be linked to it).
+  const [apiKey, setApiKey] = useState('');
+  const [tenantId, setTenantId] = useState('');
   const [category, setCategory] = useState<'payment' | 'messaging' | 'other'>('payment');
   
   // Payment States
@@ -79,7 +85,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
       };
     }
 
-    await onRequestSent(category, payload);
+    await onRequestSent(category, payload, { apiKey, tenantId });
   };
 
   const handleCategoryChange = (cat: 'payment' | 'messaging' | 'other') => {
@@ -134,6 +140,55 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
                 <option key={app.id} value={app.id}>{app.name}</option>
               ))}
             </select>
+          </div>
+
+          {/* API Key + Tenant — the real gateway requires both (get them from
+              the Developer Portal); appId above is illustrative only. */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '4px', fontWeight: '600' }}>
+                API Key
+              </label>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="bap_test_…"
+                style={{
+                  width: '100%',
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--glass-border)',
+                  color: 'var(--text-primary)',
+                  padding: '8px 12px',
+                  borderRadius: '8px',
+                  fontSize: '13px',
+                  outline: 'none',
+                  boxSizing: 'border-box'
+                }}
+              />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '4px', fontWeight: '600' }}>
+                Tenant ID
+              </label>
+              <input
+                type="text"
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                placeholder="tenant UUID"
+                style={{
+                  width: '100%',
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--glass-border)',
+                  color: 'var(--text-primary)',
+                  padding: '8px 12px',
+                  borderRadius: '8px',
+                  fontSize: '13px',
+                  outline: 'none',
+                  boxSizing: 'border-box'
+                }}
+              />
+            </div>
           </div>
 
           {/* Category Tabs */}
@@ -407,7 +462,8 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !apiKey || !tenantId}
+            title={!apiKey || !tenantId ? 'API Key and Tenant ID are required' : undefined}
             style={{
               background: 'linear-gradient(90deg, #10b981 0%, #059669 100%)',
               border: 'none',
@@ -415,7 +471,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
               padding: '10px 16px',
               borderRadius: '8px',
               fontWeight: '700',
-              cursor: loading ? 'not-allowed' : 'pointer',
+              cursor: loading || !apiKey || !tenantId ? 'not-allowed' : 'pointer',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',

@@ -100,17 +100,28 @@ export const App: React.FC = () => {
     }
   };
 
-  // Triggers request dispatch from the dashboard client to mock real app traffic
-  const handleDispatchRequest = async (category: 'payment' | 'messaging' | 'other', payload: any) => {
+  // Triggers request dispatch from the dashboard client to mock real app traffic.
+  // The gateway requires a real application API key + tenant ID (mw.apiKey +
+  // resolveTenantContext) — get both from the Developer Portal's API Keys tab.
+  const handleDispatchRequest = async (
+    category: 'payment' | 'messaging' | 'other',
+    payload: any,
+    auth: { apiKey: string; tenantId: string },
+  ) => {
     setPlaygroundLoading(true);
     setPlaygroundResponse(null);
 
-    const endpoint = `/api/gateway/${category === 'payment' ? 'payment' : category === 'messaging' ? 'messaging' : 'other'}`;
+    const endpoint = `/v1/api/gateway/${category}`;
 
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${auth.apiKey}`,
+          'x-tenant-id': auth.tenantId,
+          'Idempotency-Key': crypto.randomUUID(),
+        },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
