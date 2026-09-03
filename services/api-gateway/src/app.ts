@@ -174,7 +174,6 @@ function observeFailure(category: 'payment' | 'messaging' | 'other', providerId:
 }
 
 const auth = new AuthService({
-  adminKey: process.env.PLATFORM_ADMIN_KEY,
   rateLimit: {
     windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
     max: Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
@@ -269,7 +268,10 @@ if (!ADMIN_API_TOKEN && isProduction) {
 }
 
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  const token = req.header('x-admin-token');
+  // EventSource (used for /api/dashboard/stream) can't set custom headers, so
+  // that one route needs a query-param fallback — the standard pattern for
+  // authenticating SSE connections in browsers.
+  const token = req.header('x-admin-token') || (req.query.token as string | undefined);
   if (!ADMIN_API_TOKEN) {
     // P0: Never bypass admin auth — require token in ALL environments
     return res.status(503).json({ error: 'Admin access not configured' });
@@ -1301,8 +1303,15 @@ async function enqueueProviderWebhook(input: {
 // ----------------------------------------------------
 // DASHBOARD MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
-
-app.use('/api/dashboard', mw.admin);
+// Every mutating/sensitive route below already has its own requireAdmin
+// (ADMIN_API_TOKEN via x-admin-token, checked further up in this file) —
+// there used to also be a blanket app.use('/api/dashboard', mw.admin) here
+// checking a second, incompatible mechanism (PLATFORM_ADMIN_KEY via
+// x-admin-key/authorization). Since it ran first in the middleware chain,
+// it rejected every request — including to the intentionally-public
+// GET /providers below — before requireAdmin ever got a chance, no matter
+// what admin token was supplied. Removed along with the now-fully-dead
+// checkAdmin()/adminKey/mw.admin (see auth.ts).
 
 app.get('/api/dashboard/providers', (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());

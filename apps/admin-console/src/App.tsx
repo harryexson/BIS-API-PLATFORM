@@ -41,27 +41,34 @@ export const App: React.FC = () => {
     try {
       const res = await fetch('/api/dashboard/providers');
       const data = await res.json();
-      setProviders(data);
+      if (Array.isArray(data)) setProviders(data);
     } catch (err) {
       console.error('Failed to fetch provider registry configs:', err);
     }
   };
 
+  // /api/dashboard/logs and /metrics require admin auth — without a token
+  // these 403 with an error object, not an array/metrics shape, which used
+  // to crash AuditLogs's logs.map() and take down the whole app with no
+  // error boundary. Gate on isAdmin and attach the token like every other
+  // admin-console component already does (see Observability.tsx).
   const fetchLogs = async () => {
+    if (!isAdmin) return;
     try {
-      const res = await fetch('/api/dashboard/logs');
+      const res = await fetch('/api/dashboard/logs', { headers: { 'x-admin-token': token || '' } });
       const data = await res.json();
-      setLogs(data);
+      if (res.ok && Array.isArray(data)) setLogs(data);
     } catch (err) {
       console.error('Failed to fetch transaction logs:', err);
     }
   };
 
   const fetchMetrics = async () => {
+    if (!isAdmin) return;
     try {
-      const res = await fetch('/api/dashboard/metrics');
+      const res = await fetch('/api/dashboard/metrics', { headers: { 'x-admin-token': token || '' } });
       const data = await res.json();
-      setMetrics(data);
+      if (res.ok) setMetrics(data);
     } catch (err) {
       console.error('Failed to fetch metrics:', err);
     }
@@ -119,7 +126,10 @@ export const App: React.FC = () => {
   // Clears active logs
   const handleClearLogs = async () => {
     try {
-      const res = await fetch('/api/dashboard/logs/clear', { method: 'POST' });
+      const res = await fetch('/api/dashboard/logs/clear', {
+        method: 'POST',
+        headers: { 'x-admin-token': token || '' },
+      });
       if (res.ok) {
         setLogs([]);
         setMetrics(INITIAL_METRICS);
@@ -137,7 +147,12 @@ export const App: React.FC = () => {
     fetchLogs();
     fetchMetrics();
 
-    const eventSource = new EventSource('/api/dashboard/stream');
+    // Only requires admin, and EventSource can't set custom headers, so the
+    // token travels via query string instead (see requireAdmin's fallback
+    // in services/api-gateway/src/app.ts — the standard pattern for
+    // authenticating SSE connections from a browser).
+    if (!isAdmin) return;
+    const eventSource = new EventSource(`/api/dashboard/stream?token=${encodeURIComponent(token || '')}`);
 
     eventSource.onopen = () => setSseConnected(true);
     eventSource.onerror = () => setSseConnected(false);
@@ -161,7 +176,7 @@ export const App: React.FC = () => {
     return () => {
       eventSource.close();
     };
-  }, []);
+  }, [isAdmin, token]);
 
   return (
     <div className="main-layout">
