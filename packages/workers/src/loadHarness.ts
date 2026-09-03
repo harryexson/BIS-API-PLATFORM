@@ -148,6 +148,11 @@ export async function runLoadSuite(): Promise<LoadSuiteResult> {
   const config = createWorkerConfig();
   config.concurrency = Number(process.env.LOAD_CONCURRENCY) || 64;
   config.pollIntervalMs = 50;
+  // This tool deliberately pushes high volume to measure throughput/latency —
+  // that's a different concern from the production safety net enqueue()
+  // otherwise applies. Disable it here (0 = no cap) rather than let it
+  // reject legitimate load-test traffic.
+  config.maxQueueDepth = 0;
 
   const registry = ProviderRegistry.getInstance();
   const routing = new RoutingEngine();

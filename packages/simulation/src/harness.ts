@@ -54,6 +54,7 @@ export const DEFAULT_WORKER_CONFIG: WorkerConfig = {
     windowMs: 60_000,
     maxRequests: 10_000,
   },
+  maxQueueDepth: 10_000,
 };
 
 export function sleep(ms: number): Promise<void> {

@@ -3,6 +3,20 @@ import { Keys } from './keys';
 import { Job, JobType, JobPayload, EnqueueOptions, WorkerConfig, newJobId } from './types';
 import { computeBackoff } from './backoff';
 
+/**
+ * Thrown by JobQueue.enqueue() when a job type's ready+delayed depth is
+ * already at capacity. Producers (HTTP route handlers, webhook enqueuers,
+ * anything calling enqueue()) should treat this as "try again later" —
+ * e.g. a 503 to the caller — rather than let it become a downstream
+ * retry/dead-letter storm once the worker can't keep up.
+ */
+export class QueueBackpressureError extends Error {
+  constructor(public readonly jobType: JobType, public readonly depth: number, public readonly maxDepth: number) {
+    super(`Queue backpressure: "${jobType}" has ${depth} jobs queued (max ${maxDepth})`);
+    this.name = 'QueueBackpressureError';
+  }
+}
+
 export class JobQueue {
   constructor(
     private store: KVStore,
@@ -15,6 +29,15 @@ export class JobQueue {
     payload: JobPayload,
     opts: EnqueueOptions = {},
   ): Promise<Job> {
+    const maxDepth = this.config.maxQueueDepth;
+    if (maxDepth > 0) {
+      const [ready, delayed] = await Promise.all([this.readyCount(type), this.delayedCount(type)]);
+      const depth = ready + delayed;
+      if (depth >= maxDepth) {
+        throw new QueueBackpressureError(type, depth, maxDepth);
+      }
+    }
+
     const id = newJobId();
     const now = Date.now();
     const maxAttempts = opts.maxAttempts ?? this.config.retry.maxAttempts;

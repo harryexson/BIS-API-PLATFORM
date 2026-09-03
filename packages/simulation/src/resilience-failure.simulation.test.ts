@@ -32,6 +32,7 @@ import {
   type WorkerHandle,
 } from './harness';
 import { PROVIDER_TIMEOUT_MS } from '@company/routing';
+import { QueueBackpressureError } from '@company/workers';
 
 console.warn('\n[audit] AUDIT 5 — Resilience, Load & Failure Engineering\n');
 
@@ -459,38 +460,53 @@ describe('R9 — webhook DB write failed: now triggers retry/dead-letter (FIXED)
 // R10) 5,000 messages — no producer backpressure, rate-limit storms (GAP)
 // ---------------------------------------------------------------------------
 
-describe('R10 — mass enqueue: no backpressure, rate-limit storm (GAP)', () => {
+describe('R10 — mass enqueue: producer backpressure (FIXED)', () => {
   it(
-    'exceeding the rate limit turns into a retry/dead-letter storm',
+    'JobQueue.enqueue() rejects once a job type is at capacity, instead of converting overflow into a retry/dead-letter storm',
     async () => {
+      const MAX_DEPTH = 200;
       const w = await runtime.makeWorker({
         config: {
           ...DEFAULT_WORKER_CONFIG,
           rateLimit: { windowMs: 60_000, maxRequests: 100 },
+          maxQueueDepth: MAX_DEPTH,
         },
       });
 
-    const LOAD = 5000;
-    for (let i = 0; i < LOAD; i++) {
-      await w.queue.enqueue('message_delivery', {
-        appId: APP_SLUG,
-        recipient: DONOR_EMAIL,
-        content: `m${i}`,
-      });
-    }
+      // Stop the worker from draining the queue mid-test so the depth cap is
+      // actually exercised — otherwise jobs complete/fail fast enough that
+      // enqueue() rarely observes the queue at capacity.
+      await w.manager.stop();
 
-    await drain(w, ['message_delivery'], { timeoutMs: 120_000 });
-    const c = await counts(w, 'message_delivery');
+      const LOAD = 5000;
+      let accepted = 0;
+      let rejected = 0;
+      for (let i = 0; i < LOAD; i++) {
+        try {
+          await w.queue.enqueue('message_delivery', {
+            appId: APP_SLUG,
+            recipient: DONOR_EMAIL,
+            content: `m${i}`,
+          });
+          accepted++;
+        } catch (err) {
+          expect(err).toBeInstanceOf(QueueBackpressureError);
+          rejected++;
+        }
+      }
 
-    // EXPECTED-SAFE: the system should apply backpressure instead of converting
-    // overflow into a retry/dead-letter storm. Here dead letters pile up.
-    expect(c.dead).toBeGreaterThan(0);
-    console.warn(
-      `[GAP] no producer backpressure; exceeding the rate limit turns into a retry/dead-letter storm (count(dead)=${c.dead})`,
-    );
-    await w.manager.stop().catch(() => {});
+      // FIXED: the queue caps at maxQueueDepth instead of silently absorbing
+      // all 5000 — the producer (an HTTP route handler, a webhook enqueuer)
+      // gets an immediate, actionable rejection instead of every job being
+      // accepted only to fail downstream once the rate limit is hit.
+      expect(accepted).toBe(MAX_DEPTH);
+      expect(rejected).toBe(LOAD - MAX_DEPTH);
+      expect(await counts(w, 'message_delivery')).toMatchObject({ ready: MAX_DEPTH, delayed: 0 });
+      console.warn(
+        `[FIXED] enqueue() rejected ${rejected}/${LOAD} jobs once "message_delivery" reached maxQueueDepth=${MAX_DEPTH}`,
+      );
     },
-    180_000,
+    60_000,
   );
 });
 
