@@ -6,6 +6,59 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Phase 11/21: Provider Circuit Breaker
+
+**Phase:** 21 (circuit breaker) of the master plan, plus the doc correction
+from Phase 0/1 that first identified it as a real (not already-fixed) gap.
+
+**Files changed:**
+- `packages/schemas/src/index.ts` — added `ProviderCircuitState` type
+  (`'closed' | 'open' | 'half_open'`) and `circuitState` /
+  `consecutiveFailures` fields on `ProviderManagement`
+- `packages/providers/src/registry.ts` — per-provider circuit breaker state
+  machine on `ManagementState`; `isCircuitAvailable(id)` and
+  `isProviderAvailable(id)` (status + circuit combined); `recordTraffic()`
+  drives CLOSED→OPEN on threshold, OPEN→HALF_OPEN on cooldown expiry,
+  HALF_OPEN→CLOSED on a successful probe, HALF_OPEN→OPEN (cooldown restart)
+  on a failed probe; `findByCategoryAndCapabilities()` now excludes
+  circuit-open providers; `updateManagement()` and `updateProviderConfig()`
+  reset the circuit when an operator manually sets a provider back online
+- `packages/routing/src/index.ts` — every routing decision point
+  (`routePayment`, `routeMessage` including conversation continuity,
+  `routeOther`, and all manual-override checks) now calls
+  `registry.isProviderAvailable()` instead of reading `config.status`
+  directly, so an open circuit removes a provider from routing without an
+  operator having to flip its status by hand
+- `packages/providers/src/circuitBreaker.test.ts` (new) — 8 tests covering
+  the full state machine, including fake-timer-driven cooldown/half-open
+  transitions
+- `packages/routing/src/routing.test.ts` — 2 new tests proving routing
+  fails over around an open-circuit provider (including when a caller
+  explicitly requests it via `providerOverride`) even though its
+  admin-controlled `status` stays `online`
+- `.env.example` — documented `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default
+  5) and `CIRCUIT_BREAKER_COOLDOWN_MS` (default 30000)
+- `docs/IMPLEMENTATION_BASELINE.md` — marked the circuit-breaker gap closed
+
+**Database migrations:** none (circuit state is in-memory on the registry
+singleton, same durability model as the rest of `ManagementState` — provider
+health/errorRate were already in-memory-only)
+
+**API changes:** `GET` provider management responses now include
+`circuitState` and `consecutiveFailures`; no route signature changes
+
+**Security changes:** none
+
+**Tests:** `npm test` 219 → 229 passed (10 new), 0 failed; lint/typecheck/
+build all clean
+
+**Known issues carried forward:** circuit state resets on process restart
+(consistent with the rest of the registry's in-memory management state —
+persisting it would be a separate, larger change to move provider
+management state into the database, out of scope here). No admin-console UI
+surfaces `circuitState` yet — the field is exposed on the API but not yet
+rendered in `ProviderManagement.tsx`.
+
 ## 2026-09-08 — Phase 0/1: Repository Audit & Baseline
 
 **Phase:** 0 (repository audit) and 1 (baseline test pass)

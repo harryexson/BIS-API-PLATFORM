@@ -198,9 +198,15 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    keys but isn't checked against the requested capability.
 6. **No default API-key expiry** — `expiresAt` exists on the schema and is
    honored if set, but nothing sets it by default on key creation.
-7. **No circuit breaker** — routing does failover across a provider list on
-   error, but there's no stateful CLOSED/OPEN/HALF_OPEN breaker that removes
-   a chronically-failing provider from rotation for a cooldown window.
+7. ~~No circuit breaker~~ — **closed 2026-09-08.** `ProviderRegistry` now
+   tracks a per-provider CLOSED/OPEN/HALF_OPEN state
+   (`isCircuitAvailable`/`isProviderAvailable`, driven by `recordTraffic`),
+   configurable via `CIRCUIT_BREAKER_FAILURE_THRESHOLD` /
+   `CIRCUIT_BREAKER_COOLDOWN_MS`, and wired into every routing decision
+   point (`RoutingEngine.routePayment`/`routeMessage`/`routeOther`,
+   including manual overrides and conversation continuity) plus
+   `findByCategoryAndCapabilities`. Manually setting a provider back online
+   resets its circuit.
 8. **No startup configuration validation** — misconfiguration (e.g. a
    provider enabled in production with no API key configured) surfaces at
    request time via each adapter's `verifyAvailability()`, not at boot.
@@ -234,7 +240,7 @@ safety):
    Trembi) — needs live credentials to fully certify, but the HTTP
    integration + error normalization + contract tests can be built now
    against each provider's public API documentation.
-2. Circuit breaker around provider failover.
+2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
 3. API-key scope enforcement + default expiry.
 4. `/ready` queue/worker-store health check (DB + rate-limiter already covered).
 5. A2P/10DLC `MessagingProfile` model.

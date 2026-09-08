@@ -271,4 +271,39 @@ describe('RoutingEngine', () => {
       ).rejects.toThrow();
     });
   });
+
+  describe('circuit breaker integration', () => {
+    it('excludes a provider whose circuit is open from capability-based routing, without an admin having to mark it offline', async () => {
+      const registry = ProviderRegistry.getInstance();
+      // Trip the breaker purely through repeated recorded failures — the
+      // provider's admin-controlled `status` stays 'online' throughout.
+      for (let i = 0; i < 5; i++) {
+        registry.recordTraffic('stripe', false, 100);
+      }
+      expect(registry.getProvider('stripe')!.config.status).toBe('online');
+      expect(registry.isProviderAvailable('stripe')).toBe(false);
+
+      const result = await engine.routePayment('testapp', {
+        amount: 1000,
+        currency: 'USD',
+        paymentMethod: 'card',
+      });
+      expect(result.providerId).not.toBe('stripe');
+    });
+
+    it('a manual override onto an open-circuit provider falls through to normal routing', async () => {
+      const registry = ProviderRegistry.getInstance();
+      for (let i = 0; i < 5; i++) {
+        registry.recordTraffic('stripe', false, 100);
+      }
+
+      const result = await engine.routePayment('testapp', {
+        amount: 1000,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+      expect(result.providerId).not.toBe('stripe');
+    });
+  });
 });

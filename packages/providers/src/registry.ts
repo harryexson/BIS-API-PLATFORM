@@ -5,6 +5,7 @@ import {
   ProviderHealthStatus,
   ProviderSecretMeta,
   ProviderCapabilityMatch,
+  ProviderCircuitState,
   RoutingRule,
   HealthCheckSummary,
 } from '@company/schemas';
@@ -47,7 +48,18 @@ export interface ManagementState {
   errorRate: number;
   routingRules: RoutingRule[];
   secrets: StoredSecret[];
+  circuitState: ProviderCircuitState;
+  consecutiveFailures: number;
+  circuitOpenedAt: number | null;
 }
+
+// Circuit breaker tuning. Configurable per Phase 21 of the master plan:
+// failure threshold, open duration, half-open attempts, recovery threshold.
+// A single failed half-open probe re-opens the circuit (recovery threshold
+// of 1); this keeps the breaker simple while still preventing a flapping
+// provider from being hammered.
+const CIRCUIT_FAILURE_THRESHOLD = Number(process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD) || 5;
+const CIRCUIT_COOLDOWN_MS = Number(process.env.CIRCUIT_BREAKER_COOLDOWN_MS) || 30_000;
 
 export class ProviderRegistry {
   private static instance: ProviderRegistry;
@@ -261,6 +273,9 @@ export class ProviderRegistry {
       lastSuccessfulRequest: null,
       errorRate: 0,
       routingRules: [],
+      circuitState: 'closed',
+      consecutiveFailures: 0,
+      circuitOpenedAt: null,
       secrets: [{
         meta: {
           id: `${id}_api_key`,
@@ -281,6 +296,39 @@ export class ProviderRegistry {
     return Array.from(this.providers.values()).map(p => p.config);
   }
 
+  // Circuit breaker: whether a provider may currently receive routed
+  // traffic. CLOSED — yes. OPEN — no, unless the cooldown has elapsed, in
+  // which case this call transitions the circuit to HALF_OPEN and allows
+  // exactly one probe request through. HALF_OPEN — yes (the probe already
+  // in flight); recordTraffic() resolves it to CLOSED or back to OPEN.
+  public isCircuitAvailable(id: string): boolean {
+    const state = this.management.get(id);
+    if (!state) return false;
+
+    if (state.circuitState === 'closed') return true;
+
+    if (state.circuitState === 'open') {
+      const openedAt = state.circuitOpenedAt ?? 0;
+      if (Date.now() - openedAt >= CIRCUIT_COOLDOWN_MS) {
+        state.circuitState = 'half_open';
+        return true;
+      }
+      return false;
+    }
+
+    // half_open: allow the in-flight probe.
+    return true;
+  }
+
+  // Combines the admin-controlled online/offline/maintenance status with
+  // circuit breaker availability — this is the single check routing should
+  // use to decide whether a provider is eligible for a request right now.
+  public isProviderAvailable(id: string): boolean {
+    const provider = this.providers.get(id);
+    if (!provider || provider.config.status !== 'online') return false;
+    return this.isCircuitAvailable(id);
+  }
+
   // Capability-based routing: find providers by category + required capabilities + supported currencies
   public findByCategoryAndCapabilities(
     category: 'payment' | 'messaging' | 'other',
@@ -292,7 +340,7 @@ export class ProviderRegistry {
     for (const [id, provider] of this.providers) {
       const config = provider.config;
       if (config.category !== category) continue;
-      if (config.status !== 'online') continue;
+      if (!this.isProviderAvailable(id)) continue;
 
       const state = this.management.get(id);
       if (!state) continue;
@@ -334,6 +382,18 @@ export class ProviderRegistry {
       ...provider.config,
       ...updates
     };
+
+    // Manually bringing a provider back online resets the circuit — an
+    // operator's explicit judgment overrides the automatic breaker.
+    if (updates.status === 'online') {
+      const state = this.management.get(id);
+      if (state) {
+        state.circuitState = 'closed';
+        state.consecutiveFailures = 0;
+        state.circuitOpenedAt = null;
+      }
+    }
+
     return provider.config;
   }
 
@@ -356,7 +416,9 @@ export class ProviderRegistry {
       health: state.health,
       lastSuccessfulRequest: state.lastSuccessfulRequest,
       errorRate: state.errorRate,
-      routingRules: state.routingRules
+      routingRules: state.routingRules,
+      circuitState: state.circuitState,
+      consecutiveFailures: state.consecutiveFailures
     };
   }
 
@@ -383,6 +445,13 @@ export class ProviderRegistry {
     }
     if (updates.status !== undefined) {
       provider.config.status = updates.status;
+      // Manually bringing a provider back online resets the circuit —
+      // an operator's explicit judgment overrides the automatic breaker.
+      if (updates.status === 'online') {
+        state.circuitState = 'closed';
+        state.consecutiveFailures = 0;
+        state.circuitOpenedAt = null;
+      }
     }
     if (updates.latencyMin !== undefined) {
       provider.config.latencyMin = updates.latencyMin;
@@ -511,8 +580,25 @@ export class ProviderRegistry {
     if (success) {
       state.lastSuccessfulRequest = new Date().toISOString();
       state.errorRate = Math.round(state.errorRate * 0.9 * 10) / 10;
+      state.consecutiveFailures = 0;
+      // A successful half-open probe closes the circuit; a success while
+      // closed is a no-op for circuit state.
+      if (state.circuitState === 'half_open') {
+        state.circuitState = 'closed';
+        state.circuitOpenedAt = null;
+      }
     } else {
       state.errorRate = Math.min(100, Math.round((state.errorRate * 0.9 + 10) * 10) / 10);
+      state.consecutiveFailures += 1;
+
+      if (state.circuitState === 'half_open') {
+        // Recovery probe failed — back to OPEN, restart the cooldown.
+        state.circuitState = 'open';
+        state.circuitOpenedAt = Date.now();
+      } else if (state.circuitState === 'closed' && state.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD) {
+        state.circuitState = 'open';
+        state.circuitOpenedAt = Date.now();
+      }
     }
 
     if (latencyMs > 0) {

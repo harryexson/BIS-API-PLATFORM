@@ -79,7 +79,7 @@ export class RoutingEngine {
     let reason = '';
 
     const allProviders = this.registry.getAllConfigs();
-    const activePayments = allProviders.filter(p => p.category === 'payment' && p.status === 'online');
+    const activePayments = allProviders.filter(p => p.category === 'payment' && this.registry.isProviderAvailable(p.id));
 
     if (activePayments.length === 0) {
       throw new Error('All payment providers are currently OFFLINE / UNDER MAINTENANCE');
@@ -88,7 +88,7 @@ export class RoutingEngine {
     // 1. Check for manual override
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
-      if (provider && provider.config.status === 'online') {
+      if (provider && this.registry.isProviderAvailable(providerOverride)) {
         selectedProvider = provider;
         reason = `Manual override matched: Forced routing to '${provider.config.name}'.`;
       } else {
@@ -189,14 +189,14 @@ export class RoutingEngine {
 
     if (conversation && !providerOverride) {
       const provider = this.registry.getProvider(conversation.providerId);
-      if (provider && provider.config.status === 'online') {
+      if (provider && this.registry.isProviderAvailable(conversation.providerId)) {
         selectedProvider = provider;
         reason = `Conversation continuity: Reusing ${conversation.channel} provider '${provider.config.name}' for ${recipient}.`;
       }
     }
 
     const allProviders = this.registry.getAllConfigs();
-    const activeMsg = allProviders.filter(p => p.category === 'messaging' && p.status === 'online');
+    const activeMsg = allProviders.filter(p => p.category === 'messaging' && this.registry.isProviderAvailable(p.id));
 
     if (activeMsg.length === 0 && !selectedProvider) {
       throw new Error('All messaging providers are currently OFFLINE / UNDER MAINTENANCE');
@@ -205,7 +205,7 @@ export class RoutingEngine {
     // 1. Manual override check
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
-      if (provider && provider.config.status === 'online') {
+      if (provider && this.registry.isProviderAvailable(providerOverride)) {
         selectedProvider = provider;
         reason = `Manual override matched: Forced messaging route to '${provider.config.name}'.`;
       } else {
@@ -302,12 +302,12 @@ export class RoutingEngine {
     const providerId = providerOverride || (serviceType === 'maps' ? 'maps' : serviceType === 'identity' ? 'identity' : 'ai');
     const provider = this.registry.getProvider(providerId);
 
-    if (provider && provider.config.status === 'online') {
+    if (provider && this.registry.isProviderAvailable(providerId)) {
       selectedProvider = provider;
       reason = `Routed to designated API node '${provider.config.name}' for service type '${serviceType}'.`;
     } else {
       const allProviders = this.registry.getAllConfigs();
-      const backups = allProviders.filter(p => p.category === 'other' && p.status === 'online');
+      const backups = allProviders.filter(p => p.category === 'other' && this.registry.isProviderAvailable(p.id));
       if (backups.length > 0) {
         selectedProvider = this.registry.getProvider(backups[0].id) || null;
         reason = `Designated provider '${providerId}' was offline. Routed to backup services node '${selectedProvider?.config.name}'.`;

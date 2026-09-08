@@ -5,6 +5,12 @@ export type TransactionStatus = 'success' | 'failed';
 export type ProviderEnvironment = 'test' | 'live';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 
+// Circuit breaker state for a provider, tracked independently of the
+// admin-controlled `status` field. CLOSED = normal routing eligibility;
+// OPEN = temporarily excluded from routing after repeated failures;
+// HALF_OPEN = a single recovery probe is in flight.
+export type ProviderCircuitState = 'closed' | 'open' | 'half_open';
+
 export interface RoutingRule {
   id: string;
   match: string; // human readable match expression, e.g. "currency == MWK"
@@ -73,6 +79,8 @@ export interface ProviderManagement extends ProviderConfig {
   lastSuccessfulRequest: string | null;
   errorRate: number;
   routingRules: RoutingRule[];
+  circuitState: ProviderCircuitState;
+  consecutiveFailures: number;
 }
 
 export interface HealthCheckSummary {
