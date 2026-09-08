@@ -6,6 +6,68 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Phase 11: `/ready` Queue Health Check + Two Flaky-Test Fixes
+
+**Phase:** 11 (observability) — closes the last item from
+`PRODUCTION_READINESS_REPORT.md` P2-5 ("`/ready` doesn't check
+dependencies") that was still genuinely open.
+
+**Files changed:**
+- `services/api-gateway/src/app.ts` — `/ready` now pings the Redis
+  connection used for job enqueueing (`getRedisClient()`) when
+  `REDIS_URL` is set, reporting `healthy`/`unreachable`; reports
+  `unconfigured` (not a failure) when Redis isn't configured, since the
+  platform's real fallback in that case is DB-only webhook persistence,
+  not an outage. **Also fixed a real, separate bug found while making this
+  change**: the DB check assigned `checkDatabaseHealth()`'s entire
+  resolved object (`{status, latencyMs, details}`) to a variable and
+  treated any non-throwing result as truthy → always `'healthy'`. That
+  function returns (doesn't throw) `status: 'degraded'` or `'unhealthy'`
+  for a slow-but-connected database, so `/ready` never actually surfaced
+  those states — only a hard connection failure (a thrown exception) did.
+  Now reads `.status` directly.
+- `packages/simulation/src/ready-endpoint.simulation.test.ts` (new) — 3
+  tests: all dependency keys present, queue reports `unconfigured` (200)
+  when `REDIS_URL` is unset, database reports `unhealthy` (503) when the
+  DB is down — the last of which caught the bug above (it failed against
+  the pre-fix code, confirming `/ready` was silently reporting healthy).
+- `packages/simulation/src/security-isolation.simulation.test.ts` — fixed
+  a real flaky test unrelated to this phase's main change, found while
+  re-running the suite to validate it: "tampered HMAC signature is
+  rejected" flipped a webhook signature's first hex nibble to a *fixed*
+  `'a'`, which has a 1-in-16 chance of coincidentally matching the
+  original (non-deterministic per run — the webhook body includes a
+  random event id and current timestamp), producing a byte-identical
+  "tampered" signature that's actually still valid and spuriously passing
+  verification. Now flips to whichever of `'a'`/`'b'` differs from the
+  original.
+- `packages/routing/src/routing.test.ts` — fixed a second flaky test found
+  the same way: the SMS-routing test's expected-provider list omitted
+  `example-msg`, a real SMS-capable, weight-25 candidate in the same
+  weighted-random pool as the three providers it did list — about a
+  1-in-7 chance per run of a spurious failure.
+- `docs/IMPLEMENTATION_BASELINE.md` — marked the `/ready` gap closed,
+  corrected the DB-check claim
+
+**Database migrations:** none
+
+**API changes:** `/ready` response gains a `queue` key in `dependencies`
+(`healthy` / `unreachable` / `unconfigured`); `database` can now report
+`degraded` in addition to `healthy`/`unhealthy`/`unreachable`
+
+**Security changes:** none
+
+**Tests:** `npm test` 232 → 235 passed, 0 failed. Ran the full suite 5x
+consecutively after both flaky-test fixes to confirm elimination (prior to
+the fixes, 2 of 4 consecutive runs failed on one or the other).
+Lint/typecheck/build clean.
+
+**Known issues carried forward:** none new. The `queue` check only
+verifies the Redis connection is reachable, not that the worker process
+is actually consuming from it — a full worker liveness signal (e.g. a
+heartbeat key the worker refreshes) would be a further improvement but is
+out of scope here.
+
 ## 2026-09-08 — Phase 3: API-Key Scope Enforcement & Default Expiry
 
 **Phase:** 3 (API Gateway hardening) — closes two items from

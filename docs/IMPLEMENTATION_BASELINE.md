@@ -183,16 +183,23 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 1. **Real provider adapters** — all messaging + payment adapters are
    simulated (§2). This is the largest gap in the whole plan.
 2. **No Africa's Talking / Trembi adapters** — not started.
-3. **`/ready` has no independent queue/worker-store health check** — it
-   checks DB connectivity and reports the rate-limiter backend (Redis vs.
-   in-memory), but doesn't separately probe the job queue's `KVStore`
-   backend. *(Correction: an earlier draft of this document, written from
-   the stale `SECURITY_AUDIT_REPORT.md`, claimed gateway rate limiting was
-   unwired and `/ready` did no dependency checks at all. Re-reading
-   `services/api-gateway/src/auth.ts` and `app.ts` directly shows both are
-   already implemented — `auth.ts` uses `rate-limiter-flexible` with
-   `RateLimiterRedis` + in-memory fallback, and `/ready` calls
-   `checkDatabaseHealth()` and returns 503 when the DB is unreachable.)*
+3. ~~`/ready` has no independent queue/worker-store health check~~ —
+   **closed 2026-09-08.** `/ready` now pings the Redis connection used for
+   job enqueueing when `REDIS_URL` is configured (`healthy`/`unreachable`),
+   and reports `unconfigured` (not a failure) when it isn't — matching the
+   platform's real degraded-mode behavior of falling back to DB-only
+   webhook persistence. *(Correction: an earlier draft of this document,
+   written from the stale `SECURITY_AUDIT_REPORT.md`, claimed gateway rate
+   limiting was unwired and `/ready` did no dependency checks at all.
+   Re-reading `services/api-gateway/src/auth.ts` and `app.ts` directly
+   showed both were already implemented — `auth.ts` uses
+   `rate-limiter-flexible` with `RateLimiterRedis` + in-memory fallback.
+   While adding the queue check, a **real, separate bug** was found and
+   fixed in the DB check: `/ready` assigned `checkDatabaseHealth()`'s
+   entire resolved object to a boolean-ish variable and treated any
+   non-throwing result as `'healthy'`, so a `degraded`/`unhealthy` DB
+   status (returned, not thrown, by that function) never actually
+   surfaced — see `docs/IMPLEMENTATION_CHANGELOG.md` for the fix.)*
 4. **`events.app_id` has no FK constraint** — referential integrity gap.
 5. ~~No API-key scope enforcement~~ — **closed 2026-09-08.**
    `ApplicationRegistry.authenticateApplication` now surfaces the matched
@@ -250,7 +257,7 @@ safety):
    against each provider's public API documentation.
 2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
 3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
-4. `/ready` queue/worker-store health check (DB + rate-limiter already covered).
+4. ~~`/ready` queue/worker-store health check~~ — done, see §4 item 3.
 5. A2P/10DLC `MessagingProfile` model.
 6. Payment reconciliation / connected-account model.
 

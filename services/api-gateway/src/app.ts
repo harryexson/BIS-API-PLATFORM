@@ -275,10 +275,14 @@ app.get('/health', (req: Request, res: Response) => {
 app.get('/ready', async (req: Request, res: Response) => {
   const deps: Record<string, string> = {};
 
-  // P2-5: Check database connectivity
+  // P2-5: Check database connectivity.
+  // checkDatabaseHealth() resolves to a status object even for a slow or
+  // degraded connection — only a hard failure (e.g. connection refused)
+  // throws. Read its .status field rather than treating any resolved
+  // value as healthy, or a degraded/unhealthy DB never surfaces here.
   try {
-    const dbOk = await checkDatabaseHealth();
-    deps.database = dbOk ? 'healthy' : 'unhealthy';
+    const dbHealth = await checkDatabaseHealth();
+    deps.database = dbHealth.status;
   } catch {
     deps.database = 'unreachable';
   }
@@ -287,11 +291,35 @@ app.get('/ready', async (req: Request, res: Response) => {
   const rlInfo = auth.getRateLimiterInfo();
   deps.rateLimiter = rlInfo.storeBacked ? 'redis' : 'in-memory';
 
+  // Queue/worker-store backend: when REDIS_URL isn't configured, inbound
+  // webhooks fall back to DB-only persistence (no async worker hand-off) —
+  // that's a real degraded mode, but a separate, intentional one from a
+  // configured Redis actually being unreachable. Only the latter should
+  // fail readiness.
+  if (process.env.REDIS_URL) {
+    try {
+      const client = getRedisClient();
+      if (!client) throw new Error('redis client unavailable');
+      await Promise.race([
+        client.ping(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ping timeout')), 2000)),
+      ]);
+      deps.queue = 'healthy';
+    } catch {
+      deps.queue = 'unreachable';
+    }
+  } else {
+    deps.queue = 'unconfigured';
+  }
+
   // Provider registry is in-memory — always "ready" if process is up
   deps.providers = 'ready';
 
+  // 'degraded' (e.g. a slow-but-connected DB) doesn't fail readiness — the
+  // dependency is still serving, just worth surfacing to operators. Only
+  // 'unhealthy'/'unreachable' fail it.
   const allHealthy = Object.values(deps).every(
-    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis',
+    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis' || v === 'unconfigured' || v === 'degraded',
   );
   const status = allHealthy ? 'ready' : 'degraded';
 

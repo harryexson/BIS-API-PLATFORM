@@ -157,8 +157,11 @@ describe('RoutingEngine', () => {
       });
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
-      // Multiple providers have SMS capability
-      expect(['infobip', 'futuresms', 'signalhouse']).toContain(result.providerId);
+      // Multiple providers have SMS capability, including example-msg
+      // (weight 25 vs. 50 for the other three) — a real, weighted-random
+      // candidate, not a fixture to ignore. Omitting it here previously
+      // flaked this test whenever the random draw picked it (~1-in-7 runs).
+      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
