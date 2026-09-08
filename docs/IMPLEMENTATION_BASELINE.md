@@ -54,8 +54,10 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
   SSE stream, logs, metrics), `/health`, `/ready`.
 - Auth (`auth.ts`): DB-backed API key authentication
   (`ApplicationRegistry.authenticateApplication`), admin-key middleware for
-  dashboard routes, in-memory-per-instance rate limiter (Redis-backed variant
-  exists in `@company/workers` but is not yet wired at the gateway — see §4).
+  dashboard routes, rate limiting via `rate-limiter-flexible` —
+  Redis-backed (`RateLimiterRedis` with an in-memory `insuranceLimiter`
+  fallback) when `REDIS_URL` is set, falling back to `RateLimiterMemory`
+  otherwise. `/ready` reports which backend is active.
 - Tenant context: `resolveTenantContext` middleware validates `x-tenant-id`
   against `TenantRegistry.assertTenantAccess`; the authenticated application's
   slug is the source of truth for `appId` (not client-supplied body fields).
@@ -126,8 +128,10 @@ gap against the "real production requirement" in the master plan — see §6.
 - Structured logger with request/trace/tenant/app context
   (`packages/observability`), `/health` and `/ready` endpoints,
   Server-Sent-Events dashboard stream (admin-gated).
-- `/ready` currently reports process liveness; it does not yet fail on
-  DB/Redis/queue unavailability (tracked gap, §4).
+- `/ready` checks real DB connectivity (`checkDatabaseHealth`) and reports
+  the active rate-limiter backend; it returns 503 when DB is unreachable.
+  It does not yet check the job-queue/worker-store backend independently
+  of the rate limiter's Redis connection (tracked gap, §4).
 
 ### Admin Console (`apps/admin-console`)
 React/Vite app with: login gate (admin-key based), provider registry view,
@@ -179,27 +183,34 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 1. **Real provider adapters** — all messaging + payment adapters are
    simulated (§2). This is the largest gap in the whole plan.
 2. **No Africa's Talking / Trembi adapters** — not started.
-3. **Gateway rate limiting is in-memory per-instance** — a Redis-backed
-   `RateLimiter` exists in `@company/workers` but isn't wired into
-   `services/api-gateway`; horizontal scaling bypasses the limit.
-4. **`/ready` doesn't check dependencies** — reports OK without verifying
-   DB/Redis/queue reachability.
-5. **`events.app_id` has no FK constraint** — referential integrity gap.
-6. **No API-key scope enforcement** — the `scopes` column exists on API
+3. **`/ready` has no independent queue/worker-store health check** — it
+   checks DB connectivity and reports the rate-limiter backend (Redis vs.
+   in-memory), but doesn't separately probe the job queue's `KVStore`
+   backend. *(Correction: an earlier draft of this document, written from
+   the stale `SECURITY_AUDIT_REPORT.md`, claimed gateway rate limiting was
+   unwired and `/ready` did no dependency checks at all. Re-reading
+   `services/api-gateway/src/auth.ts` and `app.ts` directly shows both are
+   already implemented — `auth.ts` uses `rate-limiter-flexible` with
+   `RateLimiterRedis` + in-memory fallback, and `/ready` calls
+   `checkDatabaseHealth()` and returns 503 when the DB is unreachable.)*
+4. **`events.app_id` has no FK constraint** — referential integrity gap.
+5. **No API-key scope enforcement** — the `scopes` column exists on API
    keys but isn't checked against the requested capability.
-7. **No default API-key expiry.**
-8. **No circuit breaker** — routing does failover across a provider list on
+6. **No default API-key expiry** — `expiresAt` exists on the schema and is
+   honored if set, but nothing sets it by default on key creation.
+7. **No circuit breaker** — routing does failover across a provider list on
    error, but there's no stateful CLOSED/OPEN/HALF_OPEN breaker that removes
    a chronically-failing provider from rotation for a cooldown window.
-9. **No startup configuration validation** — misconfiguration surfaces at
-   request time, not boot time.
-10. **No A2P/10DLC compliance model** — no brand/campaign/consent-status
-    schema; STOP/START exist at the keyword-handler level but there's no
-    `MessagingProfile`-style registration record.
-11. **No payment reconciliation/settlement model** beyond a `reconciliation`
+8. **No startup configuration validation** — misconfiguration (e.g. a
+   provider enabled in production with no API key configured) surfaces at
+   request time via each adapter's `verifyAvailability()`, not at boot.
+9. **No A2P/10DLC compliance model** — no brand/campaign/consent-status
+   schema; STOP/START/JOIN exist at the keyword-handler level but there's no
+   `MessagingProfile`-style registration record.
+10. **No payment reconciliation/settlement model** beyond a `reconciliation`
     job stub — no connected-account onboarding flow for merchant-owned
     payment accounts.
-12. **npm audit**: `qs` (via `express`) has two moderate DoS advisories
+11. **npm audit**: `qs` (via `express`) has two moderate DoS advisories
     (GHSA-x5fp-wj9c-mxmx, GHSA-4mjr-xmp4-gh2g) with no non-breaking fix
     available in the express 4.x line at time of audit — remediating fully
     requires an express major-version bump, out of scope for this pass.
@@ -223,13 +234,11 @@ safety):
    Trembi) — needs live credentials to fully certify, but the HTTP
    integration + error normalization + contract tests can be built now
    against each provider's public API documentation.
-2. Redis-backed gateway rate limiting (component already exists — wiring
-   gap only).
-3. `/ready` dependency checks.
-4. Circuit breaker around provider failover.
-5. API-key scope enforcement + default expiry.
-6. A2P/10DLC `MessagingProfile` model.
-7. Payment reconciliation / connected-account model.
+2. Circuit breaker around provider failover.
+3. API-key scope enforcement + default expiry.
+4. `/ready` queue/worker-store health check (DB + rate-limiter already covered).
+5. A2P/10DLC `MessagingProfile` model.
+6. Payment reconciliation / connected-account model.
 
 ## 7. Relationship to Prior Reports
 
