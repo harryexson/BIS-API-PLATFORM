@@ -20,6 +20,7 @@ describe('RoutingEngine', () => {
     registry.updateProviderConfig('infobip', { status: 'online' });
     registry.updateProviderConfig('futuresms', { status: 'online' });
     registry.updateProviderConfig('signalhouse', { status: 'online' });
+    registry.updateProviderConfig('africastalking', { status: 'online' });
     registry.updateProviderConfig('email', { status: 'online' });
     registry.updateProviderConfig('example-pay', { status: 'online' });
     registry.updateProviderConfig('example-msg', { status: 'online' });
@@ -157,11 +158,11 @@ describe('RoutingEngine', () => {
       });
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
-      // Multiple providers have SMS capability, including example-msg
-      // (weight 25 vs. 50 for the other three) — a real, weighted-random
-      // candidate, not a fixture to ignore. Omitting it here previously
-      // flaked this test whenever the random draw picked it (~1-in-7 runs).
-      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg']).toContain(result.providerId);
+      // Multiple providers have SMS capability and are all real,
+      // weighted-random candidates for this send — every one of them must
+      // be listed here or the test flakes whenever the random draw picks
+      // an unlisted one (this exact bug bit example-msg before).
+      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
@@ -208,6 +209,7 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('infobip', { status: 'offline' });
       registry.updateProviderConfig('futuresms', { status: 'offline' });
       registry.updateProviderConfig('signalhouse', { status: 'offline' });
+      registry.updateProviderConfig('africastalking', { status: 'offline' });
       registry.updateProviderConfig('email', { status: 'offline' });
       registry.updateProviderConfig('example-msg', { status: 'offline' });
 

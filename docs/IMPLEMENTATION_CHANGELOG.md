@@ -6,6 +6,203 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Real Provider Adapters: Infobip + Africa's Talking
+
+**Phase:** 6 of the master plan. The single largest previously-open gap:
+every messaging adapter was fully simulated (fabricated message IDs,
+always-success responses, no HTTP call at all).
+
+**How the facts were verified, and what that means for confidence
+level:** `WebFetch` (direct page retrieval) is blocked in this session —
+confirmed via `infobip.com` and, as a control, an unrelated well-known
+domain, both `EGRESS_BLOCKED`. `WebSearch` is *not* blocked and returns
+real, current search-result snippets with source URLs (not training-data
+memory). Several targeted queries per provider established: exact
+endpoint path, auth header format, request body shape, success response
+shape, error envelope shape, and (for Infobip) delivery-status group
+names. Every fact used in the adapters below is traceable to a specific
+search result, not inferred or remembered. **What this is not**: a page
+fetched and read in full, or a live account tested against. Both
+adapters remain unverified against a real Infobip/Africa's Talking
+account — no credentials were available in this session. Treat as "built
+from real, current, but partial documentation," not "certified."
+
+### Infobip (`packages/providers/src/adapters/messaging/infobip.ts` — rewritten)
+- `POST https://{INFOBIP_BASE_URL}/sms/3/messages`,
+  `Authorization: App {INFOBIP_API_KEY}`
+- Request: `{ messages: [{ sender, destinations: [{to}], content: {text} }] }`
+- Success response: `{ bulkId, messages: [{ messageId, status: {groupId,
+  groupName, id, name, description}, to }] }` — only reports platform
+  `status: 'success'` when `groupName !== 'REJECTED'`; a 2xx HTTP response
+  can still carry a per-message rejection, and that's never reported as a
+  fabricated success.
+- Error envelope: `{ requestError: { serviceException: { messageId, text } } }`
+  — parsed into a real error message, not a generic "request failed" string.
+- **Falls back to the pre-existing simulated behavior when
+  `INFOBIP_API_KEY`/`INFOBIP_BASE_URL` aren't configured** — matches the
+  established pattern already in `adapters/payments/stripe.ts` (the only
+  adapter with any prior real-HTTP logic). This is why every existing test
+  continues to pass unmodified: nothing in this environment configures
+  these vars, so behavior is unchanged for all of them.
+- 7 new contract tests (`infobip.test.ts`, `vi.stubGlobal('fetch', ...)`):
+  simulated fallback makes no HTTP call; real request shape (URL, auth
+  header, body) is correct; REJECTED-in-a-200 is reported as failed, not
+  success; the documented error envelope is parsed; a malformed response
+  (no messages array) fails cleanly instead of fabricating a message ID;
+  5xx responses actually retry (via `BaseProvider.http_request`'s existing
+  retry logic) before failing; `status: offline` short-circuits before any
+  HTTP call.
+
+### Africa's Talking (net-new: `packages/providers/src/adapters/messaging/africastalking.ts`)
+Explicitly named as a priority provider in master plan Phase 16. Did not
+exist before this session — no adapter file, no registry entry, no env
+vars.
+- `POST {baseUrl}/version1/messaging` where `baseUrl` is
+  `https://api.africastalking.com` (live) or
+  `https://api.sandbox.africastalking.com` (test) — **driven by the
+  provider's registered `environment` field** (an existing first-class
+  concept in this registry), not a new env var.
+- Headers: `apiKey: {AFRICASTALKING_API_KEY}`, `Accept: application/json`
+- Request: `{ username, to, message, from? }` (JSON — confirmed
+  Africa's Talking accepts JSON as an alternative to its classic
+  form-urlencoded format)
+- Success response: `{ SMSMessageData: { Message, Recipients: [{
+  statusCode, number, status, cost, messageId }] } }` — only reports
+  platform `status: 'success'` when the recipient's `status === 'Success'`
+  exactly; every other status string (`InsufficientBalance`,
+  `InvalidPhoneNumber`, etc.) is a real provider-reported rejection,
+  surfaced as the `error` field verbatim rather than paraphrased or
+  mapped to a guessed enum.
+- Same simulated-fallback pattern as Infobip when credentials are unset.
+- Registered in `packages/providers/src/registry.ts` with the countries
+  Africa's Talking's own documentation confirms it serves for SMS: KE,
+  UG, TZ, RW, MW, NG, ZM, CI, ET, GH, ZA (not guessed, not copied from
+  another provider's list — this repo's own audit history flagged
+  exactly that mistake once already, for SignalHouse/Malawi).
+- `.env.example`: `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`.
+- 7 new contract tests (`africastalking.test.ts`), same coverage shape as
+  Infobip's, plus a dedicated test that `environment: 'test'` routes to
+  the sandbox base URL.
+
+**Adding a 16th provider required updating tests that hard-coded provider
+counts/lists** — not a design change, just consistency bookkeeping:
+`providerRegistry.test.ts`/`management.test.ts` (15→16 total, 5→6
+messaging), and every simulation/routing test that enumerates "all
+SMS-capable providers" for either a `toContain` assertion or an
+offline-toggle loop (`routing.test.ts`,
+`application-certification.simulation.test.ts`,
+`resilience-failure.simulation.test.ts`,
+`messaging-conversation.simulation.test.ts`) — the same class of
+maintenance the `example-msg` flakiness fix earlier this session required,
+now handled proactively instead of discovered via a flaky run. Verified
+provider-selection/failover tests that depend on *registration order*
+(e.g. "signalhouse fails over to infobip") are unaffected, since
+Africa's Talking was inserted after both in `registry.ts` and this
+platform's failover is single-level-by-order, not exhaustive.
+
+**Database migrations:** none
+
+**API changes:** none (adapter-internal; the gateway's public contract is
+unchanged)
+
+**Security changes:** none
+
+**Tests:** `npm test` 284 (net +14 new: 7 Infobip + 7 Africa's Talking) —
+confirmed 3x consecutive full-suite runs, 0 failures. Lint/typecheck/build
+clean.
+
+**Known issues carried forward:** SignalHouse, FutureSMS, generic SMS,
+and Email adapters remain fully simulated (SignalHouse's docs weren't
+usefully indexed by search — confirmed by trying, rather than assumed).
+All payment adapters (Stripe partially real already; NMI, Flutterwave,
+PawaPay, PayChangu, Airwallex) remain simulated. Trembi not attempted —
+net-new provider, no search results attempted yet. Neither new adapter
+has been tested against a live account.
+
+## 2026-09-08 — Neon Database Connected — Corrected Migration-Drift Diagnosis
+
+Per the user's request, connected to the project's existing Neon
+database (`bis-api-platform`, project `orange-water-80452818`, a real,
+actively-used project — not a throwaway) via the Neon MCP connector.
+
+**Important environment finding, for future sessions:** the MCP
+`mcp__Neon__*` tools work in this session, but the application's own
+database driver (`@neondatabase/serverless`, used by `getDb()` /
+`DATABASE_URL`) does **not** — it makes an HTTP call to
+`api.c-2.us-east-2.aws.neon.tech`, which this session's egress proxy
+rejects with `403 Host not in allowlist`. Confirmed by actually running
+`npm run test:integration` with `DATABASE_URL` set: every test failed
+with that exact error, not a test failure. **Practical consequence**:
+`npm run test:integration` / any code path that calls `getDb()` cannot
+be exercised end-to-end in this environment even with a real
+`DATABASE_URL` configured — only the `mcp__Neon__*` tools (which route
+through different infrastructure) can reach this database from here.
+Verification in this entry was done via `mcp__Neon__run_sql`, not by
+running the repository's own test suite against the DB.
+
+**Corrected the earlier migration-drift diagnosis** (see the HIGH entry
+above from earlier this session, and `docs/IMPLEMENTATION_BASELINE.md`
+§4 item 12) by actually inspecting the live schema:
+- `tenants`, `conversations`, and `tenant_application_links` **all
+  already match the current TypeScript schema exactly** in the live
+  database — column-for-column, index-for-index. The earlier entry's
+  claim that `0000_drizzle_init.sql`'s older `tenants` shape represented
+  live risk was wrong; that migration was superseded by something (see
+  next point) long before now, and the live table is correct.
+- `drizzle.__drizzle_migrations` (the live tracking table) has entries
+  for 11 migrations; this repo's `_journal.json` only accounts for 8
+  (0000–0007) plus the 2 added this session (0008–0009, applied directly
+  via SQL, not through this table's normal flow). **Migrations 9–11 in
+  the live tracking table have no corresponding file in this repo at
+  all** — someone applied schema changes directly to this database
+  (almost certainly via `drizzle-kit push`, not `drizzle-kit migrate`)
+  without committing what they ran.
+- Two tables exist in the live database with **no schema file anywhere
+  in the current codebase**: `checkout_sessions` and `webhook_jobs`.
+  Neither is referenced by any current repository or test. Orphaned —
+  either superseded by `transactions`/`outbox_events` or from a different
+  branch/prototype that never merged. Not touched.
+- `tenant_application_links` specifically (the table backing
+  `TenantRegistry.assertTenantAccess`, i.e. the actual gateway
+  tenant-isolation check) was independently double-checked against
+  `packages/database/src/schema/tenant-application-links.ts` — they
+  match exactly. The `&&` bug fixed earlier this session was a pure
+  query-logic bug in the repository layer, not a schema mismatch.
+
+**Empirically proved the `&&` bug's severity against real data** (not
+just JS-semantics reasoning): created two temporary applications, two
+temporary tenants, and links `(tenant1→app1)` and `(tenant2→app2)` only
+— `tenant1` was never linked to `app2`. Ran the OLD buggy query pattern's
+real SQL equivalent (`WHERE application_id = app2` — the tenant_id
+condition `&&`-chaining silently dropped) alongside the fixed pattern
+(`WHERE tenant_id = tenant1 AND application_id = app2`) against the same
+live table: **buggy pattern returned 1 row (would have granted access),
+fixed pattern returned 0 rows (correctly denies it)**. All test data
+deleted immediately after — verified zero leftover rows.
+
+**Applied `0008_add_consent_records.sql` and `0009_add_messaging_profiles.sql`
+to the live database** (via `mcp__Neon__run_sql`, statement-by-statement —
+the Neon HTTP driver rejects multi-statement calls) since `drizzle-kit
+migrate` can't be trusted here (see the drift finding above). Verified
+each new table with a real insert + select round-trip, then deleted the
+smoke-test rows. Did **not** attempt to reconcile
+`drizzle.__drizzle_migrations` for these two migrations — inserting a
+fabricated hash for them risks confusing a future real `drizzle-kit
+migrate` run worse than leaving it alone; the table was already missing
+3 unrelated migrations before this session touched anything.
+
+**Files changed:** none in the repository (database-only investigation
+and additive schema changes, executed directly against Neon via MCP
+tools, not through this repo's migration tooling)
+
+**What remains open:** reconciling `drizzle/meta/*.json` snapshots (or
+abandoning migration-file generation in favor of `drizzle-kit push` as
+the documented deployment method) and identifying/removing or
+documenting `checkout_sessions`/`webhook_jobs` — both still require a
+human decision on approach, not just more investigation.
+
+---
+
 ## 2026-09-08 — Attempted: Real Provider Adapters — Blocked by Network Policy
 
 Before starting other work this session, attempted to fetch Infobip's SMS

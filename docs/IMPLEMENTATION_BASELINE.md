@@ -180,8 +180,9 @@ audit logs, live topology, request playground. Functional and builds clean.
 | CORS/Rate limiting | `CORS_ORIGINS`, `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS`, `REDIS_URL` (optional) |
 | Logging/Workers | `LOG_LEVEL`, `WORKER_CONCURRENCY`, `RECONCILIATION_INTERVAL_MS`, `IDEMPOTENCY_TTL_HOURS` |
 
-**Not yet present:** `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`,
-`TREMBI_API_KEY` (providers don't exist yet).
+**Now present (added 2026-09-08):** `AFRICASTALKING_API_KEY`,
+`AFRICASTALKING_USERNAME`. **Still not present:** `TREMBI_API_KEY`
+(provider doesn't exist yet).
 
 Startup does **not** currently validate required configuration for
 production (e.g. "production + SignalHouse enabled → key required" from the
@@ -195,9 +196,14 @@ checks inside each simulated adapter, not at boot. Tracked gap.
 These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 `PRODUCTION_READINESS_REPORT.md` and re-verified as still open:
 
-1. **Real provider adapters** — all messaging + payment adapters are
-   simulated (§2). This is the largest gap in the whole plan.
-2. **No Africa's Talking / Trembi adapters** — not started.
+1. **Real provider adapters** — payment adapters are all still simulated;
+   messaging: Infobip and Africa's Talking are now real HTTP integrations
+   (2026-09-08, verified via WebSearch against current public docs — see
+   §6 item 1 and the changelog), SignalHouse/FutureSMS/generic SMS/email
+   remain simulated. This is still the largest gap in the whole plan.
+2. ~~No Africa's Talking / Trembi adapters~~ — **Africa's Talking closed
+   2026-09-08** (real adapter + registry entry, see item 1). **Trembi not
+   attempted.**
 3. ~~`/ready` has no independent queue/worker-store health check~~ —
    **closed 2026-09-08.** `/ready` now pings the Redis connection used for
    job enqueueing when `REDIS_URL` is configured (`healthy`/`unreachable`),
@@ -274,19 +280,35 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     requires an express major-version bump, out of scope for this pass.
     Everything else flagged by `npm audit` (vite, vitest, esbuild,
     drizzle-kit) is dev/build tooling, not shipped to production.
-12. **Drizzle migration history has diverged from the actual schema** —
-    `tenant_application_links` and `conversations` have no migration at
-    all; the migrated `tenants` shape (`0000_drizzle_init.sql`) is an
-    older, abandoned design (`application_id`/`domain`/`settings`) than
-    the current schema (`country_code`/`currency`/`status`/`metadata`,
-    many-to-many via `tenant_application_links`); migration snapshots
-    (`drizzle/meta/*.json`) only exist through migration 0001 even though
-    the journal and SQL files go to 0007+. A database built from scratch
-    via `npm run drizzle:migrate` would be missing two actively-used
-    tables and have the wrong shape for a third. Found while adding a
-    migration for `consent_records` — not fixed here, needs verification
-    against a real database this environment doesn't have. Full detail in
-    `docs/IMPLEMENTATION_CHANGELOG.md` ("HIGH: Drizzle Migration History...").
+12. **Drizzle migration *files* have diverged from reality — corrected
+    2026-09-08 after connecting to the real Neon database.** Original
+    finding (static analysis only, before DB access) overstated the
+    danger: it's re-verified now that the **live database's `tenants`,
+    `conversations`, and `tenant_application_links` tables all already
+    match the current TypeScript schema exactly** — there's no live data
+    at risk. The real, still-open problem is that the *migration files in
+    this repo* don't explain how the live DB got there:
+    `drizzle/meta/*.json` snapshots only exist through migration 0001
+    even though the journal and SQL files go to 0007+ (so `drizzle-kit
+    generate` can't be trusted — confirmed it prompts nonsensically about
+    renaming `tenants` columns that don't exist), and the live DB's own
+    `drizzle.__drizzle_migrations` tracking table has **3 more applied
+    migrations (ids 9–11) than this repo has files for** — someone ran
+    migrations directly against this database that were never committed.
+    Also found: two tables in the live DB (`checkout_sessions`,
+    `webhook_jobs`) have no corresponding schema file in the current
+    codebase at all — orphaned, not used by any current repository code,
+    but not cleaned up either. Practical impact: **a fresh database
+    bootstrapped from this repo's committed migrations alone would not
+    match the live DB or current schema** — someone doing that today
+    needs `drizzle-kit push` (direct schema sync) instead of
+    `drizzle:migrate`, not the committed migration history. This repo's
+    own two new tables from this session (`consent_records`,
+    `messaging_profiles`) were applied directly to the live DB via raw
+    SQL (not `drizzle-kit migrate`, for the reasons above) and verified
+    working with a real insert/select round-trip. Full detail, including
+    exact table diffs, in `docs/IMPLEMENTATION_CHANGELOG.md` ("Neon
+    Database Connected — Corrected Migration-Drift Diagnosis").
 13. **Gateway inbound-webhook enqueue silently no-ops without `REDIS_URL`**
     — `services/api-gateway/src/app.ts`'s `enqueueInboundMessage()` (and
     its `enqueuePaymentWebhook`/`enqueueProviderWebhook` siblings) use a
@@ -312,21 +334,29 @@ In order of what most directly blocks the master plan's stated
 non-negotiables (real integrations, no fabricated delivery status, tenant
 safety):
 
-1. Real messaging adapters (SignalHouse, Infobip; then Africa's Talking,
-   Trembi) — needs live credentials to fully certify, but the HTTP
-   integration + error normalization + contract tests can be built now
-   against each provider's public API documentation. **Attempted
-   2026-09-08, blocked**: this session's outbound network access is
-   restricted to a small allowlist (npm/pypi registries, the Anthropic
-   API) — fetching `infobip.com` and, as a control,
+1. Real messaging adapters (SignalHouse, Infobip, Africa's Talking,
+   Trembi) — needs live credentials to fully certify. **Status as of
+   2026-09-08, part two**: `WebFetch` (direct page retrieval) is blocked
+   for this session — `infobip.com` and, as a control,
    `developers.google.com` both failed with `EGRESS_BLOCKED`, confirming
-   this is a blanket session-level restriction, not a per-provider or
-   transient issue. Writing "real" adapters from training-data memory of
-   these APIs instead of verified current documentation would risk
-   exactly the fabricated-contract problem the master plan explicitly
-   prohibits, so this was not attempted. Needs either network access
-   restored for this session, or the docs/OpenAPI specs provided
-   directly (as files or pasted text) to proceed correctly.
+   a blanket session-level restriction, not a per-provider issue. `WebSearch`
+   is **not** blocked, though, and returns real, current search-result
+   snippets (with source URLs) rather than full pages — that was enough to
+   verify Infobip's and Africa's Talking's real API contracts (endpoint,
+   auth header format, request/response shape, error envelope, status
+   values) via several targeted queries. **Infobip** (`infobip.ts`) and
+   **Africa's Talking** (net-new `africastalking.ts`, registered in
+   `registry.ts`) were rewritten as real HTTP integrations on that basis —
+   see `docs/IMPLEMENTATION_CHANGELOG.md` ("Real Provider Adapters:
+   Infobip + Africa's Talking") for exactly which facts came from which
+   search and the full list of what's still unverified (no live account
+   for either). **SignalHouse remains simulated** — it's a small/niche
+   provider with essentially nothing useful in search results (confirmed
+   by trying), so building it "for real" would mean guessing the contract,
+   which the master plan explicitly prohibits. **Trembi likewise not
+   attempted** this pass. Both need either a live account/sandbox to
+   verify against, or the provider's docs supplied directly (file or
+   pasted text).
 2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
 3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
 4. ~~`/ready` queue/worker-store health check~~ — done, see §4 item 3.

@@ -22,6 +22,7 @@ import { ExamplePaymentProvider } from './adapters/payments/example';
 
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
+import { AfricasTalkingProvider } from './adapters/messaging/africastalking';
 import { FutureSMSProvider } from './adapters/messaging/futuresms';
 import { EmailProvider } from './adapters/messaging/email';
 import { ExampleMessagingProvider } from './adapters/messaging/example';
@@ -171,6 +172,22 @@ export class ProviderRegistry {
       latencyMax: 140,
       messageCost: 0.008
     }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
+
+    this.register(new AfricasTalkingProvider({
+      id: 'africastalking',
+      name: "Africa's Talking",
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 150,
+      latencyMax: 220,
+      messageCost: 0.006
+    }), {
+      environment: 'live',
+      countries: ['KE', 'UG', 'TZ', 'RW', 'MW', 'NG', 'ZM', 'CI', 'ET', 'GH', 'ZA'],
+      currencies: ['KES', 'UGX', 'TZS', 'RWF', 'MWK', 'NGN', 'ZMW', 'GHS', 'ZAR'],
+      capabilities: ['sms']
+    });
 
     this.register(new FutureSMSProvider({
       id: 'futuresms',
