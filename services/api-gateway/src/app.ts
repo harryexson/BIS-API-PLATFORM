@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
-import { RoutingEngine } from '@company/routing';
+import { RoutingEngine, ConsentBlockedError } from '@company/routing';
 import { EventBus } from '@company/events';
 import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
@@ -13,6 +13,7 @@ import {
   eventRepository,
   transactionRepository,
   checkDatabaseHealth,
+  consentRecordRepository,
 } from '@company/database';
 import {
   logger,
@@ -437,6 +438,10 @@ app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenant
     observe(event);
     return res.json(event);
   } catch (err: any) {
+    // Consent block is not a transient/retryable failure — surface it
+    // distinctly (403) rather than the generic 503 routing failure, so
+    // callers don't retry a send that will never succeed.
+    const isConsentBlock = err instanceof ConsentBlockedError;
     const errorEvent = {
       id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
@@ -446,14 +451,17 @@ app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenant
       status: 'failed' as const,
       latency: 30,
       cost: 0,
-      decisionReason: 'routing_failure',
+      decisionReason: isConsentBlock ? 'consent_blocked' : 'routing_failure',
       payload: {},
       response: null,
-      error: 'Message routing failed'
+      error: isConsentBlock ? 'Recipient has opted out' : 'Message routing failed'
     };
     eventBus.emit(errorEvent);
-    observeFailure('messaging', errorEvent.providerId, 'ROUTING_FAILED');
+    observeFailure('messaging', errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
     observe(errorEvent);
+    if (isConsentBlock) {
+      return res.status(403).json({ error: 'Recipient has opted out of messaging on this channel', id: errorEvent.id });
+    }
     return res.status(503).json({ error: 'Message routing failed', id: errorEvent.id });
   }
 });
@@ -555,6 +563,59 @@ app.get('/v1/api/gateway/providers', mw.apiKey('providers:read'), resolveTenantC
   // Return all providers with their management views
   const views = registry.getAllManagementViews();
   return res.json({ providers: views, count: views.length });
+});
+
+// Master plan Phase 39/section 66: consent management. STOP/JOIN keyword
+// handling already writes these records (packages/routing/src/keywords.ts);
+// these routes let an application query current status and set it directly
+// (e.g. importing an existing suppression list) without a keyword round-trip.
+app.get('/v1/api/consent/:recipient', mw.apiKey('consent:read'), resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const recipient = req.params.recipient;
+  const channel = typeof req.query.channel === 'string' ? req.query.channel : 'sms';
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+
+  const record = await consentRecordRepository.findByRecipient(appId, tenantId, recipient, channel);
+  return res.json({
+    recipient,
+    channel,
+    status: record?.status ?? 'unknown',
+    source: record?.source ?? null,
+    updatedAt: record?.updatedAt ?? null,
+  });
+});
+
+app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { recipient, channel, status } = req.body;
+
+  if (!appId || !recipient || !channel || !status) {
+    return res.status(400).json({ error: 'Missing required parameters: recipient, channel, and status are required' });
+  }
+  if (!['opted_in', 'opted_out', 'unknown'].includes(status)) {
+    return res.status(400).json({ error: 'status must be one of: opted_in, opted_out, unknown' });
+  }
+
+  const record = await consentRecordRepository.upsert({
+    appId,
+    tenantId,
+    recipient,
+    channel,
+    status,
+    source: 'api',
+  });
+  return res.json({
+    recipient: record.recipient,
+    channel: record.channel,
+    status: record.status,
+    source: record.source,
+    updatedAt: record.updatedAt,
+  });
 });
 
 // P1: Payment idempotency cache — prevents duplicate charges on retry.

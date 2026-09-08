@@ -1,10 +1,24 @@
 import { ProviderConfig, TransactionEvent } from '@company/schemas';
 import { ProviderRegistry, BaseProvider } from '@company/providers';
+import { consentRecordRepository } from '@company/database';
 import { ConversationManager, ConversationContext } from './conversation';
 
 export { ConversationManager, type ConversationContext } from './conversation';
 export { ConversationResolver, type ConversationResolution } from './conversation-resolver';
 export { handleKeyword, type KeywordContext, type KeywordResult } from './keywords';
+
+/**
+ * Thrown when an outbound send is blocked because the recipient has
+ * opted out (STOP) on this channel and hasn't opted back in (JOIN/START).
+ * Distinguishable from a generic routing failure so callers (the gateway)
+ * can surface a 403 instead of a retryable 503 — retrying doesn't help.
+ */
+export class ConsentBlockedError extends Error {
+  constructor(recipient: string, channel: string) {
+    super(`Recipient ${recipient} has opted out of ${channel} messaging (STOP) — outbound blocked.`);
+    this.name = 'ConsentBlockedError';
+  }
+}
 
 /**
  * P1-4: Channel fallback policy.
@@ -183,6 +197,33 @@ export class RoutingEngine {
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
 
+    // Determined once, reused for consent checking, capability routing, and
+    // conversation recording — previously recomputed inline in three places.
+    const channel = recipient.includes('@') ? 'email'
+      : content.toLowerCase().includes('wa:') || content.length > 300 ? 'whatsapp'
+      : 'sms';
+
+    // Consent: a STOP keyword blocks non-permitted outbound messaging on
+    // this channel until the recipient opts back in (JOIN/START/HELP).
+    // Fails open (allows the send) on a consent-store lookup error,
+    // consistent with ConversationManager's existing best-effort pattern
+    // in this same routing layer — a DB hiccup shouldn't take down all
+    // outbound messaging. This is a real tradeoff (a genuinely opted-out
+    // recipient could receive a message during a DB outage) surfaced via
+    // console.error rather than swallowed silently; hardening it to
+    // fail-closed is a documented follow-up, not done here.
+    let optedOut = false;
+    if (recipient) {
+      try {
+        optedOut = await consentRecordRepository.isOptedOut(appId, tenantId, recipient, channel);
+      } catch (err: any) {
+        console.error(`[routing] consent lookup failed for ${recipient} — failing open (send proceeds): ${err.message}`);
+      }
+    }
+    if (optedOut) {
+      throw new ConsentBlockedError(recipient, channel);
+    }
+
     // P0 FIX: Check conversation history — now includes tenantId for isolation
     const conversationCtx: ConversationContext = { phoneNumber: recipient, appId, tenantId };
     const conversation = await this.conversationManager.resolve(conversationCtx);
@@ -215,8 +256,8 @@ export class RoutingEngine {
 
     // 2. Channel detection + capability-based routing
     if (!selectedProvider) {
-      const isEmail = recipient.includes('@');
-      const isWhatsapp = content.toLowerCase().includes('wa:') || content.length > 300;
+      const isEmail = channel === 'email';
+      const isWhatsapp = channel === 'whatsapp';
 
       if (isEmail) {
         const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['email']);
@@ -268,9 +309,6 @@ export class RoutingEngine {
         () => selectedProvider!.processRequest(appId, payload, reason),
       );
       // P2-8: Record conversation after successful delivery
-      const channel = recipient.includes('@') ? 'email'
-        : content.toLowerCase().includes('wa:') || content.length > 300 ? 'whatsapp'
-        : 'sms';
       await this.conversationManager.record(conversationCtx, selectedProvider.config.id, channel);
       return event;
     } catch (err: any) {

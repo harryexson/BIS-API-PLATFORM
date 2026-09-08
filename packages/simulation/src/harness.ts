@@ -401,6 +401,24 @@ export function enqueueProviderWebhook(
   return queue.enqueue('provider_webhook', input);
 }
 
+/**
+ * Directly enqueues an inbound_message job, matching the shape
+ * services/api-gateway/src/app.ts's enqueueInboundMessage() pushes when
+ * Redis is available. In this environment (no REDIS_URL) that gateway path
+ * silently no-ops — see "the gateway accepts a correctly signed inbound
+ * webhook but never enqueues it (documented gap)" in
+ * messaging-conversation.simulation.test.ts — so this helper reaches the
+ * worker's inbound_message processor directly, the same way
+ * enqueueProviderWebhook/enqueuePaymentWebhook bypass the same gap for
+ * their job types, to exercise keyword handling end-to-end.
+ */
+export function enqueueInboundMessage(
+  queue: JobQueue,
+  input: { providerId: string; payload: unknown },
+): Promise<Job> {
+  return queue.enqueue('inbound_message', input);
+}
+
 /** Active/closed conversation the platform tracked for (appId, phoneNumber, tenantId?). */
 export function findConversation(
   appId: string,

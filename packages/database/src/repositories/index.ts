@@ -14,3 +14,4 @@ export { outboxEventRepository } from './outbox-events';
 export { transactionRepository } from './transactions';
 export { idempotencyRecordRepository } from './idempotency-records';
 export { supplierRepository } from './suppliers';
+export { consentRecordRepository } from './consent-records';

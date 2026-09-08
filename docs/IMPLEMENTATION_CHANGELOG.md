@@ -6,6 +6,189 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Phase 39: Consent Management (STOP/JOIN Blocks/Restores Outbound Sends)
+
+**Phase:** 39 (STOP/consent management) of the master plan. Closes the gap
+where a STOP keyword was logged and closed the conversation but nothing
+in the outbound send path ever checked it — a recipient who replied STOP
+could still receive further messages.
+
+**Files changed:**
+- `packages/database/src/schema/consent-records.ts` (new) — `consent_records`
+  table: `(appId, tenantId, recipient, channel)` → current `status`
+  (`opted_in`/`opted_out`/`unknown`), `source` (`keyword`/`api`/`import`),
+  `keyword`. Unique per `(recipient, appId, tenantId, channel)` — one
+  current value, not a log (the existing `events` table already records
+  every keyword/API call that changed it).
+- `packages/database/drizzle/0008_add_consent_records.sql` (new,
+  hand-authored — see the migration-drift entry above for why
+  `drizzle-kit generate` couldn't be used directly) +
+  `drizzle/meta/_journal.json` entry. Verified with `drizzle-kit check`.
+- `packages/database/src/repositories/consent-records.ts` (new) —
+  `findByRecipient`, `upsert` (the STOP/JOIN write path), `isOptedOut`
+  (the send-path read), `findByApplicationId`, `count`.
+- `packages/routing/src/keywords.ts` — `handleStop`/`handleJoin` now write
+  a consent record via `consentRecordRepository.upsert`. **Also removed
+  `conversationRepository.close()` from `handleStop`**: closing the
+  conversation broke `ConversationResolver`'s ability to route a
+  *subsequent* JOIN back to the same app (inbound routing only matches
+  *active* conversations — see `packages/routing/src/conversation-resolver.ts`
+  `findActiveByPhone`), which would have made re-subscribing impossible.
+  Consent (compliance) and conversation status (routing/continuity) are
+  now correctly separate concerns; `KeywordContext` gained an optional
+  `channel` field, threaded through from `packages/workers/src/jobs/inboundMessage.ts`.
+- `packages/routing/src/index.ts` — `RoutingEngine.routeMessage` computes
+  `channel` once (previously recomputed inline in three places) and
+  checks `consentRecordRepository.isOptedOut(appId, tenantId, recipient,
+  channel)` before any provider selection; throws the new
+  `ConsentBlockedError` if blocked. **Fails open** (allows the send, logs
+  via `console.error`) if the consent lookup itself errors — consistent
+  with `ConversationManager`'s existing best-effort pattern in this same
+  file, not a new precedent. This is a real, documented tradeoff: a
+  genuinely opted-out recipient could receive one message during a
+  consent-store outage. Hardening to fail-closed is a flagged follow-up,
+  not done here, because it would make all outbound messaging hard-depend
+  on the consent store's availability.
+- `services/api-gateway/src/app.ts` — `POST /v1/api/gateway/messaging`
+  catches `ConsentBlockedError` specifically and returns 403 (not the
+  generic 503 every other routing failure gets), since retrying a
+  consent-blocked send will never succeed. Added
+  `GET /v1/api/consent/:recipient` and `POST /v1/api/consent` (master plan
+  §66's final API contract) — the latter lets an application set consent
+  directly (e.g. importing an existing suppression list) without a
+  keyword round-trip; both scoped under new `consent:read`/`consent:write`
+  API-key scopes.
+- `packages/simulation/src/db.ts` — added a real (stateful, not stubbed)
+  `consentRecordRepository` mock backed by `dbState.consentRecords`, so
+  simulation tests can exercise actual STOP/JOIN → send-blocking behavior,
+  not just that a keyword was logged.
+- `packages/simulation/src/harness.ts` — added `enqueueInboundMessage()`,
+  mirroring the existing `enqueueProviderWebhook()`/`enqueuePaymentWebhook()`
+  pattern: it reaches the worker's `inbound_message` processor directly,
+  bypassing a **separate, pre-existing gap** discovered while testing this
+  (see below).
+- `packages/simulation/src/messaging-conversation.simulation.test.ts` — 3
+  new tests: STOP blocks a subsequent send (403) and is recorded with
+  `source: 'keyword'`; JOIN after STOP restores `opted_in` and sends
+  succeed again; opting out one recipient doesn't block another. Also
+  corrected the framing of two pre-existing "documented gap" tests whose
+  narrative this work made stale (see below) — their assertions were
+  already correct, only their comments/titles were wrong.
+- `packages/routing/package.json` — added `@company/database` as an
+  explicit dependency. `conversation.ts` and `keywords.ts` already
+  imported from it without declaring it (working only via npm workspace
+  hoisting); `index.ts` now imports it too, a good point to fix the
+  manifest.
+
+**Separate pre-existing gap found while writing these tests:** the
+gateway's real inbound-webhook path
+(`services/api-gateway/src/app.ts` `enqueueInboundMessage()`) uses a raw
+`ioredis` client with no fallback; without `REDIS_URL` configured (as in
+this environment) it silently no-ops, so **no inbound message — including
+STOP — ever reaches `handleKeyword()` via the actual webhook route today**.
+This was already independently documented by two pre-existing
+"documented gap" test blocks in this same file (the `it.each(KEYWORDS)`
+block and "the gateway accepts a correctly signed inbound webhook but
+never enqueues it") — not new. The new consent tests reach the worker's
+processor directly via `enqueueInboundMessage()` (the harness helper, not
+the gateway function of the same name) to test consent enforcement
+independent of that gap, the same way existing tests already do for
+`provider_webhook`/`payment_webhook`. Fixing the gateway's inbound
+enqueue path to use the same abstracted, testable queue the rest of the
+system uses (instead of a raw, Redis-required client) is a real,
+separate piece of follow-up work — not done here.
+
+**Database migrations:** `0008_add_consent_records.sql` (new table, no
+data migration)
+
+**API changes:** `GET /v1/api/consent/:recipient?channel=sms`,
+`POST /v1/api/consent`; `POST /v1/api/gateway/messaging` can now return
+403 in addition to its existing 400/401/403(tenant)/503
+
+**Security/compliance changes:** outbound messaging now actually respects
+STOP (previously logged only, never enforced) — closes the specific
+platform gap the master plan's Phase 39 exists to address.
+
+**Tests:** `npm test` 254 → 257 passed (3 net new — some iteration
+happened getting the seed-conversation provider deterministic, see git
+history), 0 failed. Ran the full suite and the messaging-conversation file
+alone 3x consecutively to confirm no flakiness. Lint/typecheck/build
+clean.
+
+**Known issues carried forward:** consent enforcement fails open on a
+lookup error (documented above); no admin-console UI for consent records
+yet (API only); `application.allowedCapabilities` remains unused (same
+note as the API-key scoping phase); the gateway's raw-ioredis inbound
+enqueue gap (documented above) means STOP sent via the real webhook route
+still doesn't work end-to-end in a `REDIS_URL`-less deployment — only
+the underlying keyword-handling and consent-enforcement logic this phase
+adds has been fixed and verified.
+
+## 2026-09-08 — HIGH: Drizzle Migration History Has Diverged From The Actual Schema
+
+**Severity:** High. Found while generating a migration for the new
+`consent_records` table (next entry below) — `drizzle-kit generate`
+unexpectedly prompted interactively asking whether `tenants.country_code`
+was a new column or a rename of `tenants.domain`/`tenants.settings`/
+`tenants.application_id`, which are columns that don't exist in the
+current `packages/database/src/schema/tenants.ts` at all.
+
+**What's actually wrong:**
+1. `packages/database/drizzle/meta/` only has snapshot files for
+   migrations 0000 and 0001 (`0000_snapshot.json`, `0001_snapshot.json`),
+   but `_journal.json` and the SQL files on disk go up to migration 0007.
+   Migrations 0002–0007 were added without regenerating their snapshots —
+   `drizzle-kit generate`'s diffing (which snapshots exist to support) has
+   been comparing against 0001's state ever since, not the schema as it
+   actually stood after each later migration.
+2. Two tables that exist in the TypeScript schema and are actively used by
+   real code have **no migration at all**: `tenant_application_links`
+   (`packages/database/src/schema/tenant-application-links.ts` — this is
+   the table backing `TenantRegistry.assertTenantAccess`, the platform's
+   core tenant-isolation check) and `conversations`
+   (`packages/database/src/schema/conversations.ts` — backs all
+   conversation continuity and inbound message routing). A fresh database
+   built by running `npm run drizzle:migrate` from migration 0000 forward
+   would never create either table.
+3. `0000_drizzle_init.sql`'s `tenants` table (`application_id`, `domain`,
+   `settings` columns, one tenant belongs to one application) is a
+   fundamentally different, older design than the current
+   `tenants.ts` schema (`country_code`, `currency`, `status`, `metadata`,
+   no `application_id` — tenants now relate to applications many-to-many
+   via `tenant_application_links`). That redesign was never captured in a
+   migration either.
+
+**Why this wasn't fixed in this pass:** reconstructing the exact
+`ALTER TABLE`/`CREATE TABLE` sequence that would take a database built
+from the current migration files to the schema real code actually expects
+is a real, standalone task — done wrong it risks producing a migration
+that looks plausible but corrupts or loses data on a database that already
+has the old `tenants` shape applied. That needs to be verified against a
+real (or realistic staging) Postgres instance, which this environment
+doesn't have (`DATABASE_URL` isn't configured here). Attempting it blind
+would be exactly the kind of "looks done, isn't" work the master plan
+warns against — documenting it precisely, rather than guessing, is the
+correct move per that plan's explicit instruction to flag what can't be
+verified rather than claim unearned confidence.
+
+**What was verified safe:** `npx drizzle-kit check` (the command
+`migration-check` in CI runs) still passes — it validates journal/file
+self-consistency, not schema-vs-snapshot drift, so this finding doesn't
+newly break that gate; it was already silently not catching this.
+
+**Recommended next steps for whoever picks this up:** (1) stand up a
+throwaway Postgres instance, `drizzle:push` the *current* schema to it to
+see the target shape, (2) `drizzle:push` migrations 0000-0007 to a second
+instance to see what's actually reachable via versioned migrations today,
+(3) diff the two and hand-write the missing/corrective migrations,
+verifying against real data-preservation semantics for the `tenants`
+redesign specifically. Do not attempt this by re-running
+`drizzle-kit generate` interactively without first fixing the missing
+snapshots, or its rename-vs-new-column guesses can't be trusted.
+
+**Files changed:** none (investigation only, documented here and in
+`docs/IMPLEMENTATION_BASELINE.md`)
+
 ## 2026-09-08 — CRITICAL: `&&`-Chained Drizzle Conditions Silently Dropped Filters Across 10 Repository Files
 
 **Severity:** Critical. Found while adding the consent-records repository

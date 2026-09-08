@@ -48,6 +48,19 @@ export interface ConversationRow {
   updatedAt: Date;
 }
 
+export interface ConsentRow {
+  id: string;
+  appId: string;
+  tenantId: string;
+  recipient: string;
+  channel: string;
+  status: 'opted_in' | 'opted_out' | 'unknown';
+  source: 'keyword' | 'api' | 'import';
+  keyword: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface DbState {
   failEventWrites: boolean;
   failAuditWrites: boolean;
@@ -78,6 +91,7 @@ export interface DbState {
   }>;
   tenantLinks: Array<{ tenantId: string; applicationId: string; status: string }>;
   conversations: ConversationRow[];
+  consentRecords: ConsentRow[];
 }
 
 export const dbState: DbState = {
@@ -90,6 +104,7 @@ export const dbState: DbState = {
   tenants: [],
   tenantLinks: [],
   conversations: [],
+  consentRecords: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -134,6 +149,7 @@ export function clearDb(): void {
   dbState.tenants = [];
   dbState.tenantLinks = [];
   dbState.conversations = [];
+  dbState.consentRecords = [];
 }
 
 export function seedReachChurch(): void {
@@ -593,6 +609,62 @@ export function installDatabaseMock(): Record<string, unknown> {
       },
       async count() {
         return 0;
+      },
+    },
+    // Real (not stubbed) in-memory mock — backs consent enforcement in the
+    // routing layer, so simulation tests can actually exercise STOP
+    // blocking a subsequent send, not just that the keyword was logged.
+    consentRecordRepository: {
+      async findByRecipient(appId: string, tenantId: string, recipient: string, channel: string) {
+        return dbState.consentRecords.find(
+          (c) => c.appId === appId && c.tenantId === tenantId && c.recipient === recipient && c.channel === channel,
+        );
+      },
+      async upsert(data: {
+        appId: string;
+        tenantId: string;
+        recipient: string;
+        channel: string;
+        status: 'opted_in' | 'opted_out' | 'unknown';
+        source: 'keyword' | 'api' | 'import';
+        keyword?: string | null;
+      }) {
+        const existing = dbState.consentRecords.find(
+          (c) => c.appId === data.appId && c.tenantId === data.tenantId && c.recipient === data.recipient && c.channel === data.channel,
+        );
+        if (existing) {
+          existing.status = data.status;
+          existing.source = data.source;
+          existing.keyword = data.keyword ?? null;
+          existing.updatedAt = new Date();
+          return existing;
+        }
+        const row: ConsentRow = {
+          id: `consent_${randomUUID().slice(0, 12)}`,
+          appId: data.appId,
+          tenantId: data.tenantId,
+          recipient: data.recipient,
+          channel: data.channel,
+          status: data.status,
+          source: data.source,
+          keyword: data.keyword ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.consentRecords.push(row);
+        return row;
+      },
+      async isOptedOut(appId: string, tenantId: string, recipient: string, channel: string) {
+        const record = dbState.consentRecords.find(
+          (c) => c.appId === appId && c.tenantId === tenantId && c.recipient === recipient && c.channel === channel,
+        );
+        return record?.status === 'opted_out';
+      },
+      async findByApplicationId(appId: string, limit = 100) {
+        return dbState.consentRecords.filter((c) => c.appId === appId).slice(0, limit);
+      },
+      async count() {
+        return dbState.consentRecords.length;
       },
     },
     // P0: Mock runInTransaction — just runs the function directly in simulation

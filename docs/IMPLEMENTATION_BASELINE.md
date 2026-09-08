@@ -240,9 +240,14 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 8. **No startup configuration validation** — misconfiguration (e.g. a
    provider enabled in production with no API key configured) surfaces at
    request time via each adapter's `verifyAvailability()`, not at boot.
-9. **No A2P/10DLC compliance model** — no brand/campaign/consent-status
-   schema; STOP/START/JOIN exist at the keyword-handler level but there's no
-   `MessagingProfile`-style registration record.
+9. ~~STOP is logged but never enforced on outbound sends~~ — **closed
+   2026-09-08.** `consent_records` table + `RoutingEngine.routeMessage`
+   now blocks outbound sends to an opted-out recipient (403
+   `ConsentBlockedError`), and JOIN restores it. Still missing: the
+   broader A2P/10DLC compliance model — no brand/campaign/10DLC
+   registration-status schema, no `MessagingProfile` record tying a
+   sender/country to a compliance status. See
+   `docs/IMPLEMENTATION_CHANGELOG.md` ("Phase 39: Consent Management").
 10. **No payment reconciliation/settlement model** beyond a `reconciliation`
     job stub — no connected-account onboarding flow for merchant-owned
     payment accounts.
@@ -252,6 +257,30 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     requires an express major-version bump, out of scope for this pass.
     Everything else flagged by `npm audit` (vite, vitest, esbuild,
     drizzle-kit) is dev/build tooling, not shipped to production.
+12. **Drizzle migration history has diverged from the actual schema** —
+    `tenant_application_links` and `conversations` have no migration at
+    all; the migrated `tenants` shape (`0000_drizzle_init.sql`) is an
+    older, abandoned design (`application_id`/`domain`/`settings`) than
+    the current schema (`country_code`/`currency`/`status`/`metadata`,
+    many-to-many via `tenant_application_links`); migration snapshots
+    (`drizzle/meta/*.json`) only exist through migration 0001 even though
+    the journal and SQL files go to 0007+. A database built from scratch
+    via `npm run drizzle:migrate` would be missing two actively-used
+    tables and have the wrong shape for a third. Found while adding a
+    migration for `consent_records` — not fixed here, needs verification
+    against a real database this environment doesn't have. Full detail in
+    `docs/IMPLEMENTATION_CHANGELOG.md` ("HIGH: Drizzle Migration History...").
+13. **Gateway inbound-webhook enqueue silently no-ops without `REDIS_URL`**
+    — `services/api-gateway/src/app.ts`'s `enqueueInboundMessage()` (and
+    its `enqueuePaymentWebhook`/`enqueueProviderWebhook` siblings) use a
+    raw `ioredis` client with no fallback. Without Redis configured, no
+    inbound message — including STOP — ever reaches the worker via the
+    real webhook route. Already independently documented by two
+    pre-existing "documented gap" tests in
+    `packages/simulation/src/messaging-conversation.simulation.test.ts`;
+    surfaced again while adding consent-enforcement tests, which had to
+    bypass it (enqueue directly onto the worker queue) to test keyword
+    handling at all.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 
@@ -273,8 +302,19 @@ safety):
 2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
 3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
 4. ~~`/ready` queue/worker-store health check~~ — done, see §4 item 3.
-5. A2P/10DLC `MessagingProfile` model.
-6. Payment reconciliation / connected-account model.
+5. ~~STOP consent enforcement on outbound sends~~ — done, see §4 item 9.
+   Remaining: the broader A2P/10DLC `MessagingProfile` model
+   (brand/campaign/10DLC registration status).
+6. **Drizzle migration history divergence** (§4 item 12) — newly found,
+   high severity, needs a real database to fix safely. Recommend
+   prioritizing this above new feature work: it means a from-scratch
+   deployment is currently broken for two actively-used tables.
+7. Gateway inbound-webhook enqueue path (§4 item 13) — replace the raw
+   ioredis calls in `services/api-gateway/src/app.ts` with the same
+   abstracted job queue the rest of the system uses, so STOP/inbound
+   messages work end-to-end without depending on a specific enqueue
+   mechanism having Redis reachable at that exact call site.
+8. Payment reconciliation / connected-account model.
 
 ## 7. Relationship to Prior Reports
 

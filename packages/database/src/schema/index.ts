@@ -17,3 +17,4 @@ export { outboxEvents, type OutboxEvent, type NewOutboxEvent } from './outbox-ev
 export { transactions, type Transaction, type NewTransaction } from './transactions';
 export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
+export { consentRecords, type ConsentRecord, type NewConsentRecord } from './consent-records';

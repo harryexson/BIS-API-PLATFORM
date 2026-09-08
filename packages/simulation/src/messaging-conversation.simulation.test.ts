@@ -22,6 +22,7 @@ import {
   buildInboundSms,
   signWebhook,
   enqueueProviderWebhook,
+  enqueueInboundMessage,
   enqueueReceipt,
   drain,
   waitFor,
@@ -351,7 +352,7 @@ describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS 
     { keyword: 'YES', compliant: 'acknowledge/confirm the intent and auto-reply with a confirmation' },
     { keyword: 'NO', compliant: 'acknowledge the cancellation and halt the confirmation flow' },
     { keyword: 'HELP', compliant: 'reply with the help text including the STOP opt-out' },
-    { keyword: 'STOP', compliant: 'opt the number out, close the conversation, and stop all further messaging' },
+    { keyword: 'STOP', compliant: 'record opt-out consent and block all further outbound messaging to this recipient' },
     { keyword: 'PRAY', compliant: 'log a prayer request and reply with a confirmation + guidance' },
     { keyword: 'CHECK IN', compliant: 'respond with the member’s check-in status' },
     { keyword: 'WHERE IS MY DRIVER?', compliant: 'resolve the trip and reply with the driver/location update' },
@@ -378,7 +379,7 @@ describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS 
     },
   );
 
-  it('inbound STOP leaves the conversation active instead of closing it (documented gap)', async () => {
+  it('inbound STOP via the real webhook route is never processed — the gateway does not enqueue it (documented gap, separate from consent enforcement)', async () => {
     await sendMessage(runtime, { recipient: DONOR_PHONE, content: 'Keeping you in the loop.' });
 
     const before = findConversation(APP_SLUG, DONOR_PHONE);
@@ -388,12 +389,113 @@ describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS 
     expect(delivery.status).toBe(200);
     await sleep(150);
 
+    // The conversation stays active regardless — that's correct behavior by
+    // design (see "Consent enforcement" below), not the gap. The actual gap:
+    // this webhook never reaches handleKeyword() at all in this environment
+    // (services/api-gateway/src/app.ts's enqueueInboundMessage() uses a raw
+    // ioredis client with no REDIS_URL configured here, so it silently
+    // no-ops — same root cause as the "documented gap" tests above). No
+    // consent record gets created via this path, unlike the direct-queue
+    // path the "Consent enforcement" tests below use to bypass it.
     const after = findConversation(APP_SLUG, DONOR_PHONE);
-    // A compliant platform closes the conversation (opt-out). The platform never
-    // calls ConversationManager.close() → the number stays opted in.
     expect(after?.status).toBe('active');
     expect(after?.providerId).toBe(before?.providerId);
     expect(after?.channel).toBe(before?.channel);
-    console.warn('[gap] inbound STOP does not invoke ConversationManager.close(); the number remains opted-in and routable');
+    expect(dbState.consentRecords.find((c) => c.recipient === DONOR_PHONE)).toBeUndefined();
+    console.warn('[gap] gateway does not enqueue inbound webhooks without REDIS_URL — STOP sent via the real webhook route never reaches handleKeyword()');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Consent enforcement (STOP blocks sends; JOIN restores them)
+// ---------------------------------------------------------------------------
+// The two "documented gap" describe blocks above show inbound webhooks never
+// reach the worker in this environment (the gateway's inbound enqueue uses a
+// raw ioredis client with no REDIS_URL configured here — a separate,
+// pre-existing gap). enqueueInboundMessage() reaches the worker's
+// inbound_message processor directly, the same way enqueueProviderWebhook
+// already bypasses the same gap for provider_webhook jobs, so keyword
+// handling and the consent enforcement it feeds can be tested end-to-end.
+describe('Consent enforcement: STOP blocks outbound sends, JOIN restores them', () => {
+  it('STOP records opt-out and a subsequent send to that recipient is blocked with 403', async () => {
+    const phone = '+15556667777';
+
+    const first = await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    expect(first.status).toBe(200);
+    expect(SMS_CAPABLE).toContain(first.body.providerId);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: phone, text: 'STOP' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    const consent = dbState.consentRecords.find(
+      (c) => c.appId === APP_SLUG && c.recipient === phone && c.channel === 'sms',
+    );
+    expect(consent?.status).toBe('opted_out');
+    expect(consent?.source).toBe('keyword');
+
+    const blocked = await sendMessage(runtime, { recipient: phone, content: 'Are you still there?' });
+    expect(blocked.status).toBe(403);
+    expect(String(blocked.body.error)).toMatch(/opted out/i);
+  });
+
+  it('JOIN after STOP restores consent and outbound sends succeed again', async () => {
+    const phone = '+15558889999';
+
+    // Inbound routing matches sender -> active conversation -> owning app,
+    // so a conversation must exist before an inbound STOP can be attributed
+    // to this app (see the "documented gap" tests above for why the real
+    // gateway webhook path can't establish this in this environment either).
+    const seed = await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    expect(seed.status).toBe(200);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: phone, text: 'STOP' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    const blocked = await sendMessage(runtime, { recipient: phone, content: 'Still blocked?' });
+    expect(blocked.status).toBe(403);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: phone, text: 'JOIN' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    const consent = dbState.consentRecords.find(
+      (c) => c.appId === APP_SLUG && c.recipient === phone && c.channel === 'sms',
+    );
+    expect(consent?.status).toBe('opted_in');
+
+    const allowed = await sendMessage(runtime, { recipient: phone, content: 'Welcome back!' });
+    expect(allowed.status).toBe(200);
+    expect(SMS_CAPABLE).toContain(allowed.body.providerId);
+  });
+
+  it('opting out on SMS does not block a different recipient', async () => {
+    const optedOutPhone = '+15551112222';
+    const otherPhone = '+15559990000';
+
+    const seed = await sendMessage(runtime, { recipient: optedOutPhone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    expect(seed.status).toBe(200);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: optedOutPhone, text: 'STOP' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    // Confirm the opt-out actually took effect for this recipient, so the
+    // "other recipient still allowed" assertion below is meaningful rather
+    // than trivially true.
+    const stillBlocked = await sendMessage(runtime, { recipient: optedOutPhone, content: 'Blocked?' });
+    expect(stillBlocked.status).toBe(403);
+
+    const stillAllowed = await sendMessage(runtime, { recipient: otherPhone, content: 'Hello' });
+    expect(stillAllowed.status).toBe(200);
   });
 });
