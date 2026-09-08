@@ -1,3 +1,9 @@
+import { assertStartupConfig } from '@company/shared';
+
+// P26: Fail fast on invalid configuration rather than degrading silently —
+// see packages/shared/src/startup-config.ts for exactly what's checked and why.
+assertStartupConfig();
+
 import app from './app';
 
 const PORT = process.env.PORT || 3001;

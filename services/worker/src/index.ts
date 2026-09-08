@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine } from '@company/routing';
 import { EventBus } from '@company/events';
+import { assertStartupConfig } from '@company/shared';
 import {
   createStore,
   createKeys,
@@ -13,6 +14,10 @@ import {
 } from '@company/workers';
 
 async function main(): Promise<void> {
+  // P26: Fail fast on invalid configuration rather than degrading silently
+  // — see packages/shared/src/startup-config.ts for what's checked and why.
+  assertStartupConfig();
+
   const config = createWorkerConfig();
   const store = await createStore(config.redisUrl);
   const keys = createKeys(config.queuePrefix);

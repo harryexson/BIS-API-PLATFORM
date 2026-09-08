@@ -237,9 +237,19 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    including manual overrides and conversation continuity) plus
    `findByCategoryAndCapabilities`. Manually setting a provider back online
    resets its circuit.
-8. **No startup configuration validation** — misconfiguration (e.g. a
-   provider enabled in production with no API key configured) surfaces at
-   request time via each adapter's `verifyAvailability()`, not at boot.
+8. ~~No startup configuration validation~~ — **closed 2026-09-08** for the
+   configuration that actually has teeth today (`DATABASE_URL` always;
+   `WEBHOOK_HMAC_SECRET`/`SECRET_ENCRYPTION_KEY`/`PLATFORM_ADMIN_KEY` in
+   production). Both `services/api-gateway` and `services/worker` now
+   call `assertStartupConfig()` (`packages/shared/src/startup-config.ts`)
+   before doing anything else and `process.exit(1)` with a clear,
+   itemized message if invalid — verified by actually running the
+   gateway entrypoint with production config missing (exit code 1, no
+   attempt to bind the port). Provider-level API-key validation (e.g.
+   "SignalHouse enabled in production requires SIGNALHOUSE_API_KEY") is
+   **not** included: every current adapter is simulated and never reads
+   its API key at all, so validating a key nothing checks would be
+   hollow — this becomes meaningful once real adapters land (§4 item 1).
 9. ~~STOP is logged but never enforced on outbound sends~~ — **closed
    2026-09-08.** `consent_records` table + `RoutingEngine.routeMessage`
    now blocks outbound sends to an opted-out recipient (403
@@ -305,7 +315,18 @@ safety):
 1. Real messaging adapters (SignalHouse, Infobip; then Africa's Talking,
    Trembi) — needs live credentials to fully certify, but the HTTP
    integration + error normalization + contract tests can be built now
-   against each provider's public API documentation.
+   against each provider's public API documentation. **Attempted
+   2026-09-08, blocked**: this session's outbound network access is
+   restricted to a small allowlist (npm/pypi registries, the Anthropic
+   API) — fetching `infobip.com` and, as a control,
+   `developers.google.com` both failed with `EGRESS_BLOCKED`, confirming
+   this is a blanket session-level restriction, not a per-provider or
+   transient issue. Writing "real" adapters from training-data memory of
+   these APIs instead of verified current documentation would risk
+   exactly the fabricated-contract problem the master plan explicitly
+   prohibits, so this was not attempted. Needs either network access
+   restored for this session, or the docs/OpenAPI specs provided
+   directly (as files or pasted text) to proceed correctly.
 2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
 3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
 4. ~~`/ready` queue/worker-store health check~~ — done, see §4 item 3.

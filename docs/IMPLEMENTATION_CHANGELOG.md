@@ -6,6 +6,91 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Attempted: Real Provider Adapters — Blocked by Network Policy
+
+Before starting other work this session, attempted to fetch Infobip's SMS
+API documentation (`infobip.com`) to begin replacing the simulated
+adapter with a real HTTP integration per master plan Phase 6. It failed
+with `EGRESS_BLOCKED`. As a control, fetched an unrelated, well-known
+documentation domain (`developers.google.com`) — same failure — confirming
+this session's outbound network access is restricted to a small
+allowlist (package registries, the Anthropic API) rather than
+Infobip specifically being unreachable.
+
+Writing "real" adapters from training-data memory of these APIs instead
+of verified current documentation would risk exactly the
+fabricated-request/response-contract problem the master plan explicitly
+prohibits ("Do not guess API payloads," "Official developer documentation
+must be treated as the source of truth"), so this was not attempted.
+Pivoted to other work this session that doesn't depend on external
+network access. Real provider adapters remain the single largest gap
+against the master plan's stated non-negotiables — see
+`docs/IMPLEMENTATION_BASELINE.md` §6 item 1 for what's needed to unblock
+it (network access for this session, or the docs/OpenAPI specs supplied
+directly).
+
+**Files changed:** none
+
+## 2026-09-08 — Phase 26: Startup Configuration Validation
+
+**Phase:** 26 of the master plan.
+
+**What it does:** both `services/api-gateway` and `services/worker` now
+validate required configuration before doing anything else and
+`process.exit(1)` with an itemized error list if it's invalid, instead of
+starting up and letting the problem surface request-by-request later.
+Verified end-to-end, not just via unit test: actually ran the gateway
+entrypoint (`ts-node --transpile-only src/index.ts`) with
+`NODE_ENV=production` and no other config set — exited 1, printed all
+four missing-var errors, never attempted to bind the port.
+
+**What's validated:**
+- `DATABASE_URL` — always required (every repository call fails without
+  it, in every environment, not just production).
+- In production only: `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY`,
+  `PLATFORM_ADMIN_KEY` — each of these already fails closed at request
+  time when missing (webhooks rejected, secret encryption broken, admin
+  routes all reject); this phase doesn't change that runtime behavior, it
+  just catches the same problem at boot instead of via a stream of
+  request failures.
+- Deliberately **not** validated: `REDIS_URL`. Both the rate limiter
+  (`services/api-gateway/src/auth.ts`) and the job store
+  (`packages/workers/src/client.ts`) already have a working in-memory
+  fallback when it's unset — a legitimate (if reduced-durability)
+  deployment choice, not a misconfiguration.
+- Deliberately **not** validated: any provider API key (e.g.
+  `SIGNALHOUSE_API_KEY`). Every current provider adapter is simulated and
+  never reads its own API key — validating a key nothing checks would be
+  hollow, matching the master plan's own instruction not to make things
+  "appear production-ready" without substance. This becomes real once
+  real adapters land (currently blocked, see the entry above).
+
+**Files changed:**
+- `packages/shared/src/startup-config.ts` (new) — `validateStartupConfig()`
+  (pure, testable) and `assertStartupConfig()` (validates + exits)
+- `packages/shared/src/startup-config.test.ts` (new) — 8 unit tests
+- `packages/shared/src/index.ts` — exports the above
+- `services/api-gateway/src/index.ts` — calls `assertStartupConfig()`
+  before importing `./app` (so an invalid config never even constructs
+  the Express app). Deliberately **not** added to `app.ts` itself — the
+  simulation test harness imports `app.ts` directly and constructs its
+  own environment; forcing it through this check would break every
+  simulation test that doesn't happen to set all of these vars.
+- `services/worker/src/index.ts` — calls it as the first line of `main()`
+- `services/worker/package.json` — added `@company/shared` (already used
+  by `services/api-gateway`, newly needed here)
+
+**Database migrations:** none
+
+**API changes:** none (process-startup behavior only)
+
+**Security changes:** none beyond making existing fail-closed behavior
+visible earlier
+
+**Tests:** `npm test` 269 → 277 passed (8 new), 0 failed. Lint/typecheck/
+build clean. Also manually verified the real process exit behavior
+(described above), not just the extracted function.
+
 ## 2026-09-08 — Phase 40/41: A2P/10DLC Messaging Profiles (Registration CRUD)
 
 **Phase:** 40/41 (A2P/10DLC compliance model) of the master plan.
