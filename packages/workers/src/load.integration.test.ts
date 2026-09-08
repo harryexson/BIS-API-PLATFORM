@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { runLoadSuite } from './loadHarness';
 
+const hasDb = !!process.env.DATABASE_URL;
+
 function printReport(result: Awaited<ReturnType<typeof runLoadSuite>>) {
   console.log('\n=== LOAD TEST RESULTS (backend: ' + result.backend + ') ===');
   console.log(
@@ -37,7 +39,7 @@ function printReport(result: Awaited<ReturnType<typeof runLoadSuite>>) {
   console.log('=== END ===\n');
 }
 
-describe('load testing', () => {
+describe.skipIf(!hasDb)('load testing', () => {
   it('measures throughput and latency under increasing load', async () => {
     const result = await runLoadSuite();
     printReport(result);

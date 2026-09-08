@@ -47,16 +47,16 @@ describe('EventBus', () => {
     expect(received).toHaveLength(0);
   });
 
-  it('keeps history bounded to the latest 100 events (newest first)', () => {
+  it('keeps history bounded to the latest 1000 events (newest first)', () => {
     const bus = EventBus.getInstance();
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 1020; i++) {
       bus.emit(makeEvent({ providerId: `p${i}` }));
     }
 
     const history = bus.getHistory();
-    expect(history).toHaveLength(100);
-    expect(history[0].providerId).toBe('p119');
-    expect(history[99].providerId).toBe('p20');
+    expect(history).toHaveLength(1000);
+    expect(history[0].providerId).toBe('p1019');
+    expect(history[999].providerId).toBe('p20');
   });
 
   it('a throwing listener does not prevent delivery to other listeners', () => {

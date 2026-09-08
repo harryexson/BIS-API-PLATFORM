@@ -90,16 +90,21 @@ function newRows<T extends { createdAt: Date }>(all: T[], baseline: T[]) {
   return all.filter((row) => !known.has(row));
 }
 
+// history is newest-first (EventBus.unshift); a "mark" is the history length
+// at capture time, so events added since are the leading `length - token`
+// entries. Millisecond timestamps are unreliable here — events created in
+// the same tick as the mark can otherwise be misclassified as "after" it.
 function busEventsAfter(token: number, category?: string, providerId?: string) {
   const history = runtime.bus.getHistory();
+  const newCount = Math.max(0, history.length - token);
   return history
-    .filter((e: any) => new Date(e.timestamp).getTime() >= token)
+    .slice(0, newCount)
     .filter((e: any) => (category ? e.category === category : true))
     .filter((e: any) => (providerId ? e.providerId === providerId : true));
 }
 
 function mark(): number {
-  return Date.now() - 1;
+  return runtime.bus.getHistory().length;
 }
 
 // ---------------------------------------------------------------------------
