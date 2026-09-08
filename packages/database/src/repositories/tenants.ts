@@ -1,4 +1,4 @@
-import { eq, desc, count } from 'drizzle-orm';
+import { eq, and, desc, count } from 'drizzle-orm';
 import { getDb } from '../connection';
 import {
   tenants,
@@ -52,8 +52,10 @@ export const tenantRepository = {
         eq(tenants.id, tenantApplicationLinks.tenantId),
       )
       .where(
-        eq(tenantApplicationLinks.applicationId, applicationId) &&
+        and(
+          eq(tenantApplicationLinks.applicationId, applicationId),
           eq(tenantApplicationLinks.status, 'active'),
+        ),
       )
       .orderBy(desc(tenants.createdAt));
     return rows.map((r) => r.tenant);

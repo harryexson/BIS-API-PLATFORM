@@ -11,6 +11,21 @@ not facts — every claim below was re-verified against the running code.
 This document is Phase 0 of the master implementation plan: a factual
 snapshot of what exists today, before any further phase begins.
 
+> **2026-09-08 addendum — critical finding, since fixed:** ten repository
+> files in `packages/database/src/repositories/` combined multi-field
+> Drizzle query filters with the JS `&&` operator instead of `and()`,
+> which silently drops every condition but the last. This affected the
+> actual gateway-level tenant authorization check
+> (`TenantRegistry.assertTenantAccess` → `tenant-application-links.ts`
+> `isLinked`), among others. See
+> `docs/IMPLEMENTATION_CHANGELOG.md` ("CRITICAL: `&&`-Chained Drizzle
+> Conditions...") for the full list, the fix, and the regression guard
+> added (`packages/database/src/where-clause-and.test.ts`). Flagging here
+> because it directly contradicts this document's earlier characterization
+> (§2) of tenant isolation as enforced — the *code path* was correctly
+> wired, but the *query* it called down to wasn't actually filtering on
+> the fields it appeared to.
+
 ---
 
 ## 1. Repository Shape

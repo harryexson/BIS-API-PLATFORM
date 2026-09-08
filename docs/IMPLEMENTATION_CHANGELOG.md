@@ -6,6 +6,118 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — CRITICAL: `&&`-Chained Drizzle Conditions Silently Dropped Filters Across 10 Repository Files
+
+**Severity:** Critical. Found while adding the consent-records repository
+(next entry below) and reading `conversations.ts` as a style reference.
+
+**The defect:** Ten repository files combined multiple Drizzle `eq()`/`gt()`
+conditions with the JavaScript `&&` operator instead of Drizzle's `and()`
+combinator:
+
+```ts
+.where(
+  eq(conversations.phoneNumber, phoneNumber) &&
+    eq(conversations.appId, appId) &&
+    eq(conversations.tenantId, tenantId),
+)
+```
+
+`eq()` returns a truthy `SQL` object. `a && b && c` evaluates left to
+right and returns its *last* truthy operand — so `.where()` received only
+`eq(conversations.tenantId, tenantId)`; the phoneNumber and appId
+conditions were computed (for their side effects, building unused SQL AST
+nodes) and then silently discarded. This is invisible to TypeScript
+(every intermediate value is a structurally valid `SQL` type) and
+invisible to most hand-written tests, because it only produces a wrong
+result when the *dropped* condition would have excluded a row that the
+*kept* condition still matches — exactly the scenario cross-tenant
+isolation tests are supposed to exercise, and in several cases apparently
+didn't (see "Confirmed impact" below).
+
+**Confirmed impact by file:**
+- `tenant-application-links.ts` `findByTenantAndApplication` (used by
+  `isLinked`, which backs `TenantRegistry.assertTenantAccess` — **the
+  actual gateway-level tenant authorization check**) filtered only by
+  `applicationId`. **Any tenant ID would pass authorization as long as
+  *some* tenant was linked to the requested application** — a real
+  cross-tenant authorization bypass in the platform's core isolation
+  primitive. Also affected `unlink`.
+- `users.ts` `findByApplicationAndEmail` filtered only by `email`,
+  ignoring `applicationId` — a login lookup that could authenticate a
+  user against the wrong application's account on an email collision.
+- `transactions.ts` `findByAppAndIdempotencyKey` filtered only by
+  `idempotencyKey`, ignoring `appId`/`tenantId` — idempotency keys could
+  collide across unrelated tenants' payments.
+- `idempotency-records.ts` `findActive` filtered only by the `gt(expiresAt,
+  now)` clause, ignoring `appId`/`tenantId`/`operation`/`idempotencyKey`
+  entirely — the general-purpose idempotency guard used across the
+  worker pipeline was effectively checking "does *any* active
+  idempotency record exist," not "does *this* one."
+- `suppliers.ts` `findByApplicationAndSlug` filtered only by `slug`,
+  ignoring `applicationId`/`tenantId` — cross-tenant supplier lookup.
+- `conversations.ts` `findByPhoneAndApp` filtered only by `tenantId`;
+  `findActiveByPhone` filtered only by `status`; `close` filtered only
+  by `tenantId` — meaning `close()` (invoked by the STOP keyword
+  handler) could close *every* conversation for a tenant, not just the
+  one for the requesting phone/app.
+- `tenants.ts` `findActiveByApplicationId` filtered only by `status`,
+  ignoring `applicationId` — would return active tenants belonging to
+  *other* applications.
+- `application-permissions.ts` `findByApplicationAndResource`,
+  `findByApplicationResourceAction`, and `deleteByApplicationResource`
+  each dropped all but their last condition — the resource/action lookup
+  underlying permission checks could match the wrong application.
+- `provider-configs.ts` `findByProviderAndEnvironment` filtered only by
+  `environment`.
+
+**Fix:** every occurrence rewritten to use `and(cond1, cond2, ...)`. Several
+files (`conversations.ts`, `idempotency-records.ts`,
+`tenant-application-links.ts`, `users.ts`) already had `and` imported and
+unused right next to the bug — a strong signal the intent was always to
+use it.
+
+**Regression guard:** `packages/database/src/where-clause-and.test.ts`
+(new) statically scans every file in `repositories/` for the
+condition-immediately-followed-by-`&&` pattern and fails if it reappears.
+Verified against both the original buggy source (matches) and the fixed
+source (doesn't match) before relying on it. This doesn't require a live
+database, so it runs in every `npm test` invocation, not just the gated
+DB integration suite.
+
+**Files changed:** `packages/database/src/repositories/{conversations,
+idempotency-records,application-permissions,provider-configs,suppliers,
+tenant-application-links,tenants,transactions,users}.ts`,
+`packages/database/src/where-clause-and.test.ts` (new)
+
+**Database migrations:** none (query-logic fix only)
+
+**Tests:** `npm test` 235 → 253 passed (18 new, all from the regression
+guard), 0 failed. **Could not be verified end-to-end against a live
+Postgres database in this environment** (no `DATABASE_URL` configured) —
+`conversations.integration.test.ts` remains the only test that exercises
+these repositories against a real database, and it's gated by
+`describe.skipIf(!hasDb)`. The fix itself is a well-established, correct
+Drizzle pattern (`and()` is Drizzle's own documented condition combinator)
+and was applied identically to every occurrence, but running
+`npm run test:integration` against a real database (as CI's
+`integration-test` job does with `TEST_DATABASE_URL`) is the outstanding
+verification step — flagging this explicitly rather than claiming a
+confidence level this session couldn't actually establish.
+
+**This is exactly the class of defect Phase 0's baseline audit is meant to
+surface** — it was not caught by the extensive prior "P0 audit
+remediation" commits despite several of them specifically claiming to fix
+cross-tenant isolation in `transactions.ts`, `events.ts`, and
+`conversations.ts`. Those fixes were real (the tenant-scoping *arguments*
+were added), but the `&&` bug silently undid them at the query level. Worth
+noting for how future audits verify a fix: a positive-path test with only
+one matching row cannot distinguish a correct multi-condition filter from
+one that silently dropped every condition but the last — the isolation
+tests that would have caught this need *at least two rows differing only
+in the dropped field*, not just "does the happy path still find the
+right row."
+
 ## 2026-09-08 — Phase 11: `/ready` Queue Health Check + Two Flaky-Test Fixes
 
 **Phase:** 11 (observability) — closes the last item from
