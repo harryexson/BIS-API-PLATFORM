@@ -14,6 +14,7 @@ import {
   transactionRepository,
   checkDatabaseHealth,
   consentRecordRepository,
+  messagingProfileRepository,
 } from '@company/database';
 import {
   logger,
@@ -616,6 +617,64 @@ app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, as
     source: record.source,
     updatedAt: record.updatedAt,
   });
+});
+
+// Master plan Phase 40/41 (A2P/10DLC compliance model). An application
+// registers the senders it uses per country/provider; complianceStatus
+// tracks real-world registration state (e.g. US 10DLC campaign approval).
+// Scope of this pass: the registration record and its CRUD surface — NOT
+// enforcement (outbound sends are not blocked on complianceStatus here)
+// and NOT integration with a real carrier/registrar API. See
+// docs/IMPLEMENTATION_BASELINE.md for what's intentionally not done yet.
+app.get('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:read'), resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  const profiles = await messagingProfileRepository.findByApplicationId(appId);
+  return res.json({ profiles, count: profiles.length });
+});
+
+app.post('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:write'), resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { country, senderType, sender, provider, campaignId, brandId } = req.body;
+
+  if (!appId || !country || !senderType || !sender || !provider) {
+    return res.status(400).json({ error: 'Missing required parameters: country, senderType, sender, and provider are required' });
+  }
+
+  try {
+    const profile = await messagingProfileRepository.create({
+      appId,
+      tenantId,
+      country,
+      senderType,
+      sender,
+      provider,
+      campaignId,
+      brandId,
+    });
+    return res.json(profile);
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to create messaging profile' });
+  }
+});
+
+app.patch('/api/dashboard/messaging-profiles/:id', requireAdmin, async (req: Request, res: Response) => {
+  const { complianceStatus } = req.body;
+  if (!complianceStatus) {
+    return res.status(400).json({ error: 'complianceStatus is required' });
+  }
+  try {
+    const updated = await messagingProfileRepository.updateComplianceStatus(req.params.id, complianceStatus);
+    if (!updated) {
+      return res.status(404).json({ error: 'Messaging profile not found' });
+    }
+    return res.json(updated);
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to update messaging profile' });
+  }
 });
 
 // P1: Payment idempotency cache — prevents duplicate charges on retry.

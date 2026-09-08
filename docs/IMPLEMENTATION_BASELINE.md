@@ -243,11 +243,18 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 9. ~~STOP is logged but never enforced on outbound sends~~ — **closed
    2026-09-08.** `consent_records` table + `RoutingEngine.routeMessage`
    now blocks outbound sends to an opted-out recipient (403
-   `ConsentBlockedError`), and JOIN restores it. Still missing: the
-   broader A2P/10DLC compliance model — no brand/campaign/10DLC
-   registration-status schema, no `MessagingProfile` record tying a
-   sender/country to a compliance status. See
+   `ConsentBlockedError`), and JOIN restores it. See
    `docs/IMPLEMENTATION_CHANGELOG.md` ("Phase 39: Consent Management").
+   ~~No A2P/10DLC `MessagingProfile` model~~ — **closed (registration CRUD
+   only) 2026-09-08.** `messaging_profiles` table + `POST`/`GET
+   /v1/api/gateway/messaging-profiles` + admin
+   `PATCH /api/dashboard/messaging-profiles/:id` for compliance-status
+   transitions. Explicitly **not** in scope: enforcing `complianceStatus`
+   against outbound sends (an unregistered/rejected 10DLC number can still
+   send today — this table is a registration record, not a gate), and any
+   integration with a real carrier/registrar API to verify status
+   automatically. See `docs/IMPLEMENTATION_CHANGELOG.md` ("Phase 40/41:
+   A2P/10DLC Messaging Profiles").
 10. **No payment reconciliation/settlement model** beyond a `reconciliation`
     job stub — no connected-account onboarding flow for merchant-owned
     payment accounts.
@@ -303,18 +310,22 @@ safety):
 3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
 4. ~~`/ready` queue/worker-store health check~~ — done, see §4 item 3.
 5. ~~STOP consent enforcement on outbound sends~~ — done, see §4 item 9.
-   Remaining: the broader A2P/10DLC `MessagingProfile` model
-   (brand/campaign/10DLC registration status).
-6. **Drizzle migration history divergence** (§4 item 12) — newly found,
+6. ~~A2P/10DLC `MessagingProfile` registration model~~ — done (CRUD only,
+   not enforcement), see §4 item 9.
+7. **Drizzle migration history divergence** (§4 item 12) — newly found,
    high severity, needs a real database to fix safely. Recommend
    prioritizing this above new feature work: it means a from-scratch
    deployment is currently broken for two actively-used tables.
-7. Gateway inbound-webhook enqueue path (§4 item 13) — replace the raw
+8. Gateway inbound-webhook enqueue path (§4 item 13) — replace the raw
    ioredis calls in `services/api-gateway/src/app.ts` with the same
    abstracted job queue the rest of the system uses, so STOP/inbound
    messages work end-to-end without depending on a specific enqueue
-   mechanism having Redis reachable at that exact call site.
-8. Payment reconciliation / connected-account model.
+   mechanism having Redis reachable at that exact call site. Deliberately
+   deferred once its real scope became clear — it would require updating
+   several existing "documented gap" tests across multiple simulation
+   files that specifically assert today's no-op behavior, not just a
+   gateway code change.
+9. Payment reconciliation / connected-account model.
 
 ## 7. Relationship to Prior Reports
 

@@ -64,6 +64,13 @@
       "when": 1786948000000,
       "tag": "0008_add_consent_records",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786949000000,
+      "tag": "0009_add_messaging_profiles",
+      "breakpoints": true
     }
   ]
 }

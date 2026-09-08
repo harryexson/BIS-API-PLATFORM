@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+const MESSAGING_PROFILE_COMPLIANCE_STATUSES = new Set(['unregistered', 'pending', 'approved', 'rejected', 'suspended']);
+const MESSAGING_PROFILE_SENDER_TYPES = new Set(['phone', '10dlc', 'tollfree', 'shortcode', 'alphanumeric']);
+
 // ---------------------------------------------------------------------------
 // In-memory "Neon" database double used by the simulation.
 // The killer feature: the same state object is used by the mock module factory
@@ -61,6 +64,21 @@ export interface ConsentRow {
   updatedAt: Date;
 }
 
+export interface MessagingProfileRow {
+  id: string;
+  appId: string;
+  tenantId: string;
+  country: string;
+  senderType: string;
+  sender: string;
+  provider: string;
+  campaignId: string | null;
+  brandId: string | null;
+  complianceStatus: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface DbState {
   failEventWrites: boolean;
   failAuditWrites: boolean;
@@ -92,6 +110,7 @@ export interface DbState {
   tenantLinks: Array<{ tenantId: string; applicationId: string; status: string }>;
   conversations: ConversationRow[];
   consentRecords: ConsentRow[];
+  messagingProfiles: MessagingProfileRow[];
 }
 
 export const dbState: DbState = {
@@ -105,6 +124,7 @@ export const dbState: DbState = {
   tenantLinks: [],
   conversations: [],
   consentRecords: [],
+  messagingProfiles: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -150,6 +170,7 @@ export function clearDb(): void {
   dbState.tenantLinks = [];
   dbState.conversations = [];
   dbState.consentRecords = [];
+  dbState.messagingProfiles = [];
 }
 
 export function seedReachChurch(): void {
@@ -665,6 +686,70 @@ export function installDatabaseMock(): Record<string, unknown> {
       },
       async count() {
         return dbState.consentRecords.length;
+      },
+    },
+    messagingProfileRepository: {
+      async findById(id: string) {
+        return dbState.messagingProfiles.find((p) => p.id === id);
+      },
+      async findBySender(appId: string, tenantId: string, sender: string, provider: string) {
+        return dbState.messagingProfiles.find(
+          (p) => p.appId === appId && p.tenantId === tenantId && p.sender === sender && p.provider === provider,
+        );
+      },
+      async findByApplicationId(appId: string, limit = 100) {
+        return dbState.messagingProfiles.filter((p) => p.appId === appId).slice(0, limit);
+      },
+      async create(data: {
+        appId: string;
+        tenantId: string;
+        country: string;
+        senderType: string;
+        sender: string;
+        provider: string;
+        campaignId?: string | null;
+        brandId?: string | null;
+        complianceStatus?: string;
+      }) {
+        // Mirrors the validation in packages/database/src/repositories/messaging-profiles.ts
+        // (kept duplicated rather than imported since this mock stands in
+        // for the whole @company/database module).
+        if (!MESSAGING_PROFILE_SENDER_TYPES.has(data.senderType)) {
+          throw new Error(`Invalid senderType: ${data.senderType}`);
+        }
+        const complianceStatus = data.complianceStatus ?? 'unregistered';
+        if (!MESSAGING_PROFILE_COMPLIANCE_STATUSES.has(complianceStatus)) {
+          throw new Error(`Invalid complianceStatus: ${complianceStatus}`);
+        }
+        const row: MessagingProfileRow = {
+          id: `mprof_${randomUUID().slice(0, 12)}`,
+          appId: data.appId,
+          tenantId: data.tenantId,
+          country: data.country,
+          senderType: data.senderType,
+          sender: data.sender,
+          provider: data.provider,
+          campaignId: data.campaignId ?? null,
+          brandId: data.brandId ?? null,
+          complianceStatus,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.messagingProfiles.push(row);
+        return row;
+      },
+      async updateComplianceStatus(id: string, status: string) {
+        if (!MESSAGING_PROFILE_COMPLIANCE_STATUSES.has(status)) {
+          throw new Error(`Invalid complianceStatus: ${status}`);
+        }
+        const profile = dbState.messagingProfiles.find((p) => p.id === id);
+        if (!profile) return undefined;
+        profile.complianceStatus = status;
+        profile.updatedAt = new Date();
+        return profile;
+      },
+      async count() {
+        return dbState.messagingProfiles.length;
       },
     },
     // P0: Mock runInTransaction — just runs the function directly in simulation

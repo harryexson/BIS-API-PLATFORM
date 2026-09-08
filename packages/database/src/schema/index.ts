@@ -18,3 +18,4 @@ export { transactions, type Transaction, type NewTransaction } from './transacti
 export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
 export { consentRecords, type ConsentRecord, type NewConsentRecord } from './consent-records';
+export { messagingProfiles, type MessagingProfile, type NewMessagingProfile } from './messaging-profiles';

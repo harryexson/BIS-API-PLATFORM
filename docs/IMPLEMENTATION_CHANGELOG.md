@@ -6,6 +6,73 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Phase 40/41: A2P/10DLC Messaging Profiles (Registration CRUD)
+
+**Phase:** 40/41 (A2P/10DLC compliance model) of the master plan.
+
+**Scope of this pass, stated plainly:** this adds the `MessagingProfile`
+registration record from master plan §41 and a CRUD surface for it. It
+does **not** enforce `complianceStatus` against outbound sends (an
+unregistered or rejected sender can still send messages today — nothing
+in `RoutingEngine` checks this table) and does **not** integrate with any
+real carrier/registrar API to verify registration automatically. Building
+those is real, separate follow-up work; this phase is the foundation they
+would build on, not a claim that A2P/10DLC compliance is "done."
+
+**Files changed:**
+- `packages/database/src/schema/messaging-profiles.ts` (new) —
+  `messaging_profiles` table: `(appId, tenantId, country, senderType,
+  sender, provider, campaignId?, brandId?, complianceStatus)`, matching
+  the master plan's `MessagingProfile` interface. `senderType` ∈
+  `{phone, 10dlc, tollfree, shortcode, alphanumeric}`, `complianceStatus`
+  ∈ `{unregistered, pending, approved, rejected, suspended}`. Unique per
+  `(appId, tenantId, sender, provider)`.
+- `packages/database/drizzle/0009_add_messaging_profiles.sql` (new,
+  hand-authored per the migration-drift entry above) + journal entry.
+  Verified with `drizzle-kit check`.
+- `packages/database/src/repositories/messaging-profiles.ts` (new) —
+  `findById`, `findBySender`, `findByApplicationId`, `create` (validates
+  `senderType`/`complianceStatus` before touching the database),
+  `updateComplianceStatus`, `count`.
+- `packages/database/src/repositories/messaging-profiles.test.ts` (new) —
+  5 DB-free unit tests for the validation logic, which runs before
+  `getDb()` is ever called.
+- `services/api-gateway/src/app.ts` — `POST`/`GET
+  /v1/api/gateway/messaging-profiles` (app registers/lists its own
+  senders, scoped under new `messaging-profiles:read`/`:write` API-key
+  scopes) and admin `PATCH /api/dashboard/messaging-profiles/:id` (ops
+  transitions `complianceStatus` after real-world registration/approval —
+  intentionally admin-only, since that's a real-world fact the platform
+  can't self-certify).
+- `packages/simulation/src/db.ts` — real (not stubbed) mock repository,
+  including the same validation as the real one (duplicated intentionally
+  — this mock stands in for the whole `@company/database` module).
+- `packages/simulation/src/messaging-profiles.simulation.test.ts` (new) —
+  6 tests: register + list via HTTP, missing-field and invalid-senderType
+  rejection, tenant/app data isolation, and the admin compliance-status
+  transition workflow (`unregistered` → `pending` → `approved`) exercised
+  directly against the repository.
+
+**Database migrations:** `0009_add_messaging_profiles.sql` (new table)
+
+**API changes:** `GET`/`POST /v1/api/gateway/messaging-profiles`,
+`PATCH /api/dashboard/messaging-profiles/:id`
+
+**Security changes:** none beyond standard API-key scoping + admin gating
+on the new routes
+
+**Tests:** `npm test` 257 → 269 passed (11 net new: 6 simulation + 5 unit),
+0 failed. Lint/typecheck/build clean.
+
+**Known issues carried forward:** no enforcement against
+`complianceStatus` in routing (stated above, not hidden); no registrar
+integration; `PATCH .../messaging-profiles/:id` isn't exercised by an
+automated test via HTTP (no `PLATFORM_ADMIN_KEY` configured in this
+environment — same limitation as every other admin-dashboard route in
+this test suite, not new here) — it's covered indirectly by testing
+`updateComplianceStatus` directly against the (mocked) repository the
+route calls.
+
 ## 2026-09-08 — Phase 39: Consent Management (STOP/JOIN Blocks/Restores Outbound Sends)
 
 **Phase:** 39 (STOP/consent management) of the master plan. Closes the gap
