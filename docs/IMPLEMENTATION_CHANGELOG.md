@@ -6,6 +6,56 @@ tests cover it.
 
 ---
 
+## 2026-09-08 — Phase 3: API-Key Scope Enforcement & Default Expiry
+
+**Phase:** 3 (API Gateway hardening) — closes two items from
+`SECURITY_AUDIT_REPORT.md` (M2, M3) that were still open per
+`docs/IMPLEMENTATION_BASELINE.md`.
+
+**Files changed:**
+- `packages/database/src/registry.ts` — `AuthenticateResult.scopes` now
+  surfaces the matched API key's `scopes` column;
+  `API_KEY_DEFAULT_EXPIRY_DAYS` (default 365, 0 disables) applied to
+  `expiresAt` in `createApplication` and `rotateApplicationKey`
+- `services/api-gateway/src/auth.ts` — `AuthService.authenticate()` parses
+  `scopes` into a string array; `createMiddleware().apiKey` is now a
+  factory `apiKey(requiredScope?: string)` that 403s when the key has
+  scopes configured and the requested capability isn't among them (a key
+  with no scopes stays unrestricted — opt-in scoping, not a breaking
+  change for keys issued before this existed)
+- `services/api-gateway/src/app.ts` — wired `mw.apiKey(scope)` onto all 5
+  gateway routes: `payments:send`, `messaging:send`, `other:send`,
+  `transactions:read`, `providers:read`
+- `packages/database/src/registry.test.ts` — 4 new tests: default expiry
+  set on creation, scopes surfaced on successful auth (both configured and
+  null/unrestricted cases)
+- `.env.example` — documented `API_KEY_DEFAULT_EXPIRY_DAYS`
+- `docs/IMPLEMENTATION_BASELINE.md` — marked both gaps closed
+
+**Database migrations:** none (`scopes` and `expiresAt` columns already
+existed on `application_api_keys`; this phase starts populating/enforcing
+them)
+
+**API changes:** gateway routes now return 403
+(`API key is not authorized for scope "..."`) for a scoped key missing the
+required capability. No change to unscoped keys' behavior.
+
+**Security changes:** closes SECURITY_AUDIT_REPORT.md M2 (no scope
+enforcement) and M3 (no default expiry).
+
+**Tests:** `npm test` 229 → 232 passed (3 net new — one prior "preserves
+scopes on rotation" test already existed and continues to pass), 0 failed;
+lint/typecheck/build clean, including the full `packages/simulation`
+end-to-end suite (proves existing unscoped keys are unaffected).
+
+**Known issues carried forward:** no admin-console UI or dashboard API
+route yet to set a key's `scopes` after creation — the enforcement is live,
+but assigning scopes today means writing the `scopes` column directly
+(e.g. via a migration or direct DB access). `application.allowedCapabilities`
+(a separate, application-level field also in the schema) is still unused —
+left out of this phase to keep scope narrow; only per-key `scopes` is
+enforced.
+
 ## 2026-09-08 — Phase 11/21: Provider Circuit Breaker
 
 **Phase:** 21 (circuit breaker) of the master plan, plus the doc correction

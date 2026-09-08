@@ -194,10 +194,18 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    `RateLimiterRedis` + in-memory fallback, and `/ready` calls
    `checkDatabaseHealth()` and returns 503 when the DB is unreachable.)*
 4. **`events.app_id` has no FK constraint** — referential integrity gap.
-5. **No API-key scope enforcement** — the `scopes` column exists on API
-   keys but isn't checked against the requested capability.
-6. **No default API-key expiry** — `expiresAt` exists on the schema and is
-   honored if set, but nothing sets it by default on key creation.
+5. ~~No API-key scope enforcement~~ — **closed 2026-09-08.**
+   `ApplicationRegistry.authenticateApplication` now surfaces the matched
+   key's `scopes`; the gateway's `mw.apiKey(requiredScope)` middleware
+   factory rejects with 403 when a key has scopes configured and the
+   requested capability isn't among them. A key with no scopes configured
+   (`null`, the default for every key issued before this existed) remains
+   unrestricted — scoping is opt-in per key, not a breaking change. Wired
+   onto all 5 gateway routes: `payments:send`, `messaging:send`,
+   `other:send`, `transactions:read`, `providers:read`.
+6. ~~No default API-key expiry~~ — **closed 2026-09-08.** `createApplication`
+   and `rotateApplicationKey` now set `expiresAt` via
+   `API_KEY_DEFAULT_EXPIRY_DAYS` (default 365 days; 0 disables it).
 7. ~~No circuit breaker~~ — **closed 2026-09-08.** `ProviderRegistry` now
    tracks a per-provider CLOSED/OPEN/HALF_OPEN state
    (`isCircuitAvailable`/`isProviderAvailable`, driven by `recordTraffic`),
@@ -241,7 +249,7 @@ safety):
    integration + error normalization + contract tests can be built now
    against each provider's public API documentation.
 2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
-3. API-key scope enforcement + default expiry.
+3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
 4. `/ready` queue/worker-store health check (DB + rate-limiter already covered).
 5. A2P/10DLC `MessagingProfile` model.
 6. Payment reconciliation / connected-account model.

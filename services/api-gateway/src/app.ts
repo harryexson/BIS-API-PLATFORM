@@ -307,7 +307,7 @@ app.get('/ready', async (req: Request, res: Response) => {
 // GATEWAY TRAFFIC ENDPOINTS — P2-1: Versioned under /v1
 // ----------------------------------------------------
 
-app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
   // P1: Accept idempotency key from header — prevents duplicate charges on retries
@@ -387,7 +387,7 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
   }
 });
 
-app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { recipient, content, providerOverride } = req.body;
   // P0: Use authenticated tenant from header, NOT from request body
@@ -430,7 +430,7 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
   }
 });
 
-app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/other', mw.apiKey('other:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { serviceType, payload, providerOverride } = req.body;
 
@@ -475,7 +475,7 @@ app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: R
 // ----------------------------------------------------
 // Consuming applications can poll for transaction status after submission.
 
-app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
+app.get('/v1/api/gateway/transaction/:id', mw.apiKey('transactions:read'), resolveTenantContext, (req: Request, res: Response) => {
   const { id } = req.params;
   const appId = (req as Request & { appId?: string }).appId;
   const events = eventBus.getHistory();
@@ -510,7 +510,7 @@ app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req
 // ----------------------------------------------------
 // Consuming applications can discover available providers and their capabilities.
 
-app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
+app.get('/v1/api/gateway/providers', mw.apiKey('providers:read'), resolveTenantContext, (req: Request, res: Response) => {
   const { category, capability, currency } = req.query;
 
   if (category && typeof category === 'string') {

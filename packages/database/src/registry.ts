@@ -6,6 +6,17 @@ import type {
 } from './schema';
 import { hashApiKey, generateApiKey } from './crypto';
 
+// Default lifetime for newly issued/rotated API keys, in days. Configurable
+// so operators can tighten or loosen the default without a code change;
+// set to 0 (or any non-positive value) to disable the default entirely and
+// issue keys with no expiry, matching the prior behavior.
+const API_KEY_DEFAULT_TTL_DAYS = Number(process.env.API_KEY_DEFAULT_EXPIRY_DAYS ?? 365);
+
+function defaultKeyExpiry(): Date | null {
+  if (!API_KEY_DEFAULT_TTL_DAYS || API_KEY_DEFAULT_TTL_DAYS <= 0) return null;
+  return new Date(Date.now() + API_KEY_DEFAULT_TTL_DAYS * 24 * 60 * 60 * 1000);
+}
+
 export interface ApplicationRecord {
   id: string;
   name: string;
@@ -57,6 +68,11 @@ export interface AuthenticateResult {
   authenticated: boolean;
   application?: ApplicationRecord;
   error?: string;
+  // Comma-separated capability scopes from the matched API key. `null`/
+  // absent means unrestricted (no scopes configured for this key) — callers
+  // must treat that as "allow", not "deny", to stay backward compatible
+  // with every key issued before scoping existed.
+  scopes?: string | null;
 }
 
 export interface RotateKeyResult {
@@ -127,6 +143,7 @@ export class ApplicationRegistry {
       prefix,
       environment: application.environment,
       scopes: null,
+      expiresAt: defaultKeyExpiry(),
     });
 
     return {
@@ -177,6 +194,7 @@ export class ApplicationRegistry {
       prefix,
       environment: keyEnvironment,
       scopes: currentKey.scopes,
+      expiresAt: defaultKeyExpiry(),
     });
 
     return {
@@ -256,6 +274,6 @@ export class ApplicationRegistry {
 
     await this.keyRepo.updateLastUsed(apiKey.id);
 
-    return { authenticated: true, application };
+    return { authenticated: true, application, scopes: apiKey.scopes };
   }
 }
