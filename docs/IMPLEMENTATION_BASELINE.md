@@ -139,9 +139,11 @@ gap against the "real production requirement" in the master plan — see §6.
   conversations, audit logs, users/roles/permissions, user sessions, user
   verification tokens (email verification / password reset).
 - `users`/`roles`/`permissions` are now real and in production use
-  (2026-09-09, customer account signup/login — see §4 item 1 and the
+  (2026-09-09, customer account signup/login — see §4 item 14 and the
   changelog) — previously schema-only with zero call sites anywhere in the
   codebase.
+- `plans`/`subscriptions` (added 2026-09-09, §4 item 16) — platform
+  subscription billing for the businesses that hold an application.
 - `events.app_id` and `audit_logs.*` queries are scoped by `appId`/`tenantId`
   at the repository layer (cross-tenant leak fix from the latest commit).
 - `events.app_id` is still `text`, not a foreign key to `applications.id` —
@@ -188,6 +190,7 @@ not started yet.
 | Database | `DATABASE_URL` |
 | Auth/Secrets | `PLATFORM_ADMIN_KEY`, `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY`, `ADMIN_API_TOKEN` |
 | Customer account auth (added 2026-09-09) | `SESSION_TTL_HOURS`, `EMAIL_VERIFICATION_TTL_HOURS`, `PASSWORD_RESET_TTL_HOURS`, `MAX_FAILED_LOGIN_ATTEMPTS`, `ACCOUNT_LOCKOUT_MINUTES` (all optional — sensible defaults in `auth-registry.ts`) |
+| Subscription billing (added 2026-09-09) | `STRIPE_BILLING_WEBHOOK_SECRET` (reuses `STRIPE_SECRET_KEY`, below, for the API calls themselves) |
 | Deployment | `DEPLOYMENT_ID`, `NODE_ENV`, `PORT` |
 | Payments | `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `NMI_GATEWAY_ID`, `NMI_API_KEY`, `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_PUBLIC_KEY`, `PAWAPAY_API_KEY`, `PAYCHANGU_API_KEY`, `AIRWALLEX_CLIENT_ID`, `AIRWALLEX_API_KEY` |
 | Messaging | `SIGNALHOUSE_API_KEY`, `INFOBIP_API_KEY`, `INFOBIP_BASE_URL`, `FUTURESMS_API_KEY`, `FUTURESMS_BASE_URL`, `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`, `SINCH_API_TOKEN`, `SINCH_SERVICE_PLAN_ID`, `SINCH_REGION`, `VIBES_USERNAME`, `VIBES_PASSWORD` |
@@ -351,12 +354,16 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     send one either — see item 14). Needed before password reset / email
     verification are usable by an actual person in production, not just
     testable via the API response.
-16. **No subscription/billing model for platform customers** — `Stripe`'s
-    adapter only ever called the one-off Charges API (and even that is
-    simulated without `STRIPE_SECRET_KEY`); there is no concept anywhere
-    of a plan, tier, recurring subscription, or usage-based billing for
-    the businesses that hold a BIS Platform application. Not started as
-    of 2026-09-09 (Phase B of the auth/subscriptions/CRM work — see §6).
+16. ~~No subscription/billing model for platform customers~~ — **Phase B
+    done, 2026-09-09.** `plans` + `subscriptions` tables, a real
+    Stripe Customers/Subscriptions integration (`SubscriptionRegistry`,
+    with the same simulated-fallback pattern as every provider adapter),
+    and a correctly-signature-verified `/v1/api/billing/webhooks/stripe`
+    route — see the changelog ("Subscription Billing: Plans, Stripe
+    Subscriptions"). **Remaining gap within it**: plan usage limits
+    (`messageLimit`, `paymentVolumeLimitCents`) are stored but not
+    enforced anywhere in the gateway/routing path — a `starter`-plan
+    application can send unlimited messages today.
 17. **No CRM/support back office** — confirmed by a 2026-09-09 audit: no
     endpoint or admin-console view lists `applications` (tenants/
     customers) at all, let alone notes, support tickets, or contact
@@ -434,18 +441,17 @@ safety):
    gateway code change.
 9. Payment reconciliation / connected-account model.
 10. ~~Customer signup/login~~ — **Phase A done, 2026-09-09** (§4 item 14).
-    Remaining phases of that same request, not started:
-    - **Phase B — subscription/billing** (§4 item 16): plan tiers +
-      real Stripe Subscriptions integration for the businesses that hold
-      a BIS Platform application, following the same real-HTTP +
-      simulated-fallback pattern used throughout `packages/providers`.
+    ~~Subscription/billing~~ — **Phase B done, 2026-09-09** (§4 item 16).
+    Remaining phases of that same original request, not started:
     - **Phase C — CRM/support back office** (§4 item 17): a customer
       list, notes, and support tickets, backend + admin console UI.
     - **Phase D — admin console consolidation**: add real routing and
       wire in Phases B/C's views; verify the existing 3 tabs still work.
-    - **Also needed for Phase A itself to be production-usable**: a real
+    - **Also needed for Phase A/B to be production-usable**: a real
       transactional email integration (§4 item 15) — currently
-      verification/reset tokens have no delivery path outside dev/test.
+      verification/reset tokens have no delivery path outside dev/test;
+      and plan usage-limit enforcement (§4 item 16) — limits are stored
+      but nothing in the gateway enforces them yet.
 
 ## 7. Relationship to Prior Reports
 

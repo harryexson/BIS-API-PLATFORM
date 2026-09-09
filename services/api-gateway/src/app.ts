@@ -27,6 +27,10 @@ import {
   userVerificationTokenRepository,
   roleRepository,
   type PublicUser,
+  SubscriptionRegistry,
+  SubscriptionError,
+  planRepository,
+  subscriptionRepository,
 } from '@company/database';
 import {
   logger,
@@ -71,7 +75,17 @@ app.use((_req, res, next) => {
 });
 
 // P1-3: Explicit body size limit
-app.use(express.json({ limit: '100kb' }));
+// `verify` stashes the raw request bytes on req.rawBody alongside the
+// parsed JSON — needed by the Stripe billing webhook route below, whose
+// signature verification is computed over the exact raw body, not a
+// re-serialized JSON.stringify(req.body) (which can differ in key order/
+// whitespace and would break the signature).
+app.use(express.json({
+  limit: '100kb',
+  verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
+    req.rawBody = buf;
+  },
+}));
 
 // ----------------------------------------------------
 // P3-1: REQUEST/RESPONSE LOGGING + TRACING
@@ -408,6 +422,128 @@ app.post('/v1/api/auth/reset-password', async (req: Request, res: Response) => {
   } catch (err: any) {
     const status = err instanceof ValidationError || err instanceof AuthError ? 400 : 500;
     return res.status(status).json({ error: err.message || 'Password reset failed' });
+  }
+});
+
+// ----------------------------------------------------
+// SUBSCRIPTIONS / BILLING
+// ----------------------------------------------------
+// Billing for the platform's own customers (the businesses that hold an
+// application) — distinct from packages/providers/payments, which routes
+// one-off payments those businesses make on their own behalf. Plan
+// management is session-authed (requireSession, above); the webhook
+// route is signature-verified instead, since Stripe calls it directly.
+const subscriptionRegistry = new SubscriptionRegistry(planRepository, subscriptionRepository, applicationRepository);
+
+app.get('/v1/api/billing/plans', async (_req: Request, res: Response) => {
+  const plans = await subscriptionRegistry.listPlans();
+  return res.json({ plans });
+});
+
+app.get('/v1/api/billing/subscription', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const subscription = await subscriptionRegistry.getSubscription(user.applicationId);
+  return res.json({ subscription: subscription ?? null });
+});
+
+app.post('/v1/api/billing/subscribe', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const { planSlug } = req.body || {};
+  if (!planSlug) return res.status(400).json({ error: 'planSlug is required' });
+  try {
+    const subscription = await subscriptionRegistry.subscribe(user.applicationId, planSlug, user.email);
+    return res.json({ subscription });
+  } catch (err: any) {
+    const status = err instanceof SubscriptionError ? 400 : 500;
+    if (status === 500) {
+      logger.error('subscribe failed', {
+        operation: 'billing-subscribe',
+        applicationId: user.applicationId,
+        errorCode: 'SUBSCRIBE_FAILED',
+        status: 'failed',
+      });
+    }
+    return res.status(status).json({ error: err.message || 'Subscription failed' });
+  }
+});
+
+app.post('/v1/api/billing/cancel', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const atPeriodEnd = req.body?.atPeriodEnd !== false; // defaults to true — cancel at period end, not immediately
+  try {
+    const subscription = await subscriptionRegistry.cancelSubscription(user.applicationId, atPeriodEnd);
+    return res.json({ subscription });
+  } catch (err: any) {
+    const status = err instanceof SubscriptionError ? 400 : 500;
+    return res.status(status).json({ error: err.message || 'Cancellation failed' });
+  }
+});
+
+// Real Stripe webhook signature verification (Stripe-Signature header:
+// t=<unix seconds>,v1=<hex hmac-sha256(`${t}.${rawBody}`, secret)>) — NOT
+// the generic WEBHOOK_HMAC_SECRET scheme used by /v1/api/webhooks/:provider
+// above, which only ever compares against this platform's own signing
+// convention and would reject every genuine Stripe delivery. Verified via
+// web search against Stripe's current docs (2026-09-09), not memory.
+function verifyStripeSignature(rawBody: Buffer, header: string | undefined, secret: string): boolean {
+  if (!header) return false;
+  const parts = Object.fromEntries(
+    header.split(',').map((kv) => {
+      const [k, v] = kv.split('=');
+      return [k, v];
+    }),
+  );
+  const timestamp = parts.t;
+  const signature = parts.v1;
+  if (!timestamp || !signature) return false;
+
+  // 5-minute tolerance, matching Stripe's own library default.
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(age) || age > 5 * 60) return false;
+
+  const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody.toString('utf8')}`).digest('hex');
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signature, 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+app.post('/v1/api/billing/webhooks/stripe', async (req: Request, res: Response) => {
+  const secret = process.env.STRIPE_BILLING_WEBHOOK_SECRET;
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+
+  if (!secret) {
+    logger.error('billing webhook rejected — no secret configured', {
+      operation: 'billing-webhook',
+      errorCode: 'NO_WEBHOOK_SECRET',
+      status: 'failed',
+    });
+    return res.status(503).json({ error: 'Webhook verification not configured' });
+  }
+  if (!rawBody || !verifyStripeSignature(rawBody, req.header('stripe-signature'), secret)) {
+    logger.error('billing webhook rejected — invalid signature', {
+      operation: 'billing-webhook',
+      errorCode: 'INVALID_SIGNATURE',
+      status: 'failed',
+    });
+    return res.status(401).json({ error: 'Invalid webhook signature' });
+  }
+
+  try {
+    const event = req.body;
+    const updated = await subscriptionRegistry.syncFromStripeEvent(event);
+    logger.info('billing webhook processed', {
+      operation: 'billing-webhook',
+      status: 'success',
+      applicationId: updated?.applicationId,
+    });
+    return res.json({ received: true });
+  } catch (err: any) {
+    logger.error('billing webhook processing failed', {
+      operation: 'billing-webhook',
+      errorCode: 'PROCESSING_FAILED',
+      status: 'failed',
+    });
+    return res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 

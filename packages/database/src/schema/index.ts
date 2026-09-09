@@ -12,6 +12,8 @@ export {
   type UserVerificationToken,
   type NewUserVerificationToken,
 } from './user-verification-tokens';
+export { plans, type Plan, type NewPlan } from './plans';
+export { subscriptions, type Subscription, type NewSubscription } from './subscriptions';
 export { providers, type Provider, type NewProvider } from './providers';
 export { providerCapabilities, type ProviderCapability, type NewProviderCapability } from './provider-capabilities';
 export { providerConfigs, type ProviderConfig, type NewProviderConfig } from './provider-configs';

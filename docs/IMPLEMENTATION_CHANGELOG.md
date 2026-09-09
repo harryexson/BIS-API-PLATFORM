@@ -6,6 +6,99 @@ tests cover it.
 
 ---
 
+## 2026-09-09 — Subscription Billing: Plans, Stripe Subscriptions (Phase B of 4)
+
+**Context:** continuation of the same 4-phase request as Phase A (below).
+This is Phase B — subscription/billing for the platform's own customers
+(the businesses that hold an application). Phases C (CRM/support back
+office) and D (admin console consolidation) are not started yet.
+
+### What was built
+- **Schema** (migration `0011_add_subscriptions.sql`, applied directly to
+  the live Neon project, same hand-written/hand-applied method as
+  migration 0010 and for the same reason — see that entry): new `plans`
+  table (slug, price, interval, soft usage limits, an optional
+  `stripe_price_id` for when a plan has a live-mode Stripe Price) and
+  `subscriptions` table (one row per application; `stripe_customer_id`/
+  `stripe_subscription_id`, period dates, `cancel_at_period_end`).
+  Seeded with 3 placeholder plans (Starter/Growth/Enterprise) —
+  **placeholder pricing for a real billing mechanism, not a business
+  decision about actual prices**; whoever owns pricing should update these
+  rows before this is used for real billing. Confirmed via `run_sql`
+  before applying that this was a genuinely new, empty pair of tables.
+- **Stripe Billing HTTP client + `SubscriptionRegistry`**
+  (`packages/database/src/subscription-registry.ts`) — a *different*
+  Stripe object graph than `packages/providers/src/adapters/payments/
+  stripe.ts` (which only calls the one-off Charges API): Customers,
+  Subscriptions, cancellation. Facts verified via WebSearch against
+  Stripe's current API reference (2026-09-09), not memory — endpoint
+  paths/params for creating a customer and a subscription, and
+  specifically that `DELETE /v1/subscriptions/{id}` cancels immediately
+  while `POST /v1/subscriptions/{id}` with `cancel_at_period_end: true`
+  schedules cancellation (a real, easy-to-get-backwards distinction).
+  Not verified against a live Stripe account. Same real-HTTP +
+  simulated-fallback philosophy as every provider adapter: without
+  `STRIPE_SECRET_KEY` (or when a plan has no `stripePriceId` yet), it
+  fabricates a `sim_sub_`-prefixed subscription with a real
+  period-end date computed from the plan's interval — never a fabricated
+  "real" Stripe id. No retry/backoff logic (unlike `BaseProvider.
+  http_request`, which the payment adapters get for free) — a deliberate
+  scope cut, not an oversight.
+- **Gateway routes** (`services/api-gateway/src/app.ts`, new
+  "SUBSCRIPTIONS / BILLING" section): `GET /v1/api/billing/plans` (public),
+  `GET /subscription`, `POST /subscribe`, `POST /cancel` (all
+  session-authed via Phase A's `requireSession`), and
+  `POST /webhooks/stripe`.
+- **Real Stripe webhook signature verification** — the billing webhook
+  route verifies the actual `Stripe-Signature` header (`t=<unix>,
+  v1=hex_hmac_sha256(`${t}.${rawBody}`, secret)`, 5-minute tolerance),
+  verified via WebSearch against Stripe's docs, **not** the platform's
+  pre-existing generic `WEBHOOK_HMAC_SECRET` scheme used by
+  `/v1/api/webhooks/:provider` — that scheme only ever checks against this
+  platform's own signing convention and would reject every genuine Stripe
+  delivery, so reusing it here would have shipped a webhook endpoint that
+  cannot actually receive real Stripe events. Required capturing the raw
+  request body (`express.json()`'s `verify` callback, stashed as
+  `req.rawBody`) since Stripe's signature is computed over the exact raw
+  bytes, not a re-serialized `JSON.stringify(req.body)`.
+- `.env.example`: `STRIPE_BILLING_WEBHOOK_SECRET` (reuses the existing
+  `STRIPE_SECRET_KEY`for the API calls themselves).
+- `docs/openapi.yaml`: new `Billing` tag and full path/schema definitions
+  for all 5 routes.
+
+### Tests
+- `packages/database/src/subscription-registry.test.ts` — 15 unit tests
+  against in-memory fakes (plan listing, subscribe/simulated-fallback,
+  unknown application/plan rejection, plan-change updates the same row,
+  immediate vs. scheduled cancellation, `syncFromStripeEvent` for all 3
+  handled event types plus unrecognized-event and unknown-subscription
+  no-ops).
+- `packages/simulation/src/billing.simulation.test.ts` — 12 tests booting
+  the real gateway, including a full HMAC round-trip: signing a payload
+  with `createHmac('sha256', ...)` exactly as Stripe's algorithm specifies
+  and confirming the real route accepts it and rejects a bad one.
+- Extending `packages/simulation/src/db.ts` was required again, same
+  reason as Phase A — `app.ts` now also constructs a `SubscriptionRegistry`
+  at module load time.
+- Full suite: 384 total (372 passed, 12 pre-existing skipped) — confirmed
+  3x consecutive runs, 0 failures. Lint (0 errors), typecheck, and
+  `npm run build:all` all clean.
+
+**Files changed:** `packages/database/drizzle/0011_add_subscriptions.sql`
+(new), `packages/database/drizzle/meta/_journal.json`,
+`packages/database/src/schema/{plans,subscriptions,index}.ts` (2 new),
+`packages/database/src/repositories/{plans,subscriptions,index}.ts` (2
+new), `packages/database/src/subscription-registry.ts` (new) + `.test.ts`
+(new), `packages/database/src/index.ts`, `services/api-gateway/src/app.ts`,
+`packages/simulation/src/db.ts`, `packages/simulation/src/
+billing.simulation.test.ts` (new), `docs/openapi.yaml`, `.env.example`.
+
+**Known gap carried into Phase C/D:** plan limits (`messageLimit`,
+`paymentVolumeLimitCents`) are stored but **not enforced anywhere** — a
+`starter`-plan application can send unlimited messages today. Enforcement
+would need to hook into the routing engine or gateway request path and
+wasn't in scope for standing up the billing mechanism itself.
+
 ## 2026-09-09 — Customer Account Auth: Signup/Login (Phase A of 4)
 
 **Context:** user asked for four things in one request — (1) subscription

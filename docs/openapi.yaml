@@ -55,6 +55,12 @@ tags:
       Signup/login for the developer/business accounts that own a BIS
       Platform application — distinct from the per-application API key
       (`bearerAuth`) used on every other tagged section below.
+  - name: Billing
+    description: >-
+      Subscription plans for the platform's own customers (the businesses
+      that hold an application), billed for platform usage — distinct
+      from Payments, which routes one-off payments those businesses make
+      on their own behalf.
   - name: Payments
     description: Create and retrieve payments.
   - name: Refunds
@@ -259,6 +265,128 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /billing/plans:
+    get:
+      tags: [Billing]
+      operationId: listPlans
+      summary: List active subscription plans
+      security: []
+      responses:
+        '200':
+          description: Active plans.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plans:
+                    type: array
+                    items: { $ref: '#/components/schemas/Plan' }
+
+  /billing/subscription:
+    get:
+      tags: [Billing]
+      operationId: getSubscription
+      summary: Get the authenticated account's current subscription
+      security: [{ sessionAuth: [] }]
+      responses:
+        '200':
+          description: The current subscription, or null if never subscribed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription:
+                    nullable: true
+                    allOf: [{ $ref: '#/components/schemas/Subscription' }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /billing/subscribe:
+    post:
+      tags: [Billing]
+      operationId: subscribe
+      summary: Subscribe (or change plan) to a plan by slug
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planSlug]
+              properties:
+                planSlug: { type: string, example: growth }
+      responses:
+        '200':
+          description: Current subscription after the change.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: Unknown/inactive plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /billing/cancel:
+    post:
+      tags: [Billing]
+      operationId: cancelSubscription
+      summary: Cancel the current subscription
+      description: >-
+        `atPeriodEnd` defaults to true (schedules cancellation at the
+        current period's end rather than cutting access off immediately).
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                atPeriodEnd: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Updated subscription.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: No subscription exists for this account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /billing/webhooks/stripe:
+    post:
+      tags: [Billing]
+      operationId: stripeBillingWebhook
+      summary: Stripe subscription lifecycle webhook (internal — called by Stripe)
+      description: >-
+        Verified against the real `Stripe-Signature` header (not the
+        generic provider-webhook HMAC scheme used elsewhere in this API).
+        Handles `customer.subscription.updated`, `.deleted`, and
+        `invoice.payment_failed`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200': { description: Event processed (or a recognized-but-irrelevant event type, a no-op). }
+        '401': { description: Missing or invalid Stripe-Signature. }
+        '503': { description: STRIPE_BILLING_WEBHOOK_SECRET not configured. }
 
   /payments:
     post:
@@ -1015,6 +1143,44 @@ components:
           description: Opaque session token — send as `Authorization Bearer` on session-authed routes.
           example: sess_a1b2c3...
         expiresAt: { type: string, format: date-time }
+
+    Plan:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string, example: growth }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        priceCents: { type: integer, example: 4900 }
+        currency: { type: string, example: USD }
+        interval: { type: string, enum: [month, year] }
+        messageLimit:
+          type: integer
+          nullable: true
+          description: Informational only in this pass — not yet enforced by the gateway.
+        paymentVolumeLimitCents:
+          type: integer
+          nullable: true
+          description: Informational only in this pass — not yet enforced by the gateway.
+
+    Subscription:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        planId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [trialing, active, past_due, canceled, incomplete]
+        stripeCustomerId: { type: string, nullable: true }
+        stripeSubscriptionId:
+          type: string
+          nullable: true
+          description: Prefixed `sim_sub_` when no live Stripe key is configured.
+        currentPeriodStart: { type: string, format: date-time, nullable: true }
+        currentPeriodEnd: { type: string, format: date-time, nullable: true }
+        cancelAtPeriodEnd: { type: boolean }
+        canceledAt: { type: string, format: date-time, nullable: true }
 
     Payment:
       type: object

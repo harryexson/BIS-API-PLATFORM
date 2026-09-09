@@ -128,6 +128,39 @@ export interface DbState {
   userSessions: UserSessionRow[];
   userVerificationTokens: UserVerificationTokenRow[];
   roles: RoleRow[];
+  plans: PlanRow[];
+  subscriptions: SubscriptionRow[];
+}
+
+export interface PlanRow {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  priceCents: number;
+  currency: string;
+  interval: string;
+  messageLimit: number | null;
+  paymentVolumeLimitCents: number | null;
+  stripePriceId: string | null;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface SubscriptionRow {
+  id: string;
+  applicationId: string;
+  planId: string;
+  status: string;
+  stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  currentPeriodStart: Date | null;
+  currentPeriodEnd: Date | null;
+  cancelAtPeriodEnd: boolean;
+  canceledAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface UserRow {
@@ -194,6 +227,8 @@ export const dbState: DbState = {
   userSessions: [],
   userVerificationTokens: [],
   roles: [],
+  plans: [],
+  subscriptions: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -251,6 +286,17 @@ class MockConflictError extends Error {
     this.name = 'ConflictError';
   }
 }
+class MockSubscriptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SubscriptionError';
+  }
+}
+
+const INTERVAL_MS: Record<string, number> = {
+  month: 30 * 24 * 60 * 60 * 1000,
+  year: 365 * 24 * 60 * 60 * 1000,
+};
 
 export function clearDb(): void {
   dbState.failEventWrites = false;
@@ -268,6 +314,62 @@ export function clearDb(): void {
   dbState.userSessions = [];
   dbState.userVerificationTokens = [];
   dbState.roles = [];
+  dbState.plans = [];
+  dbState.subscriptions = [];
+}
+
+// Mirrors the seed plans inserted by migration 0011_add_subscriptions.sql
+// against the real database — opt-in (like seedReachChurch()) since most
+// simulation suites don't exercise billing at all.
+export function seedPlans(): void {
+  const now = new Date();
+  dbState.plans.push(
+    {
+      id: 'plan_starter',
+      slug: 'starter',
+      name: 'Starter',
+      description: 'Free tier for evaluating the platform.',
+      priceCents: 0,
+      currency: 'USD',
+      interval: 'month',
+      messageLimit: 1000,
+      paymentVolumeLimitCents: 500_000,
+      stripePriceId: null,
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'plan_growth',
+      slug: 'growth',
+      name: 'Growth',
+      description: 'For applications with active production traffic.',
+      priceCents: 4900,
+      currency: 'USD',
+      interval: 'month',
+      messageLimit: 25_000,
+      paymentVolumeLimitCents: 5_000_000,
+      stripePriceId: null,
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: 'plan_enterprise',
+      slug: 'enterprise',
+      name: 'Enterprise',
+      description: 'Unlimited usage, dedicated support.',
+      priceCents: 19_900,
+      currency: 'USD',
+      interval: 'month',
+      messageLimit: null,
+      paymentVolumeLimitCents: null,
+      stripePriceId: null,
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    },
+  );
 }
 
 export function seedReachChurch(): void {
@@ -661,6 +763,80 @@ export function installDatabaseMock(): Record<string, unknown> {
       },
       async findPermissionsByRoleId(_roleId: string) {
         return [];
+      },
+    },
+    planRepository: {
+      async findById(id: string) {
+        return dbState.plans.find((p) => p.id === id);
+      },
+      async findBySlug(slug: string) {
+        return dbState.plans.find((p) => p.slug === slug);
+      },
+      async listActive() {
+        return dbState.plans.filter((p) => p.isActive);
+      },
+      async list() {
+        return dbState.plans;
+      },
+      async create(data: Record<string, unknown>) {
+        const row: PlanRow = {
+          id: `plan_${randomUUID().slice(0, 8)}`,
+          slug: String(data.slug),
+          name: String(data.name),
+          description: (data.description as string) ?? null,
+          priceCents: Number(data.priceCents),
+          currency: (data.currency as string) ?? 'USD',
+          interval: (data.interval as string) ?? 'month',
+          messageLimit: (data.messageLimit as number) ?? null,
+          paymentVolumeLimitCents: (data.paymentVolumeLimitCents as number) ?? null,
+          stripePriceId: (data.stripePriceId as string) ?? null,
+          isActive: (data.isActive as boolean) ?? true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.plans.push(row);
+        return row;
+      },
+      async update(id: string, data: Partial<Record<string, unknown>>) {
+        const row = dbState.plans.find((p) => p.id === id);
+        if (!row) return undefined;
+        Object.assign(row, data, { updatedAt: new Date() });
+        return row;
+      },
+    },
+    subscriptionRepository: {
+      async findById(id: string) {
+        return dbState.subscriptions.find((s) => s.id === id);
+      },
+      async findByApplicationId(applicationId: string) {
+        return dbState.subscriptions.find((s) => s.applicationId === applicationId);
+      },
+      async findByStripeSubscriptionId(stripeSubscriptionId: string) {
+        return dbState.subscriptions.find((s) => s.stripeSubscriptionId === stripeSubscriptionId);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: SubscriptionRow = {
+          id: `subx_${randomUUID().slice(0, 8)}`,
+          applicationId: String(data.applicationId),
+          planId: String(data.planId),
+          status: (data.status as string) ?? 'active',
+          stripeCustomerId: (data.stripeCustomerId as string) ?? null,
+          stripeSubscriptionId: (data.stripeSubscriptionId as string) ?? null,
+          currentPeriodStart: (data.currentPeriodStart as Date) ?? null,
+          currentPeriodEnd: (data.currentPeriodEnd as Date) ?? null,
+          cancelAtPeriodEnd: (data.cancelAtPeriodEnd as boolean) ?? false,
+          canceledAt: (data.canceledAt as Date) ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.subscriptions.push(row);
+        return row;
+      },
+      async update(id: string, data: Partial<Record<string, unknown>>) {
+        const row = dbState.subscriptions.find((s) => s.id === id);
+        if (!row) return undefined;
+        Object.assign(row, data, { updatedAt: new Date() });
+        return row;
       },
     },
     tenantRepository: {
@@ -1068,6 +1244,87 @@ export function installDatabaseMock(): Record<string, unknown> {
     AuthError: MockAuthError,
     ValidationError: MockValidationError,
     ConflictError: MockConflictError,
+    SubscriptionError: MockSubscriptionError,
+    SubscriptionRegistry: class {
+      async listPlans() {
+        return dbState.plans.filter((p) => p.isActive);
+      }
+
+      async getSubscription(applicationId: string) {
+        return dbState.subscriptions.find((s) => s.applicationId === applicationId);
+      }
+
+      // Simulated-only in the simulation harness — no live Stripe key is
+      // ever configured here, matching every other adapter's fallback path.
+      async subscribe(applicationId: string, planSlug: string, _customerEmail: string) {
+        const application = dbState.applications.find((a) => a.id === applicationId);
+        if (!application) throw new MockSubscriptionError(`Application ${applicationId} not found`);
+
+        const plan = dbState.plans.find((p) => p.slug === planSlug);
+        if (!plan || !plan.isActive) throw new MockSubscriptionError(`Plan "${planSlug}" not found or inactive`);
+
+        const existing = dbState.subscriptions.find((s) => s.applicationId === applicationId);
+        const now = new Date();
+        const periodMs = INTERVAL_MS[plan.interval] ?? INTERVAL_MS.month;
+        const data = {
+          planId: plan.id,
+          status: 'active',
+          stripeCustomerId: existing?.stripeCustomerId ?? 'sim_cus_' + randomUUID().replace(/-/g, '').slice(0, 16),
+          stripeSubscriptionId: 'sim_sub_' + randomUUID().replace(/-/g, '').slice(0, 16),
+          currentPeriodStart: now,
+          currentPeriodEnd: new Date(now.getTime() + periodMs),
+          cancelAtPeriodEnd: false,
+          canceledAt: null,
+        };
+        if (existing) {
+          Object.assign(existing, data, { updatedAt: new Date() });
+          return existing;
+        }
+        const row: SubscriptionRow = {
+          id: `subx_${randomUUID().slice(0, 8)}`,
+          applicationId,
+          createdAt: now,
+          updatedAt: now,
+          ...data,
+        };
+        dbState.subscriptions.push(row);
+        return row;
+      }
+
+      async cancelSubscription(applicationId: string, atPeriodEnd: boolean) {
+        const existing = dbState.subscriptions.find((s) => s.applicationId === applicationId);
+        if (!existing) throw new MockSubscriptionError(`No subscription found for application ${applicationId}`);
+        if (atPeriodEnd) {
+          existing.cancelAtPeriodEnd = true;
+        } else {
+          existing.status = 'canceled';
+          existing.canceledAt = new Date();
+          existing.cancelAtPeriodEnd = false;
+        }
+        existing.updatedAt = new Date();
+        return existing;
+      }
+
+      async syncFromStripeEvent(event: { type: string; data: { object: Record<string, unknown> } }) {
+        const obj = event.data.object as any;
+        if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+          const existing = dbState.subscriptions.find((s) => s.stripeSubscriptionId === obj.id);
+          if (!existing) return null;
+          existing.status = event.type === 'customer.subscription.deleted' ? 'canceled' : obj.status;
+          existing.cancelAtPeriodEnd = !!obj.cancel_at_period_end;
+          existing.updatedAt = new Date();
+          return existing;
+        }
+        if (event.type === 'invoice.payment_failed') {
+          const existing = dbState.subscriptions.find((s) => s.stripeSubscriptionId === obj.subscription);
+          if (!existing) return null;
+          existing.status = 'past_due';
+          existing.updatedAt = new Date();
+          return existing;
+        }
+        return null;
+      }
+    },
     // Faithful-enough reimplementation of packages/database/src/auth-registry.ts
     // against dbState, for the same reason every other class here is
     // reimplemented rather than imported — see the module-level comment.

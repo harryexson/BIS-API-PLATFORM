@@ -7,6 +7,8 @@ export { userRepository } from './users';
 export { userSessionRepository } from './user-sessions';
 export { userVerificationTokenRepository } from './user-verification-tokens';
 export { roleRepository } from './roles';
+export { planRepository } from './plans';
+export { subscriptionRepository } from './subscriptions';
 export { providerRepository } from './providers';
 export { providerConfigRepository } from './provider-configs';
 export { providerHealthRepository } from './provider-health';

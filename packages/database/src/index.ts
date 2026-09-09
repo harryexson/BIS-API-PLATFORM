@@ -70,3 +70,15 @@ export {
   type UserVerificationTokenRepositoryForAuth,
   type RoleRepositoryForAuth,
 } from './auth-registry';
+
+// Subscription Registry (platform customer billing — see docstring in
+// subscription-registry.ts)
+export {
+  SubscriptionRegistry,
+  SubscriptionError,
+  type PlanRecord,
+  type SubscriptionRecord,
+  type PlanRepositoryForBilling,
+  type SubscriptionRepositoryForBilling,
+  type ApplicationLookupForBilling,
+} from './subscription-registry';
