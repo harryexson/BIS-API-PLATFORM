@@ -273,9 +273,13 @@ describe('L) SSRF surface (control)', () => {
 describe('M) Provider secret endpoint (control)', () => {
   it('does not leak a raw provider secret', async () => {
     const res = await runtime.get('/api/dashboard/providers/stripe/secrets');
-    if (res.status === 401 || res.status === 403) {
+    // 503 is the gateway's deliberate "admin access not configured" signal
+    // (requireAdmin refuses to fall back to an unauthenticated allow when no
+    // ADMIN_API_TOKEN is set) — distinct from 401/403's "wrong credentials",
+    // but equally a no-leak outcome for this control test.
+    if (res.status === 401 || res.status === 403 || res.status === 503) {
       console.warn('[OK] secret endpoint requires admin auth');
-      expect([401, 403]).toContain(res.status);
+      expect([401, 403, 503]).toContain(res.status);
       return;
     }
     expect(res.status).toBe(200);

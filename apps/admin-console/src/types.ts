@@ -79,6 +79,94 @@ export interface TransactionEvent {
   error?: string;
 }
 
+export interface Role {
+  id: string;
+  applicationId: string;
+  name: string;
+  description?: string | null;
+  isSystem: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Permission {
+  id: string;
+  roleId: string;
+  resource: string;
+  action: string;
+  createdAt: string;
+}
+
+export interface SubscriptionPlan {
+  id: string;
+  slug: string;
+  name: string;
+  description?: string | null;
+  priceCents: number;
+  currency: string;
+  billingInterval: string;
+  features?: Record<string, unknown> | null;
+  isActive: boolean;
+  stripeProductId?: string | null;
+  stripePriceId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TenantSubscription {
+  id: string;
+  appId: string;
+  tenantId: string;
+  planId: string;
+  status: string;
+  currentPeriodStart: string;
+  currentPeriodEnd?: string | null;
+  stripeCustomerId?: string | null;
+  stripeSubscriptionId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SupportTicket {
+  id: string;
+  appId: string;
+  tenantId: string;
+  requesterEmail: string;
+  subject: string;
+  status: string;
+  priority: string;
+  externalProvider?: string | null;
+  externalRef?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string | null;
+}
+
+export interface SupportTicketMessage {
+  id: string;
+  ticketId: string;
+  authorType: string;
+  authorEmail?: string | null;
+  body: string;
+  createdAt: string;
+}
+
+export interface AccessCredential {
+  id: string;
+  appId: string;
+  tenantId: string;
+  token: string;
+  credentialType: string;
+  purpose: string;
+  ownerType: string;
+  ownerRef: string;
+  label?: string | null;
+  status: string;
+  issuedAt: string;
+  expiresAt?: string | null;
+  revokedAt?: string | null;
+}
+
 export interface DashboardMetrics {
   totalRequests: number;
   successRate: number;

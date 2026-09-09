@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity } from 'lucide-react';
+import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users, CreditCard, LifeBuoy, QrCode } from 'lucide-react';
 import { MetricCards } from './components/MetricCards';
 import { LiveTopology } from './components/LiveTopology';
 import { ProviderRegistry } from './components/ProviderRegistry';
@@ -8,6 +8,10 @@ import { AuditLogs } from './components/AuditLogs';
 import { ProviderManagement } from './components/ProviderManagement';
 import { Observability } from './components/Observability';
 import { LoginGate } from './components/LoginGate';
+import { RBACManagement } from './components/RBACManagement';
+import { SubscriptionManagement } from './components/SubscriptionManagement';
+import { SupportDesk } from './components/SupportDesk';
+import { CredentialsManagement } from './components/CredentialsManagement';
 import { useAuth } from './auth';
 import { ProviderConfig, ProviderManagement as ProviderManagementType, TransactionEvent, DashboardMetrics } from './types';
 
@@ -20,7 +24,7 @@ const INITIAL_METRICS: DashboardMetrics = {
   volumePerApp: {}
 };
 
-type Tab = 'operations' | 'management' | 'observability';
+type Tab = 'operations' | 'management' | 'observability' | 'rbac' | 'billing' | 'support' | 'credentials';
 
 export const App: React.FC = () => {
   const { token, isAdmin, logout } = useAuth();
@@ -39,7 +43,10 @@ export const App: React.FC = () => {
 
   const fetchProviders = async () => {
     try {
-      const res = await fetch('/api/dashboard/providers');
+      const res = await fetch('/api/dashboard/providers', {
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
+      if (!res.ok) return;
       const data = await res.json();
       setProviders(data);
     } catch (err) {
@@ -49,7 +56,13 @@ export const App: React.FC = () => {
 
   const fetchLogs = async () => {
     try {
-      const res = await fetch('/api/dashboard/logs');
+      const res = await fetch('/api/dashboard/logs', {
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
+      // /logs requires an admin token — without one (or with an invalid one)
+      // this 403s. Leave the existing logs state alone rather than setting
+      // it to the error body, which crashed every child that expects an array.
+      if (!res.ok) return;
       const data = await res.json();
       setLogs(data);
     } catch (err) {
@@ -59,7 +72,10 @@ export const App: React.FC = () => {
 
   const fetchMetrics = async () => {
     try {
-      const res = await fetch('/api/dashboard/metrics');
+      const res = await fetch('/api/dashboard/metrics', {
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
+      if (!res.ok) return;
       const data = await res.json();
       setMetrics(data);
     } catch (err) {
@@ -131,12 +147,22 @@ export const App: React.FC = () => {
     }
   };
 
-  // Establish SSE Connection
+  // Every /api/dashboard/* route requires an admin token (by design — this
+  // used to leak cross-tenant data unauthenticated). Don't attempt any of
+  // this until logged in, and re-fetch once a token becomes available.
   useEffect(() => {
+    if (!isAdmin) return;
+
     fetchProviders();
     fetchLogs();
     fetchMetrics();
 
+    // NOTE: the browser EventSource API cannot attach the x-admin-token
+    // header this endpoint requires, so this stream will not connect even
+    // when logged in. Left in place (it fails safely to "disconnected"
+    // rather than crashing) pending a token-carrying transport — e.g. a
+    // short-lived signed stream ticket issued over the authenticated
+    // fetch API, or switching to a fetch-based ReadableStream.
     const eventSource = new EventSource('/api/dashboard/stream');
 
     eventSource.onopen = () => setSseConnected(true);
@@ -161,7 +187,8 @@ export const App: React.FC = () => {
     return () => {
       eventSource.close();
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
 
   return (
     <div className="main-layout">
@@ -249,9 +276,27 @@ export const App: React.FC = () => {
         <TabButton active={tab === 'operations'} onClick={() => setTab('operations')} icon={<Cpu className="w-4 h-4" />} label="Operations Dashboard" />
         <TabButton active={tab === 'management'} onClick={() => setTab('management')} icon={<Server className="w-4 h-4" />} label="Provider Management" />
         <TabButton active={tab === 'observability'} onClick={() => setTab('observability')} icon={<Activity className="w-4 h-4" />} label="Observability" />
+        <TabButton active={tab === 'rbac'} onClick={() => setTab('rbac')} icon={<Users className="w-4 h-4" />} label="Roles & Access" />
+        <TabButton active={tab === 'billing'} onClick={() => setTab('billing')} icon={<CreditCard className="w-4 h-4" />} label="Billing & Plans" />
+        <TabButton active={tab === 'support'} onClick={() => setTab('support')} icon={<LifeBuoy className="w-4 h-4" />} label="Support" />
+        <TabButton active={tab === 'credentials'} onClick={() => setTab('credentials')} icon={<QrCode className="w-4 h-4" />} label="Credentials" />
       </div>
 
-      {tab === 'operations' && (
+      {tab === 'operations' && !isAdmin && (
+        <div className="glass-card" style={{ padding: '24px', textAlign: 'center' }}>
+          <ShieldCheck className="w-8 h-8" style={{ color: 'var(--text-muted)', margin: '0 auto 12px' }} />
+          <h3 style={{ margin: 0, fontWeight: 700 }}>Operations Dashboard</h3>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '13px', marginBottom: '16px' }}>
+            All dashboard data requires administrator login — it used to be readable
+            without one, which leaked cross-tenant traffic to anyone with the URL.
+          </p>
+          <button onClick={() => setShowLogin(true)} style={{ ...iconBtn, width: 'auto', padding: '8px 16px' }}>
+            Admin Login
+          </button>
+        </div>
+      )}
+
+      {tab === 'operations' && isAdmin && (
         <>
           <MetricCards metrics={metrics} />
 
@@ -290,6 +335,21 @@ export const App: React.FC = () => {
       )}
 
       {tab === 'observability' && <Observability />}
+
+      {(tab === 'rbac' || tab === 'billing' || tab === 'support' || tab === 'credentials') && !isAdmin && (
+        <div className="glass-card" style={{ textAlign: 'center', padding: '48px' }}>
+          <ShieldCheck className="w-8 h-8" style={{ color: 'var(--accent-yellow)', marginBottom: '12px' }} />
+          <p>Administrator login is required to manage this section.</p>
+          <button onClick={() => setShowLogin(true)} style={{ ...iconBtn, width: 'auto', padding: '8px 16px' }}>
+            Admin Login
+          </button>
+        </div>
+      )}
+
+      {tab === 'rbac' && isAdmin && <RBACManagement token={token} />}
+      {tab === 'billing' && isAdmin && <SubscriptionManagement token={token} />}
+      {tab === 'support' && isAdmin && <SupportDesk token={token} />}
+      {tab === 'credentials' && isAdmin && <CredentialsManagement token={token} />}
 
       {showLogin && <LoginGate onClose={() => setShowLogin(false)} />}
     </div>

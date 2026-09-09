@@ -862,7 +862,17 @@ async function enqueueProviderWebhook(input: {
 // DASHBOARD MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
 
-app.use('/api/dashboard', mw.admin);
+// P0: was `mw.admin`, which checks `x-admin-key`/`Authorization` against
+// PLATFORM_ADMIN_KEY — a *different* header and env var than the one every
+// dashboard route (via requireAdmin below) and the entire admin-console
+// frontend actually use (`x-admin-token` / ADMIN_API_TOKEN). Because this
+// blanket check ran first and always failed against the frontend's header,
+// no request from the admin console could ever authenticate against any
+// /api/dashboard/* route. requireAdmin is the credential the UI is built
+// against; standardizing on it here makes the console usable again without
+// weakening the gate — the route was never reachable without matching
+// PLATFORM_ADMIN_KEY, now it requires the token the UI actually sends.
+app.use('/api/dashboard', requireAdmin);
 
 app.get('/api/dashboard/providers', (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());
@@ -1494,6 +1504,56 @@ app.get('/v1/api/gateway/credentials/:id/scans', mw.apiKey, resolveTenantContext
   } catch {
     logger.error('failed to list credential scans', { operation: 'credentials', status: 'failed' });
     return res.status(500).json({ error: 'Failed to list scans' });
+  }
+});
+
+// Admin visibility/issuance on behalf of a tenant (e.g. support staff
+// issuing a replacement badge) — mirrors the tenant-facing endpoints above
+// but authenticated as platform admin instead of an application API key.
+app.get('/api/dashboard/applications/:appSlug/tenants/:tenantId/credentials', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const credentials = await accessCredentialRepository.listByAppAndTenant(req.params.appSlug, req.params.tenantId);
+    return res.json({ credentials });
+  } catch {
+    logger.error('failed to list credentials', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list credentials' });
+  }
+});
+
+app.post('/api/dashboard/applications/:appSlug/tenants/:tenantId/credentials', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { purpose, ownerType, ownerRef, credentialType, label, expiresAt, metadata } = req.body || {};
+    if (!purpose || !ownerType || !ownerRef) {
+      return res.status(400).json({ error: 'purpose, ownerType, and ownerRef are required' });
+    }
+    const credential = await accessCredentialRepository.issue({
+      appId: req.params.appSlug,
+      tenantId: req.params.tenantId,
+      purpose,
+      ownerType,
+      ownerRef,
+      credentialType: credentialType || 'qr',
+      label,
+      metadata,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+    });
+    return res.status(201).json({ credential });
+  } catch {
+    logger.error('failed to issue credential', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to issue credential' });
+  }
+});
+
+app.post('/api/dashboard/credentials/:id/revoke', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const appSlug = req.query.appId as string | undefined;
+    if (!appSlug) return res.status(400).json({ error: 'appId query param is required' });
+    const credential = await accessCredentialRepository.revoke(req.params.id, appSlug);
+    if (!credential) return res.status(404).json({ error: 'Credential not found' });
+    return res.json({ credential });
+  } catch {
+    logger.error('failed to revoke credential', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to revoke credential' });
   }
 });
 
