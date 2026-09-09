@@ -169,9 +169,16 @@ status workflows against the new `/api/dashboard/customers*` and
 in a real headless browser this pass (not just typecheck), via mocked API
 responses since this environment cannot reach the live database (same
 constraint noted throughout this document).
-Still no router library (4 in-memory tabs via `useState`, not real
-routes) — tracked as Phase D of the 2026-09-09 auth/subscriptions/CRM
-work, not started yet. The root `tsc --noEmit` does **not** typecheck
+**Phase D (2026-09-09) verified all 4 tabs function correctly** — a real
+headless-browser regression pass (mocked backend, same constraint as
+above) plus a permanent automated suite: `apps/admin-console/tests/
+smoke.spec.ts` (`@playwright/test`, run via `npm run test:e2e` in that
+workspace), 6 tests, stable across 3 runs. Found and fixed one genuine
+bug in the process — see the changelog for detail. **Deliberately still
+no router library** (4 in-memory tabs via `useState`, not real routes) —
+this was explicitly scoped out of Phase D (the user's ask was
+verification, not a routing rewrite) rather than silently dropped; still
+the one remaining gap. The root `tsc --noEmit` does **not** typecheck
 this app (`tsconfig.json`'s `include` covers `packages/**` and
 `services/**` only) — use `apps/admin-console`'s own `npm run type-check`.
 
@@ -453,15 +460,20 @@ safety):
 10. ~~Customer signup/login~~ — **Phase A done, 2026-09-09** (§4 item 14).
     ~~Subscription/billing~~ — **Phase B done, 2026-09-09** (§4 item 16).
     ~~CRM/support back office~~ — **Phase C done, 2026-09-09** (§4 item 17).
-    Remaining phase of that same original request, not started:
-    - **Phase D — admin console consolidation**: add real routing (the
-      console is still 4 in-memory tabs via `useState`, not URLs) and do
-      a final regression pass across all 4 tabs together.
-    - **Also needed for Phases A/B to be production-usable**: a real
-      transactional email integration (§4 item 15) — currently
-      verification/reset tokens have no delivery path outside dev/test;
-      and plan usage-limit enforcement (§4 item 16) — limits are stored
-      but nothing in the gateway enforces them yet.
+    ~~Admin console verification~~ — **Phase D done, 2026-09-09** — a
+    real-browser regression pass across all 4 tabs (found and fixed one
+    genuine bug) plus a permanent `@playwright/test` suite
+    (`apps/admin-console/tests/smoke.spec.ts`, `npm run test:e2e`). See
+    the changelog for what was deliberately left out of scope (a router
+    library) and why.
+    All 4 phases of the original request are now done. Real gaps
+    remaining, none silently dropped:
+    - A real transactional email integration (§4 item 15) — verification/
+      reset tokens (Phases A/B) have no delivery path outside dev/test.
+    - Plan usage-limit enforcement (§4 item 16) — limits are stored but
+      nothing in the gateway enforces them.
+    - Admin console routing (this item) — still 4 in-memory tabs via
+      `useState`, not URLs; no deep-linking or browser back/forward.
 
 ## 7. Relationship to Prior Reports
 

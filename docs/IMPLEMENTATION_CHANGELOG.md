@@ -6,6 +6,94 @@ tests cover it.
 
 ---
 
+## 2026-09-09 — Admin Console Verification + Permanent Regression Suite (Phase D of 4)
+
+**Context:** final phase of the same 4-phase request as Phases A/B/C
+(below). The user's literal ask for this phase was to "make sure the
+admin console is functioning properly" — a verification request, not a
+request to add routing infrastructure. Scoped accordingly: this phase is
+a thorough regression pass across all 4 tabs (Operations, Provider
+Management, the new Customers tab, Observability) plus turning that
+verification into a permanent, automated check, rather than bolting on
+`react-router` (a real architecture change with genuine regression risk)
+to a console that has zero pre-existing test coverage of any kind.
+
+### What was done
+- **Manual regression pass in a real headless browser** (Chromium via
+  Playwright, launched against the environment's pre-installed browser at
+  `/opt/pw-browsers/chromium`) — booted the Vite dev server standalone,
+  mocked every `/api/dashboard/*` and `/api/observability/*` endpoint the
+  console calls (this environment cannot reach the live database, the
+  same constraint noted throughout this document), and walked all 4 tabs
+  plus tab-switching. **Found and fixed one real bug in the process**
+  (not a pre-existing one — introduced by this session's own first
+  regression-script draft, not by the app): the mock `/api/observability/
+  metrics` response didn't match `Observability.tsx`'s actual
+  `MetricsSnapshot` interface (`counters`/`latency`/`providerHealth`),
+  which crashed the component with "Cannot convert undefined or null to
+  object." Confirms the check is doing real work, not rubber-stamping —
+  a wrong assumption about a response shape surfaces immediately as a
+  crash, exactly like it would with real data.
+- **Turned that manual check into `apps/admin-console/tests/smoke.spec.ts`**
+  (new `@playwright/test` devDependency) — 6 tests, run via
+  `npm run test:e2e` in `apps/admin-console`: each of the 4 tabs renders
+  real (mocked) data with zero console/page errors, the Customers tab's
+  unauthenticated gate renders correctly, and switching through all 4
+  tabs in sequence never throws. `playwright.config.ts` pins
+  `launchOptions.executablePath` to the environment's pre-installed
+  Chromium rather than letting Playwright attempt its own version-matched
+  download, per this session's environment notes.
+- **One real test-harness bug found and fixed while building the suite**:
+  the login helper did `page.goto('/')` then `page.evaluate(...
+  localStorage.setItem...)` then `page.reload()` — the reload cancels the
+  first load's in-flight `fetch()` calls mid-navigation, which surfaces
+  as spurious "Failed to fetch" console errors that look like app bugs
+  but aren't. Fixed by seeding `localStorage` via `page.addInitScript()`
+  before a single navigation instead. Documented in the test file so a
+  future contributor doesn't reintroduce the same race.
+- **Result: no app defects found.** All 4 tabs — including the Phase C
+  Customers tab — render correctly with real backend data, no console
+  errors, no crashes, and tab-switching doesn't corrupt state.
+
+### Deliberately not done in this phase
+- **No router library added.** The console remains 4 in-memory tabs via
+  `useState`, not real URLs — no deep-linking, no browser back/forward
+  between tabs, no page-refresh tab persistence. This was flagged as a
+  known gap in Phases A–C's changelog entries and remains one; adding
+  `react-router` (or similar) is a real architecture change, and doing it
+  under this phase's actual scope ("make sure it's functioning") without
+  dedicated design/testing time would be exactly the kind of
+  under-verified change the master plan warns against. Tracked as a
+  follow-up, not silently dropped.
+
+### Tests
+- `apps/admin-console/tests/smoke.spec.ts` — 6 new Playwright tests,
+  confirmed stable across 3 consecutive runs (no flakiness) once the
+  login-helper race above was fixed.
+- `apps/admin-console`'s own `npm run type-check` — clean (covers the new
+  test/config files too; confirmed the root `tsc --noEmit` still does
+  **not** cover `apps/**`, so this remains the only way to typecheck this
+  app — see Phase C's entry).
+- Full backend suite unaffected by this phase (no backend code changed):
+  399 passed, 12 pre-existing skipped, unchanged from Phase C.
+  `npm run build:all` clean.
+
+**Files changed:** `apps/admin-console/package.json` (new
+`@playwright/test` devDependency, new `test:e2e` script),
+`apps/admin-console/playwright.config.ts` (new),
+`apps/admin-console/tests/smoke.spec.ts` (new), `.gitignore` (Playwright
+artifact directories), `package-lock.json`.
+
+**This closes out the 4-phase request** (customer signup/login,
+subscription billing, developer CRM/support back office, admin console
+verification). Real, load-bearing gaps that remain across all four
+phases, for whoever picks this up next: no transactional email
+integration (Phase A/B — verification/reset tokens have no delivery path
+in production), no plan usage-limit enforcement (Phase B), and no admin
+console routing (Phase D, this entry) — none of these were silently
+dropped; each is called out explicitly in `IMPLEMENTATION_BASELINE.md`
+§4/§6.
+
 ## 2026-09-09 — Developer CRM / Support Back Office (Phase C of 4)
 
 **Context:** continuation of the same 4-phase request as Phases A/B
