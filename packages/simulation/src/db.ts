@@ -130,6 +130,38 @@ export interface DbState {
   roles: RoleRow[];
   plans: PlanRow[];
   subscriptions: SubscriptionRow[];
+  customerNotes: CustomerNoteRow[];
+  supportTickets: SupportTicketRow[];
+  ticketComments: TicketCommentRow[];
+}
+
+export interface CustomerNoteRow {
+  id: string;
+  applicationId: string;
+  authorName: string;
+  body: string;
+  createdAt: Date;
+}
+
+export interface SupportTicketRow {
+  id: string;
+  applicationId: string;
+  subject: string;
+  description: string;
+  status: string;
+  priority: string;
+  requesterEmail: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  resolvedAt: Date | null;
+}
+
+export interface TicketCommentRow {
+  id: string;
+  ticketId: string;
+  authorName: string;
+  body: string;
+  createdAt: Date;
 }
 
 export interface PlanRow {
@@ -229,6 +261,9 @@ export const dbState: DbState = {
   roles: [],
   plans: [],
   subscriptions: [],
+  customerNotes: [],
+  supportTickets: [],
+  ticketComments: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -292,6 +327,15 @@ class MockSubscriptionError extends Error {
     this.name = 'SubscriptionError';
   }
 }
+class MockCrmError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CrmError';
+  }
+}
+
+const TICKET_STATUSES = ['open', 'in_progress', 'resolved', 'closed'];
+const TICKET_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
 
 const INTERVAL_MS: Record<string, number> = {
   month: 30 * 24 * 60 * 60 * 1000,
@@ -316,6 +360,9 @@ export function clearDb(): void {
   dbState.roles = [];
   dbState.plans = [];
   dbState.subscriptions = [];
+  dbState.customerNotes = [];
+  dbState.supportTickets = [];
+  dbState.ticketComments = [];
 }
 
 // Mirrors the seed plans inserted by migration 0011_add_subscriptions.sql
@@ -575,7 +622,8 @@ export function installDatabaseMock(): Record<string, unknown> {
     },
     applicationRepository: {
       async findById(id: string) {
-        return dbState.applications.find((a) => a.id === id);
+        const row = dbState.applications.find((a) => a.id === id);
+        return row ? { ...row, createdAt: (row as any).createdAt ?? new Date() } : undefined;
       },
       async findBySlug(slug: string) {
         return dbState.applications.find((a) => a.slug === slug);
@@ -583,8 +631,16 @@ export function installDatabaseMock(): Record<string, unknown> {
       async findByName(name: string) {
         return dbState.applications.find((a) => a.name === name);
       },
+      // Applications created before this CRM work don't have createdAt at
+      // all (see DbState.applications' type) — default it here rather
+      // than touching every existing creation call site (seedReachChurch,
+      // the ApplicationRegistry/AuthRegistry mocks' own app-creation
+      // paths) just to satisfy the CRM's display-only need for a value.
+      async findAll() {
+        return dbState.applications.map((a) => ({ ...a, createdAt: (a as any).createdAt ?? new Date() }));
+      },
       async create(data: Record<string, unknown>) {
-        const row = { id: `app_${randomUUID().slice(0, 8)}`, slug: String(data.slug), name: String(data.name), status: 'active', environment: 'development' };
+        const row = { id: `app_${randomUUID().slice(0, 8)}`, slug: String(data.slug), name: String(data.name), status: 'active', environment: 'development', createdAt: new Date() };
         dbState.applications.push(row);
         return row;
       },
@@ -836,6 +892,74 @@ export function installDatabaseMock(): Record<string, unknown> {
         const row = dbState.subscriptions.find((s) => s.id === id);
         if (!row) return undefined;
         Object.assign(row, data, { updatedAt: new Date() });
+        return row;
+      },
+    },
+    customerNoteRepository: {
+      async findByApplicationId(applicationId: string) {
+        return dbState.customerNotes.filter((n) => n.applicationId === applicationId);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: CustomerNoteRow = {
+          id: `note_${randomUUID().slice(0, 8)}`,
+          applicationId: String(data.applicationId),
+          authorName: String(data.authorName),
+          body: String(data.body),
+          createdAt: new Date(),
+        };
+        dbState.customerNotes.push(row);
+        return row;
+      },
+    },
+    supportTicketRepository: {
+      async findById(id: string) {
+        return dbState.supportTickets.find((t) => t.id === id);
+      },
+      async findByApplicationId(applicationId: string) {
+        return dbState.supportTickets.filter((t) => t.applicationId === applicationId);
+      },
+      async findAll(status?: string) {
+        return status ? dbState.supportTickets.filter((t) => t.status === status) : dbState.supportTickets;
+      },
+      async countOpenByApplicationId(applicationId: string) {
+        return dbState.supportTickets.filter((t) => t.applicationId === applicationId && t.status === 'open').length;
+      },
+      async create(data: Record<string, unknown>) {
+        const row: SupportTicketRow = {
+          id: `ticket_${randomUUID().slice(0, 8)}`,
+          applicationId: String(data.applicationId),
+          subject: String(data.subject),
+          description: String(data.description),
+          status: (data.status as string) ?? 'open',
+          priority: (data.priority as string) ?? 'normal',
+          requesterEmail: (data.requesterEmail as string) ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          resolvedAt: null,
+        };
+        dbState.supportTickets.push(row);
+        return row;
+      },
+      async update(id: string, data: Partial<Record<string, unknown>>) {
+        const row = dbState.supportTickets.find((t) => t.id === id);
+        if (!row) return undefined;
+        Object.assign(row, data, { updatedAt: new Date() });
+        return row;
+      },
+    },
+    ticketCommentRepository: {
+      async findByTicketId(ticketId: string) {
+        return dbState.ticketComments.filter((c) => c.ticketId === ticketId);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: TicketCommentRow = {
+          id: `comment_${randomUUID().slice(0, 8)}`,
+          ticketId: String(data.ticketId),
+          authorName: String(data.authorName),
+          body: String(data.body),
+          createdAt: new Date(),
+        };
+        dbState.ticketComments.push(row);
         return row;
       },
     },
@@ -1245,6 +1369,7 @@ export function installDatabaseMock(): Record<string, unknown> {
     ValidationError: MockValidationError,
     ConflictError: MockConflictError,
     SubscriptionError: MockSubscriptionError,
+    CrmError: MockCrmError,
     SubscriptionRegistry: class {
       async listPlans() {
         return dbState.plans.filter((p) => p.isActive);
@@ -1323,6 +1448,133 @@ export function installDatabaseMock(): Record<string, unknown> {
           return existing;
         }
         return null;
+      }
+    },
+    CrmRegistry: class {
+      private toUserSummary(user: UserRow) {
+        return {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          lastLoginAt: user.lastLoginAt,
+          emailVerifiedAt: user.emailVerifiedAt,
+        };
+      }
+
+      private async summarize(application: { id: string; name: string; slug: string; status: string; environment: string; createdAt?: Date }) {
+        const subscription = dbState.subscriptions.find((s) => s.applicationId === application.id);
+        const users = dbState.users.filter((u) => u.applicationId === application.id);
+        const openTicketCount = dbState.supportTickets.filter(
+          (t) => t.applicationId === application.id && t.status === 'open',
+        ).length;
+        const plan = subscription ? dbState.plans.find((p) => p.id === subscription.planId) : undefined;
+        return {
+          application: { ...application, createdAt: application.createdAt ?? new Date() },
+          subscription: subscription ?? null,
+          plan: plan ? { id: plan.id, slug: plan.slug, name: plan.name } : null,
+          userCount: users.length,
+          openTicketCount,
+        };
+      }
+
+      async listCustomers() {
+        return Promise.all(dbState.applications.map((a) => this.summarize(a as any)));
+      }
+
+      async getCustomer(applicationId: string) {
+        const application = dbState.applications.find((a) => a.id === applicationId);
+        if (!application) return null;
+        const summary = await this.summarize(application as any);
+        const users = dbState.users.filter((u) => u.applicationId === applicationId).map((u) => this.toUserSummary(u));
+        const notes = dbState.customerNotes.filter((n) => n.applicationId === applicationId);
+        const tickets = dbState.supportTickets.filter((t) => t.applicationId === applicationId);
+        return { ...summary, users, notes, tickets };
+      }
+
+      async addNote(applicationId: string, authorName: string, body: string) {
+        if (!body || !body.trim()) throw new MockCrmError('Note body is required');
+        const application = dbState.applications.find((a) => a.id === applicationId);
+        if (!application) throw new MockCrmError(`Application ${applicationId} not found`);
+        const row: CustomerNoteRow = {
+          id: `note_${randomUUID().slice(0, 8)}`,
+          applicationId,
+          authorName: authorName || 'Admin',
+          body,
+          createdAt: new Date(),
+        };
+        dbState.customerNotes.push(row);
+        return row;
+      }
+
+      async listTickets(status?: string) {
+        if (status && !TICKET_STATUSES.includes(status)) throw new MockCrmError(`Invalid status "${status}"`);
+        return status ? dbState.supportTickets.filter((t) => t.status === status) : dbState.supportTickets;
+      }
+
+      async getTicket(ticketId: string) {
+        const ticket = dbState.supportTickets.find((t) => t.id === ticketId);
+        if (!ticket) return null;
+        const comments = dbState.ticketComments.filter((c) => c.ticketId === ticketId);
+        return { ticket, comments };
+      }
+
+      async createTicket(
+        applicationId: string,
+        input: { subject: string; description: string; priority?: string; requesterEmail?: string },
+      ) {
+        if (!input.subject || !input.subject.trim()) throw new MockCrmError('subject is required');
+        if (!input.description || !input.description.trim()) throw new MockCrmError('description is required');
+        const priority = input.priority ?? 'normal';
+        if (!TICKET_PRIORITIES.includes(priority)) throw new MockCrmError(`Invalid priority "${priority}"`);
+        const application = dbState.applications.find((a) => a.id === applicationId);
+        if (!application) throw new MockCrmError(`Application ${applicationId} not found`);
+
+        const row: SupportTicketRow = {
+          id: `ticket_${randomUUID().slice(0, 8)}`,
+          applicationId,
+          subject: input.subject,
+          description: input.description,
+          status: 'open',
+          priority,
+          requesterEmail: input.requesterEmail ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          resolvedAt: null,
+        };
+        dbState.supportTickets.push(row);
+        return row;
+      }
+
+      async updateTicket(ticketId: string, updates: { status?: string; priority?: string }) {
+        if (updates.status && !TICKET_STATUSES.includes(updates.status)) {
+          throw new MockCrmError(`Invalid status "${updates.status}"`);
+        }
+        if (updates.priority && !TICKET_PRIORITIES.includes(updates.priority)) {
+          throw new MockCrmError(`Invalid priority "${updates.priority}"`);
+        }
+        const existing = dbState.supportTickets.find((t) => t.id === ticketId);
+        if (!existing) throw new MockCrmError(`Ticket ${ticketId} not found`);
+
+        Object.assign(existing, updates, { updatedAt: new Date() });
+        if (updates.status === 'resolved' || updates.status === 'closed') {
+          existing.resolvedAt = new Date();
+        }
+        return existing;
+      }
+
+      async addTicketComment(ticketId: string, authorName: string, body: string) {
+        if (!body || !body.trim()) throw new MockCrmError('Comment body is required');
+        const ticket = dbState.supportTickets.find((t) => t.id === ticketId);
+        if (!ticket) throw new MockCrmError(`Ticket ${ticketId} not found`);
+        const row: TicketCommentRow = {
+          id: `comment_${randomUUID().slice(0, 8)}`,
+          ticketId,
+          authorName: authorName || 'Admin',
+          body,
+          createdAt: new Date(),
+        };
+        dbState.ticketComments.push(row);
+        return row;
       }
     },
     // Faithful-enough reimplementation of packages/database/src/auth-registry.ts

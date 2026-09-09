@@ -6,6 +6,90 @@ tests cover it.
 
 ---
 
+## 2026-09-09 — Developer CRM / Support Back Office (Phase C of 4)
+
+**Context:** continuation of the same 4-phase request as Phases A/B
+(below). This is Phase C — a customer list, notes, and support tickets
+for BIS staff, backend + admin console UI. Phase D (admin console
+routing/regression consolidation) is the only phase not started.
+
+### What was built
+- **Schema** (migration `0012_add_crm.sql`, applied directly to the live
+  Neon project, same hand-written/hand-applied method as 0010/0011):
+  `customer_notes` (free-text notes on an application), `support_tickets`
+  (subject/description/status/priority/requester), `ticket_comments`
+  (threaded replies on a ticket). `authorName` is a plain string rather
+  than a user FK — admin auth is still a single shared token
+  (`requireAdmin`), so there's no per-admin identity to reference.
+- **`CrmRegistry`** (`packages/database/src/crm-registry.ts`) — composes
+  `applicationRepository.findAll()` (confirmed already existed — the
+  2026-09-09 audit's finding was that no *route* exposed it, not that the
+  repository layer lacked it) with subscriptions/plans (Phase B) and the
+  new notes/tickets/comments repos into a `listCustomers()`/
+  `getCustomer()` view. **Security fix caught during review, not after**:
+  `getCustomer()` initially spread real `User` rows (which include
+  `passwordHash`) straight into the API response — TypeScript's
+  `UserSummary` interface doesn't strip that field at runtime, only an
+  explicit field whitelist does. Fixed before this was ever exercised
+  over HTTP by building a `toUserSummary()` mapper; a dedicated test
+  (`'never leaks passwordHash through getCustomer'`, at both the unit and
+  HTTP-simulation level) guards the regression.
+- **Gateway routes** (`services/api-gateway/src/app.ts`, new "DEVELOPER
+  CRM / SUPPORT BACK OFFICE" section, all `requireAdmin`-gated — same
+  single shared-secret admin auth as every other `/api/dashboard/*`
+  route): `GET /customers`, `GET /customers/:id`, `POST /customers/:id/
+  notes`, `GET /tickets` (optionally `?status=`), `GET /tickets/:id`,
+  `POST /customers/:id/tickets`, `PATCH /tickets/:id`, `POST /tickets/:id/
+  comments`.
+- **Admin console UI** (`apps/admin-console/src/components/Customers.tsx`,
+  new "Customers" tab in `App.tsx`) — a customer list (plan, subscription
+  status, user count, open ticket count) that drills into a detail view:
+  users, notes with an add-note form, and a support-ticket panel
+  (create, expand to see/add comments, one-click status change).
+  Verified in a real headless browser (Chromium via Playwright), not just
+  typecheck/build: booted the Vite dev server standalone, confirmed the
+  unauthenticated gate renders, then mocked `/api/dashboard/*` responses
+  via request interception (no live DB reachable from this environment —
+  same constraint as every other real-data verification this session) to
+  confirm the populated list, customer detail, and expanded-ticket views
+  render with zero console/page errors. Screenshots retained for this
+  session only, not committed to the repo.
+
+### Tests
+- `packages/database/src/crm-registry.test.ts` — 13 unit tests against
+  in-memory fakes, including the passwordHash-leak regression guard.
+- `packages/simulation/src/crm.simulation.test.ts` — 11 tests booting the
+  real gateway: admin-auth enforcement, full customer/note/ticket/comment
+  CRUD, ticket status → `resolvedAt`, and the same passwordHash-leak check
+  at the HTTP level.
+- Extending `packages/simulation/src/db.ts` was required again (`app.ts`
+  now also constructs a `CrmRegistry` at module load time) — including
+  adding `applicationRepository.findAll()` to the mock, which didn't
+  exist there before, and backfilling a `createdAt` field onto mock
+  application rows (several pre-existing call sites — `seedReachChurch`,
+  the `ApplicationRegistry`/`AuthRegistry` mocks' own app-creation paths —
+  never set one; defaulted lazily in the two read paths that now need it
+  rather than touching every writer).
+- Full suite: 411 total (399 passed, 12 pre-existing skipped) — confirmed
+  3x consecutive runs, 0 failures. Lint (0 errors — including the new
+  `Customers.tsx`, zero findings), `apps/admin-console`'s dedicated
+  `type-check` script (clean — the root `tsc --noEmit` does **not** cover
+  `apps/**/*.tsx`, so this had to be run separately), and
+  `npm run build:all` all clean.
+
+**Files changed:** `packages/database/drizzle/0012_add_crm.sql` (new),
+`packages/database/drizzle/meta/_journal.json`, `packages/database/src/
+schema/{customer-notes,support-tickets,ticket-comments,index}.ts` (3
+new), `packages/database/src/repositories/{customer-notes,support-
+tickets,ticket-comments,index}.ts` (3 new), `packages/database/src/
+crm-registry.ts` (new) + `.test.ts` (new), `packages/database/src/
+repositories/applications.ts` (no change needed — `findAll()` already
+existed), `packages/database/src/index.ts`,
+`services/api-gateway/src/app.ts`, `packages/simulation/src/db.ts`,
+`packages/simulation/src/crm.simulation.test.ts` (new),
+`apps/admin-console/src/components/Customers.tsx` (new),
+`apps/admin-console/src/App.tsx`.
+
 ## 2026-09-09 — Subscription Billing: Plans, Stripe Subscriptions (Phase B of 4)
 
 **Context:** continuation of the same 4-phase request as Phase A (below).

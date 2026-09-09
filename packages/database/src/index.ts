@@ -82,3 +82,26 @@ export {
   type SubscriptionRepositoryForBilling,
   type ApplicationLookupForBilling,
 } from './subscription-registry';
+
+// CRM Registry (developer/support back office — see docstring in
+// crm-registry.ts)
+export {
+  CrmRegistry,
+  CrmError,
+  type ApplicationSummary,
+  type SubscriptionSummary,
+  type PlanSummary,
+  type UserSummary,
+  type CustomerNoteRecord,
+  type SupportTicketRecord,
+  type TicketCommentRecord,
+  type CustomerSummary,
+  type CustomerDetail,
+  type ApplicationRepositoryForCrm,
+  type SubscriptionRepositoryForCrm,
+  type PlanRepositoryForCrm,
+  type UserRepositoryForCrm,
+  type CustomerNoteRepositoryForCrm,
+  type SupportTicketRepositoryForCrm,
+  type TicketCommentRepositoryForCrm,
+} from './crm-registry';

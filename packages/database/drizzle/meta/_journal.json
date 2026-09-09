@@ -85,6 +85,13 @@
       "when": 1786951000000,
       "tag": "0011_add_subscriptions",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1786952000000,
+      "tag": "0012_add_crm",
+      "breakpoints": true
     }
   ]
 }

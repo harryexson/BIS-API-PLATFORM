@@ -161,13 +161,19 @@ gap against the "real production requirement" in the master plan — see §6.
 ### Admin Console (`apps/admin-console`)
 React/Vite app with: login gate (admin-key based), provider registry view,
 provider management (enable/disable/priority/health), observability panel,
-audit logs, live topology, request playground. Functional and builds clean.
-No router library (3 in-memory tabs via `useState`, not real routes) and
-no customer/CRM/subscription views of any kind — confirmed by a
-2026-09-09 audit (see §4 item 1/§6): there is no page listing
-`applications` (tenants/customers) at all, admin or otherwise. Tracked as
-a separate phase (Phase D of the 2026-09-09 auth/subscriptions/CRM work),
-not started yet.
+audit logs, live topology, request playground, and (added 2026-09-09,
+Phase C) a **Customers** tab — customer list, per-customer detail
+(users/notes/support tickets), note-taking, and ticket create/comment/
+status workflows against the new `/api/dashboard/customers*` and
+`/api/dashboard/tickets*` routes. Functional and builds clean; verified
+in a real headless browser this pass (not just typecheck), via mocked API
+responses since this environment cannot reach the live database (same
+constraint noted throughout this document).
+Still no router library (4 in-memory tabs via `useState`, not real
+routes) — tracked as Phase D of the 2026-09-09 auth/subscriptions/CRM
+work, not started yet. The root `tsc --noEmit` does **not** typecheck
+this app (`tsconfig.json`'s `include` covers `packages/**` and
+`services/**` only) — use `apps/admin-console`'s own `npm run type-check`.
 
 ### Testing
 - Unit/component tests colocated with source (`*.test.ts`).
@@ -364,12 +370,16 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     (`messageLimit`, `paymentVolumeLimitCents`) are stored but not
     enforced anywhere in the gateway/routing path — a `starter`-plan
     application can send unlimited messages today.
-17. **No CRM/support back office** — confirmed by a 2026-09-09 audit: no
-    endpoint or admin-console view lists `applications` (tenants/
-    customers) at all, let alone notes, support tickets, or contact
-    history. Not started as of 2026-09-09 (Phase C — see §6). The admin
-    console itself (Phase D) remains a 3-tab operator dashboard with no
-    router and no customer-facing views — see §2's Admin Console section.
+17. ~~No CRM/support back office~~ — **Phase C done, 2026-09-09.**
+    `customer_notes`/`support_tickets`/`ticket_comments` tables, a
+    `CrmRegistry`, `requireAdmin`-gated `/api/dashboard/customers*` and
+    `/api/dashboard/tickets*` routes, and a new admin-console Customers
+    tab — see the changelog ("Developer CRM / Support Back Office").
+    Admin auth is still the single shared-secret token
+    (no per-admin identity, so ticket/note authorship is a free-text
+    field the person types in, not tied to an account). The admin
+    console itself (Phase D) still has no router and remains 4 in-memory
+    tabs — see §2's Admin Console section.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 
@@ -442,12 +452,12 @@ safety):
 9. Payment reconciliation / connected-account model.
 10. ~~Customer signup/login~~ — **Phase A done, 2026-09-09** (§4 item 14).
     ~~Subscription/billing~~ — **Phase B done, 2026-09-09** (§4 item 16).
-    Remaining phases of that same original request, not started:
-    - **Phase C — CRM/support back office** (§4 item 17): a customer
-      list, notes, and support tickets, backend + admin console UI.
-    - **Phase D — admin console consolidation**: add real routing and
-      wire in Phases B/C's views; verify the existing 3 tabs still work.
-    - **Also needed for Phase A/B to be production-usable**: a real
+    ~~CRM/support back office~~ — **Phase C done, 2026-09-09** (§4 item 17).
+    Remaining phase of that same original request, not started:
+    - **Phase D — admin console consolidation**: add real routing (the
+      console is still 4 in-memory tabs via `useState`, not URLs) and do
+      a final regression pass across all 4 tabs together.
+    - **Also needed for Phases A/B to be production-usable**: a real
       transactional email integration (§4 item 15) — currently
       verification/reset tokens have no delivery path outside dev/test;
       and plan usage-limit enforcement (§4 item 16) — limits are stored

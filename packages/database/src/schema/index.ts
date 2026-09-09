@@ -14,6 +14,9 @@ export {
 } from './user-verification-tokens';
 export { plans, type Plan, type NewPlan } from './plans';
 export { subscriptions, type Subscription, type NewSubscription } from './subscriptions';
+export { customerNotes, type CustomerNote, type NewCustomerNote } from './customer-notes';
+export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
+export { ticketComments, type TicketComment, type NewTicketComment } from './ticket-comments';
 export { providers, type Provider, type NewProvider } from './providers';
 export { providerCapabilities, type ProviderCapability, type NewProviderCapability } from './provider-capabilities';
 export { providerConfigs, type ProviderConfig, type NewProviderConfig } from './provider-configs';

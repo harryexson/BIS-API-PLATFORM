@@ -31,6 +31,11 @@ import {
   SubscriptionError,
   planRepository,
   subscriptionRepository,
+  CrmRegistry,
+  CrmError,
+  customerNoteRepository,
+  supportTicketRepository,
+  ticketCommentRepository,
 } from '@company/database';
 import {
   logger,
@@ -544,6 +549,90 @@ app.post('/v1/api/billing/webhooks/stripe', async (req: Request, res: Response) 
       status: 'failed',
     });
     return res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
+// ----------------------------------------------------
+// DEVELOPER CRM / SUPPORT BACK OFFICE
+// ----------------------------------------------------
+// BIS staff-facing (requireAdmin-gated, same single shared-secret admin
+// auth used by every other /api/dashboard/* route below) — a "customer"
+// here is an `application`. Confirmed absent entirely by a 2026-09-09
+// audit: no endpoint anywhere listed applications for admin use before
+// this section.
+const crmRegistry = new CrmRegistry(
+  applicationRepository,
+  subscriptionRepository,
+  planRepository,
+  userRepository,
+  customerNoteRepository,
+  supportTicketRepository,
+  ticketCommentRepository,
+);
+
+app.get('/api/dashboard/customers', requireAdmin, async (_req: Request, res: Response) => {
+  const customers = await crmRegistry.listCustomers();
+  return res.json({ customers });
+});
+
+app.get('/api/dashboard/customers/:id', requireAdmin, async (req: Request, res: Response) => {
+  const customer = await crmRegistry.getCustomer(req.params.id);
+  if (!customer) return res.status(404).json({ error: 'Customer not found' });
+  return res.json(customer);
+});
+
+app.post('/api/dashboard/customers/:id/notes', requireAdmin, async (req: Request, res: Response) => {
+  const { body, authorName } = req.body || {};
+  try {
+    const note = await crmRegistry.addNote(req.params.id, authorName, body);
+    return res.status(201).json(note);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add note' });
+  }
+});
+
+app.get('/api/dashboard/tickets', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const tickets = await crmRegistry.listTickets(req.query.status as string | undefined);
+    return res.json({ tickets });
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to list tickets' });
+  }
+});
+
+app.get('/api/dashboard/tickets/:id', requireAdmin, async (req: Request, res: Response) => {
+  const result = await crmRegistry.getTicket(req.params.id);
+  if (!result) return res.status(404).json({ error: 'Ticket not found' });
+  return res.json(result);
+});
+
+app.post('/api/dashboard/customers/:id/tickets', requireAdmin, async (req: Request, res: Response) => {
+  const { subject, description, priority, requesterEmail } = req.body || {};
+  try {
+    const ticket = await crmRegistry.createTicket(req.params.id, { subject, description, priority, requesterEmail });
+    return res.status(201).json(ticket);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to create ticket' });
+  }
+});
+
+app.patch('/api/dashboard/tickets/:id', requireAdmin, async (req: Request, res: Response) => {
+  const { status, priority } = req.body || {};
+  try {
+    const ticket = await crmRegistry.updateTicket(req.params.id, { status, priority });
+    return res.json(ticket);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to update ticket' });
+  }
+});
+
+app.post('/api/dashboard/tickets/:id/comments', requireAdmin, async (req: Request, res: Response) => {
+  const { body, authorName } = req.body || {};
+  try {
+    const comment = await crmRegistry.addTicketComment(req.params.id, authorName, body);
+    return res.status(201).json(comment);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add comment' });
   }
 });
 
