@@ -18,6 +18,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--workspace=apps/admin-console", "run", "dev"],
       "port": 5173
+    },
+    {
+      "name": "landing",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--workspace=apps/landing", "run", "dev"],
+      "port": 5176
     }
   ]
 }

@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BIS API Platform — one gate for payments and messaging</title>
+  <meta name="description" content="One API for payments and messaging across 14 providers — Stripe to pawaPay, Twilio to FutureSMS. When one rail stalls, BIS reroutes before your request fails." />
+  <meta name="theme-color" content="#fafafa" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='5' fill='%23ff5a1f'/%3E%3Cg stroke='%23101012' stroke-width='2' stroke-linecap='round'%3E%3Cline x1='16' y1='3' x2='16' y2='8'/%3E%3Cline x1='16' y1='24' x2='16' y2='29'/%3E%3Cline x1='3' y1='16' x2='8' y2='16'/%3E%3Cline x1='24' y1='16' x2='29' y2='16'/%3E%3C/g%3E%3Ccircle cx='16' cy='3' r='2.4' fill='%23101012'/%3E%3Ccircle cx='16' cy='29' r='2.4' fill='%23101012'/%3E%3Ccircle cx='3' cy='16' r='2.4' fill='%23101012'/%3E%3Ccircle cx='29' cy='16' r='2.4' fill='%23101012'/%3E%3C/svg%3E" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- DEPLOY STEP: replace with the live absolute URL and a real social preview image -->
+  <meta property="og:title" content="BIS API Platform" />
+  <meta property="og:description" content="One API for payments and messaging across 14 providers, with automatic failover." />
+  <meta property="og:url" content="/" />
+  <meta property="og:type" content="website" />
+
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="#top" aria-label="BIS API Platform, home">
+        <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="5" fill="var(--accent)" />
+          <g stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="16" y1="3" x2="16" y2="8" /><line x1="16" y1="24" x2="16" y2="29" />
+            <line x1="3" y1="16" x2="8" y2="16" /><line x1="24" y1="16" x2="29" y2="16" />
+          </g>
+          <circle cx="16" cy="3" r="2.4" /><circle cx="16" cy="29" r="2.4" />
+          <circle cx="3" cy="16" r="2.4" /><circle cx="29" cy="16" r="2.4" />
+        </svg>
+        <span>BIS</span>
+      </a>
+      <button class="nav-toggle" aria-label="Toggle menu" aria-expanded="false" aria-controls="nav-links">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="nav-links" id="nav-links">
+        <a href="#how-it-works">Product</a>
+        <a href="#providers">Providers</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#faq">FAQ</a>
+        <div class="nav-cta">
+          <a class="btn btn-ghost btn-sm" data-portal-link="/login">Sign in</a>
+          <a class="btn btn-primary btn-sm" data-portal-link="/signup">Get API keys</a>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main" tabindex="-1">
+
+    <section class="hero" id="top">
+      <div class="hero-inner reveal" data-stagger>
+        <p class="kicker">Payments and messaging, one gateway</p>
+        <h1 class="hero-title">One request in.<br /><strong>The right rail</strong> out, every time.</h1>
+        <p class="hero-sub">BIS routes payments and messages across 14 providers&nbsp;&mdash; Stripe to pawaPay, Twilio to FutureSMS&nbsp;&mdash; and reroutes automatically the moment one stalls, before your request ever fails.</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary btn-lg" data-portal-link="/signup">Get your API keys</a>
+          <a class="btn btn-ghost btn-lg" href="#how-it-works">See how routing works<span aria-hidden="true"> &darr;</span></a>
+        </div>
+        <p class="hero-proof"><span class="mono">9</span> payment rails &middot; <span class="mono">5</span> messaging rails &middot; <span class="mono">1</span> idempotent API</p>
+      </div>
+
+      <div class="relay-section reveal" data-stagger>
+        <div class="relay-stage" id="relay-stage">
+          <svg class="relay-lines" viewBox="0 0 400 400" aria-hidden="true" preserveAspectRatio="xMidYMid meet">
+            <line class="relay-line" data-i="0" x1="200" y1="200" x2="200.00" y2="50.00" />
+            <line class="relay-line" data-i="1" x1="200" y1="200" x2="265.08" y2="64.86" />
+            <line class="relay-line" data-i="2" x1="200" y1="200" x2="317.27" y2="106.48" />
+            <line class="relay-line" data-i="3" x1="200" y1="200" x2="346.24" y2="166.62" />
+            <line class="relay-line" data-i="4" x1="200" y1="200" x2="346.24" y2="233.38" />
+            <line class="relay-line" data-i="5" x1="200" y1="200" x2="317.27" y2="293.52" />
+            <line class="relay-line" data-i="6" x1="200" y1="200" x2="265.08" y2="335.14" />
+            <line class="relay-line" data-i="7" x1="200" y1="200" x2="200.00" y2="350.00" />
+            <line class="relay-line" data-i="8" x1="200" y1="200" x2="134.92" y2="335.14" />
+            <line class="relay-line" data-i="9" x1="200" y1="200" x2="82.73" y2="293.52" />
+            <line class="relay-line" data-i="10" x1="200" y1="200" x2="53.76" y2="233.38" />
+            <line class="relay-line" data-i="11" x1="200" y1="200" x2="53.76" y2="166.62" />
+            <line class="relay-line" data-i="12" x1="200" y1="200" x2="82.73" y2="106.48" />
+            <line class="relay-line" data-i="13" x1="200" y1="200" x2="134.92" y2="64.86" />
+            <circle class="relay-pulse" id="relay-pulse" cx="200" cy="200" r="5" />
+          </svg>
+
+          <div class="relay-center" aria-hidden="true">
+            <span class="relay-center-dot"></span>
+            <span class="relay-center-label">BIS<br />Gateway</span>
+          </div>
+
+          <button class="relay-node" style="--i:0" data-index="0" data-name="Stripe" data-kind="payments" aria-pressed="false"><span class="relay-code">STR</span></button>
+          <button class="relay-node" style="--i:1" data-index="1" data-name="NMI" data-kind="payments" aria-pressed="false"><span class="relay-code">NMI</span></button>
+          <button class="relay-node" style="--i:2" data-index="2" data-name="Flutterwave" data-kind="payments" aria-pressed="false"><span class="relay-code">FLW</span></button>
+          <button class="relay-node" style="--i:3" data-index="3" data-name="pawaPay" data-kind="payments" aria-pressed="false"><span class="relay-code">PWP</span></button>
+          <button class="relay-node" style="--i:4" data-index="4" data-name="PayChangu" data-kind="payments" aria-pressed="false"><span class="relay-code">PCH</span></button>
+          <button class="relay-node" style="--i:5" data-index="5" data-name="Airwallex" data-kind="payments" aria-pressed="false"><span class="relay-code">AWX</span></button>
+          <button class="relay-node" style="--i:6" data-index="6" data-name="Authorize.Net" data-kind="payments" aria-pressed="false"><span class="relay-code">ANT</span></button>
+          <button class="relay-node" style="--i:7" data-index="7" data-name="Checkout.com" data-kind="payments" aria-pressed="false"><span class="relay-code">CKO</span></button>
+          <button class="relay-node" style="--i:8" data-index="8" data-name="Paystack" data-kind="payments" aria-pressed="false"><span class="relay-code">PSK</span></button>
+          <button class="relay-node" style="--i:9" data-index="9" data-name="SignalHouse" data-kind="messaging" aria-pressed="false"><span class="relay-code">SGH</span></button>
+          <button class="relay-node" style="--i:10" data-index="10" data-name="Infobip" data-kind="messaging" aria-pressed="false"><span class="relay-code">INF</span></button>
+          <button class="relay-node" style="--i:11" data-index="11" data-name="FutureSMS" data-kind="messaging" aria-pressed="false"><span class="relay-code">FSM</span></button>
+          <button class="relay-node" style="--i:12" data-index="12" data-name="Twilio" data-kind="messaging" aria-pressed="false"><span class="relay-code">TWL</span></button>
+          <button class="relay-node" style="--i:13" data-index="13" data-name="Email" data-kind="messaging" aria-pressed="false"><span class="relay-code">EML</span></button>
+        </div>
+
+        <div class="relay-controls">
+          <button class="btn btn-primary" id="relay-send">Send test event</button>
+          <button class="btn btn-ghost btn-sm" id="relay-reset">Reset rails</button>
+          <p class="relay-status chip" id="relay-status" role="status" aria-live="polite">Click a rail to take it offline, then send a test event and watch BIS route around it.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="proof-strip" id="providers" aria-label="Supported providers">
+      <div class="section-inner">
+        <p class="proof-label">Every rail behind one contract</p>
+        <ul class="proof-list">
+          <li>Stripe</li><li>NMI</li><li>Flutterwave</li><li>pawaPay</li><li>PayChangu</li>
+          <li>Airwallex</li><li>Authorize.Net</li><li>Checkout.com</li><li>Paystack</li>
+          <li>SignalHouse</li><li>Infobip</li><li>FutureSMS</li><li>Twilio</li><li>Email</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="how" id="how-it-works">
+      <div class="section-inner">
+        <h2 class="section-title reveal" data-stagger>How it routes</h2>
+        <div class="how-grid">
+          <div class="how-step reveal" data-stagger>
+            <span class="how-index mono">01</span>
+            <h3>Call one endpoint</h3>
+            <p>Send a payment or a message the same way, with an <code>Idempotency-Key</code> so a retried request can never charge or send twice.</p>
+            <pre class="code-block"><code><span class="tok-kw">POST</span> /v1/api/gateway/payment
+<span class="tok-key">Idempotency-Key</span>: 8f14e-...
+
+{
+  <span class="tok-key">"appId"</span>: <span class="tok-str">"afribook"</span>,
+  <span class="tok-key">"amount"</span>: <span class="tok-num">2500</span>,
+  <span class="tok-key">"currency"</span>: <span class="tok-str">"USD"</span>,
+  <span class="tok-key">"paymentMethod"</span>: <span class="tok-str">"card"</span>
+}</code></pre>
+          </div>
+          <div class="how-step reveal" data-stagger>
+            <span class="how-index mono">02</span>
+            <h3>The engine picks the rail</h3>
+            <p>Nine payment rails, five messaging rails. The routing engine checks live health and picks one; if that rail errors, it tries the next before your request ever fails.</p>
+          </div>
+          <div class="how-step reveal" data-stagger>
+            <span class="how-index mono">03</span>
+            <h3>One verified webhook back</h3>
+            <p>Every provider webhook is HMAC-verified on arrival and lands in Postgres first &mdash; if the queue backend is down, it waits there and replays the moment it's back. Nothing drops at the door.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="trust" id="reliability">
+      <div class="section-inner">
+        <h2 class="section-title reveal" data-stagger>Built for the failure cases, not just the happy path</h2>
+        <div class="trust-grid">
+          <div class="trust-item reveal" data-stagger>
+            <svg class="trust-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-7 4 14 2-7h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <h3>Idempotent by default</h3>
+            <p>The same key and payload always return the same result. A reused key with a different payload gets a 409, not a silent double charge.</p>
+          </div>
+          <div class="trust-item reveal" data-stagger>
+            <svg class="trust-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 12h8M12 8v8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <h3>Durable by design</h3>
+            <p>Inbound webhooks land in Postgres before anything else happens. If the job queue's backend is unreachable, events wait safely and drain the moment it recovers.</p>
+          </div>
+          <div class="trust-item reveal" data-stagger>
+            <svg class="trust-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v6M12 15v6M3 12h6M15 12h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+            <h3>Backpressure, not collapse</h3>
+            <p>Every queue has a configurable depth cap. Once it's hit, new jobs are rejected immediately with a clear error &mdash; never queued silently until they die downstream.</p>
+          </div>
+          <div class="trust-item reveal" data-stagger>
+            <svg class="trust-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="8" height="12" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="13" y="7" width="8" height="12" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+            <h3>Tenant isolation</h3>
+            <p>Every request is scoped to your application and tenant at the query level. One customer's records never surface in another's lookup.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="pricing" id="pricing">
+      <div class="section-inner">
+        <h2 class="section-title reveal" data-stagger>Pay for what moves, not for seats</h2>
+        <p class="section-sub reveal" data-stagger>Usage-based across every tier &mdash; a quiet app and a busy one don't pay the same bill.</p>
+        <div class="pricing-grid">
+          <div class="price-card reveal" data-stagger>
+            <h3>Free</h3>
+            <p class="price-amount">$0</p>
+            <p class="price-note">for testing and low volume</p>
+            <ul class="price-features">
+              <li>All 14 provider rails</li>
+              <li>Sandbox credentials</li>
+              <li>Community support</li>
+            </ul>
+            <a class="btn btn-ghost" data-portal-link="/signup">Start free</a>
+          </div>
+          <div class="price-card reveal" data-stagger>
+            <h3>Growth</h3>
+            <p class="price-amount">Usage&#8209;based</p>
+            <p class="price-note">per successful transaction</p>
+            <ul class="price-features">
+              <li>Everything in Free</li>
+              <li>Production credentials</li>
+              <li>Email support</li>
+            </ul>
+            <a class="btn btn-ghost" data-portal-link="/signup">Start building</a>
+          </div>
+          <div class="price-card price-card-featured reveal" data-stagger>
+            <p class="price-badge">Most rails, best rates</p>
+            <h3>Scale</h3>
+            <p class="price-amount">Usage&#8209;based</p>
+            <p class="price-note">volume pricing as you grow</p>
+            <ul class="price-features">
+              <li>Everything in Growth</li>
+              <li>Volume discounts</li>
+              <li>Priority support</li>
+            </ul>
+            <a class="btn btn-primary" data-portal-link="/signup">Talk to us</a>
+          </div>
+          <div class="price-card reveal" data-stagger>
+            <h3>Enterprise</h3>
+            <p class="price-amount">Custom</p>
+            <p class="price-note">dedicated corridors and SLA</p>
+            <ul class="price-features">
+              <li>Everything in Scale</li>
+              <li>Custom corridors</li>
+              <li>Dedicated support</li>
+            </ul>
+            <a class="btn btn-ghost" href="#faq">Contact sales</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="faq" id="faq">
+      <div class="section-inner section-inner-narrow">
+        <h2 class="section-title reveal" data-stagger>Questions builders actually ask</h2>
+        <div class="faq-list reveal" data-stagger>
+          <details class="faq-item">
+            <summary>What happens when a provider goes down?</summary>
+            <p>The routing engine detects the failure and tries the next healthy rail before your request times out. If a webhook can't be delivered, it's retried from a durable queue instead of being lost.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Do you ever hold our funds?</summary>
+            <p>No. BIS routes requests to the payment and messaging accounts you connect &mdash; it isn't a custodian. Money and messages move directly between your customer and your own provider accounts.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Which African corridors do you support?</summary>
+            <p>Mobile money and card rails across multiple African markets through pawaPay, PayChangu, and Flutterwave, alongside the global card and bank rails.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Is this only for payments?</summary>
+            <p>No &mdash; the same gateway routes SMS, WhatsApp, and email through Twilio, Infobip, SignalHouse, FutureSMS, and email, with STOP/HELP/YES/NO compliance keywords already handled.</p>
+          </details>
+          <details class="faq-item">
+            <summary>How do I try it?</summary>
+            <p>Create a free account, generate a sandbox API key, and send your first request &mdash; no card required to start.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="cta-final">
+      <div class="section-inner cta-final-inner reveal" data-stagger>
+        <h2>Send your first request in the next five minutes.</h2>
+        <a class="btn btn-primary btn-lg" data-portal-link="/signup">Get your API keys</a>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="section-inner footer-inner">
+      <div class="footer-brand">
+        <span class="brand">
+          <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
+            <circle cx="16" cy="16" r="5" fill="var(--accent)" />
+            <g stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="16" y1="3" x2="16" y2="8" /><line x1="16" y1="24" x2="16" y2="29" />
+              <line x1="3" y1="16" x2="8" y2="16" /><line x1="24" y1="16" x2="29" y2="16" />
+            </g>
+          </svg>
+          BIS API Platform
+        </span>
+        <p>Payments and messaging, routed.</p>
+      </div>
+      <div class="footer-links">
+        <a href="#how-it-works">Product</a>
+        <a href="#providers">Providers</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#faq">FAQ</a>
+        <a data-portal-link="/login">Developer portal</a>
+      </div>
+      <p class="footer-copy">&copy; <span id="year"></span> BIS API Platform</p>
+    </div>
+  </footer>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
