@@ -17,3 +17,10 @@ export { outboxEvents, type OutboxEvent, type NewOutboxEvent } from './outbox-ev
 export { transactions, type Transaction, type NewTransaction } from './transactions';
 export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
+export { userRoles, type UserRole, type NewUserRole } from './user-roles';
+export { subscriptionPlans, type SubscriptionPlan, type NewSubscriptionPlan } from './subscription-plans';
+export { tenantSubscriptions, type TenantSubscription, type NewTenantSubscription } from './tenant-subscriptions';
+export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
+export { supportTicketMessages, type SupportTicketMessage, type NewSupportTicketMessage } from './support-ticket-messages';
+export { accessCredentials, type AccessCredential, type NewAccessCredential } from './access-credentials';
+export { credentialScans, type CredentialScan, type NewCredentialScan } from './credential-scans';
