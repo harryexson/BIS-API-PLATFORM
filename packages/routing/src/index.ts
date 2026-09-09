@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ProviderConfig, TransactionEvent } from '@company/schemas';
 import { ProviderRegistry, BaseProvider } from '@company/providers';
 import { ConversationManager, ConversationContext } from './conversation';
@@ -33,6 +34,14 @@ const DEFAULT_FALLBACK_POLICY: ChannelFallbackPolicy = {
 const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 30_000;
 
 /**
+ * A timeout is not a normal failure: the request may have reached the
+ * provider and been processed before the response was lost. Tagging it
+ * distinctly lets payment routing refuse to treat "we don't know" the same
+ * as "it definitely failed" (see routePayment's catch block below).
+ */
+export class ProviderTimeoutError extends Error {}
+
+/**
  * Wraps a provider processRequest call with an AbortSignal timeout.
  * If the provider doesn't respond within the timeout, the call is aborted.
  */
@@ -47,7 +56,7 @@ async function withProviderTimeout<T>(
       fn(),
       new Promise<never>((_, reject) =>
         controller.addEventListener('abort', () =>
-          reject(new Error(`Provider request timed out after ${timeoutMs}ms`)),
+          reject(new ProviderTimeoutError(`Provider request timed out after ${timeoutMs}ms`)),
         ),
       ),
     ]);
@@ -56,7 +65,7 @@ async function withProviderTimeout<T>(
   return Promise.race([
     fn(),
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Provider request timed out after ${timeoutMs}ms`)), timeoutMs),
+      setTimeout(() => reject(new ProviderTimeoutError(`Provider request timed out after ${timeoutMs}ms`)), timeoutMs),
     ),
   ]);
 }
@@ -166,6 +175,36 @@ export class RoutingEngine {
         () => selectedProvider!.processRequest(appId, payload, reason),
       );
     } catch (err: any) {
+      // P0: A payment timeout is ambiguous — the provider may have received
+      // and even completed the charge before the response was lost. Never
+      // treat that the same as a confirmed failure: retrying the same
+      // payment through a second provider here would risk a real double
+      // charge on money we don't know the status of. Surface it as its own
+      // 'unknown' outcome instead — the caller must persist it as pending
+      // reconciliation (via webhook or a status check against the
+      // provider), not silently resolve it either way.
+      if (err instanceof ProviderTimeoutError) {
+        return {
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          appId,
+          category: 'payment',
+          providerId: selectedProvider.config.id,
+          status: 'unknown',
+          amount: Number(payload.amount),
+          currency,
+          latency: PROVIDER_TIMEOUT_MS,
+          cost: 0,
+          decisionReason: `${reason} | Ambiguous outcome: ${err.message}. Not retried via another provider — outcome must be reconciled via webhook/status check before any further action.`,
+          payload,
+          response: null,
+          error: err.message,
+        };
+      }
+
+      // Any other error (e.g. the provider rejected the request outright,
+      // or went offline in the race between selection and dispatch) is
+      // safe to treat as "never processed" and failover.
       const nextProviderConfig = activePayments.find(p => p.id !== selectedProvider!.config.id);
       if (nextProviderConfig) {
         const nextProvider = this.registry.getProvider(nextProviderConfig.id)!;

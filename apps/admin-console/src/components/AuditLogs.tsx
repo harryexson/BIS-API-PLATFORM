@@ -1,5 +1,5 @@
 import React from 'react';
-import { Database, Trash2, ArrowUpRight, AlertCircle } from 'lucide-react';
+import { Database, Trash2, ArrowUpRight, AlertCircle, HelpCircle } from 'lucide-react';
 import { TransactionEvent } from '../types';
 
 interface AuditLogsProps {
@@ -92,14 +92,18 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
             <tbody>
               {logs.map((log) => {
                 const isSuccess = log.status === 'success';
+                // 'unknown' = an ambiguous provider timeout deliberately left
+                // unresolved rather than risk a double charge — it is not a
+                // failure, and must not be styled or labeled as one.
+                const isUnknown = log.status === 'unknown';
                 const timeStr = new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
                 return (
-                  <tr 
-                    key={log.id} 
-                    style={{ 
+                  <tr
+                    key={log.id}
+                    style={{
                       borderBottom: '1px solid rgba(255,255,255,0.03)',
-                      background: isSuccess ? 'transparent' : 'rgba(239, 68, 68, 0.02)'
+                      background: isSuccess ? 'transparent' : isUnknown ? 'rgba(245, 158, 11, 0.02)' : 'rgba(239, 68, 68, 0.02)'
                     }}
                   >
                     <td style={{ padding: '10px 8px', color: 'var(--text-muted)' }}>{timeStr}</td>
@@ -151,12 +155,12 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
                           display: 'inline-flex',
                           alignItems: 'center',
                           gap: '3px',
-                          background: isSuccess ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-                          color: isSuccess ? 'var(--accent-green)' : 'var(--accent-red)'
+                          background: isSuccess ? 'rgba(16, 185, 129, 0.1)' : isUnknown ? 'rgba(245, 158, 11, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                          color: isSuccess ? 'var(--accent-green)' : isUnknown ? 'var(--accent-yellow)' : 'var(--accent-red)'
                         }}
                       >
-                        {!isSuccess && <AlertCircle className="w-3 h-3" />}
-                        {isSuccess ? 'SUCCESS' : 'FAILED'}
+                        {isUnknown ? <HelpCircle className="w-3 h-3" /> : !isSuccess && <AlertCircle className="w-3 h-3" />}
+                        {isSuccess ? 'SUCCESS' : isUnknown ? 'UNKNOWN' : 'FAILED'}
                       </span>
                     </td>
                   </tr>

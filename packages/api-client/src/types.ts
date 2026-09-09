@@ -14,7 +14,10 @@ export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 export type PaymentMethod = 'card' | 'mobile_money' | 'bank_transfer' | 'wallet';
-export type TransactionStatus = 'success' | 'failed';
+// 'unknown' is a real, distinct outcome (a payment provider timeout, for
+// example) — never treat it as a synonym for 'failed'. See
+// RoutingEngine.routePayment / @company/schemas for the full rationale.
+export type TransactionStatus = 'success' | 'failed' | 'unknown';
 
 export interface PaymentCreate {
   amount: number;

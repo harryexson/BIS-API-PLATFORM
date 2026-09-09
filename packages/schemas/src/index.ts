@@ -1,6 +1,12 @@
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
-export type TransactionStatus = 'success' | 'failed';
+// 'unknown' is a legitimate, distinct outcome — not a synonym for 'failed'.
+// A payment provider timeout means the request's outcome is genuinely
+// unknown (it may have been charged); routing must never silently convert
+// that into 'failed' (risks a false "declined" being retried into a real
+// double charge) or 'success' (risks confirming a charge that never
+// happened). See RoutingEngine.routePayment's timeout handling.
+export type TransactionStatus = 'success' | 'failed' | 'unknown';
 
 export type ProviderEnvironment = 'test' | 'live';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
