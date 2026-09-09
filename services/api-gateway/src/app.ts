@@ -13,6 +13,17 @@ import {
   eventRepository,
   transactionRepository,
   checkDatabaseHealth,
+  applicationRepository,
+  roleRepository,
+  permissionRepository,
+  userRoleRepository,
+  subscriptionPlanRepository,
+  tenantSubscriptionRepository,
+  supportTicketRepository,
+  supportTicketMessageRepository,
+  accessCredentialRepository,
+  credentialScanRepository,
+  verifyCredentialScan,
 } from '@company/database';
 import {
   logger,
@@ -1104,6 +1115,405 @@ app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => 
   req.on('close', () => {
     unsubscribe();
   });
+});
+
+// ----------------------------------------------------
+// RBAC — role/permission management (admin-operated on behalf of an
+// application) and per-user effective-permission resolution.
+// ----------------------------------------------------
+
+app.get('/api/dashboard/applications/:appSlug/roles', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const application = await applicationRepository.findBySlug(req.params.appSlug);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const roles = await roleRepository.findByApplicationId(application.id);
+    return res.json({ roles });
+  } catch {
+    logger.error('failed to list roles', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list roles' });
+  }
+});
+
+app.post('/api/dashboard/applications/:appSlug/roles', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const application = await applicationRepository.findBySlug(req.params.appSlug);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const { name, description } = req.body || {};
+    if (!name || typeof name !== 'string') {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    const role = await roleRepository.create({ applicationId: application.id, name, description });
+    return res.status(201).json({ role });
+  } catch {
+    logger.error('failed to create role', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to create role' });
+  }
+});
+
+app.delete('/api/dashboard/roles/:roleId', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const deleted = await roleRepository.delete(req.params.roleId);
+    if (!deleted) return res.status(404).json({ error: 'Role not found' });
+    return res.status(204).send();
+  } catch {
+    logger.error('failed to delete role', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to delete role' });
+  }
+});
+
+app.get('/api/dashboard/roles/:roleId/permissions', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const permissions = await permissionRepository.findByRoleId(req.params.roleId);
+    return res.json({ permissions });
+  } catch {
+    logger.error('failed to list permissions', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list permissions' });
+  }
+});
+
+app.post('/api/dashboard/roles/:roleId/permissions', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { resource, action } = req.body || {};
+    if (!resource || !action) {
+      return res.status(400).json({ error: 'resource and action are required' });
+    }
+    const permission = await permissionRepository.grant({ roleId: req.params.roleId, resource, action });
+    return res.status(201).json({ permission });
+  } catch {
+    logger.error('failed to grant permission', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to grant permission' });
+  }
+});
+
+app.delete('/api/dashboard/roles/:roleId/permissions/:resource/:action', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const removed = await permissionRepository.revoke(req.params.roleId, req.params.resource, req.params.action);
+    if (!removed) return res.status(404).json({ error: 'Permission not found' });
+    return res.status(204).send();
+  } catch {
+    logger.error('failed to revoke permission', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to revoke permission' });
+  }
+});
+
+app.post('/api/dashboard/users/:userId/roles/:roleId', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const assignment = await userRoleRepository.assign(req.params.userId, req.params.roleId);
+    return res.status(201).json({ assignment });
+  } catch {
+    logger.error('failed to assign role', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to assign role' });
+  }
+});
+
+app.delete('/api/dashboard/users/:userId/roles/:roleId', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const removed = await userRoleRepository.unassign(req.params.userId, req.params.roleId);
+    if (!removed) return res.status(404).json({ error: 'Assignment not found' });
+    return res.status(204).send();
+  } catch {
+    logger.error('failed to unassign role', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to unassign role' });
+  }
+});
+
+app.get('/api/dashboard/users/:userId/permissions', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const appSlug = req.query.appSlug as string | undefined;
+    if (!appSlug) return res.status(400).json({ error: 'appSlug query param is required' });
+    const application = await applicationRepository.findBySlug(appSlug);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const permissions = await userRoleRepository.findEffectivePermissions(req.params.userId, application.id);
+    return res.json({ permissions });
+  } catch {
+    logger.error('failed to resolve effective permissions', { operation: 'rbac', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to resolve permissions' });
+  }
+});
+
+// ----------------------------------------------------
+// SUBSCRIPTIONS & PRICING — plan catalog is admin-managed; each consuming
+// application can read its own tenant's subscription/entitlement.
+// ----------------------------------------------------
+
+app.get('/api/dashboard/plans', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const plans = await subscriptionPlanRepository.listAll();
+    return res.json({ plans });
+  } catch {
+    logger.error('failed to list plans', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list plans' });
+  }
+});
+
+app.post('/api/dashboard/plans', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { slug, name, description, priceCents, currency, billingInterval, features } = req.body || {};
+    if (!slug || !name || typeof priceCents !== 'number') {
+      return res.status(400).json({ error: 'slug, name, and priceCents are required' });
+    }
+    const plan = await subscriptionPlanRepository.create({
+      slug, name, description, priceCents, currency, billingInterval, features,
+    });
+    return res.status(201).json({ plan });
+  } catch {
+    logger.error('failed to create plan', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to create plan' });
+  }
+});
+
+app.patch('/api/dashboard/plans/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const plan = await subscriptionPlanRepository.update(req.params.id, req.body || {});
+    if (!plan) return res.status(404).json({ error: 'Plan not found' });
+    return res.json({ plan });
+  } catch {
+    logger.error('failed to update plan', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to update plan' });
+  }
+});
+
+app.delete('/api/dashboard/plans/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const plan = await subscriptionPlanRepository.deactivate(req.params.id);
+    if (!plan) return res.status(404).json({ error: 'Plan not found' });
+    return res.status(204).send();
+  } catch {
+    logger.error('failed to deactivate plan', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to deactivate plan' });
+  }
+});
+
+app.post('/api/dashboard/applications/:appSlug/tenants/:tenantId/subscription', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { planSlug, status } = req.body || {};
+    if (!planSlug) return res.status(400).json({ error: 'planSlug is required' });
+    const plan = await subscriptionPlanRepository.findBySlug(planSlug);
+    if (!plan) return res.status(404).json({ error: 'Plan not found' });
+    const subscription = await tenantSubscriptionRepository.create({
+      appId: req.params.appSlug,
+      tenantId: req.params.tenantId,
+      planId: plan.id,
+      status: status || 'trialing',
+    });
+    return res.status(201).json({ subscription });
+  } catch {
+    logger.error('failed to create subscription', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to create subscription' });
+  }
+});
+
+app.patch('/api/dashboard/applications/:appSlug/tenants/:tenantId/subscription', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { status, planSlug } = req.body || {};
+    if (planSlug) {
+      const plan = await subscriptionPlanRepository.findBySlug(planSlug);
+      if (!plan) return res.status(404).json({ error: 'Plan not found' });
+      await tenantSubscriptionRepository.changePlan(req.params.appSlug, req.params.tenantId, plan.id);
+    }
+    const subscription = status
+      ? await tenantSubscriptionRepository.updateStatus(req.params.appSlug, req.params.tenantId, status)
+      : await tenantSubscriptionRepository.findByAppAndTenant(req.params.appSlug, req.params.tenantId);
+    if (!subscription) return res.status(404).json({ error: 'Subscription not found' });
+    return res.json({ subscription });
+  } catch {
+    logger.error('failed to update subscription', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to update subscription' });
+  }
+});
+
+app.get('/v1/api/gateway/subscription', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const tenantId = req.header('x-tenant-id')!;
+    const subscription = await tenantSubscriptionRepository.findByAppAndTenant(appId, tenantId);
+    if (!subscription) return res.status(404).json({ error: 'No subscription found for this tenant' });
+    const plan = await subscriptionPlanRepository.findById(subscription.planId);
+    return res.json({ subscription, plan });
+  } catch {
+    logger.error('failed to read subscription', { operation: 'billing', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to read subscription' });
+  }
+});
+
+// ----------------------------------------------------
+// SUPPORT — thin in-house ticket log. externalProvider/externalRef exist to
+// sync against a real helpdesk (Zendesk/Intercom) once one is connected.
+// ----------------------------------------------------
+
+app.post('/v1/api/gateway/support/tickets', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const tenantId = req.header('x-tenant-id')!;
+    const { requesterEmail, subject, priority } = req.body || {};
+    if (!requesterEmail || !subject) {
+      return res.status(400).json({ error: 'requesterEmail and subject are required' });
+    }
+    const ticket = await supportTicketRepository.create({ appId, tenantId, requesterEmail, subject, priority });
+    return res.status(201).json({ ticket });
+  } catch {
+    logger.error('failed to create support ticket', { operation: 'support', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to create support ticket' });
+  }
+});
+
+app.get('/v1/api/gateway/support/tickets', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const tenantId = req.header('x-tenant-id')!;
+    const tickets = await supportTicketRepository.listByAppAndTenant(appId, tenantId);
+    return res.json({ tickets });
+  } catch {
+    logger.error('failed to list support tickets', { operation: 'support', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list support tickets' });
+  }
+});
+
+app.get('/api/dashboard/support/tickets', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const appId = req.query.appId as string | undefined;
+    const tenantId = (req.query.tenantId as string | undefined) || 'default';
+    if (!appId) return res.status(400).json({ error: 'appId query param is required' });
+    const tickets = await supportTicketRepository.listByAppAndTenant(appId, tenantId);
+    return res.json({ tickets });
+  } catch {
+    logger.error('failed to list support tickets', { operation: 'support', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list support tickets' });
+  }
+});
+
+app.patch('/api/dashboard/support/tickets/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const appId = req.query.appId as string | undefined;
+    const { status } = req.body || {};
+    if (!appId || !status) return res.status(400).json({ error: 'appId query param and status are required' });
+    const ticket = await supportTicketRepository.updateStatus(req.params.id, appId, status);
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+    return res.json({ ticket });
+  } catch {
+    logger.error('failed to update support ticket', { operation: 'support', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to update support ticket' });
+  }
+});
+
+app.post('/api/dashboard/support/tickets/:id/messages', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { body, authorEmail } = req.body || {};
+    if (!body) return res.status(400).json({ error: 'body is required' });
+    const message = await supportTicketMessageRepository.create({
+      ticketId: req.params.id,
+      authorType: 'agent',
+      authorEmail,
+      body,
+    });
+    return res.status(201).json({ message });
+  } catch {
+    logger.error('failed to post support ticket message', { operation: 'support', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to post message' });
+  }
+});
+
+app.get('/api/dashboard/support/tickets/:id/messages', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const messages = await supportTicketMessageRepository.listByTicketId(req.params.id);
+    return res.json({ messages });
+  } catch {
+    logger.error('failed to list support ticket messages', { operation: 'support', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list messages' });
+  }
+});
+
+// ----------------------------------------------------
+// CREDENTIALS — NFC/QR issue + verify. One generic model backs event
+// check-in, asset/shipment tracking, and membership/loyalty use cases; the
+// mobile app's encode (issue) and read (verify) tools call these directly.
+// ----------------------------------------------------
+
+app.post('/v1/api/gateway/credentials', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const tenantId = req.header('x-tenant-id')!;
+    const { purpose, ownerType, ownerRef, credentialType, label, expiresAt, metadata } = req.body || {};
+    if (!purpose || !ownerType || !ownerRef) {
+      return res.status(400).json({ error: 'purpose, ownerType, and ownerRef are required' });
+    }
+    const credential = await accessCredentialRepository.issue({
+      appId,
+      tenantId,
+      purpose,
+      ownerType,
+      ownerRef,
+      credentialType: credentialType || 'qr',
+      label,
+      metadata,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+    });
+    return res.status(201).json({ credential });
+  } catch {
+    logger.error('failed to issue credential', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to issue credential' });
+  }
+});
+
+app.get('/v1/api/gateway/credentials', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const tenantId = req.header('x-tenant-id')!;
+    const { ownerType, ownerRef } = req.query;
+    if (ownerType && ownerRef) {
+      const credentials = await accessCredentialRepository.listByOwner(
+        appId, tenantId, ownerType as string, ownerRef as string,
+      );
+      return res.json({ credentials });
+    }
+    const credentials = await accessCredentialRepository.listByAppAndTenant(appId, tenantId);
+    return res.json({ credentials });
+  } catch {
+    logger.error('failed to list credentials', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list credentials' });
+  }
+});
+
+app.post('/v1/api/gateway/credentials/:id/revoke', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const credential = await accessCredentialRepository.revoke(req.params.id, appId);
+    if (!credential) return res.status(404).json({ error: 'Credential not found' });
+    return res.json({ credential });
+  } catch {
+    logger.error('failed to revoke credential', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to revoke credential' });
+  }
+});
+
+app.get('/v1/api/gateway/credentials/:id/scans', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const scans = await credentialScanRepository.listByCredentialId(req.params.id, appId);
+    return res.json({ scans });
+  } catch {
+    logger.error('failed to list credential scans', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to list scans' });
+  }
+});
+
+// The scan/verify endpoint is deliberately never a 500 for "not found" —
+// an unknown, expired, or revoked token is a normal, expected outcome (a
+// forged QR code, an expired badge) and is recorded like any other scan.
+app.post('/v1/api/gateway/credentials/verify', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  try {
+    const appId = (req as Request & { appId?: string }).appId!;
+    const tenantId = req.header('x-tenant-id')!;
+    const { token, scannedBy, deviceInfo, metadata } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'token is required' });
+    }
+    const outcome = await verifyCredentialScan({ appId, tenantId, token, scannedBy, deviceInfo, metadata });
+    return res.json(outcome);
+  } catch {
+    logger.error('failed to verify credential', { operation: 'credentials', status: 'failed' });
+    return res.status(500).json({ error: 'Failed to verify credential' });
+  }
 });
 
 export default app;

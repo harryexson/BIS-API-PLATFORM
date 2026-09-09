@@ -20,6 +20,15 @@ export default defineConfig({
   },
   test: {
     include: ['packages/**/*.test.ts'],
-    environment: 'node'
+    environment: 'node',
+    // Several suites (packages/simulation/**, plus eventBus/registry/routing
+    // tests) exercise real process-wide singletons (EventBus.getInstance(),
+    // ProviderRegistry.getInstance(), shared in-memory queues) rather than
+    // fresh instances per test. Running test files concurrently lets one
+    // file's singleton mutation bleed into another's assertions, producing
+    // intermittent cross-file failures unrelated to the code under test.
+    // Serializing file execution trades some wall-clock time for a
+    // deterministic, non-flaky suite — worth it for a financial platform.
+    fileParallelism: false,
   }
 });
