@@ -296,13 +296,28 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
+const READY_CHECK_TIMEOUT_MS = 3_000;
+
 app.get('/ready', async (req: Request, res: Response) => {
   const deps: Record<string, string> = {};
 
-  // P2-5: Check database connectivity
+  // P2-5: Check database connectivity. Bounded by a timeout — a health
+  // check must fail fast, never hang the process waiting on a stuck
+  // connection (a hung /ready is worse than a fast 503: it leaks a pending
+  // request per probe and gives orchestrators no signal to act on).
   try {
-    const dbOk = await checkDatabaseHealth();
-    deps.database = dbOk ? 'healthy' : 'unhealthy';
+    const dbHealth = await Promise.race([
+      checkDatabaseHealth(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('database health check timed out')), READY_CHECK_TIMEOUT_MS),
+      ),
+    ]);
+    // was `const dbOk = await checkDatabaseHealth(); deps.database = dbOk ? 'healthy' : 'unhealthy'` —
+    // checkDatabaseHealth() resolves to an object ({status, latencyMs, details}),
+    // which is always truthy, so this unconditionally reported 'healthy' for
+    // any non-throwing result, silently discarding the degraded/unhealthy
+    // status it computed from query latency.
+    deps.database = dbHealth.status;
   } catch {
     deps.database = 'unreachable';
   }

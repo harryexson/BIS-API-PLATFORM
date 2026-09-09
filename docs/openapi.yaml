@@ -4,6 +4,22 @@ info:
   version: 1.0.0
   summary: Unified payments, messaging, and provider orchestration API.
   description: |
+    ⚠️ STALE — DOES NOT MATCH THE IMPLEMENTED GATEWAY. This document
+    describes a `/payments`, `/refunds`, `/messages`, `/conversations/{id}`,
+    `/providers` REST-resource design that was never built. The actual
+    routes live in services/api-gateway/src/app.ts under `/v1/api/gateway/
+    {payment,messaging,other}`, `/v1/api/gateway/transaction/{id}`, and
+    `/v1/api/gateway/providers`, take differently-shaped request bodies,
+    require an `x-tenant-id` header this spec doesn't mention, use
+    `x-idempotency-key` (not `Idempotency-Key`), and return a flat
+    `{ error: string }` on failure rather than the nested error object
+    documented below. packages/api-client was found calling the paths
+    documented here — which 404'd or 400'd against the real gateway on
+    every single call — and has been rewritten to match the real routes;
+    this spec has not been. Treat everything below as aspirational until
+    it's reconciled with services/api-gateway, not as ground truth for what
+    the platform actually accepts.
+
     The BIS API Platform exposes a single, versioned surface for initiating
     payments, sending messages, managing providers, and receiving asynchronous
     event notifications (webhooks).

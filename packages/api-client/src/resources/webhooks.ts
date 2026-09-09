@@ -2,14 +2,24 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { ApiError } from '../errors';
 import { WebhookEvent } from '../types';
 
-// Helper utilities for verifying OUTBOUND platform webhooks delivered to your
-// configured endpoint. The platform signs the raw request body with HMAC-SHA256
-// using your webhook signing secret and sends it in the `X-Signature` header
-// (optionally prefixed with `sha256=`).
-//
-// This is intentionally provider-agnostic — it does NOT implement inbound
-// provider webhook verification (Stripe/Flutterwave/etc.), which lives in the
-// platform's webhook service.
+/**
+ * Helper utilities for verifying outbound platform webhooks delivered to
+ * your configured endpoint.
+ *
+ * IMPORTANT — current server state: packages/events/src/webhook-delivery.ts
+ * (the platform's outbound delivery implementation) does not sign its
+ * requests today. It POSTs the raw event body with `X-Webhook-Id` /
+ * `X-Webhook-Attempt` headers only — there is no `X-Signature` header to
+ * verify. verify()/constructEvent() are kept here ready for when outbound
+ * signing is added (this is a real, currently-unaddressed gap — see the
+ * production-readiness report), but calling them against a real delivery
+ * today will only ever see `signature` values you construct yourself, not
+ * anything the platform sent.
+ *
+ * This is intentionally provider-agnostic — it does NOT implement inbound
+ * provider webhook verification (Stripe/Flutterwave/etc.), which lives
+ * server-side in packages/workers/src/jobs/{payment,provider}Webhook.ts.
+ */
 export class WebhooksResource {
   verify(rawBody: string, signature: string, secret: string): boolean {
     const expected = this.computeSignature(rawBody, secret);
@@ -22,18 +32,12 @@ export class WebhooksResource {
 
   constructEvent(rawBody: string, signature: string, secret: string): WebhookEvent {
     if (!this.verify(rawBody, signature, secret)) {
-      throw new ApiError(401, {
-        code: 'authentication_failed',
-        message: 'Webhook signature verification failed'
-      });
+      throw new ApiError({ error: 'Webhook signature verification failed' }, 401);
     }
     try {
       return JSON.parse(rawBody) as WebhookEvent;
     } catch {
-      throw new ApiError(400, {
-        code: 'invalid_request',
-        message: 'Webhook payload is not valid JSON'
-      });
+      throw new ApiError({ error: 'Webhook payload is not valid JSON' }, 400);
     }
   }
 

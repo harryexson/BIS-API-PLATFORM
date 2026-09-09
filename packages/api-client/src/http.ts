@@ -1,8 +1,12 @@
-import { ApiError, ApiErrorShape } from './errors';
+import { ApiError } from './errors';
+import { ApiErrorShape } from './types';
 
 export interface HttpClientOptions {
   baseUrl: string;
   apiKey: string;
+  // Required for every /v1/api/gateway/* call — the gateway's
+  // resolveTenantContext middleware rejects requests without it.
+  tenantId: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
 }
@@ -27,15 +31,25 @@ function buildUrl(baseUrl: string, path: string, query?: RequestParams['query'])
   return url.toString();
 }
 
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
 export class HttpClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly tenantId: string;
   private readonly timeoutMs?: number;
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = options.baseUrl;
     this.apiKey = options.apiKey;
+    this.tenantId = options.tenantId;
     this.timeoutMs = options.timeoutMs;
     this.fetchImpl = options.fetchImpl || ((...args: Parameters<typeof fetch>) => fetch(...args));
   }
@@ -45,10 +59,14 @@ export class HttpClient {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.apiKey}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'company-api-client/1.0.0'
+      'User-Agent': 'company-api-client/1.0.0',
+      'x-tenant-id': this.tenantId,
     };
-    if (params.idempotencyKey) headers['Idempotency-Key'] = params.idempotencyKey;
-    if (params.correlationId) headers['X-Correlation-Id'] = params.correlationId;
+    // Matches services/api-gateway's actual header name (req.header('x-idempotency-key')) —
+    // not the Stripe-style `Idempotency-Key` this client previously sent, which the
+    // gateway never reads.
+    if (params.idempotencyKey) headers['x-idempotency-key'] = params.idempotencyKey;
+    if (params.correlationId) headers['x-correlation-id'] = params.correlationId;
 
     const controller = this.timeoutMs ? new AbortController() : undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -63,7 +81,7 @@ export class HttpClient {
         method,
         headers,
         body: params.body !== undefined ? JSON.stringify(params.body) : undefined,
-        signal
+        signal,
       });
     } finally {
       if (timer) clearTimeout(timer);
@@ -73,32 +91,20 @@ export class HttpClient {
     const correlationId = response.headers.get('X-Correlation-Id') || undefined;
 
     const text = await response.text();
-    const data = (text ? safeJsonParse(text) : undefined) as Record<string, any> | undefined;
+    const data = text ? safeJsonParse(text) : undefined;
 
     if (!response.ok) {
-      const shape = (data && (data.error as ApiErrorShape)) || {};
-      const resource = data && data.resource;
-      throw new ApiError(
-        response.status,
-        {
-          code: shape.code,
-          message: shape.message || response.statusText,
-          request_id: requestId,
-          correlation_id: correlationId,
-          details: shape.details
-        },
-        resource
-      );
+      // The gateway's error body is a flat { error: string }. Fall back to
+      // statusText only if the body genuinely didn't parse as that shape —
+      // previously this always fell back to statusText because it expected
+      // data.error to be an object with a .message field, which it never is.
+      const shape: ApiErrorShape =
+        data && typeof data === 'object' && typeof (data as Record<string, unknown>).error === 'string'
+          ? (data as ApiErrorShape)
+          : { error: response.statusText };
+      throw new ApiError(shape, response.status, requestId, correlationId);
     }
 
-    return data as unknown as T;
-  }
-}
-
-function safeJsonParse(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
+    return data as T;
   }
 }

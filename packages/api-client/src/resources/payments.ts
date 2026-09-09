@@ -1,23 +1,27 @@
 import { HttpClient } from '../http';
-import { Payment, PaymentCreate, RequestOptions } from '../types';
+import { PaymentCreate, RequestOptions, TransactionEvent, TransactionStatusResponse } from '../types';
 
 export class PaymentsResource {
   constructor(private readonly http: HttpClient) {}
 
-  async create(input: PaymentCreate, opts?: RequestOptions): Promise<Payment> {
-    return this.http.request<Payment>('POST', '/payments', {
+  /** POST /v1/api/gateway/payment */
+  async create(input: PaymentCreate, opts?: RequestOptions): Promise<TransactionEvent> {
+    return this.http.request<TransactionEvent>('POST', '/v1/api/gateway/payment', {
       body: input,
-      idempotencyKey: opts?.idempotencyKey ?? input.idempotency_key,
+      idempotencyKey: opts?.idempotencyKey,
       correlationId: opts?.correlationId,
-      signal: opts?.signal
+      signal: opts?.signal,
     });
   }
 
-  async get(id: string, opts?: RequestOptions): Promise<Payment> {
-    return this.http.request<Payment>('GET', `/payments/${encodeURIComponent(id)}`, {
-      idempotencyKey: opts?.idempotencyKey,
+  /**
+   * GET /v1/api/gateway/transaction/:id — shared status-polling endpoint
+   * for both payments and messages, scoped to the authenticated application.
+   */
+  async get(id: string, opts?: RequestOptions): Promise<TransactionStatusResponse> {
+    return this.http.request<TransactionStatusResponse>('GET', `/v1/api/gateway/transaction/${encodeURIComponent(id)}`, {
       correlationId: opts?.correlationId,
-      signal: opts?.signal
+      signal: opts?.signal,
     });
   }
 }
