@@ -157,8 +157,9 @@ describe('RoutingEngine', () => {
       });
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
-      // Multiple providers have SMS capability
-      expect(['infobip', 'futuresms', 'signalhouse']).toContain(result.providerId);
+      // Multiple providers have SMS capability (example-msg is a test-environment
+      // provider that remains a candidate outside NODE_ENV=production).
+      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
@@ -269,6 +270,53 @@ describe('RoutingEngine', () => {
       await expect(
         engine.routeOther('testapp', { serviceType: 'maps', payload: {} })
       ).rejects.toThrow();
+    });
+  });
+
+  describe('production environment isolation', () => {
+    // NODE_ENV is process-global and this suite runs alongside other test
+    // files, so every mutation below is synchronous (no `await` in between)
+    // to guarantee it can't interleave with another file's async assertions.
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      process.env.NODE_ENV = originalNodeEnv;
+    });
+
+    it('excludes test-environment example providers from production capability matches', () => {
+      const registry = ProviderRegistry.getInstance();
+      process.env.NODE_ENV = 'production';
+      try {
+        const paymentMatches = registry.findByCategoryAndCapabilities('payment', ['card'], 'USD');
+        const msgMatches = registry.findByCategoryAndCapabilities('messaging', ['sms']);
+        expect(paymentMatches.map((m) => m.id)).not.toContain('example-pay');
+        expect(msgMatches.map((m) => m.id)).not.toContain('example-msg');
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it('treats test-environment providers as ineligible for production overrides', () => {
+      const registry = ProviderRegistry.getInstance();
+      process.env.NODE_ENV = 'production';
+      try {
+        expect(registry.isLiveEligible('example-pay')).toBe(false);
+        expect(registry.isLiveEligible('example-msg')).toBe(false);
+        expect(registry.isLiveEligible('stripe')).toBe(true);
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it('allows test-environment providers outside production', () => {
+      const registry = ProviderRegistry.getInstance();
+      process.env.NODE_ENV = 'test';
+      try {
+        expect(registry.isLiveEligible('example-pay')).toBe(true);
+        expect(registry.isLiveEligible('example-msg')).toBe(true);
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
     });
   });
 });

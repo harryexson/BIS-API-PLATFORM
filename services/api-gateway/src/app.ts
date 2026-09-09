@@ -28,6 +28,14 @@ const app = express();
 const allowedOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
   : [];
+const corsProductionEnv = process.env.NODE_ENV === 'production';
+if (allowedOrigins.length === 0 && corsProductionEnv) {
+  logger.error('CORS_ORIGINS is not set in production — failing closed (cross-origin requests will be rejected)', {
+    operation: 'startup',
+    errorCode: 'MISSING_CORS_ORIGINS',
+    status: 'failed',
+  });
+}
 app.use(
   cors(
     allowedOrigins.length > 0
@@ -41,7 +49,12 @@ app.use(
           },
           credentials: true,
         }
-      : { origin: '*' },
+      // Never default an unconfigured production environment to an open CORS
+      // policy. Fail closed (no cross-origin access) instead; dev/test keep
+      // the permissive default so local tooling isn't blocked.
+      : corsProductionEnv
+        ? { origin: false }
+        : { origin: '*' },
   ),
 );
 

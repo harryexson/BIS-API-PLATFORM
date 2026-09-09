@@ -79,7 +79,9 @@ export class RoutingEngine {
     let reason = '';
 
     const allProviders = this.registry.getAllConfigs();
-    const activePayments = allProviders.filter(p => p.category === 'payment' && p.status === 'online');
+    const activePayments = allProviders.filter(
+      p => p.category === 'payment' && p.status === 'online' && this.registry.isLiveEligible(p.id),
+    );
 
     if (activePayments.length === 0) {
       throw new Error('All payment providers are currently OFFLINE / UNDER MAINTENANCE');
@@ -88,11 +90,11 @@ export class RoutingEngine {
     // 1. Check for manual override
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
-      if (provider && provider.config.status === 'online') {
+      if (provider && provider.config.status === 'online' && this.registry.isLiveEligible(providerOverride)) {
         selectedProvider = provider;
         reason = `Manual override matched: Forced routing to '${provider.config.name}'.`;
       } else {
-        reason = `Manual override '${providerOverride}' requested but provider is offline/invalid. Falling back. | `;
+        reason = `Manual override '${providerOverride}' requested but provider is offline/invalid/not production-eligible. Falling back. | `;
       }
     }
 
@@ -196,7 +198,9 @@ export class RoutingEngine {
     }
 
     const allProviders = this.registry.getAllConfigs();
-    const activeMsg = allProviders.filter(p => p.category === 'messaging' && p.status === 'online');
+    const activeMsg = allProviders.filter(
+      p => p.category === 'messaging' && p.status === 'online' && this.registry.isLiveEligible(p.id),
+    );
 
     if (activeMsg.length === 0 && !selectedProvider) {
       throw new Error('All messaging providers are currently OFFLINE / UNDER MAINTENANCE');
@@ -205,11 +209,11 @@ export class RoutingEngine {
     // 1. Manual override check
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
-      if (provider && provider.config.status === 'online') {
+      if (provider && provider.config.status === 'online' && this.registry.isLiveEligible(providerOverride)) {
         selectedProvider = provider;
         reason = `Manual override matched: Forced messaging route to '${provider.config.name}'.`;
       } else {
-        reason = `Override '${providerOverride}' unavailable. Falling back. | `;
+        reason = `Override '${providerOverride}' unavailable or not production-eligible. Falling back. | `;
       }
     }
 
@@ -302,12 +306,14 @@ export class RoutingEngine {
     const providerId = providerOverride || (serviceType === 'maps' ? 'maps' : serviceType === 'identity' ? 'identity' : 'ai');
     const provider = this.registry.getProvider(providerId);
 
-    if (provider && provider.config.status === 'online') {
+    if (provider && provider.config.status === 'online' && this.registry.isLiveEligible(providerId)) {
       selectedProvider = provider;
       reason = `Routed to designated API node '${provider.config.name}' for service type '${serviceType}'.`;
     } else {
       const allProviders = this.registry.getAllConfigs();
-      const backups = allProviders.filter(p => p.category === 'other' && p.status === 'online');
+      const backups = allProviders.filter(
+        p => p.category === 'other' && p.status === 'online' && this.registry.isLiveEligible(p.id),
+      );
       if (backups.length > 0) {
         selectedProvider = this.registry.getProvider(backups[0].id) || null;
         reason = `Designated provider '${providerId}' was offline. Routed to backup services node '${selectedProvider?.config.name}'.`;
