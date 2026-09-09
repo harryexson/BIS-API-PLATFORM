@@ -15,6 +15,18 @@ import {
   checkDatabaseHealth,
   consentRecordRepository,
   messagingProfileRepository,
+  ApplicationRegistry,
+  applicationRepository,
+  apiKeyRepository,
+  AuthRegistry,
+  AuthError,
+  ValidationError,
+  ConflictError,
+  userRepository,
+  userSessionRepository,
+  userVerificationTokenRepository,
+  roleRepository,
+  type PublicUser,
 } from '@company/database';
 import {
   logger,
@@ -261,6 +273,143 @@ function recordTrafficResult(providerId: string | undefined, status: 'success' |
   if (!providerId) return;
   registry.recordTraffic(providerId, status === 'success', latency);
 }
+
+// ----------------------------------------------------
+// CUSTOMER ACCOUNT AUTH
+// ----------------------------------------------------
+// Signup/login for the developers/businesses that own a BIS Platform
+// application (e.g. "Reach Church") — distinct from the per-application
+// API-key auth (mw.apiKey, above) used on /v1/api/gateway/* and the
+// single shared-secret admin auth (requireAdmin) used on /api/dashboard/*.
+// Session tokens are opaque and revocable, not stateless JWTs — see
+// AuthRegistry's docstring in packages/database/src/auth-registry.ts.
+// Rate-limited by the existing `app.use('/v1/api', mw.rateLimit)` above
+// (keyed by IP, since these routes carry no API key).
+const authRegistry = new AuthRegistry(
+  userRepository,
+  userSessionRepository,
+  userVerificationTokenRepository,
+  roleRepository,
+  new ApplicationRegistry(applicationRepository, apiKeyRepository),
+);
+
+type SessionAuthedRequest = Request & { user?: PublicUser };
+
+async function requireSession(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers['authorization'];
+  const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : undefined;
+  if (!token) {
+    return res.status(401).json({ error: 'Session token required' });
+  }
+  const user = await authRegistry.verifySession(token);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+  (req as SessionAuthedRequest).user = user;
+  return next();
+}
+
+app.post('/v1/api/auth/signup', async (req: Request, res: Response) => {
+  const { email, password, name, applicationName, applicationSlug } = req.body || {};
+  try {
+    const result = await authRegistry.signup({ email, password, name, applicationName, applicationSlug });
+    logger.info('account signup', {
+      operation: 'auth-signup',
+      applicationId: result.application.id,
+      status: 'success',
+    });
+    return res.status(201).json({
+      user: result.user,
+      application: result.application,
+      apiKey: result.apiKey,
+      // A real transactional email send isn't built in this pass (see
+      // docs/IMPLEMENTATION_BASELINE.md) — the token is only surfaced here
+      // outside production so signup/verification stays testable end to
+      // end today, rather than fabricating an email that was never sent.
+      ...(process.env.NODE_ENV !== 'production'
+        ? { emailVerificationToken: result.emailVerificationToken }
+        : {}),
+    });
+  } catch (err: any) {
+    const status = err instanceof ValidationError ? 400 : err instanceof ConflictError ? 409 : 500;
+    if (status === 500) {
+      logger.error('signup failed', { operation: 'auth-signup', errorCode: 'SIGNUP_FAILED', status: 'failed' });
+    }
+    return res.status(status).json({ error: err.message || 'Signup failed' });
+  }
+});
+
+app.post('/v1/api/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
+  try {
+    const result = await authRegistry.login({
+      email,
+      password,
+      userAgent: req.header('user-agent'),
+      ipAddress: req.ip,
+    });
+    return res.json({ user: result.user, token: result.token, expiresAt: result.expiresAt });
+  } catch (err: any) {
+    const status = err instanceof AuthError ? 401 : 500;
+    return res.status(status).json({ error: err.message || 'Login failed' });
+  }
+});
+
+app.post('/v1/api/auth/logout', requireSession, async (req: Request, res: Response) => {
+  const header = req.headers['authorization'] as string;
+  await authRegistry.logout(header.slice(7));
+  return res.status(204).send();
+});
+
+app.get('/v1/api/auth/me', requireSession, (req: Request, res: Response) => {
+  return res.json({ user: (req as SessionAuthedRequest).user });
+});
+
+app.post('/v1/api/auth/verify-email', async (req: Request, res: Response) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token is required' });
+  try {
+    const user = await authRegistry.verifyEmail(token);
+    return res.json({ user });
+  } catch (err: any) {
+    return res.status(err instanceof AuthError ? 400 : 500).json({ error: err.message || 'Verification failed' });
+  }
+});
+
+app.post('/v1/api/auth/resend-verification', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const { token } = await authRegistry.resendEmailVerification(user.id);
+  return res.json({
+    message: 'Verification email requested',
+    ...(process.env.NODE_ENV !== 'production' ? { emailVerificationToken: token } : {}),
+  });
+});
+
+app.post('/v1/api/auth/request-password-reset', async (req: Request, res: Response) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email is required' });
+  const result = await authRegistry.requestPasswordReset(email);
+  // Always a generic success — never reveal whether the account exists.
+  return res.json({
+    message: 'If an account exists for this email, a password reset link has been sent.',
+    ...(process.env.NODE_ENV !== 'production' && result ? { passwordResetToken: result.token } : {}),
+  });
+});
+
+app.post('/v1/api/auth/reset-password', async (req: Request, res: Response) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: 'token and password are required' });
+  try {
+    await authRegistry.resetPassword(token, password);
+    return res.json({ message: 'Password reset successful' });
+  } catch (err: any) {
+    const status = err instanceof ValidationError || err instanceof AuthError ? 400 : 500;
+    return res.status(status).json({ error: err.message || 'Password reset failed' });
+  }
+});
 
 // ----------------------------------------------------
 // OPERATIONAL ENDPOINTS

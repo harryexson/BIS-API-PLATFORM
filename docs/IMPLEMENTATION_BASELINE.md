@@ -136,7 +136,12 @@ gap against the "real production requirement" in the master plan — see §6.
 - Drizzle ORM against Neon Postgres. Schema covers applications, API keys,
   tenants, tenant-application links, providers, provider configs/health,
   transactions, events, outbox events, idempotency records, suppliers,
-  conversations, audit logs, users/roles/permissions.
+  conversations, audit logs, users/roles/permissions, user sessions, user
+  verification tokens (email verification / password reset).
+- `users`/`roles`/`permissions` are now real and in production use
+  (2026-09-09, customer account signup/login — see §4 item 1 and the
+  changelog) — previously schema-only with zero call sites anywhere in the
+  codebase.
 - `events.app_id` and `audit_logs.*` queries are scoped by `appId`/`tenantId`
   at the repository layer (cross-tenant leak fix from the latest commit).
 - `events.app_id` is still `text`, not a foreign key to `applications.id` —
@@ -155,6 +160,12 @@ gap against the "real production requirement" in the master plan — see §6.
 React/Vite app with: login gate (admin-key based), provider registry view,
 provider management (enable/disable/priority/health), observability panel,
 audit logs, live topology, request playground. Functional and builds clean.
+No router library (3 in-memory tabs via `useState`, not real routes) and
+no customer/CRM/subscription views of any kind — confirmed by a
+2026-09-09 audit (see §4 item 1/§6): there is no page listing
+`applications` (tenants/customers) at all, admin or otherwise. Tracked as
+a separate phase (Phase D of the 2026-09-09 auth/subscriptions/CRM work),
+not started yet.
 
 ### Testing
 - Unit/component tests colocated with source (`*.test.ts`).
@@ -176,6 +187,7 @@ audit logs, live topology, request playground. Functional and builds clean.
 |---|---|
 | Database | `DATABASE_URL` |
 | Auth/Secrets | `PLATFORM_ADMIN_KEY`, `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY`, `ADMIN_API_TOKEN` |
+| Customer account auth (added 2026-09-09) | `SESSION_TTL_HOURS`, `EMAIL_VERIFICATION_TTL_HOURS`, `PASSWORD_RESET_TTL_HOURS`, `MAX_FAILED_LOGIN_ATTEMPTS`, `ACCOUNT_LOCKOUT_MINUTES` (all optional — sensible defaults in `auth-registry.ts`) |
 | Deployment | `DEPLOYMENT_ID`, `NODE_ENV`, `PORT` |
 | Payments | `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `NMI_GATEWAY_ID`, `NMI_API_KEY`, `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_PUBLIC_KEY`, `PAWAPAY_API_KEY`, `PAYCHANGU_API_KEY`, `AIRWALLEX_CLIENT_ID`, `AIRWALLEX_API_KEY` |
 | Messaging | `SIGNALHOUSE_API_KEY`, `INFOBIP_API_KEY`, `INFOBIP_BASE_URL`, `FUTURESMS_API_KEY`, `FUTURESMS_BASE_URL`, `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`, `SINCH_API_TOKEN`, `SINCH_SERVICE_PLAN_ID`, `SINCH_REGION`, `VIBES_USERNAME`, `VIBES_PASSWORD` |
@@ -328,6 +340,30 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     bypass it (enqueue directly onto the worker queue) to test keyword
     handling at all.
 
+14. ~~No customer signup/login~~ — **closed 2026-09-09.** See the changelog
+    ("Customer Account Auth: Signup/Login"). One real, remaining gap
+    within it: no transactional email sending is wired up, so verification/
+    reset tokens are only returned in the API response outside production
+    — production has no delivery path for them yet (item 15 below).
+15. **No transactional email integration** — nothing in this codebase
+    sends a real email (the `EmailProvider` messaging adapter is fully
+    simulated, and the new auth flows added 2026-09-09 don't attempt to
+    send one either — see item 14). Needed before password reset / email
+    verification are usable by an actual person in production, not just
+    testable via the API response.
+16. **No subscription/billing model for platform customers** — `Stripe`'s
+    adapter only ever called the one-off Charges API (and even that is
+    simulated without `STRIPE_SECRET_KEY`); there is no concept anywhere
+    of a plan, tier, recurring subscription, or usage-based billing for
+    the businesses that hold a BIS Platform application. Not started as
+    of 2026-09-09 (Phase B of the auth/subscriptions/CRM work — see §6).
+17. **No CRM/support back office** — confirmed by a 2026-09-09 audit: no
+    endpoint or admin-console view lists `applications` (tenants/
+    customers) at all, let alone notes, support tickets, or contact
+    history. Not started as of 2026-09-09 (Phase C — see §6). The admin
+    console itself (Phase D) remains a 3-tab operator dashboard with no
+    router and no customer-facing views — see §2's Admin Console section.
+
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 
 - `DISASTER_RECOVERY.md` — RPO/RTO, backup/restore procedures. Not
@@ -397,6 +433,19 @@ safety):
    files that specifically assert today's no-op behavior, not just a
    gateway code change.
 9. Payment reconciliation / connected-account model.
+10. ~~Customer signup/login~~ — **Phase A done, 2026-09-09** (§4 item 14).
+    Remaining phases of that same request, not started:
+    - **Phase B — subscription/billing** (§4 item 16): plan tiers +
+      real Stripe Subscriptions integration for the businesses that hold
+      a BIS Platform application, following the same real-HTTP +
+      simulated-fallback pattern used throughout `packages/providers`.
+    - **Phase C — CRM/support back office** (§4 item 17): a customer
+      list, notes, and support tickets, backend + admin console UI.
+    - **Phase D — admin console consolidation**: add real routing and
+      wire in Phases B/C's views; verify the existing 3 tabs still work.
+    - **Also needed for Phase A itself to be production-usable**: a real
+      transactional email integration (§4 item 15) — currently
+      verification/reset tokens have no delivery path outside dev/test.
 
 ## 7. Relationship to Prior Reports
 

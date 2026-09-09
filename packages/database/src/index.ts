@@ -16,6 +16,11 @@ export {
   decryptSecret,
   hashApiKey,
   generateApiKey,
+  hashToken,
+  hashPassword,
+  verifyPassword,
+  generateSessionToken,
+  generateVerificationToken,
   type EncryptedPayload,
 } from './crypto';
 
@@ -43,3 +48,25 @@ export {
   type TenantApplicationLinkRepository,
   type TenantAccessContext,
 } from './tenant-registry';
+
+// Auth Registry (customer signup/login — see docstring in auth-registry.ts
+// for how this differs from application API-key auth and admin auth)
+export {
+  AuthRegistry,
+  AuthError,
+  ValidationError,
+  ConflictError,
+  type UserRecord,
+  type PublicUser,
+  type UserSessionRecord,
+  type UserVerificationTokenRecord,
+  type RoleRecord,
+  type SignupInput,
+  type SignupResult,
+  type LoginInput,
+  type LoginResult,
+  type UserRepositoryForAuth,
+  type UserSessionRepositoryForAuth,
+  type UserVerificationTokenRepositoryForAuth,
+  type RoleRepositoryForAuth,
+} from './auth-registry';

@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync, createHash } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync, createHash, timingSafeEqual } from 'crypto';
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;
@@ -66,8 +66,16 @@ export function decryptSecret(payload: EncryptedPayload): string {
   return decrypted.toString('utf8');
 }
 
+// Generic sha256 hash for high-entropy, single-use/revocable tokens
+// (API keys, session tokens, verification tokens). Not for passwords —
+// those are low-entropy user-chosen secrets and need hashPassword's
+// salted/slow scrypt derivation instead.
+export function hashToken(raw: string): string {
+  return createHash('sha256').update(raw).digest('hex');
+}
+
 export function hashApiKey(rawKey: string): string {
-  return createHash('sha256').update(rawKey).digest('hex');
+  return hashToken(rawKey);
 }
 
 export function generateApiKeyPrefix(): string {
@@ -83,4 +91,50 @@ export function generateApiKey(): {
   const hash = hashApiKey(raw);
   const prefix = generateApiKeyPrefix() + '_' + raw.substring(0, 8);
   return { raw, hash, prefix };
+}
+
+// ---------------------------------------------------------------------
+// Password hashing (scrypt, random salt per password — not the fixed
+// SECRET_ENCRYPTION_KEY salt used above, which is for a single shared
+// server-side key, not per-user secrets).
+// ---------------------------------------------------------------------
+
+export function hashPassword(password: string): string {
+  const salt = randomBytes(SALT_LENGTH);
+  const derived = scryptSync(password, salt, KEY_LENGTH, {
+    cost: SCRYPT_COST,
+    blockSize: SCRYPT_BLOCK_SIZE,
+    parallelization: SCRYPT_PARALLELIZATION,
+  });
+  return `${salt.toString('hex')}:${derived.toString('hex')}`;
+}
+
+export function verifyPassword(password: string, stored: string): boolean {
+  const [saltHex, hashHex] = stored.split(':');
+  if (!saltHex || !hashHex) return false;
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(hashHex, 'hex');
+  const derived = scryptSync(password, salt, expected.length, {
+    cost: SCRYPT_COST,
+    blockSize: SCRYPT_BLOCK_SIZE,
+    parallelization: SCRYPT_PARALLELIZATION,
+  });
+  if (derived.length !== expected.length) return false;
+  return timingSafeEqual(derived, expected);
+}
+
+// ---------------------------------------------------------------------
+// Session tokens (login sessions) and verification tokens (email
+// verification / password reset) — same shape as API keys: a random raw
+// secret returned once, only its hash stored.
+// ---------------------------------------------------------------------
+
+export function generateSessionToken(): { raw: string; hash: string } {
+  const raw = 'sess_' + randomBytes(32).toString('hex');
+  return { raw, hash: hashToken(raw) };
+}
+
+export function generateVerificationToken(): { raw: string; hash: string } {
+  const raw = randomBytes(32).toString('hex');
+  return { raw, hash: hashToken(raw) };
 }

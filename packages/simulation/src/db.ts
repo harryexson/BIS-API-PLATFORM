@@ -1,4 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
+// Relative import (not the '@company/database' package specifier) — this
+// file's whole point is to stand in for that package under vi.mock, so it
+// can't import from it. crypto.ts has no DB dependency of its own (pure
+// node:crypto), so reusing the real implementation here is safe and keeps
+// password/session/token handling identical to production.
+import {
+  hashPassword,
+  verifyPassword,
+  hashToken,
+  generateSessionToken,
+  generateVerificationToken,
+  generateApiKey,
+} from '../../database/src/crypto';
 
 const MESSAGING_PROFILE_COMPLIANCE_STATUSES = new Set(['unregistered', 'pending', 'approved', 'rejected', 'suspended']);
 const MESSAGING_PROFILE_SENDER_TYPES = new Set(['phone', '10dlc', 'tollfree', 'shortcode', 'alphanumeric']);
@@ -111,6 +124,58 @@ export interface DbState {
   conversations: ConversationRow[];
   consentRecords: ConsentRow[];
   messagingProfiles: MessagingProfileRow[];
+  users: UserRow[];
+  userSessions: UserSessionRow[];
+  userVerificationTokens: UserVerificationTokenRow[];
+  roles: RoleRow[];
+}
+
+export interface UserRow {
+  id: string;
+  applicationId: string;
+  tenantId: string | null;
+  roleId: string | null;
+  email: string;
+  name: string | null;
+  passwordHash: string | null;
+  emailVerifiedAt: Date | null;
+  lastLoginAt: Date | null;
+  failedLoginAttempts: number;
+  lockedUntilAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface UserSessionRow {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  userAgent: string | null;
+  ipAddress: string | null;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  lastUsedAt: Date | null;
+  createdAt: Date;
+}
+
+export interface UserVerificationTokenRow {
+  id: string;
+  userId: string;
+  purpose: string;
+  tokenHash: string;
+  expiresAt: Date;
+  usedAt: Date | null;
+  createdAt: Date;
+}
+
+export interface RoleRow {
+  id: string;
+  applicationId: string;
+  name: string;
+  description: string | null;
+  isSystem: string;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export const dbState: DbState = {
@@ -125,6 +190,10 @@ export const dbState: DbState = {
   conversations: [],
   consentRecords: [],
   messagingProfiles: [],
+  users: [],
+  userSessions: [],
+  userVerificationTokens: [],
+  roles: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -159,6 +228,30 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+// Defined at module scope (not inline in the mock's returned object
+// literal) so AuthRegistry's methods below can throw instances of the
+// exact same classes the mock exports as AuthError/ValidationError/
+// ConflictError — object-literal properties can't reference their
+// siblings while the literal itself is being constructed.
+class MockAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthError';
+  }
+}
+class MockValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+class MockConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictError';
+  }
+}
+
 export function clearDb(): void {
   dbState.failEventWrites = false;
   dbState.failAuditWrites = false;
@@ -171,6 +264,10 @@ export function clearDb(): void {
   dbState.conversations = [];
   dbState.consentRecords = [];
   dbState.messagingProfiles = [];
+  dbState.users = [];
+  dbState.userSessions = [];
+  dbState.userVerificationTokens = [];
+  dbState.roles = [];
 }
 
 export function seedReachChurch(): void {
@@ -419,6 +516,151 @@ export function installDatabaseMock(): Record<string, unknown> {
       },
       async updateLastUsed(_id: string): Promise<void> {
         // no-op in simulation
+      },
+    },
+    userRepository: {
+      async findByEmail(email: string) {
+        return dbState.users.find((u) => u.email === email);
+      },
+      async findById(id: string) {
+        return dbState.users.find((u) => u.id === id);
+      },
+      async findByApplicationAndEmail(applicationId: string, email: string) {
+        return dbState.users.find((u) => u.applicationId === applicationId && u.email === email);
+      },
+      async findByApplicationId(applicationId: string) {
+        return dbState.users.filter((u) => u.applicationId === applicationId);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: UserRow = {
+          id: `user_${randomUUID().slice(0, 8)}`,
+          applicationId: String(data.applicationId),
+          tenantId: (data.tenantId as string) ?? null,
+          roleId: (data.roleId as string) ?? null,
+          email: String(data.email),
+          name: (data.name as string) ?? null,
+          passwordHash: (data.passwordHash as string) ?? null,
+          emailVerifiedAt: null,
+          lastLoginAt: null,
+          failedLoginAttempts: 0,
+          lockedUntilAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.users.push(row);
+        return row;
+      },
+      async update(id: string, data: Partial<Record<string, unknown>>) {
+        const row = dbState.users.find((u) => u.id === id);
+        if (!row) return undefined;
+        Object.assign(row, data, { updatedAt: new Date() });
+        return row;
+      },
+      async incrementFailedLoginAttempts(id: string) {
+        const row = dbState.users.find((u) => u.id === id);
+        if (!row) return undefined;
+        row.failedLoginAttempts += 1;
+        return row;
+      },
+      async count() {
+        return dbState.users.length;
+      },
+    },
+    userSessionRepository: {
+      async findByTokenHash(tokenHash: string) {
+        return dbState.userSessions.find((s) => s.tokenHash === tokenHash);
+      },
+      async findActiveByUserId(userId: string) {
+        return dbState.userSessions.filter((s) => s.userId === userId && !s.revokedAt);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: UserSessionRow = {
+          id: `usess_${randomUUID().slice(0, 8)}`,
+          userId: String(data.userId),
+          tokenHash: String(data.tokenHash),
+          userAgent: (data.userAgent as string) ?? null,
+          ipAddress: (data.ipAddress as string) ?? null,
+          expiresAt: data.expiresAt as Date,
+          revokedAt: null,
+          lastUsedAt: null,
+          createdAt: new Date(),
+        };
+        dbState.userSessions.push(row);
+        return row;
+      },
+      async revoke(id: string) {
+        const row = dbState.userSessions.find((s) => s.id === id);
+        if (!row) return undefined;
+        row.revokedAt = new Date();
+        return row;
+      },
+      async revokeAllForUser(userId: string) {
+        for (const s of dbState.userSessions) {
+          if (s.userId === userId && !s.revokedAt) s.revokedAt = new Date();
+        }
+      },
+      async updateLastUsed(id: string) {
+        const row = dbState.userSessions.find((s) => s.id === id);
+        if (row) row.lastUsedAt = new Date();
+      },
+    },
+    userVerificationTokenRepository: {
+      async findByTokenHash(tokenHash: string) {
+        return dbState.userVerificationTokens.find((t) => t.tokenHash === tokenHash);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: UserVerificationTokenRow = {
+          id: `uvt_${randomUUID().slice(0, 8)}`,
+          userId: String(data.userId),
+          purpose: String(data.purpose),
+          tokenHash: String(data.tokenHash),
+          expiresAt: data.expiresAt as Date,
+          usedAt: null,
+          createdAt: new Date(),
+        };
+        dbState.userVerificationTokens.push(row);
+        return row;
+      },
+      async markUsed(id: string) {
+        const row = dbState.userVerificationTokens.find((t) => t.id === id);
+        if (!row) return undefined;
+        row.usedAt = new Date();
+        return row;
+      },
+      async invalidateOutstanding(userId: string, purpose: string) {
+        for (const t of dbState.userVerificationTokens) {
+          if (t.userId === userId && t.purpose === purpose && !t.usedAt) t.usedAt = new Date();
+        }
+      },
+    },
+    roleRepository: {
+      async findById(id: string) {
+        return dbState.roles.find((r) => r.id === id);
+      },
+      async findByApplicationAndName(applicationId: string, name: string) {
+        return dbState.roles.find((r) => r.applicationId === applicationId && r.name === name);
+      },
+      async findByApplicationId(applicationId: string) {
+        return dbState.roles.filter((r) => r.applicationId === applicationId);
+      },
+      async create(data: Record<string, unknown>) {
+        const row: RoleRow = {
+          id: `role_${randomUUID().slice(0, 8)}`,
+          applicationId: String(data.applicationId),
+          name: String(data.name),
+          description: (data.description as string) ?? null,
+          isSystem: (data.isSystem as string) ?? 'false',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.roles.push(row);
+        return row;
+      },
+      async addPermission(data: Record<string, unknown>) {
+        return { id: `perm_${randomUUID().slice(0, 8)}`, ...data };
+      },
+      async findPermissionsByRoleId(_roleId: string) {
+        return [];
       },
     },
     tenantRepository: {
@@ -757,6 +999,38 @@ export function installDatabaseMock(): Record<string, unknown> {
       return fn(null);
     },
     ApplicationRegistry: class {
+      async createApplication(input: { name: string; slug: string; environment?: string }) {
+        if (dbState.applications.some((a) => a.name === input.name)) {
+          throw new Error(`Application with name "${input.name}" already exists`);
+        }
+        if (dbState.applications.some((a) => a.slug === input.slug)) {
+          throw new Error(`Application with slug "${input.slug}" already exists`);
+        }
+        const application = {
+          id: `app_${randomUUID().slice(0, 8)}`,
+          slug: input.slug,
+          name: input.name,
+          status: 'active',
+          environment: input.environment ?? 'development',
+        };
+        dbState.applications.push(application);
+
+        const { raw, hash, prefix } = generateApiKey();
+        const apiKeyRow = {
+          id: `key_${randomUUID().slice(0, 8)}`,
+          keyHash: hash,
+          applicationId: application.id,
+          environment: application.environment,
+          revokedAt: null,
+          expiresAt: null,
+        };
+        dbState.apiKeys.push(apiKeyRow);
+
+        return {
+          application,
+          apiKey: { id: apiKeyRow.id, raw, hash, prefix, environment: apiKeyRow.environment },
+        };
+      }
       async authenticateApplication(rawKey: string, _environment?: string) {
         if (!rawKey || rawKey.length === 0) {
           return { authenticated: false, error: 'API key is required' };
@@ -789,6 +1063,244 @@ export function installDatabaseMock(): Record<string, unknown> {
         const linked = dbState.tenantLinks.some((l) => l.tenantId === tenant.id && l.applicationId === applicationId);
         if (!linked) return { resolved: false, error: `Tenant "${tenantSlug}" is not linked to this application` };
         return { resolved: true, tenant, applicationId };
+      }
+    },
+    AuthError: MockAuthError,
+    ValidationError: MockValidationError,
+    ConflictError: MockConflictError,
+    // Faithful-enough reimplementation of packages/database/src/auth-registry.ts
+    // against dbState, for the same reason every other class here is
+    // reimplemented rather than imported — see the module-level comment.
+    AuthRegistry: class {
+      private toPublic(user: UserRow) {
+        const { passwordHash: _passwordHash, ...rest } = user;
+        return rest;
+      }
+
+      async signup(input: {
+        email: string;
+        password: string;
+        name?: string;
+        applicationName: string;
+        applicationSlug: string;
+      }) {
+        if (!input.email || !input.email.includes('@')) {
+          throw new MockValidationError('A valid email is required');
+        }
+        if (!input.password || input.password.length < 8) {
+          throw new MockValidationError('Password must be at least 8 characters');
+        }
+        if (!input.applicationName || !input.applicationSlug) {
+          throw new MockValidationError('applicationName and applicationSlug are required');
+        }
+        if (dbState.users.some((u) => u.email === input.email)) {
+          throw new MockConflictError('An account with this email already exists');
+        }
+        if (dbState.applications.some((a) => a.name === input.applicationName)) {
+          throw new Error(`Application with name "${input.applicationName}" already exists`);
+        }
+        if (dbState.applications.some((a) => a.slug === input.applicationSlug)) {
+          throw new Error(`Application with slug "${input.applicationSlug}" already exists`);
+        }
+
+        const application = {
+          id: `app_${randomUUID().slice(0, 8)}`,
+          slug: input.applicationSlug,
+          name: input.applicationName,
+          status: 'active',
+          environment: 'development',
+        };
+        dbState.applications.push(application);
+
+        const { raw: rawKey, hash: keyHash, prefix } = generateApiKey();
+        dbState.apiKeys.push({
+          id: `key_${randomUUID().slice(0, 8)}`,
+          keyHash,
+          applicationId: application.id,
+          environment: application.environment,
+          revokedAt: null,
+          expiresAt: null,
+        });
+
+        let role = dbState.roles.find((r) => r.applicationId === application.id && r.name === 'Owner');
+        if (!role) {
+          role = {
+            id: `role_${randomUUID().slice(0, 8)}`,
+            applicationId: application.id,
+            name: 'Owner',
+            description: "Full access — created automatically for the application's first user",
+            isSystem: 'true',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          dbState.roles.push(role);
+        }
+
+        const user: UserRow = {
+          id: `user_${randomUUID().slice(0, 8)}`,
+          applicationId: application.id,
+          tenantId: null,
+          roleId: role.id,
+          email: input.email,
+          name: input.name ?? null,
+          passwordHash: hashPassword(input.password),
+          emailVerifiedAt: null,
+          lastLoginAt: null,
+          failedLoginAttempts: 0,
+          lockedUntilAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.users.push(user);
+
+        const verification = generateVerificationToken();
+        dbState.userVerificationTokens.push({
+          id: `uvt_${randomUUID().slice(0, 8)}`,
+          userId: user.id,
+          purpose: 'email_verification',
+          tokenHash: verification.hash,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          usedAt: null,
+          createdAt: new Date(),
+        });
+
+        return {
+          user: this.toPublic(user),
+          application,
+          apiKey: { raw: rawKey, prefix, environment: application.environment },
+          emailVerificationToken: verification.raw,
+        };
+      }
+
+      async login(input: { email: string; password: string; userAgent?: string; ipAddress?: string }) {
+        const user = dbState.users.find((u) => u.email === input.email);
+        if (!user || !user.passwordHash) {
+          throw new MockAuthError('Invalid email or password');
+        }
+        if (user.lockedUntilAt && new Date(user.lockedUntilAt) > new Date()) {
+          throw new MockAuthError(
+            `Account temporarily locked after too many failed attempts. Try again after ${new Date(user.lockedUntilAt).toISOString()}`,
+          );
+        }
+        if (!verifyPassword(input.password, user.passwordHash)) {
+          user.failedLoginAttempts += 1;
+          if (user.failedLoginAttempts >= 5) {
+            user.lockedUntilAt = new Date(Date.now() + 15 * 60 * 1000);
+          }
+          throw new MockAuthError('Invalid email or password');
+        }
+
+        user.failedLoginAttempts = 0;
+        user.lockedUntilAt = null;
+        user.lastLoginAt = new Date();
+
+        const session = generateSessionToken();
+        const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        dbState.userSessions.push({
+          id: `usess_${randomUUID().slice(0, 8)}`,
+          userId: user.id,
+          tokenHash: session.hash,
+          userAgent: input.userAgent ?? null,
+          ipAddress: input.ipAddress ?? null,
+          expiresAt,
+          revokedAt: null,
+          lastUsedAt: null,
+          createdAt: new Date(),
+        });
+
+        return { user: this.toPublic(user), token: session.raw, expiresAt };
+      }
+
+      async logout(rawToken: string) {
+        const hash = hashToken(rawToken);
+        const session = dbState.userSessions.find((s) => s.tokenHash === hash);
+        if (session && !session.revokedAt) session.revokedAt = new Date();
+      }
+
+      async verifySession(rawToken: string) {
+        const hash = hashToken(rawToken);
+        const session = dbState.userSessions.find((s) => s.tokenHash === hash);
+        if (!session || session.revokedAt) return null;
+        if (new Date(session.expiresAt) < new Date()) return null;
+        const user = dbState.users.find((u) => u.id === session.userId);
+        if (!user) return null;
+        session.lastUsedAt = new Date();
+        return this.toPublic(user);
+      }
+
+      async requestPasswordReset(email: string) {
+        const user = dbState.users.find((u) => u.email === email);
+        if (!user) return null;
+        for (const t of dbState.userVerificationTokens) {
+          if (t.userId === user.id && t.purpose === 'password_reset' && !t.usedAt) t.usedAt = new Date();
+        }
+        const token = generateVerificationToken();
+        dbState.userVerificationTokens.push({
+          id: `uvt_${randomUUID().slice(0, 8)}`,
+          userId: user.id,
+          purpose: 'password_reset',
+          tokenHash: token.hash,
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+          usedAt: null,
+          createdAt: new Date(),
+        });
+        return { token: token.raw };
+      }
+
+      async resetPassword(rawToken: string, newPassword: string) {
+        if (!newPassword || newPassword.length < 8) {
+          throw new MockValidationError('Password must be at least 8 characters');
+        }
+        const hash = hashToken(rawToken);
+        const record = dbState.userVerificationTokens.find((t) => t.tokenHash === hash);
+        if (!record || record.purpose !== 'password_reset' || record.usedAt || new Date(record.expiresAt) < new Date()) {
+          throw new MockAuthError('Invalid or expired reset token');
+        }
+        const user = dbState.users.find((u) => u.id === record.userId);
+        if (user) {
+          user.passwordHash = hashPassword(newPassword);
+          user.failedLoginAttempts = 0;
+          user.lockedUntilAt = null;
+        }
+        record.usedAt = new Date();
+        for (const s of dbState.userSessions) {
+          if (s.userId === record.userId && !s.revokedAt) s.revokedAt = new Date();
+        }
+      }
+
+      async resendEmailVerification(userId: string) {
+        for (const t of dbState.userVerificationTokens) {
+          if (t.userId === userId && t.purpose === 'email_verification' && !t.usedAt) t.usedAt = new Date();
+        }
+        const token = generateVerificationToken();
+        dbState.userVerificationTokens.push({
+          id: `uvt_${randomUUID().slice(0, 8)}`,
+          userId,
+          purpose: 'email_verification',
+          tokenHash: token.hash,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          usedAt: null,
+          createdAt: new Date(),
+        });
+        return { token: token.raw };
+      }
+
+      async verifyEmail(rawToken: string) {
+        const hash = hashToken(rawToken);
+        const record = dbState.userVerificationTokens.find((t) => t.tokenHash === hash);
+        if (
+          !record ||
+          record.purpose !== 'email_verification' ||
+          record.usedAt ||
+          new Date(record.expiresAt) < new Date()
+        ) {
+          throw new MockAuthError('Invalid or expired verification token');
+        }
+        const user = dbState.users.find((u) => u.id === record.userId);
+        if (!user) throw new MockAuthError('User not found');
+        user.emailVerifiedAt = new Date();
+        record.usedAt = new Date();
+        return this.toPublic(user);
       }
     },
     checkDatabaseHealth: async () => {

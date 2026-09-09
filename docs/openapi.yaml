@@ -50,6 +50,11 @@ servers:
     description: Sandbox (test API keys, simulated providers)
 
 tags:
+  - name: Auth
+    description: >-
+      Signup/login for the developer/business accounts that own a BIS
+      Platform application — distinct from the per-application API key
+      (`bearerAuth`) used on every other tagged section below.
   - name: Payments
     description: Create and retrieve payments.
   - name: Refunds
@@ -69,6 +74,192 @@ security:
   - bearerAuth: []
 
 paths:
+  /auth/signup:
+    post:
+      tags: [Auth]
+      operationId: signup
+      summary: Create an account and its BIS Platform application
+      description: |
+        Self-service signup: creates a customer account (user) and the BIS
+        Platform application it owns in one step, and issues that
+        application's first live API key. Returns 409 if the email is
+        already registered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, applicationName, applicationSlug]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+                name: { type: string }
+                applicationName: { type: string }
+                applicationSlug: { type: string }
+      responses:
+        '201':
+          description: Account and application created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignupResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: An account with this email already exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in with email and password
+      description: |
+        Returns an opaque, revocable session token (not a JWT) — send it as
+        `Authorization: Bearer <token>` on `/auth/me`, `/auth/logout`, and
+        `/auth/resend-verification`. Accounts lock temporarily after
+        repeated failed attempts.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Invalid credentials, or account temporarily locked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke the current session
+      security: [{ sessionAuth: [] }]
+      responses:
+        '204': { description: Session revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Get the currently authenticated user
+      security: [{ sessionAuth: [] }]
+      responses:
+        '200':
+          description: The authenticated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/verify-email:
+    post:
+      tags: [Auth]
+      operationId: verifyEmail
+      summary: Verify an account's email address
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        '200':
+          description: Email verified.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400':
+          description: Invalid or expired verification token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/resend-verification:
+    post:
+      tags: [Auth]
+      operationId: resendVerification
+      summary: Request a new email verification token
+      security: [{ sessionAuth: [] }]
+      responses:
+        '200': { description: Verification requested. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/request-password-reset:
+    post:
+      tags: [Auth]
+      operationId: requestPasswordReset
+      summary: Request a password reset token
+      description: >-
+        Always returns 200 with a generic message, whether or not the email
+        is registered — this endpoint never reveals account existence.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Reset requested (generic — see description). }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: Reset a password using a reset token
+      description: >-
+        On success, every existing session for the account is revoked.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Password reset. }
+        '400':
+          description: Invalid/expired token, or password too short.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /payments:
     post:
       tags: [Payments]
@@ -479,6 +670,15 @@ components:
         `app_id`; the gateway validates the key against the `api_keys` table and
         rejects requests whose `app_id` does not match the key's scope.
 
+    sessionAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: SESSION_TOKEN
+      description: |
+        Opaque, revocable session token returned by `POST /auth/login`
+        (`sess_...`). Distinct from `bearerAuth` — a session authenticates
+        a person (account owner), not an application.
+
   parameters:
     RequestIdHeader:
       name: X-Request-Id
@@ -766,6 +966,55 @@ components:
         idempotency_key:
           type: string
           description: Alternative to the `Idempotency-Key` header.
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        roleId: { type: string, format: uuid, nullable: true }
+        email: { type: string, format: email }
+        name: { type: string, nullable: true }
+        emailVerifiedAt: { type: string, format: date-time, nullable: true }
+        lastLoginAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    SignupResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        application:
+          type: object
+          description: The BIS Platform application created for this account.
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            slug: { type: string }
+            status: { type: string }
+            environment: { type: string }
+        apiKey:
+          type: object
+          description: This application's first API key. Shown once — store it now.
+          properties:
+            raw: { type: string, example: sk_live_a1b2c3... }
+            prefix: { type: string }
+            environment: { type: string }
+        emailVerificationToken:
+          type: string
+          description: >-
+            Present only outside production. In production this token is
+            emailed, not returned in the response (transactional email
+            sending is not yet implemented — see IMPLEMENTATION_BASELINE.md).
+
+    LoginResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        token:
+          type: string
+          description: Opaque session token — send as `Authorization Bearer` on session-authed routes.
+          example: sess_a1b2c3...
+        expiresAt: { type: string, format: date-time }
 
     Payment:
       type: object

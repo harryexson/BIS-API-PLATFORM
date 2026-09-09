@@ -6,6 +6,12 @@ export { applicationPermissions, type ApplicationPermission, type NewApplication
 export { users, type User, type NewUser } from './users';
 export { roles, type Role, type NewRole } from './roles';
 export { permissions, type Permission, type NewPermission } from './permissions';
+export { userSessions, type UserSession, type NewUserSession } from './user-sessions';
+export {
+  userVerificationTokens,
+  type UserVerificationToken,
+  type NewUserVerificationToken,
+} from './user-verification-tokens';
 export { providers, type Provider, type NewProvider } from './providers';
 export { providerCapabilities, type ProviderCapability, type NewProviderCapability } from './provider-capabilities';
 export { providerConfigs, type ProviderConfig, type NewProviderConfig } from './provider-configs';

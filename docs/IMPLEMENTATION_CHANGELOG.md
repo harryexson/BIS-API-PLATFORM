@@ -6,6 +6,133 @@ tests cover it.
 
 ---
 
+## 2026-09-09 — Customer Account Auth: Signup/Login (Phase A of 4)
+
+**Context:** user asked for four things in one request — (1) subscription
+setups for customers, (2) signup/login authentication, (3) a full
+developer-facing CRM/support back office, and (4) making sure the admin
+console works. A prior read-only audit confirmed all four were either
+fully absent or (for the admin console) healthy but minimal — see that
+audit's findings folded into §1/§2/§3 of `IMPLEMENTATION_BASELINE.md`
+below. Given the scope, this is being delivered as four sequenced,
+independently-tested phases rather than partial work spread across all
+four; this entry is Phase A. Phases B (subscriptions/billing), C
+(CRM/support back office), and D (admin console consolidation) are not
+started yet.
+
+**What "customer" means here:** the businesses that hold a BIS Platform
+application (Reach Church, HaulPro, Afribook) — i.e. this platform's own
+developer/business customers self-provisioning API access — not the
+end-consumers those businesses message/charge. This reuses the existing
+`users` table (scoped to one `applicationId`), which existed in schema
+only, with zero production usage anywhere in the codebase before this
+change (confirmed by the audit).
+
+### What was built
+- **Schema** (migration `0010_add_user_auth.sql`, applied directly to the
+  live Neon project `orange-water-80452818` — hand-written and
+  hand-applied via `run_sql_transaction`, not `drizzle-kit generate`,
+  because this repo's migration history is already known to have drifted
+  from the schema on disk (see the 2026-09-08 "Drizzle Migration History
+  Has Diverged" entry below) and generating against it produces unsafe
+  interactive rename-vs-new-column guesses):
+  - `users.role_id` (nullable FK → `roles.id`) — connects the previously
+    dead `roles`/`permissions` tables to something real: signup creates an
+    "Owner" role (full-access, `resource: '*', action: '*'`) for the new
+    application and assigns it to the first user.
+  - A new global unique index on `users.email` (signup/login take no
+    application context from the caller — "one signup creates one
+    application" is this platform's self-serve model). Safe to add: the
+    table had 4 pre-existing rows (old manual QA data), all distinct
+    emails, verified via `run_sql` before applying.
+  - New tables `user_sessions` (opaque, hashed, revocable session
+    tokens — same design as `application_api_keys`, not a JWT, so
+    logout/password-reset can invalidate a session immediately) and
+    `user_verification_tokens` (single-use tokens shared by email
+    verification and password reset, distinguished by a `purpose` column).
+- **Crypto** (`packages/database/src/crypto.ts`): `hashPassword`/
+  `verifyPassword` (scrypt, random salt per password — this module already
+  used `scryptSync` for the secret-encryption key, so this is consistent
+  with existing dependencies, no new npm package); `hashToken` (sha256,
+  generalized from the existing `hashApiKey`) plus `generateSessionToken`/
+  `generateVerificationToken` for opaque revocable tokens, same shape as
+  the existing `generateApiKey`.
+- **`AuthRegistry`** (`packages/database/src/auth-registry.ts`) — same
+  dependency-injected registry pattern as `ApplicationRegistry`/
+  `TenantRegistry`: `signup` (creates the application + Owner role + user
+  in one call, via `ApplicationRegistry.createApplication`), `login`
+  (generic "Invalid email or password" for both wrong-password and
+  unknown-email, to avoid account enumeration; lockout after 5 failed
+  attempts for 15 minutes, using the `failedLoginAttempts`/`lockedUntilAt`
+  columns that already existed on `users` but were never wired to
+  anything), `logout`, `verifySession`, `requestPasswordReset`/
+  `resetPassword` (resetting revokes every existing session for the
+  account), `resendEmailVerification`/`verifyEmail`.
+- **Gateway routes** (`services/api-gateway/src/app.ts`, new "CUSTOMER
+  ACCOUNT AUTH" section): `POST /v1/api/auth/signup`, `/login`, `/logout`,
+  `GET /me`, `POST /verify-email`, `/resend-verification`,
+  `/request-password-reset`, `/reset-password`. Distinct from the
+  existing per-application API-key auth (`mw.apiKey`, used by
+  `/v1/api/gateway/*`) and the single shared-secret admin auth
+  (`requireAdmin`, used by `/api/dashboard/*`) — this is a third,
+  person-level auth surface. Rate-limited by the existing
+  `app.use('/v1/api', mw.rateLimit)` (keyed by IP for these routes, since
+  they carry no API key yet).
+- **Known, explicitly-labeled gap:** no transactional email sending was
+  built (would need a real SMTP/SES/Postmark/etc. integration and
+  credentials this session doesn't have). Email verification and password
+  reset tokens are surfaced directly in the API response, but *only
+  outside production* (`NODE_ENV !== 'production'`) — never fabricated as
+  "emailed" when they weren't. In production these endpoints currently
+  have no way to deliver the token to the user; wiring a real email send
+  is required before this phase is production-usable end to end.
+- **`docs/openapi.yaml`**: new `Auth` tag, `sessionAuth` security scheme
+  (distinct from the existing `bearerAuth` API-key scheme), and full path
+  definitions for all 8 routes — intentionally lighter-weight (inline
+  schemas, no per-error-code component refs) than the `Payments`/
+  `Messages` sections, to fit this phase's scope.
+
+### Tests
+- `packages/database/src/auth-registry.test.ts` — 22 unit tests against
+  in-memory fakes (signup validation/conflict, login success/failure/
+  lockout/enumeration-resistance, session verify/logout/expiry, password
+  reset end-to-end including session revocation, email verification
+  including reuse rejection).
+- `packages/simulation/src/auth.simulation.test.ts` — 14 tests that boot
+  the **real gateway** (`services/api-gateway/src/app.ts`, unmodified)
+  against the in-memory Neon double and exercise every route over real
+  HTTP, including confirming a signup-issued API key actually authenticates
+  against `/v1/api/gateway/*`, and that `dbState.users` gets a real row
+  with a non-plaintext password hash.
+- Extending `packages/simulation/src/db.ts` (the shared in-memory Neon
+  double used by ~30 other simulation test files) to support the new
+  repos/`AuthRegistry` was **required, not optional** — `app.ts` now
+  imports `AuthRegistry` and constructs one at module load time, so every
+  existing simulation test that boots the gateway would otherwise crash
+  immediately with "No AuthRegistry export is defined on the mock" (this
+  was caught by actually running the existing suite mid-change, not
+  assumed safe).
+- Full suite: 343 passed, 12 pre-existing skipped (unrelated integration
+  tests needing live DB/network) — confirmed 3x consecutive runs, 0
+  failures. Lint (0 errors), typecheck, and `npm run build:all` all clean.
+- **Not tested in this session**: an actual HTTP request against the real
+  Neon database — this environment's own app process still cannot reach
+  `api.c-2.us-east-2.aws.neon.tech` (403, host not in the network
+  allowlist), the same constraint documented in the 2026-09-08 "Attempted:
+  Real Provider Adapters — Blocked by Network Policy" entry. The migration
+  itself *was* applied to and verified against the real Neon project via
+  the Neon MCP tools, which are unaffected by that restriction.
+
+**Files changed:** `packages/database/drizzle/0010_add_user_auth.sql`
+(new), `packages/database/drizzle/meta/_journal.json`,
+`packages/database/src/schema/{users,user-sessions,user-verification-tokens,index}.ts`,
+`packages/database/src/repositories/{users,user-sessions,user-verification-tokens,roles,index}.ts`,
+`packages/database/src/crypto.ts`, `packages/database/src/auth-registry.ts`
+(new) + `.test.ts` (new), `packages/database/src/index.ts`,
+`services/api-gateway/src/app.ts`, `packages/simulation/src/db.ts`,
+`packages/simulation/src/auth.simulation.test.ts` (new),
+`docs/openapi.yaml`, `.env.example`.
+
 ## 2026-09-09 — Real Provider Adapters: Sinch + Vibes
 
 **Phase:** 6 of the master plan (continued). User-requested addition of two
