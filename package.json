@@ -12,10 +12,11 @@
     "dev:gateway": "npm --workspace=services/api-gateway run dev",
     "dev:console": "npm --workspace=apps/admin-console run dev",
     "dev:web": "npm --workspace=apps/web run dev",
+    "dev:mobile": "npm --workspace=apps/mobile run start",
     "dev:worker": "npm --workspace=worker run dev",
     "build:all": "npm run build --workspaces --if-present",
     "lint": "eslint .",
-    "type-check": "tsc --noEmit && npm --workspace=apps/admin-console run type-check && npm --workspace=apps/web run type-check",
+    "type-check": "tsc --noEmit && npm --workspace=apps/admin-console run type-check && npm --workspace=apps/web run type-check && npm --workspace=apps/mobile run type-check",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.config.integration.ts",
     "ci": "npm run lint && npm run type-check && npm run test && npm run build:all"
