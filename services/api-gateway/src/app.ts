@@ -336,8 +336,8 @@ app.get('/ready', async (req: Request, res: Response) => {
 
   // P2-5: Check database connectivity
   try {
-    const dbOk = await checkDatabaseHealth();
-    deps.database = dbOk ? 'healthy' : 'unhealthy';
+    const dbHealth = await checkDatabaseHealth();
+    deps.database = dbHealth.status;
   } catch {
     deps.database = 'unreachable';
   }
@@ -747,15 +747,32 @@ app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
       environment: 'test',
     });
 
+    // A new signup is useless without a tenant to send traffic under —
+    // resolveTenantContext rejects every /v1/api/gateway/* request until one
+    // exists and is linked. Provision a default one so the account is usable
+    // immediately; additional tenants can still be created later.
+    const defaultTenant = await tenantRepository.create({
+      name: 'Default',
+      slug: `${slug}-default`,
+    });
+    await tenantApplicationLinkRepository.link(defaultTenant.id, application.id);
+
     const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
 
     return res.status(201).json({
       token,
       application: { id: application.id, name: application.name, slug: application.slug },
       apiKey: { prefix: apiKey.prefix, raw: apiKey.raw },
+      tenant: { id: defaultTenant.id, name: defaultTenant.name, slug: defaultTenant.slug },
     });
   } catch (err: any) {
-    logger.error('portal signup failed', { operation: 'portal-signup', errorCode: 'SIGNUP_FAILED', status: 'failed' });
+    logger.error('portal signup failed', {
+      operation: 'portal-signup',
+      errorCode: 'SIGNUP_FAILED',
+      status: 'failed',
+      errorMessage: err?.message,
+      stack: err?.stack,
+    });
     return res.status(500).json({ error: 'Signup failed' });
   }
 });
@@ -791,6 +808,14 @@ app.get('/v1/portal/me', requirePortalAuth, async (req: Request, res: Response) 
   return res.json({
     user: { id: portalUser.userId, email: portalUser.email },
     application: { id: application.id, name: application.name, slug: application.slug, environment: application.environment },
+  });
+});
+
+app.get('/v1/portal/tenants', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const tenants = await tenantRepository.findActiveByApplicationId(portalUser.applicationId);
+  return res.json({
+    tenants: tenants.map((t) => ({ id: t.id, name: t.name, slug: t.slug })),
   });
 });
 

@@ -19,7 +19,7 @@ export default function App() {
     <div className="main-layout">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 32 }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: 20 }}>{application.name}</h1>
+          <h1 style={{ margin: 0, fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 600, letterSpacing: '-0.01em' }}>{application.name}</h1>
           <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>{application.slug}</p>
         </div>
         <button className="btn-secondary" onClick={logout}>Sign out</button>
@@ -31,7 +31,7 @@ export default function App() {
         <div className={`tab ${tab === 'transactions' ? 'active' : ''}`} onClick={() => setTab('transactions')}>Transactions</div>
       </div>
 
-      {tab === 'start' && <GettingStarted appSlug={application.slug} />}
+      {tab === 'start' && <GettingStarted token={token} appSlug={application.slug} />}
       {tab === 'keys' && <ApiKeys token={token} />}
       {tab === 'transactions' && <Transactions token={token} />}
     </div>

@@ -1,3 +1,8 @@
+import path from 'node:path';
+import dotenv from 'dotenv';
+
+dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+
 import { createServer } from 'node:http';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine } from '@company/routing';
