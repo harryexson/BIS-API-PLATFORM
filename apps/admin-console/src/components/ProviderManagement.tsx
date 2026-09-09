@@ -324,7 +324,7 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
           </thead>
           <tbody>
             {providers.map((p) => (
-              <tr key={p.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+              <tr key={p.id} style={{ borderBottom: '1px solid rgba(16, 16, 18,0.04)' }}>
                 <Td>
                   <div style={{ fontWeight: '600', color: 'var(--text-primary)' }}>{p.name}</div>
                   <div style={{ fontSize: '10px', color: 'var(--text-muted)' }}>{p.id}</div>
@@ -475,7 +475,7 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
             marginBottom: '16px',
             border: `1px solid ${HEALTH_COLOR[healthResult.status]}`,
             color: HEALTH_COLOR[healthResult.status],
-            background: 'rgba(255,255,255,0.02)',
+            background: 'rgba(16, 16, 18,0.02)',
           }}
         >
           <strong>Health check:</strong> {healthResult.status} · {healthResult.latencyMs} ms
@@ -649,7 +649,7 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
 
 function Stat({ label, value, color }: { label: string; value: string; color: string }) {
   return (
-    <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)', borderRadius: '8px', padding: '10px 14px' }}>
+    <div style={{ background: 'rgba(16, 16, 18,0.02)', border: '1px solid rgba(16, 16, 18,0.04)', borderRadius: '8px', padding: '10px 14px' }}>
       <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>{label}</div>
       <div style={{ fontSize: '20px', fontWeight: 700, color }}>{value}</div>
     </div>
@@ -669,7 +669,7 @@ function chips(values: string[] | undefined, color: string) {
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
       {shown.map((v) => (
-        <span key={v} style={{ fontSize: '10px', background: 'rgba(255,255,255,0.06)', color, padding: '2px 6px', borderRadius: '4px' }}>{v}</span>
+        <span key={v} style={{ fontSize: '10px', background: 'rgba(16, 16, 18,0.06)', color, padding: '2px 6px', borderRadius: '4px' }}>{v}</span>
       ))}
       {values.length > shown.length && (
         <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>+{values.length - shown.length}</span>
@@ -695,7 +695,7 @@ function StatusBadge({ status }: { status: string }) {
 
 function Field({ label, icon, children }: { label: string; icon: React.ReactNode; children: React.ReactNode }) {
   return (
-    <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)', borderRadius: '8px', padding: '12px' }}>
+    <div style={{ background: 'rgba(16, 16, 18,0.02)', border: '1px solid rgba(16, 16, 18,0.04)', borderRadius: '8px', padding: '12px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
         {icon} {label}
       </div>
@@ -713,7 +713,7 @@ function Section({ title, icon, children, onAdd, addLabel, addDisabled }: {
   addDisabled?: boolean;
 }) {
   return (
-    <div style={{ marginTop: '18px', background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)', borderRadius: '8px', padding: '14px' }}>
+    <div style={{ marginTop: '18px', background: 'rgba(16, 16, 18,0.02)', border: '1px solid rgba(16, 16, 18,0.04)', borderRadius: '8px', padding: '14px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--accent-cyan)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
           {icon} {title}
@@ -750,7 +750,7 @@ function actionButtonStyle(color: string): React.CSSProperties {
     display: 'inline-flex',
     alignItems: 'center',
     gap: '6px',
-    background: 'rgba(255,255,255,0.04)',
+    background: 'rgba(16, 16, 18,0.04)',
     border: `1px solid ${color}`,
     color,
     padding: '6px 12px',
@@ -802,8 +802,8 @@ const ruleRowStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   gap: '10px',
-  background: 'rgba(255,255,255,0.02)',
-  border: '1px solid rgba(255,255,255,0.04)',
+  background: 'rgba(16, 16, 18,0.02)',
+  border: '1px solid rgba(16, 16, 18,0.04)',
   borderRadius: '8px',
   padding: '8px 10px',
 };

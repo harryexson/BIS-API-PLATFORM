@@ -63,7 +63,7 @@ export default function AuthScreen() {
   return (
     <div style={{ display: 'flex', minHeight: '100vh', alignItems: 'center', justifyContent: 'center' }}>
       <form onSubmit={submit} className="glass-card" style={{ width: 380 }}>
-        <h1 style={{ marginTop: 0, fontSize: 22 }}>BIS API Platform</h1>
+        <h1 style={{ marginTop: 0, fontFamily: 'var(--font-display)', fontSize: 22, fontWeight: 600, letterSpacing: '-0.01em' }}>BIS API Platform</h1>
         <p style={{ color: 'var(--text-secondary)', marginTop: -8, fontSize: 14 }}>Developer Portal</p>
 
         {mode === 'signup' && (

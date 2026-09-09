@@ -19,7 +19,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
   const flowColor = (status: 'success' | 'failed' | 'pending' | undefined) =>
     status === 'success' ? 'var(--accent-green)' : status === 'pending' ? 'var(--accent-yellow)' : 'var(--accent-red)';
   const flowDotColor = (status: 'success' | 'failed' | 'pending' | undefined) =>
-    status === 'success' ? '#34d399' : status === 'pending' ? '#fbbf24' : '#f87171';
+    status === 'success' ? '#16a34a' : status === 'pending' ? '#b45309' : '#dc2626';
   const flowPulseAnimation = (status: 'success' | 'failed' | 'pending' | undefined) =>
     status === 'success' ? 'pulse-green 1s infinite' : status === 'pending' ? 'pulse-cyan 1s infinite' : 'pulse-red 1s infinite';
 
@@ -99,7 +99,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
         Live Routing Network Topology
       </h3>
 
-      <div className="topology-container" style={{ border: '1px solid rgba(255, 255, 255, 0.03)', borderRadius: '8px', background: '#070a13' }}>
+      <div className="topology-container" style={{ border: '1px solid rgba(16, 16, 18, 0.03)', borderRadius: '8px', background: 'var(--bg-tertiary)' }}>
         {/* SVG connection lines layer */}
         <svg 
           viewBox="0 0 1000 480" 
@@ -126,7 +126,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
               y1={40}
               x2={500}
               y2={160}
-              stroke="rgba(255, 255, 255, 0.04)"
+              stroke="rgba(16, 16, 18, 0.04)"
               strokeWidth="1.5"
             />
           ))}
@@ -138,7 +138,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
               y1={160}
               x2={router.x}
               y2={280}
-              stroke="rgba(255, 255, 255, 0.04)"
+              stroke="rgba(16, 16, 18, 0.04)"
               strokeWidth="1.5"
             />
           ))}
@@ -153,7 +153,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
                 y1={280}
                 x2={coord.x}
                 y2={420}
-                stroke={p.status === 'offline' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(255, 255, 255, 0.04)'}
+                stroke={p.status === 'offline' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 16, 18, 0.04)'}
                 strokeWidth="1.5"
                 strokeDasharray={p.status === 'maintenance' ? '4,4' : undefined}
               />
@@ -170,7 +170,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
                 y1={280}
                 x2={coord.x}
                 y2={420}
-                stroke={p.status === 'offline' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(255, 255, 255, 0.04)'}
+                stroke={p.status === 'offline' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 16, 18, 0.04)'}
                 strokeWidth="1.5"
                 strokeDasharray={p.status === 'maintenance' ? '4,4' : undefined}
               />
@@ -187,7 +187,7 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
                 y1={280}
                 x2={coord.x}
                 y2={420}
-                stroke={p.status === 'offline' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(255, 255, 255, 0.04)'}
+                stroke={p.status === 'offline' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 16, 18, 0.04)'}
                 strokeWidth="1.5"
                 strokeDasharray={p.status === 'maintenance' ? '4,4' : undefined}
               />

@@ -197,7 +197,7 @@ export const App: React.FC = () => {
           justifyContent: 'space-between',
           alignItems: 'center',
           marginBottom: '32px',
-          borderBottom: '1px solid rgba(255, 255, 255, 0.05)',
+          borderBottom: '1px solid rgba(16, 16, 18, 0.05)',
           paddingBottom: '20px',
           flexWrap: 'wrap',
           gap: '12px',
@@ -208,19 +208,18 @@ export const App: React.FC = () => {
             style={{
               width: '44px',
               height: '44px',
-              borderRadius: '12px',
-              background: 'linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-purple) 100%)',
+              borderRadius: '8px',
+              background: 'var(--accent-cyan)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              boxShadow: '0 0 20px rgba(6, 182, 212, 0.3)',
             }}
           >
-            <Network className="w-6 h-6 text-white" />
+            <Network className="w-6 h-6 text-white" style={{ color: '#ffffff' }} />
           </div>
           <div>
-            <h1 style={{ margin: 0, fontSize: '22px', fontWeight: 800, letterSpacing: '-0.5px' }}>
-              BIS API GATEWAY PLATFORM
+            <h1 style={{ margin: 0, fontFamily: 'var(--font-display)', fontSize: '20px', fontWeight: 600, letterSpacing: '-0.01em' }}>
+              BIS API Gateway Platform
             </h1>
             <span style={{ fontSize: '12px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
               <Layers className="w-3.5 h-3.5 text-cyan-400" />
@@ -235,8 +234,8 @@ export const App: React.FC = () => {
               display: 'flex',
               alignItems: 'center',
               gap: '6px',
-              background: 'rgba(255, 255, 255, 0.02)',
-              border: '1px solid rgba(255, 255, 255, 0.05)',
+              background: 'rgba(16, 16, 18, 0.02)',
+              border: '1px solid rgba(16, 16, 18, 0.05)',
               padding: '6px 12px',
               borderRadius: '20px',
               fontSize: '12px',
@@ -340,7 +339,7 @@ function adminPill(needsLogin: boolean): React.CSSProperties {
     display: 'inline-flex',
     alignItems: 'center',
     gap: '6px',
-    background: needsLogin ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.12)',
+    background: needsLogin ? 'rgba(16, 16, 18, 0.04)' : 'rgba(22, 163, 74, 0.1)',
     border: `1px solid ${needsLogin ? 'var(--glass-border)' : 'var(--accent-green)'}`,
     color: needsLogin ? 'var(--text-primary)' : 'var(--accent-green)',
     padding: '6px 12px',
@@ -365,7 +364,7 @@ function TabButton({ active, onClick, icon, label }: { active: boolean; onClick:
         fontWeight: 600,
         cursor: 'pointer',
         border: active ? '1px solid var(--accent-cyan)' : '1px solid var(--glass-border)',
-        background: active ? 'rgba(6,182,212,0.12)' : 'var(--bg-tertiary)',
+        background: active ? 'rgba(255, 90, 31, 0.1)' : 'var(--bg-tertiary)',
         color: active ? 'var(--accent-cyan)' : 'var(--text-secondary)',
       }}
     >

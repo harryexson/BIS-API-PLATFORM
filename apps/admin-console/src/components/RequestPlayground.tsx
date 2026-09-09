@@ -223,7 +223,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
 
           {/* Dynamic Category Parameters */}
           {category === 'payment' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(255,255,255,0.01)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.02)' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(16, 16, 18,0.01)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(16, 16, 18,0.02)' }}>
               <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '8px' }}>
                 <div>
                   <label style={{ display: 'block', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>Amount</label>
@@ -334,7 +334,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
           )}
 
           {category === 'messaging' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(255,255,255,0.01)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.02)' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(16, 16, 18,0.01)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(16, 16, 18,0.02)' }}>
               <div>
                 <label style={{ display: 'block', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>Recipient Address / Mobile</label>
                 <input
@@ -380,7 +380,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
           )}
 
           {category === 'other' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(255,255,255,0.01)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.02)' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', background: 'rgba(16, 16, 18,0.01)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(16, 16, 18,0.02)' }}>
               <div>
                 <label style={{ display: 'block', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>API Service Type</label>
                 <select
@@ -465,11 +465,11 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
             disabled={loading || !apiKey || !tenantId}
             title={!apiKey || !tenantId ? 'API Key and Tenant ID are required' : undefined}
             style={{
-              background: 'linear-gradient(90deg, #10b981 0%, #059669 100%)',
+              background: 'var(--accent-green)',
               border: 'none',
               color: '#ffffff',
               padding: '10px 16px',
-              borderRadius: '8px',
+              borderRadius: '6px',
               fontWeight: '700',
               cursor: loading || !apiKey || !tenantId ? 'not-allowed' : 'pointer',
               display: 'flex',
@@ -477,7 +477,6 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
               justifyContent: 'center',
               gap: '8px',
               fontSize: '13px',
-              boxShadow: '0 4px 14px 0 rgba(16, 185, 129, 0.3)',
               transition: 'transform 0.1s ease',
               marginTop: '6px'
             }}
@@ -493,7 +492,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
           {/* Terminal Console */}
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: '260px' }}>
-            <div style={{ background: '#1e293b', borderTopLeftRadius: '8px', borderTopRightRadius: '8px', padding: '6px 12px', border: '1px solid rgba(255,255,255,0.05)', borderBottom: 'none', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <div style={{ background: '#1e293b', borderTopLeftRadius: '8px', borderTopRightRadius: '8px', padding: '6px 12px', border: '1px solid rgba(16, 16, 18,0.05)', borderBottom: 'none', display: 'flex', alignItems: 'center', gap: '6px' }}>
               <Terminal className="w-4 h-4 text-cyan-400" style={{ color: 'var(--accent-cyan)' }} />
               <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', fontWeight: '600' }}>response_terminal.json</span>
             </div>
@@ -504,7 +503,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
                 background: '#0f172a',
                 borderBottomLeftRadius: '8px',
                 borderBottomRightRadius: '8px',
-                border: '1px solid rgba(255,255,255,0.05)',
+                border: '1px solid rgba(16, 16, 18,0.05)',
                 padding: '12px',
                 fontFamily: 'var(--font-mono)',
                 fontSize: '11px',
@@ -530,8 +529,8 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
           {/* Decision engine details */}
           <div 
             style={{ 
-              background: 'rgba(255,255,255,0.02)', 
-              border: '1px solid rgba(255,255,255,0.05)', 
+              background: 'rgba(16, 16, 18,0.02)', 
+              border: '1px solid rgba(16, 16, 18,0.05)', 
               borderRadius: '8px', 
               padding: '12px' 
             }}

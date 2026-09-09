@@ -91,7 +91,7 @@ export default function App() {
           <p style={{ color: 'var(--text-muted)', margin: '0 0 4px', fontSize: 13, textTransform: 'uppercase', letterSpacing: 0.5 }}>
             {state.session.applicationName}
           </p>
-          <h1 style={{ margin: '0 0 24px', fontSize: 36 }}>{formatAmount(state.session.amount, state.session.currency)}</h1>
+          <h1 style={{ margin: '0 0 24px', fontFamily: 'var(--font-display)', fontSize: 36, fontWeight: 500, letterSpacing: '-0.01em' }}>{formatAmount(state.session.amount, state.session.currency)}</h1>
 
           <label style={{ display: 'block', marginBottom: 6, fontSize: 13, color: 'var(--text-secondary)' }}>Payment method</label>
           <select value={paymentMethod} onChange={(e) => setPaymentMethod(e.target.value)} disabled={state.phase === 'paying'} style={{ marginBottom: 20 }}>

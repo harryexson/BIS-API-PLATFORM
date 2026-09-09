@@ -1,22 +1,23 @@
 :root {
-  --bg-primary: #0a0e17;
-  --bg-secondary: #111827;
-  --bg-tertiary: #1f2937;
-  --glass-bg: rgba(17, 24, 39, 0.7);
-  --glass-border: rgba(255, 255, 255, 0.08);
+  --bg-primary: #fafafa;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f3f4f6;
+  --glass-bg: #ffffff;
+  --glass-border: #e4e4e7;
 
-  --accent-cyan: #06b6d4;
-  --accent-green: #10b981;
-  --accent-red: #ef4444;
+  --accent-cyan: #ff5a1f;
+  --accent-green: #16a34a;
+  --accent-red: #dc2626;
 
-  --text-primary: #f3f4f6;
-  --text-secondary: #9ca3af;
-  --text-muted: #6b7280;
+  --text-primary: #101012;
+  --text-secondary: #52525b;
+  --text-muted: #8a8a92;
 
   --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
 
   font-family: var(--font-sans);
-  color-scheme: dark;
+  color-scheme: light;
   background-color: var(--bg-primary);
   color: var(--text-primary);
   margin: 0;
@@ -24,8 +25,7 @@
 
 body {
   margin: 0;
-  background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg-primary) 70%);
-  background-attachment: fixed;
+  background: var(--bg-primary);
   min-height: 100vh;
   display: flex;
   align-items: center;
@@ -33,20 +33,18 @@ body {
 }
 
 .glass-card {
-  background: var(--glass-bg);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: var(--bg-secondary);
   border: 1px solid var(--glass-border);
-  border-radius: 16px;
+  border-radius: 10px;
   padding: 32px;
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+  box-shadow: 0 2px 16px rgba(16, 16, 18, 0.06);
 }
 
 input, select {
   font-family: inherit;
   font-size: 15px;
   padding: 10px 12px;
-  border-radius: 8px;
+  border-radius: 6px;
   border: 1px solid var(--glass-border);
   background: var(--bg-secondary);
   color: var(--text-primary);
@@ -64,7 +62,7 @@ button {
   font-size: 15px;
   font-weight: 600;
   padding: 12px 20px;
-  border-radius: 8px;
+  border-radius: 6px;
   border: none;
   cursor: pointer;
   width: 100%;
@@ -77,9 +75,9 @@ button:disabled {
 
 .btn-primary {
   background: var(--accent-cyan);
-  color: #001318;
+  color: #ffffff;
 }
 
 .btn-primary:hover:not(:disabled) {
-  filter: brightness(1.1);
+  filter: brightness(1.08);
 }
