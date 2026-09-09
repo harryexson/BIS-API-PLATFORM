@@ -43,7 +43,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking'];
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -195,7 +195,7 @@ describe('Provider Selection edge cases', () => {
   });
 
   it('when all SMS providers are offline, an SMS silently falls back to email (documented gap)', async () => {
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking'];
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 

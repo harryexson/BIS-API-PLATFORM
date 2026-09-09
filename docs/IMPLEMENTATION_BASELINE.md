@@ -97,7 +97,10 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | Adapter | File | Status |
 |---|---|---|
 | SignalHouse | `messaging/signalhouse.ts` | **Simulated** — fabricates `messageId`, always `status: QUEUED`/`delivered: true`, no HTTP call |
-| Infobip | `messaging/infobip.ts` | **Simulated** — same pattern |
+| Infobip | `messaging/infobip.ts` | **Real HTTP** (2026-09-08) — falls back to simulated when credentials unset |
+| Africa's Talking | `messaging/africastalking.ts` | **Real HTTP** (2026-09-08) — falls back to simulated when credentials unset |
+| Sinch | `messaging/sinch.ts` | **Real HTTP** (2026-09-09) — falls back to simulated when credentials unset |
+| Vibes | `messaging/vibes.ts` | **Real HTTP** (2026-09-09) — **lower confidence**: submit path and response schema inferred, not directly observed; see the adapter's class comment. Falls back to simulated when credentials unset |
 | Generic SMS | `messaging/sms.ts` | **Simulated** |
 | Email | `messaging/email.ts` | **Simulated** |
 | FutureSMS | `messaging/futuresms.ts` | **Simulated**, explicitly a placeholder/example provider |
@@ -106,8 +109,8 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | NMI, Flutterwave, PawaPay, PayChangu, Airwallex | `payments/*.ts` | **Simulated** |
 | Example (payments) | `payments/example.ts` | **Simulated**, reference implementation only |
 
-**No adapters exist yet for Africa's Talking or Trembi** — no files, no env
-vars in `.env.example`. These are net-new work, not remediation.
+**No adapter exists yet for Trembi** — no file, no env vars in
+`.env.example`. This is net-new work, not remediation.
 
 All "simulated" adapters share the same shape: `verifyAvailability()` +
 `simulateLatency()`, a fabricated provider-format response, and a
@@ -175,14 +178,16 @@ audit logs, live topology, request playground. Functional and builds clean.
 | Auth/Secrets | `PLATFORM_ADMIN_KEY`, `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY`, `ADMIN_API_TOKEN` |
 | Deployment | `DEPLOYMENT_ID`, `NODE_ENV`, `PORT` |
 | Payments | `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `NMI_GATEWAY_ID`, `NMI_API_KEY`, `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_PUBLIC_KEY`, `PAWAPAY_API_KEY`, `PAYCHANGU_API_KEY`, `AIRWALLEX_CLIENT_ID`, `AIRWALLEX_API_KEY` |
-| Messaging | `SIGNALHOUSE_API_KEY`, `INFOBIP_API_KEY`, `INFOBIP_BASE_URL`, `FUTURESMS_API_KEY`, `FUTURESMS_BASE_URL` |
+| Messaging | `SIGNALHOUSE_API_KEY`, `INFOBIP_API_KEY`, `INFOBIP_BASE_URL`, `FUTURESMS_API_KEY`, `FUTURESMS_BASE_URL`, `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`, `SINCH_API_TOKEN`, `SINCH_SERVICE_PLAN_ID`, `SINCH_REGION`, `VIBES_USERNAME`, `VIBES_PASSWORD` |
 | Other providers | `GOOGLE_MAPS_API_KEY`, `GEMINI_API_KEY` |
 | CORS/Rate limiting | `CORS_ORIGINS`, `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS`, `REDIS_URL` (optional) |
 | Logging/Workers | `LOG_LEVEL`, `WORKER_CONCURRENCY`, `RECONCILIATION_INTERVAL_MS`, `IDEMPOTENCY_TTL_HOURS` |
 
 **Now present (added 2026-09-08):** `AFRICASTALKING_API_KEY`,
-`AFRICASTALKING_USERNAME`. **Still not present:** `TREMBI_API_KEY`
-(provider doesn't exist yet).
+`AFRICASTALKING_USERNAME`. **Now present (added 2026-09-09):**
+`SINCH_API_TOKEN`, `SINCH_SERVICE_PLAN_ID`, `SINCH_REGION`,
+`VIBES_USERNAME`, `VIBES_PASSWORD`. **Still not present:**
+`TREMBI_API_KEY` (provider doesn't exist yet).
 
 Startup does **not** currently validate required configuration for
 production (e.g. "production + SignalHouse enabled → key required" from the
@@ -197,13 +202,15 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 `PRODUCTION_READINESS_REPORT.md` and re-verified as still open:
 
 1. **Real provider adapters** — payment adapters are all still simulated;
-   messaging: Infobip and Africa's Talking are now real HTTP integrations
-   (2026-09-08, verified via WebSearch against current public docs — see
-   §6 item 1 and the changelog), SignalHouse/FutureSMS/generic SMS/email
-   remain simulated. This is still the largest gap in the whole plan.
+   messaging: Infobip, Africa's Talking, Sinch, and Vibes are now real HTTP
+   integrations (2026-09-08/09, verified via WebSearch against current
+   public docs — see §6 item 1 and the changelog; Vibes at materially
+   lower confidence than the other three — see its adapter file's class
+   comment), SignalHouse/FutureSMS/generic SMS/email remain simulated.
+   This is still the largest gap in the whole plan.
 2. ~~No Africa's Talking / Trembi adapters~~ — **Africa's Talking closed
-   2026-09-08** (real adapter + registry entry, see item 1). **Trembi not
-   attempted.**
+   2026-09-08, Sinch and Vibes closed 2026-09-09** (real adapters +
+   registry entries, see item 1). **Trembi not attempted.**
 3. ~~`/ready` has no independent queue/worker-store health check~~ —
    **closed 2026-09-08.** `/ready` now pings the Redis connection used for
    job enqueueing when `REDIS_URL` is configured (`healthy`/`unreachable`),
@@ -334,8 +341,8 @@ In order of what most directly blocks the master plan's stated
 non-negotiables (real integrations, no fabricated delivery status, tenant
 safety):
 
-1. Real messaging adapters (SignalHouse, Infobip, Africa's Talking,
-   Trembi) — needs live credentials to fully certify. **Status as of
+1. Real messaging adapters (SignalHouse, Infobip, Africa's Talking, Sinch,
+   Vibes, Trembi) — needs live credentials to fully certify. **Status as of
    2026-09-08, part two**: `WebFetch` (direct page retrieval) is blocked
    for this session — `infobip.com` and, as a control,
    `developers.google.com` both failed with `EGRESS_BLOCKED`, confirming
@@ -353,10 +360,23 @@ safety):
    for either). **SignalHouse remains simulated** — it's a small/niche
    provider with essentially nothing useful in search results (confirmed
    by trying), so building it "for real" would mean guessing the contract,
-   which the master plan explicitly prohibits. **Trembi likewise not
-   attempted** this pass. Both need either a live account/sandbox to
-   verify against, or the provider's docs supplied directly (file or
-   pasted text).
+   which the master plan explicitly prohibits.
+   **Status as of 2026-09-09**: user supplied direct documentation URLs
+   for **Sinch** (`sinch.com/messaging/sms-api/send-sms`) and **Vibes**
+   (`developer.vibes.com`). Both domains are also `EGRESS_BLOCKED` for
+   `WebFetch` in this session (confirmed by trying), so the same
+   `WebSearch`-only method was used. **Sinch** (net-new `sinch.ts`,
+   registered in `registry.ts`) was built at confidence comparable to
+   Infobip/Africa's Talking. **Vibes** (net-new `vibes.ts`) was built at
+   materially *lower* confidence — search snippets were thinner, and the
+   exact submit path/response schema are inferred from a URL pattern
+   rather than directly observed; this is documented in detail in the
+   adapter's own class comment and should not be removed until verified
+   against a live Vibes sandbox. See `docs/IMPLEMENTATION_CHANGELOG.md`
+   ("Real Provider Adapters: Sinch + Vibes") for the full breakdown.
+   **Trembi not attempted** this pass. Every adapter above still needs
+   either a live account/sandbox to verify against, or the provider's docs
+   supplied directly (file or pasted text) for anything not yet built.
 2. ~~Circuit breaker around provider failover~~ — done, see §4 item 7.
 3. ~~API-key scope enforcement + default expiry~~ — done, see §4 items 5-6.
 4. ~~`/ready` queue/worker-store health check~~ — done, see §4 item 3.

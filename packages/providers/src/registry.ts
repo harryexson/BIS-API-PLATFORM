@@ -23,6 +23,8 @@ import { ExamplePaymentProvider } from './adapters/payments/example';
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
 import { AfricasTalkingProvider } from './adapters/messaging/africastalking';
+import { SinchProvider } from './adapters/messaging/sinch';
+import { VibesProvider } from './adapters/messaging/vibes';
 import { FutureSMSProvider } from './adapters/messaging/futuresms';
 import { EmailProvider } from './adapters/messaging/email';
 import { ExampleMessagingProvider } from './adapters/messaging/example';
@@ -188,6 +190,28 @@ export class ProviderRegistry {
       currencies: ['KES', 'UGX', 'TZS', 'RWF', 'MWK', 'NGN', 'ZMW', 'GHS', 'ZAR'],
       capabilities: ['sms']
     });
+
+    this.register(new SinchProvider({
+      id: 'sinch',
+      name: 'Sinch',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 100,
+      latencyMax: 160,
+      messageCost: 0.007
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms'] });
+
+    this.register(new VibesProvider({
+      id: 'vibes',
+      name: 'Vibes',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 120,
+      latencyMax: 200,
+      messageCost: 0.007
+    }), { environment: 'live', countries: ['US', 'CA'], currencies: ['USD', 'CAD'], capabilities: ['sms'] });
 
     this.register(new FutureSMSProvider({
       id: 'futuresms',

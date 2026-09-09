@@ -10,7 +10,7 @@ describe('ProviderRegistry management surface', () => {
 
   it('exposes management views for all providers with required fields', () => {
     const views = registry.getAllManagementViews();
-    expect(views).toHaveLength(16);
+    expect(views).toHaveLength(18);
     for (const v of views) {
       expect(v).toHaveProperty('environment');
       expect(v).toHaveProperty('countries');

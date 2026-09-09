@@ -70,7 +70,10 @@ export abstract class BaseProvider {
         };
 
         if (body && method !== 'GET') {
-          fetchOpts.body = JSON.stringify(body);
+          // Pass pre-serialized string bodies through as-is (e.g. XML for
+          // providers that don't speak JSON) — a caller-supplied
+          // Content-Type header above already overrides the JSON default.
+          fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
         }
 
         const res = await fetch(url, fetchOpts);

@@ -6,6 +6,110 @@ tests cover it.
 
 ---
 
+## 2026-09-09 — Real Provider Adapters: Sinch + Vibes
+
+**Phase:** 6 of the master plan (continued). User-requested addition of two
+more messaging providers, given their public documentation URLs
+(`sinch.com/messaging/sms-api/send-sms`, `developer.vibes.com`).
+
+**How the facts were verified:** Same method as the Infobip/Africa's
+Talking entry below — `WebFetch` is blocked for both `sinch.com` and
+`developer.vibes.com` (confirmed `EGRESS_BLOCKED`), so all facts came from
+`WebSearch` result snippets and their source URLs, gathered 2026-09-09.
+Neither adapter has been tested against a live account — no credentials
+were available in this session.
+
+### Sinch (net-new: `packages/providers/src/adapters/messaging/sinch.ts`)
+Confidence level: comparable to Infobip/Africa's Talking — multiple
+corroborating search results for the endpoint, auth, and request/response
+shapes.
+- `POST https://{region}.sms.api.sinch.com/xms/v1/{SINCH_SERVICE_PLAN_ID}/batches`
+  (the "Batches" endpoint of Sinch's SMS API), `Authorization: Bearer
+  {SINCH_API_TOKEN}`. `SINCH_REGION` selects `us` (default) or `eu` — Sinch
+  serves SMS from regional endpoints, not a single global one.
+- Request: `{ from, to: [recipient], body: content }`
+- Success response: `{ id, to, from, body, canceled, created_at,
+  modified_at }` — `canceled: false` only confirms Sinch *accepted* the
+  batch, not delivery; per-recipient delivery status arrives later via a
+  webhook this session did not build, so it is never fabricated here.
+  `canceled: true` is reported as a real failure.
+- Error envelope: `{ code, text }`, parsed into the real error message.
+- Same simulated-fallback pattern as the other real adapters when
+  `SINCH_API_TOKEN`/`SINCH_SERVICE_PLAN_ID` are unset.
+- Registered with `countries: ['*']` (Sinch is a global Tier-1 SMS
+  aggregator, same treatment as Infobip).
+- 7 new contract tests (`sinch.test.ts`): simulated fallback makes no HTTP
+  call; real request shape/URL/region is correct; `canceled: true` is
+  reported as failed, not success; the documented error envelope is
+  parsed; a malformed response (no batch id) fails cleanly; the `eu`
+  region routes to the eu endpoint; `status: offline` short-circuits.
+
+### Vibes (net-new: `packages/providers/src/adapters/messaging/vibes.ts`)
+**Lower confidence than every other real adapter in this platform** — the
+class-level comment in `vibes.ts` documents this in detail and should be
+read before trusting or extending the adapter further. Search snippets for
+Vibes were noticeably thinner than for the other three real providers.
+- CONFIRMED: base URL `https://messageapi.vibesapps.com` (US/Canada SMS);
+  HTTP Basic auth (`base64(email:password)`); `Content-Type: text/xml`
+  required; XML vocabulary `mtMessage`/`submitterMessageId`/`destination`/
+  `source`/`text`.
+- **NOT CONFIRMED, and handled defensively rather than guessed**: the
+  exact submit path (`/MessageApi/mt/messages` is inferred from a
+  documented URL *pattern* plus a sibling GET path, not observed against
+  an actual submit example); the `destination`/`source` `type` attribute
+  (omitted entirely rather than risk a wrong value); the response XML
+  schema for the returned message ID (parsed defensively for a
+  `messageId`/`message_id` attribute or element; returns failure, never a
+  fabricated ID, if nothing plausible is found); the error response
+  format.
+- `packages/providers/src/base.ts`'s shared `http_request()` was extended
+  to pass a pre-serialized string body through as-is (needed for Vibes'
+  XML) instead of always `JSON.stringify`-ing — backward compatible, every
+  existing JSON-object caller is unaffected.
+- Same simulated-fallback pattern when `VIBES_USERNAME`/`VIBES_PASSWORD`
+  are unset.
+- Registered with `countries: ['US', 'CA']` only, matching the *confirmed*
+  scope of the base URL — deliberately not `['*']` given the lower
+  confidence here.
+- 6 new contract tests (`vibes.test.ts`): simulated fallback makes no HTTP
+  call; real XML request/headers/auth are correct; a `message_id` element
+  is parsed as a fallback response shape; a non-2xx response fails; an
+  unparseable response fails cleanly without fabricating a message id;
+  `status: offline` short-circuits.
+
+**Adding a 17th and 18th provider required the same test bookkeeping as
+the Africa's Talking addition** — `providerRegistry.test.ts`/
+`management.test.ts` (16→18 total, 6→8 messaging), and every
+simulation/routing test enumerating "all SMS-capable providers"
+(`routing.test.ts`, `application-certification.simulation.test.ts`,
+`resilience-failure.simulation.test.ts`,
+`messaging-conversation.simulation.test.ts`), including the "all SMS
+providers offline" gap tests that must now take both new providers
+offline too for the assertion to hold. Registration-order-dependent
+failover tests (e.g. signalhouse → infobip) are unaffected — both new
+providers are registered after infobip.
+
+**Database migrations:** none
+
+**API changes:** none (adapter-internal)
+
+**Security changes:** none
+
+**Tests:** full suite 316 (304 passed, 12 pre-existing skipped —
+integration tests requiring live DB/network) — net +13 new (7 Sinch + 6
+Vibes) — confirmed 3x consecutive full-suite runs, 0 failures.
+Lint/typecheck/build clean.
+
+**Known issues carried forward:** Vibes' exact submit path and response
+schema are inferred, not observed — do not treat it as production-ready
+without verifying against a live Vibes sandbox account or the actual
+documentation pages. SignalHouse, FutureSMS, generic SMS, and Email
+adapters remain fully simulated. All payment adapters except Stripe
+(partially real) remain simulated. Neither Sinch nor Vibes has been
+tested against a live account.
+
+---
+
 ## 2026-09-08 — Real Provider Adapters: Infobip + Africa's Talking
 
 **Phase:** 6 of the master plan. The single largest previously-open gap:
