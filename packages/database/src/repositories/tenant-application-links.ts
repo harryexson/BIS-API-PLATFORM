@@ -16,8 +16,10 @@ export const tenantApplicationLinkRepository = {
       .select()
       .from(tenantApplicationLinks)
       .where(
-        eq(tenantApplicationLinks.tenantId, tenantId) &&
+        and(
+          eq(tenantApplicationLinks.tenantId, tenantId),
           eq(tenantApplicationLinks.applicationId, applicationId),
+        ),
       )
       .limit(1);
     return rows[0];
@@ -84,8 +86,10 @@ export const tenantApplicationLinkRepository = {
       .update(tenantApplicationLinks)
       .set({ status: 'revoked' })
       .where(
-        eq(tenantApplicationLinks.tenantId, tenantId) &&
+        and(
+          eq(tenantApplicationLinks.tenantId, tenantId),
           eq(tenantApplicationLinks.applicationId, applicationId),
+        ),
       )
       .returning();
     return rows.length > 0;

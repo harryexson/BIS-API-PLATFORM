@@ -26,8 +26,10 @@ export const userRepository = {
       .select()
       .from(users)
       .where(
-        eq(users.applicationId, applicationId) &&
+        and(
+          eq(users.applicationId, applicationId),
           eq(users.email, email),
+        ),
       )
       .limit(1);
     return rows[0];

@@ -26,8 +26,10 @@ export const applicationPermissionRepository = {
       .select()
       .from(applicationPermissions)
       .where(
-        eq(applicationPermissions.applicationId, applicationId) &&
+        and(
+          eq(applicationPermissions.applicationId, applicationId),
           eq(applicationPermissions.resource, resource),
+        ),
       );
   },
 
@@ -41,9 +43,11 @@ export const applicationPermissionRepository = {
       .select()
       .from(applicationPermissions)
       .where(
-        eq(applicationPermissions.applicationId, applicationId) &&
-          eq(applicationPermissions.resource, resource) &&
+        and(
+          eq(applicationPermissions.applicationId, applicationId),
+          eq(applicationPermissions.resource, resource),
           eq(applicationPermissions.action, action),
+        ),
       )
       .limit(1);
     return rows[0];
@@ -88,8 +92,10 @@ export const applicationPermissionRepository = {
     const rows = await db
       .delete(applicationPermissions)
       .where(
-        eq(applicationPermissions.applicationId, applicationId) &&
+        and(
+          eq(applicationPermissions.applicationId, applicationId),
           eq(applicationPermissions.resource, resource),
+        ),
       )
       .returning();
     return rows.length;
