@@ -1,36 +1,19 @@
-// Public DTOs for the BIS API Platform /v1 surface.
-// These mirror the OpenAPI contract (docs/openapi.yaml) and are intentionally
-// decoupled from internal @company/schemas types.
+// Public DTOs for the BIS API Platform gateway. These intentionally mirror
+// the *actual* services/api-gateway response shapes (camelCase, matching
+// TransactionEvent) rather than a hypothetical REST-resource redesign —
+// this package previously targeted a `/v1/payments`-style contract
+// documented in docs/openapi.yaml that was never implemented server-side,
+// which meant every call this client made 404'd or 400'd against the real
+// gateway. Decoupled from @company/schemas on purpose: this is meant to be
+// consumable outside the monorepo, so it defines its own copies of the
+// fields it actually needs rather than importing internal workspace types.
 
 export type Environment = 'production' | 'sandbox';
 
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
-
 export type PaymentMethod = 'card' | 'mobile_money' | 'bank_transfer' | 'wallet';
-export type PaymentStatus = 'pending' | 'success' | 'failed' | 'reconciling';
-export type RefundStatus = 'pending' | 'success' | 'failed';
-export type MessageChannel = 'sms' | 'whatsapp' | 'email';
-export type MessageStatus = 'queued' | 'sent' | 'delivered' | 'failed' | 'undeliverable';
-
-export type RefundReason =
-  | 'customer_requested'
-  | 'duplicate'
-  | 'fraudulent'
-  | 'partial_shipment'
-  | 'other';
-
-export interface Fee {
-  percent?: number;
-  flat?: number;
-  total?: number;
-}
-
-export interface PaymentError {
-  code?: string;
-  message?: string;
-}
 
 // 'unknown' is a real, distinct outcome (a payment provider timeout, for
 // example) — never treat it as a synonym for 'failed'. See
@@ -38,157 +21,118 @@ export interface PaymentError {
 export type TransactionStatus = 'success' | 'failed' | 'unknown';
 
 export interface PaymentCreate {
-  app_id: string;
   amount: number;
   currency: string;
-  payment_method: PaymentMethod;
-  phone_number?: string;
-  customer?: {
-    email?: string;
-    phone?: string;
-    reference?: string;
-  };
-  provider_override?: string;
-  metadata?: Record<string, unknown>;
-  idempotency_key?: string;
-}
-
-export interface Payment {
-  id: string;
-  object: 'payment';
-  status: PaymentStatus;
-  amount: number;
-  currency: string;
-  payment_method: PaymentMethod;
-  app_id: string;
-  provider?: string;
-  provider_transaction_id?: string;
-  fee?: Fee;
-  customer?: { email?: string; phone?: string };
-  idempotency_key?: string;
-  metadata?: Record<string, unknown>;
-  error?: PaymentError;
-  created_at: string;
-  updated_at?: string;
-  settled_at?: string;
-}
-
-export interface RefundCreate {
-  payment_id: string;
-  amount?: number;
-  currency?: string;
-  reason?: RefundReason;
-  metadata?: Record<string, unknown>;
-}
-
-export interface Refund {
-  id: string;
-  object: 'refund';
-  payment_id: string;
-  status: RefundStatus;
-  amount: number;
-  currency: string;
-  reason?: string;
-  provider_refund_id?: string;
-  created_at: string;
+  paymentMethod: PaymentMethod;
+  phoneNumber?: string;
+  providerOverride?: string;
 }
 
 export interface MessageCreate {
-  app_id: string;
-  channel: MessageChannel;
   recipient: string;
-  subject?: string;
   content: string;
-  provider_override?: string;
-  metadata?: Record<string, unknown>;
+  providerOverride?: string;
 }
 
-export interface Message {
+// Mirrors TransactionEvent from services/api-gateway — the shape every
+// payment/messaging call actually returns, success or failure alike.
+export interface TransactionEvent {
   id: string;
-  object: 'message';
-  status: MessageStatus;
-  channel: MessageChannel;
-  recipient: string;
-  subject?: string;
-  content?: string;
-  app_id: string;
-  provider?: string;
-  provider_message_id?: string;
-  conversation_id?: string;
-  cost?: number;
-  created_at: string;
-  delivered_at?: string;
+  timestamp: string;
+  appId: string;
+  category: ProviderCategory;
+  providerId: string;
+  status: TransactionStatus;
+  amount?: number;
+  currency?: string;
+  messageType?: string;
+  latency: number;
+  cost: number;
+  decisionReason: string;
+  payload: unknown;
+  response: unknown;
+  error?: string;
 }
 
-export interface Conversation {
+// GET /v1/api/gateway/transaction/:id
+export interface TransactionStatusResponse {
   id: string;
-  object: 'conversation';
-  participant: string;
-  app_id: string;
-  message_count: number;
-  messages: Message[];
-  has_more: boolean;
-  next_cursor?: string | null;
-  created_at: string;
-  updated_at?: string;
+  status: TransactionStatus;
+  providerId: string;
+  category: ProviderCategory;
+  amount?: number;
+  currency?: string;
+  messageType?: string;
+  cost: number;
+  latency: number;
+  timestamp: string;
+  providerTransactionId?: string;
+  error?: string;
 }
 
-export interface Provider {
+export interface ProviderCapabilityMatch {
+  id: string;
+  name: string;
+  category: ProviderCategory;
+  capabilities: string[];
+  currencies: string[];
+  countries: string[];
+  weight: number;
+  status: ProviderStatus;
+}
+
+export interface ProviderManagement {
   id: string;
   name: string;
   category: ProviderCategory;
   status: ProviderStatus;
-  environment?: 'test' | 'live';
-  countries?: string[];
-  currencies?: string[];
-  capabilities?: string[];
-  weight?: number;
-  health?: ProviderHealthStatus;
-  last_successful_request?: string | null;
-  error_rate?: number;
-  latency_estimate_ms?: { min?: number; max?: number };
+  weight: number;
+  environment: 'test' | 'live';
+  countries: string[];
+  currencies: string[];
+  capabilities: string[];
+  priority: number;
+  health: ProviderHealthStatus;
+  lastSuccessfulRequest: string | null;
+  errorRate: number;
 }
 
-export interface ProviderList {
-  object: 'list';
-  data: Provider[];
-  has_more: boolean;
-  next_cursor?: string | null;
+export interface ListProvidersOptions extends RequestOptions {
+  category?: ProviderCategory;
+  capability?: string;
+  currency?: string;
 }
 
-export type HealthStatus = 'healthy' | 'degraded' | 'down';
+// GET /v1/api/gateway/providers — a category+capability query returns the
+// filtered ProviderCapabilityMatch shape; an unfiltered call returns the
+// full ProviderManagement view for every registered provider. Real
+// response, not the fictional {object:'list', data, has_more} envelope
+// this client used to assume.
+export interface ProviderListResponse {
+  providers: ProviderCapabilityMatch[] | ProviderManagement[];
+  count: number;
+}
 
-export interface Health {
-  status: HealthStatus;
-  version?: string;
+// GET /health (liveness) and GET /ready (readiness) — two distinct,
+// unversioned endpoints, not one /v1/health resource.
+export interface LivenessStatus {
+  status: 'healthy';
+  service: string;
   timestamp: string;
-  dependencies?: {
-    database?: HealthStatus;
-    event_bus?: HealthStatus;
-    providers?: HealthStatus;
-  };
 }
 
-export type WebhookEventType =
-  | 'payment.pending'
-  | 'payment.succeeded'
-  | 'payment.failed'
-  | 'refund.pending'
-  | 'refund.succeeded'
-  | 'refund.failed'
-  | 'message.sent'
-  | 'message.delivered'
-  | 'message.failed'
-  | 'message.undeliverable';
+export interface ReadinessStatus {
+  status: 'ready' | 'degraded';
+  service: string;
+  dependencies: Record<string, string>;
+  timestamp: string;
+}
 
-export interface WebhookEvent {
-  id: string;
-  object: 'event';
-  type: WebhookEventType;
-  created_at: string;
-  livemode: boolean;
-  correlation_id?: string;
-  data: Record<string, any>;
+// The real gateway's error envelope is a flat { error: string } — no
+// nested code/message/request_id object. request_id/correlation_id are
+// carried in the X-Request-Id/X-Correlation-Id response headers instead.
+export interface ApiErrorShape {
+  error: string;
 }
 
 // Per-request options honored across all resources.
@@ -198,10 +142,8 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
-export interface ListProvidersOptions extends RequestOptions {
-  category?: ProviderCategory;
-  capability?: string;
-  country?: string;
-  limit?: number;
-  cursor?: string;
-}
+// Outbound webhook deliveries (packages/events/src/webhook-delivery.ts)
+// POST the raw TransactionEvent as the body — there is no wrapping envelope
+// with a `type`/`created_at`/`data` shape, so this is just TransactionEvent
+// again rather than a distinct WebhookEvent type.
+export type WebhookEvent = TransactionEvent;

@@ -1,29 +1,34 @@
 import { HttpClient } from '../http';
-import { ListProvidersOptions, Provider, ProviderList } from '../types';
+import { ListProvidersOptions, ProviderCapabilityMatch, ProviderListResponse, ProviderManagement, RequestOptions } from '../types';
 
 export class ProvidersResource {
   constructor(private readonly http: HttpClient) {}
 
-  async list(opts?: ListProvidersOptions): Promise<ProviderList> {
-    return this.http.request<ProviderList>('GET', '/providers', {
+  /**
+   * GET /v1/api/gateway/providers. Passing `category` returns
+   * capability-matched candidates (ProviderCapabilityMatch[]); omitting it
+   * returns the full management view for every registered provider
+   * (ProviderManagement[]) — the real gateway's two response shapes, not a
+   * single uniform "list" envelope.
+   */
+  async list(opts?: ListProvidersOptions): Promise<ProviderListResponse> {
+    return this.http.request<ProviderListResponse>('GET', '/v1/api/gateway/providers', {
       query: {
         category: opts?.category,
         capability: opts?.capability,
-        country: opts?.country,
-        limit: opts?.limit,
-        cursor: opts?.cursor
+        currency: opts?.currency,
       },
-      idempotencyKey: opts?.idempotencyKey,
       correlationId: opts?.correlationId,
-      signal: opts?.signal
+      signal: opts?.signal,
     });
   }
 
-  async get(id: string, opts?: ListProvidersOptions): Promise<Provider> {
-    return this.http.request<Provider>('GET', `/providers/${encodeURIComponent(id)}`, {
-      idempotencyKey: opts?.idempotencyKey,
-      correlationId: opts?.correlationId,
-      signal: opts?.signal
-    });
+  /**
+   * There is no server-side GET /v1/api/gateway/providers/:id — this is a
+   * client-side convenience over list(), not a dedicated endpoint.
+   */
+  async get(id: string, opts?: RequestOptions): Promise<ProviderCapabilityMatch | ProviderManagement | undefined> {
+    const { providers } = await this.list({ correlationId: opts?.correlationId, signal: opts?.signal });
+    return providers.find((p) => p.id === id);
   }
 }

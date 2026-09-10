@@ -4,18 +4,28 @@ info:
   version: 1.0.0
   summary: Unified payments, messaging, and provider orchestration API.
   description: |
+    ⚠️ STALE — DOES NOT MATCH THE IMPLEMENTED GATEWAY. This document
+    describes a `/payments`, `/refunds`, `/messages`, `/conversations/{id}`,
+    `/providers` REST-resource design that was never built. The actual
+    routes live in services/api-gateway/src/app.ts under `/v1/api/gateway/
+    {payment,messaging,other}`, `/v1/api/gateway/transaction/{id}`, and
+    `/v1/api/gateway/providers`, take differently-shaped request bodies,
+    require an `x-tenant-id` header this spec doesn't mention, use
+    `x-idempotency-key` (not `Idempotency-Key`), and return a flat
+    `{ error: string }` on failure rather than the nested error object
+    documented below. packages/api-client was found calling the paths
+    documented here — which 404'd or 400'd against the real gateway on
+    every single call — and has been rewritten to match the real routes;
+    this spec has not been. The Auth and Billing sections below have since
+    been corrected to match the real `/api/auth/*` and `/api/billing/*`
+    routes; the Payments/Refunds/Messages/Conversations/Providers sections
+    still need the same pass — treat those as aspirational until they're
+    reconciled with services/api-gateway, not as ground truth for what the
+    platform actually accepts.
+
     The BIS API Platform exposes a single, versioned surface for initiating
     payments, sending messages, managing providers, and receiving asynchronous
     event notifications (webhooks).
-
-    > ⚠️ **STALE — DOES NOT MATCH THE IMPLEMENTED GATEWAY**: the Payments,
-    > Messages, Conversations, and Providers sections below document an
-    > idealized contract (e.g. `/payments`, `/messages`,
-    > `/conversations/{id}`, `/providers`) that predates the real routes
-    > implemented in `services/api-gateway/src/app.ts` (e.g.
-    > `/v1/api/gateway/payment`). The Auth and Billing sections have been
-    > corrected to match the real `/api/auth/*` and `/api/billing/*` routes;
-    > the rest still needs the same pass.
 
     All requests are routed through a central API gateway which handles
     authentication, rate limiting, request/correlation IDs, and dispatch to the
