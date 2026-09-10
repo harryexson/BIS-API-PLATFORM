@@ -1,15 +1,17 @@
 # BIS API Platform — Production Readiness Report
 
-**Date:** September 9, 2026
-**Branch:** `claude/bis-api-production-readiness-altvu7` (commits `ae3e5ca`..`f572544`, 9 commits)
+**Date:** September 10, 2026
+**Branch:** `claude/bis-api-production-readiness-altvu7` (commits `ae3e5ca`..`dcd085d`, 10 commits)
 **Supersedes:** the August 26/28/31 reports below, which this session's audit found to be
 partially stale (several of their "fixed" claims were re-verified and found still broken).
 Kept for history, not as current status: `SECURITY_AUDIT_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 this file's own prior August 26 content (git history).
 **Scope:** Re-audit of the entire platform against the 36-section production-remediation brief,
 starting from the assumption that prior "remediated" claims needed independent verification —
-not taken on faith. Plus: RBAC/subscription/support/NFC-QR-credential build-out, a public
-landing page, and an Expo mobile app, per explicit request alongside the audit.
+not taken on faith. Plus: RBAC/subscription/support build-out, a public landing page, and an
+Expo mobile app, per explicit request alongside the audit. An NFC/QR credential feature was
+built and then removed at the user's request later in the session — see "What was built
+alongside the audit" below for what remains.
 
 ---
 
@@ -27,10 +29,10 @@ test or a real end-to-end run (browser + live gateway process for the admin cons
 both mobile targets, `curl` against a running instance) proving the fix holds.
 
 The backend (`services/api-gateway`, `services/worker`, `packages/*`) is materially more correct and
-secure than it was at the start of this session. The four new product surfaces requested alongside
-the audit — RBAC/subscriptions/support/credentials on the gateway and admin console, a marketing
-landing page, and an Expo mobile app — are real, working code, not scaffolding: typechecked, built,
-and where a browser or bundler could exercise them, run and verified. They are also new, meaning
+secure than it was at the start of this session. The new product surfaces requested alongside
+the audit — RBAC/subscriptions/support on the gateway and admin console, a marketing landing page,
+and an Expo mobile app — are real, working code, not scaffolding: typechecked, built, and where a
+browser or bundler could exercise them, run and verified. They are also new, meaning
 they carry the caveats new code always carries (unit-level verification only, no live-database
 exercise, no user acceptance testing) rather than the "years of production traffic" confidence
 the phrase "production ready" can imply.
@@ -355,32 +357,34 @@ is called out rather than hidden.
 
 ## What was built alongside the audit
 
-Per explicit request, four things beyond the remediation brief:
+Per explicit request, three things beyond the remediation brief. A fourth — NFC/QR credential
+issue/scan (schema, gateway endpoints, an admin-console tab, and the mobile app's only two
+screens) — was built, then removed at the user's request later in the session (commit
+`bffb5f9`); it's mentioned here only so the history of this report doesn't read as if it never
+happened. It is not part of the current codebase.
 
-1. **RBAC, subscriptions/pricing, support, and NFC/QR credentials** — schema
+1. **RBAC, subscriptions/pricing, and support** — schema
    (`packages/database/src/schema/{user-roles,subscription-plans,tenant-subscriptions,
-   support-tickets,support-ticket-messages,access-credentials,credential-scans}.ts`, migration
-   `0008`), repositories, and gateway endpoints (`services/api-gateway/src/app.ts`), plus four new
-   admin-console tabs (`RBACManagement`, `SubscriptionManagement`, `SupportDesk`,
-   `CredentialsManagement`). Support is deliberately a thin in-house layer with
-   `externalProvider`/`externalRef` fields ready for a real helpdesk integration (Zendesk/
-   Intercom), per the "integrate, don't build a full CRM" direction. Subscriptions are the
-   platform's own record — no Stripe calls; `stripeCustomerId`/`stripeSubscriptionId` are ready
-   for that connection once authorized. **Known gap:** these new endpoints type-check and are
-   wired correctly, but are not yet exercised by the simulation harness (would need extending
-   `packages/simulation/src/db.ts`'s mock-DB to cover the 9 new repositories) or a live database —
-   NOT VERIFIED beyond typecheck/build.
+   support-tickets,support-ticket-messages}.ts`, migration `0008_add_rbac_billing_support.sql`),
+   repositories, and gateway endpoints (`services/api-gateway/src/app.ts`), plus three admin-console
+   tabs (`RBACManagement`, `SubscriptionManagement`, `SupportDesk`). Support is deliberately a thin
+   in-house layer with `externalProvider`/`externalRef` fields ready for a real helpdesk
+   integration (Zendesk/Intercom), per the "integrate, don't build a full CRM" direction.
+   Subscriptions are the platform's own record — no Stripe calls; `stripeCustomerId`/
+   `stripeSubscriptionId` are ready for that connection once authorized. **Known gap:** these
+   endpoints type-check and are wired correctly, but are not yet exercised by the simulation
+   harness (would need extending `packages/simulation/src/db.ts`'s mock-DB to cover the new
+   repositories) or a live database — NOT VERIFIED beyond typecheck/build.
 2. **Public landing page** (`apps/web`) — new Vite+React workspace, verified live in a browser
    (Playwright, zero console errors) at three scroll positions.
-3. **Expo mobile app** (`apps/mobile`) — issue (encode: QR via `react-native-qrcode-svg`, or NFC
-   write via `react-native-nfc-manager`) and scan (read: `expo-camera` barcode scanning or NFC
-   tap), calling the real gateway credential endpoints. Required real monorepo Metro configuration
-   (`apps/mobile/metro.config.js`), not just app code, since npm's workspace hoisting put
-   dependencies where Metro's default resolver couldn't find them. **Verified:** `expo export`
-   successfully bundles both iOS and Android targets (3000+ modules resolved, real Hermes
-   bytecode produced) — real evidence the dependency graph and monorepo integration work.
-   **NOT verified:** anything requiring a device, simulator, or EAS build service — actual camera/
-   NFC hardware behavior, OS permission prompts, native build output. See `apps/mobile/README.md`.
+3. **Expo mobile app** (`apps/mobile`) — a connection shell (Setup screen collecting gateway
+   URL/API key/tenant, stored via `expo-secure-store`; Home screen confirming the connection) with
+   no feature screens beyond that following the NFC/QR removal. Required real monorepo Metro
+   configuration (`apps/mobile/metro.config.js`), not just app code, since npm's workspace hoisting
+   put dependencies where Metro's default resolver couldn't find them. **Verified:** `expo export`
+   successfully bundles both iOS and Android targets (real Hermes bytecode produced) — real
+   evidence the dependency graph and monorepo integration work. **NOT verified:** anything
+   requiring a device, simulator, or EAS build service. See `apps/mobile/README.md`.
 
 ---
 
@@ -395,7 +399,7 @@ here.
 | Live database behavior (all 9 F1 query fixes, transaction/idempotency state machine, outbox durability) | No `DATABASE_URL`/Neon instance in this sandbox | A real Postgres/Neon instance; run the 11 skipped integration tests and the DB-dependent load test against it |
 | Real provider calls (Stripe, NMI, Flutterwave, PawaPay, PayChangu, Airwallex, SignalHouse, Infobip, FutureSMS) | Adapters are simulated; no provider sandbox credentials configured | Provider sandbox accounts + credentials; re-run the timeout/ambiguity test (F5) against a real provider's actual timeout behavior, not a mocked one |
 | Deployment (Railway/Vercel/Cloudflare, per repo conventions) | No deployment target connected in this session | Actual deploy + smoke test against production-like config (`NODE_ENV=production`, real `CORS_ORIGINS`/`ADMIN_API_TOKEN`/`PLATFORM_ADMIN_KEY`/`WEBHOOK_HMAC_SECRET`) |
-| Mobile app on real hardware | No simulator/device/EAS access in this sandbox | Run on an actual iOS and Android device; verify camera scanning, NFC read/write against physical tags, and OS permission-prompt flows |
+| Mobile app on real hardware | No simulator/device/EAS access in this sandbox | Run on an actual iOS and Android device; verify the connection flow and OS permission-prompt behavior |
 | Mobile app store submission | No Apple/Google developer account access here | `expo prebuild` + platform-specific build and submission process |
 | Load/scale testing under realistic concurrency | `packages/loadtest`/`load.test.ts` exist but need a live DB to produce meaningful numbers | Run against a staging environment with production-like data volume |
 | Stripe MCP connector (available in this session's tooling) | Requires OAuth the user hasn't completed | Authorize via claude.ai connector settings if Stripe-side changes are wanted in a future session |
@@ -415,9 +419,9 @@ here.
 3. **Test-isolation flake (F8)** reduced, not eliminated. A proper fix means resetting shared
    singletons between tests or giving each simulation test its own instances, not just serializing
    file execution.
-4. **New SaaS surface (RBAC/subscriptions/support/credentials) is unverified against a live
-   database.** Type-safe and logically reviewed, but no integration test has exercised the actual
-   SQL these repositories generate.
+4. **New SaaS surface (RBAC/subscriptions/support) is unverified against a live database.**
+   Type-safe and logically reviewed, but no integration test has exercised the actual SQL these
+   repositories generate.
 5. **Mobile app is unverified beyond successful bundling** — see External Validation.
 6. Everything the prior reports already flagged as open (P2/P3 items: circuit breakers, Redis-
    backed provider registry persistence, SSE authentication over `EventSource`'s header
@@ -432,7 +436,7 @@ here.
 **CONDITIONAL GO.** The nine findings in this report were real, severe, and are now fixed with
 verification evidence, not just claims — including the one (F5) that had a genuine path to
 double-charging a customer, and one (F4) that meant the admin console was completely unusable in
-any correctly-secured deployment. The four new product surfaces are real, working, tested code.
+any correctly-secured deployment. The new product surfaces are real, working, tested code.
 
 The condition is entirely the external validation table above. None of it is a euphemism for
 "probably broken" — it's the honest set of things that require a database, provider sandboxes, or
@@ -440,4 +444,4 @@ a device this sandbox doesn't have. Before live traffic: stand up a real Postgre
 the skipped integration + load tests against it; get provider sandbox credentials and re-verify
 the timeout/ambiguity fix against real provider latency; deploy to a staging environment with
 production-style config and confirm CORS/admin-auth/webhook-HMAC all fail closed as designed; and
-put the mobile app on real hardware before trusting its NFC/camera flows.
+put the mobile app on real hardware before trusting its connection flow.
