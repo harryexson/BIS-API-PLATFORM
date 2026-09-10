@@ -214,6 +214,21 @@ function observeFailure(category: 'payment' | 'messaging' | 'other', providerId:
   });
 }
 
+// Express 4 does not catch a rejected promise thrown by an async route
+// handler — it becomes an unhandled promise rejection at the Node process
+// level instead of reaching the `app.use((err, ...))` error middleware
+// below, which crashes the entire gateway (every tenant, every route) on
+// a single failed query. Wrap any async handler that doesn't already have
+// its own try/catch with this so the error middleware gets a chance to
+// turn it into a normal 500 response instead.
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 const auth = new AuthService({
   adminKey: process.env.PLATFORM_ADMIN_KEY,
   rateLimit: {
@@ -402,11 +417,11 @@ app.post('/v1/api/auth/login', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/v1/api/auth/logout', requireSession, async (req: Request, res: Response) => {
+app.post('/v1/api/auth/logout', requireSession, asyncHandler(async (req: Request, res: Response) => {
   const header = req.headers['authorization'] as string;
   await authRegistry.logout(header.slice(7));
   return res.status(204).send();
-});
+}));
 
 app.get('/v1/api/auth/me', requireSession, (req: Request, res: Response) => {
   return res.json({ user: (req as SessionAuthedRequest).user });
@@ -423,16 +438,16 @@ app.post('/v1/api/auth/verify-email', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/v1/api/auth/resend-verification', requireSession, async (req: Request, res: Response) => {
+app.post('/v1/api/auth/resend-verification', requireSession, asyncHandler(async (req: Request, res: Response) => {
   const user = (req as SessionAuthedRequest).user!;
   const { token } = await authRegistry.resendEmailVerification(user.id);
   return res.json({
     message: 'Verification email requested',
     ...(process.env.NODE_ENV !== 'production' ? { emailVerificationToken: token } : {}),
   });
-});
+}));
 
-app.post('/v1/api/auth/request-password-reset', async (req: Request, res: Response) => {
+app.post('/v1/api/auth/request-password-reset', asyncHandler(async (req: Request, res: Response) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'email is required' });
   const result = await authRegistry.requestPasswordReset(email);
@@ -441,7 +456,7 @@ app.post('/v1/api/auth/request-password-reset', async (req: Request, res: Respon
     message: 'If an account exists for this email, a password reset link has been sent.',
     ...(process.env.NODE_ENV !== 'production' && result ? { passwordResetToken: result.token } : {}),
   });
-});
+}));
 
 app.post('/v1/api/auth/reset-password', async (req: Request, res: Response) => {
   const { token, password } = req.body || {};
@@ -465,16 +480,16 @@ app.post('/v1/api/auth/reset-password', async (req: Request, res: Response) => {
 // route is signature-verified instead, since Stripe calls it directly.
 const subscriptionRegistry = new SubscriptionRegistry(planRepository, subscriptionRepository, applicationRepository);
 
-app.get('/v1/api/billing/plans', async (_req: Request, res: Response) => {
+app.get('/v1/api/billing/plans', asyncHandler(async (_req: Request, res: Response) => {
   const plans = await subscriptionRegistry.listPlans();
   return res.json({ plans });
-});
+}));
 
-app.get('/v1/api/billing/subscription', requireSession, async (req: Request, res: Response) => {
+app.get('/v1/api/billing/subscription', requireSession, asyncHandler(async (req: Request, res: Response) => {
   const user = (req as SessionAuthedRequest).user!;
   const subscription = await subscriptionRegistry.getSubscription(user.applicationId);
   return res.json({ subscription: subscription ?? null });
-});
+}));
 
 app.post('/v1/api/billing/subscribe', requireSession, async (req: Request, res: Response) => {
   const user = (req as SessionAuthedRequest).user!;
@@ -595,16 +610,16 @@ const crmRegistry = new CrmRegistry(
   ticketCommentRepository,
 );
 
-app.get('/api/dashboard/customers', requireAdmin, async (_req: Request, res: Response) => {
+app.get('/api/dashboard/customers', requireAdmin, asyncHandler(async (_req: Request, res: Response) => {
   const customers = await crmRegistry.listCustomers();
   return res.json({ customers });
-});
+}));
 
-app.get('/api/dashboard/customers/:id', requireAdmin, async (req: Request, res: Response) => {
+app.get('/api/dashboard/customers/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const customer = await crmRegistry.getCustomer(req.params.id);
   if (!customer) return res.status(404).json({ error: 'Customer not found' });
   return res.json(customer);
-});
+}));
 
 app.post('/api/dashboard/customers/:id/notes', requireAdmin, async (req: Request, res: Response) => {
   const { body, authorName } = req.body || {};
@@ -625,11 +640,11 @@ app.get('/api/dashboard/tickets', requireAdmin, async (req: Request, res: Respon
   }
 });
 
-app.get('/api/dashboard/tickets/:id', requireAdmin, async (req: Request, res: Response) => {
+app.get('/api/dashboard/tickets/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const result = await crmRegistry.getTicket(req.params.id);
   if (!result) return res.status(404).json({ error: 'Ticket not found' });
   return res.json(result);
-});
+}));
 
 app.post('/api/dashboard/customers/:id/tickets', requireAdmin, async (req: Request, res: Response) => {
   const { subject, description, priority, requesterEmail } = req.body || {};
@@ -985,7 +1000,7 @@ app.get('/v1/api/gateway/providers', mw.apiKey('providers:read'), resolveTenantC
 // handling already writes these records (packages/routing/src/keywords.ts);
 // these routes let an application query current status and set it directly
 // (e.g. importing an existing suppression list) without a keyword round-trip.
-app.get('/v1/api/consent/:recipient', mw.apiKey('consent:read'), resolveTenantContext, async (req: Request, res: Response) => {
+app.get('/v1/api/consent/:recipient', mw.apiKey('consent:read'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const tenantId = req.header('x-tenant-id') || 'default';
   const recipient = req.params.recipient;
@@ -1003,9 +1018,9 @@ app.get('/v1/api/consent/:recipient', mw.apiKey('consent:read'), resolveTenantCo
     source: record?.source ?? null,
     updatedAt: record?.updatedAt ?? null,
   });
-});
+}));
 
-app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const tenantId = req.header('x-tenant-id') || 'default';
   const { recipient, channel, status } = req.body;
@@ -1032,7 +1047,7 @@ app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, as
     source: record.source,
     updatedAt: record.updatedAt,
   });
-});
+}));
 
 // Master plan Phase 40/41 (A2P/10DLC compliance model). An application
 // registers the senders it uses per country/provider; complianceStatus
@@ -1041,14 +1056,14 @@ app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, as
 // enforcement (outbound sends are not blocked on complianceStatus here)
 // and NOT integration with a real carrier/registrar API. See
 // docs/IMPLEMENTATION_BASELINE.md for what's intentionally not done yet.
-app.get('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:read'), resolveTenantContext, async (req: Request, res: Response) => {
+app.get('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:read'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   if (!appId) {
     return res.status(400).json({ error: 'Missing authenticated appId' });
   }
   const profiles = await messagingProfileRepository.findByApplicationId(appId);
   return res.json({ profiles, count: profiles.length });
-});
+}));
 
 app.post('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:write'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
@@ -1119,7 +1134,7 @@ setInterval(() => {
   }
 }, 60_000);
 
-app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
+app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Response) => {
   const provider = req.params.provider;
   setContextField('providerId', provider);
   const signature = req.header('x-webhook-signature');
@@ -1263,7 +1278,7 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
   });
 
   return res.json({ received: true });
-});
+}));
 
 // P0: Lightweight helper to enqueue inbound messages to the worker queue.
 // Uses Redis directly if available; falls back to no-op if Redis is down.
