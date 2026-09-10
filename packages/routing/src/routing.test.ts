@@ -163,7 +163,9 @@ describe('RoutingEngine', () => {
       // Multiple providers have SMS capability and are all real,
       // weighted-random candidates for this send — every one of them must
       // be listed here or the test flakes whenever the random draw picks
-      // an unlisted one (this exact bug bit example-msg before).
+      // an unlisted one (this exact bug bit example-msg before). example-msg
+      // is a test-environment provider that remains a candidate outside
+      // NODE_ENV=production.
       expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking', 'sinch', 'vibes']).toContain(result.providerId);
     });
 
@@ -366,6 +368,53 @@ describe('RoutingEngine', () => {
       expect(result.providerId).not.toBe('stripe');
 
       stripeSpy.mockRestore();
+    });
+  });
+
+  describe('production environment isolation', () => {
+    // NODE_ENV is process-global and this suite runs alongside other test
+    // files, so every mutation below is synchronous (no `await` in between)
+    // to guarantee it can't interleave with another file's async assertions.
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      process.env.NODE_ENV = originalNodeEnv;
+    });
+
+    it('excludes test-environment example providers from production capability matches', () => {
+      const registry = ProviderRegistry.getInstance();
+      process.env.NODE_ENV = 'production';
+      try {
+        const paymentMatches = registry.findByCategoryAndCapabilities('payment', ['card'], 'USD');
+        const msgMatches = registry.findByCategoryAndCapabilities('messaging', ['sms']);
+        expect(paymentMatches.map((m) => m.id)).not.toContain('example-pay');
+        expect(msgMatches.map((m) => m.id)).not.toContain('example-msg');
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it('treats test-environment providers as ineligible for production overrides', () => {
+      const registry = ProviderRegistry.getInstance();
+      process.env.NODE_ENV = 'production';
+      try {
+        expect(registry.isLiveEligible('example-pay')).toBe(false);
+        expect(registry.isLiveEligible('example-msg')).toBe(false);
+        expect(registry.isLiveEligible('stripe')).toBe(true);
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it('allows test-environment providers outside production', () => {
+      const registry = ProviderRegistry.getInstance();
+      process.env.NODE_ENV = 'test';
+      try {
+        expect(registry.isLiveEligible('example-pay')).toBe(true);
+        expect(registry.isLiveEligible('example-msg')).toBe(true);
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
     });
   });
 });

@@ -333,6 +333,14 @@ export class ProviderRegistry {
     return this.providers.get(id);
   }
 
+  // A provider is eligible to serve traffic in production only if it is
+  // configured as 'live'. Outside production, 'test' providers remain usable
+  // for local/staging development.
+  public isLiveEligible(id: string): boolean {
+    if (process.env.NODE_ENV !== 'production') return true;
+    return this.management.get(id)?.environment === 'live';
+  }
+
   public getAllConfigs(): ProviderConfig[] {
     return Array.from(this.providers.values()).map(p => p.config);
   }
@@ -385,6 +393,10 @@ export class ProviderRegistry {
 
       const state = this.management.get(id);
       if (!state) continue;
+
+      // Production traffic must never be routed to a 'test'-environment provider
+      // (e.g. example/demo adapters that fabricate success without real processing).
+      if (process.env.NODE_ENV === 'production' && state.environment !== 'live') continue;
 
       // Check that provider supports all required capabilities
       const hasAllCapabilities = requiredCapabilities.every(cap =>
