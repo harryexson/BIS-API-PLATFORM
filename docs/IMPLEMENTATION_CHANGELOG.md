@@ -6,6 +6,86 @@ tests cover it.
 
 ---
 
+## 2026-09-10 — Consolidated a Sibling Session's Parallel Branch
+
+**Context:** two Claude Code Remote sessions had independently been working
+this same repository on two different branches diverged from the same base
+commit — this session's `claude/bis-api-platform-production-r9to5j` (Phases
+A–D above: auth, subscription billing, CRM/support, admin console
+verification) and a sibling session's `claude/bis-api-production-readiness-
+altvu7` (its own production-readiness remediation pass: RBAC/subscription/
+support schema, a marketing landing page, an architecture doc suite, and
+several standalone bug fixes). The user asked to consolidate onto one
+branch. Where both sessions had independently built the same feature
+(subscriptions, support tickets, RBAC) with incompatible schemas, the user
+chose to keep this session's version (already live in Neon, fully tested)
+and drop the sibling's competing design. Everything else — genuinely
+non-overlapping work — was brought in.
+
+### What was ported in
+- **Admin-console auth fix**: `services/api-gateway/src/app.ts`'s
+  `/api/dashboard` routes were gated by `mw.admin` (checks
+  `x-admin-key`/`Authorization` against `PLATFORM_ADMIN_KEY`), but the real
+  admin-console frontend authenticates via `requireAdmin` (checks
+  `x-admin-token` against `ADMIN_API_TOKEN`) — two disconnected auth
+  mechanisms, meaning every `/api/dashboard/*` route (including all of this
+  session's own Phase A–D admin routes) was unreachable through the real
+  login flow. Also found and fixed the same-class bug independently in
+  `apps/admin-console/src/App.tsx`'s `fetchProviders`/`fetchLogs`/
+  `fetchMetrics`/`handleClearLogs`, which never sent the admin token or
+  checked `res.ok` before using an error body as state. Verified with a
+  live (non-mocked) end-to-end pass: real gateway, real browser, real login.
+- **Payment-timeout handling**: `RoutingEngine.routePayment` used to catch
+  a provider timeout the same way as any other failure and immediately
+  retried the identical payment through a second provider — a genuine
+  double-charge risk, since a timeout means the outcome is unknown, not
+  failed. Timeouts now resolve as a distinct `'unknown'` transaction status
+  (HTTP 202) instead of failing over.
+- **`packages/api-client` rewrite**: the official external SDK was built
+  against a `/payments`, `/refunds`, `/messages`, `/conversations/{id}`,
+  `/providers` REST-resource contract that was never implemented
+  server-side — every call it made would 404/400 against the real gateway.
+  Rewritten to match the real `/v1/api/gateway/*` routes, headers, and
+  error envelope; `refunds`/`conversations` (no backing endpoint) removed.
+  Also fixed `/ready` unconditionally reporting `database: 'healthy'`
+  regardless of actual status, and added a 3s timeout so a hung DB
+  connection fails `/ready` fast.
+- **Provider environment isolation + CORS fail-closed**: routing never
+  checked a provider's `environment` field, so a real production payment
+  or message had a non-zero chance of being served by a `'test'`-environment
+  demo adapter that fabricates success without doing anything — added
+  `ProviderRegistry.isLiveEligible()` and wired it into every routing path.
+  CORS also now fails closed in production when `CORS_ORIGINS` is unset,
+  instead of defaulting to `origin: '*'`.
+- **`apps/web`**: a new Vite+React+TS marketing landing page workspace
+  (hero, feature grid, pricing, CTA), wired into the root `type-check`
+  script and picked up by the existing `build:all` workspace glob.
+- **`docs/openapi.yaml`**: fixed the Auth/Billing sections' path keys and
+  prose references from `/auth/*`/`/billing/*` to the real `/api/auth/*`/
+  `/api/billing/*` routes, and added a clear warning that the
+  Payments/Refunds/Messages/Conversations/Providers sections are still
+  aspirational and don't match the implemented gateway.
+
+### Deliberately not ported
+- The sibling session's RBAC (`user_roles` join table), `subscription_
+  plans`/`tenant_subscriptions`, and `support_tickets`/`support_ticket_
+  messages` schema and APIs — this session's own Phase B/C equivalents are
+  live in Neon and fully tested; the sibling's competing design was never
+  applied to any live database. Per explicit user decision.
+- A mobile app the sibling session had itself already reverted, and a
+  redundant `&&`-chained-condition fix that turned out to touch the exact
+  same files this branch's own pre-existing fix already covers (confirmed
+  via diff comparison before skipping).
+
+### Verification
+Full suite run 3x for stability (406/406 passing each time, 0 flakes),
+`tsc --noEmit` (root + admin-console + apps/web), `npm run lint` (0
+errors), `npm run build:all`, and `apps/admin-console`'s own Playwright
+smoke suite (6/6 passing). The admin-console auth fix and the `apps/web`
+landing page were additionally verified with a real (non-mocked) browser.
+
+---
+
 ## 2026-09-09 — Admin Console Verification + Permanent Regression Suite (Phase D of 4)
 
 **Context:** final phase of the same 4-phase request as Phases A/B/C
