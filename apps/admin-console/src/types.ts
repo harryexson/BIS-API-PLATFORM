@@ -153,22 +153,6 @@ export interface SupportTicketMessage {
   createdAt: string;
 }
 
-export interface AccessCredential {
-  id: string;
-  appId: string;
-  tenantId: string;
-  token: string;
-  credentialType: string;
-  purpose: string;
-  ownerType: string;
-  ownerRef: string;
-  label?: string | null;
-  status: string;
-  issuedAt: string;
-  expiresAt?: string | null;
-  revokedAt?: string | null;
-}
-
 export interface DashboardMetrics {
   totalRequests: number;
   successRate: number;

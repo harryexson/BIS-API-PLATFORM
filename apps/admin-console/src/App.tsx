@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users, CreditCard, LifeBuoy, QrCode } from 'lucide-react';
+import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users, CreditCard, LifeBuoy } from 'lucide-react';
 import { MetricCards } from './components/MetricCards';
 import { LiveTopology } from './components/LiveTopology';
 import { ProviderRegistry } from './components/ProviderRegistry';
@@ -11,7 +11,6 @@ import { LoginGate } from './components/LoginGate';
 import { RBACManagement } from './components/RBACManagement';
 import { SubscriptionManagement } from './components/SubscriptionManagement';
 import { SupportDesk } from './components/SupportDesk';
-import { CredentialsManagement } from './components/CredentialsManagement';
 import { useAuth } from './auth';
 import { ProviderConfig, ProviderManagement as ProviderManagementType, TransactionEvent, DashboardMetrics } from './types';
 
@@ -24,7 +23,7 @@ const INITIAL_METRICS: DashboardMetrics = {
   volumePerApp: {}
 };
 
-type Tab = 'operations' | 'management' | 'observability' | 'rbac' | 'billing' | 'support' | 'credentials';
+type Tab = 'operations' | 'management' | 'observability' | 'rbac' | 'billing' | 'support';
 
 export const App: React.FC = () => {
   const { token, isAdmin, logout } = useAuth();
@@ -279,7 +278,6 @@ export const App: React.FC = () => {
         <TabButton active={tab === 'rbac'} onClick={() => setTab('rbac')} icon={<Users className="w-4 h-4" />} label="Roles & Access" />
         <TabButton active={tab === 'billing'} onClick={() => setTab('billing')} icon={<CreditCard className="w-4 h-4" />} label="Billing & Plans" />
         <TabButton active={tab === 'support'} onClick={() => setTab('support')} icon={<LifeBuoy className="w-4 h-4" />} label="Support" />
-        <TabButton active={tab === 'credentials'} onClick={() => setTab('credentials')} icon={<QrCode className="w-4 h-4" />} label="Credentials" />
       </div>
 
       {tab === 'operations' && !isAdmin && (
@@ -336,7 +334,7 @@ export const App: React.FC = () => {
 
       {tab === 'observability' && <Observability />}
 
-      {(tab === 'rbac' || tab === 'billing' || tab === 'support' || tab === 'credentials') && !isAdmin && (
+      {(tab === 'rbac' || tab === 'billing' || tab === 'support') && !isAdmin && (
         <div className="glass-card" style={{ textAlign: 'center', padding: '48px' }}>
           <ShieldCheck className="w-8 h-8" style={{ color: 'var(--accent-yellow)', marginBottom: '12px' }} />
           <p>Administrator login is required to manage this section.</p>
@@ -349,7 +347,6 @@ export const App: React.FC = () => {
       {tab === 'rbac' && isAdmin && <RBACManagement token={token} />}
       {tab === 'billing' && isAdmin && <SubscriptionManagement token={token} />}
       {tab === 'support' && isAdmin && <SupportDesk token={token} />}
-      {tab === 'credentials' && isAdmin && <CredentialsManagement token={token} />}
 
       {showLogin && <LoginGate onClose={() => setShowLogin(false)} />}
     </div>

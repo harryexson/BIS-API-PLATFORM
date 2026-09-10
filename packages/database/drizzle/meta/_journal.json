@@ -62,7 +62,7 @@
       "idx": 8,
       "version": "7",
       "when": 1786948000000,
-      "tag": "0008_add_rbac_billing_support_credentials",
+      "tag": "0008_add_rbac_billing_support",
       "breakpoints": true
     }
   ]

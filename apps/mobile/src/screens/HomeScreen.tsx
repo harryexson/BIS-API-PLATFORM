@@ -1,6 +1,6 @@
 import React from 'react';
 import { View, Text, StyleSheet, Pressable, ScrollView } from 'react-native';
-import { QrCode, ScanLine, LogOut } from 'lucide-react-native';
+import { CheckCircle2, LogOut } from 'lucide-react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../navigation/RootNavigator';
 import { colors, spacing } from '../theme';
@@ -8,7 +8,7 @@ import { useSession } from '../lib/SessionContext';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
-export default function HomeScreen({ navigation }: Props) {
+export default function HomeScreen(_props: Props) {
   const { session, signOut } = useSession();
 
   return (
@@ -16,36 +16,21 @@ export default function HomeScreen({ navigation }: Props) {
       <Text style={styles.eyebrow}>Connected as</Text>
       <Text style={styles.tenant}>{session?.tenantId}</Text>
 
-      <ActionCard
-        icon={<QrCode size={28} color={colors.accent} />}
-        title="Issue a credential"
-        body="Encode a new QR code or NFC tag for check-in, asset tracking, or membership."
-        onPress={() => navigation.navigate('Issue')}
-      />
-      <ActionCard
-        icon={<ScanLine size={28} color={colors.accent2} />}
-        title="Scan / verify"
-        body="Read a QR code or NFC tag and check whether it's valid, expired, or revoked."
-        onPress={() => navigation.navigate('Scan')}
-      />
+      <View style={styles.card}>
+        <View style={styles.cardIcon}>
+          <CheckCircle2 size={28} color={colors.success} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.cardTitle}>Connected to gateway</Text>
+          <Text style={styles.cardBody}>{session?.baseUrl}</Text>
+        </View>
+      </View>
 
       <Pressable style={styles.signOut} onPress={signOut}>
         <LogOut size={16} color={colors.textSecondary} />
         <Text style={styles.signOutText}>Disconnect from gateway</Text>
       </Pressable>
     </ScrollView>
-  );
-}
-
-function ActionCard({ icon, title, body, onPress }: { icon: React.ReactNode; title: string; body: string; onPress: () => void }) {
-  return (
-    <Pressable style={styles.card} onPress={onPress}>
-      <View style={styles.cardIcon}>{icon}</View>
-      <View style={{ flex: 1 }}>
-        <Text style={styles.cardTitle}>{title}</Text>
-        <Text style={styles.cardBody}>{body}</Text>
-      </View>
-    </Pressable>
   );
 }
 

@@ -22,5 +22,3 @@ export { subscriptionPlans, type SubscriptionPlan, type NewSubscriptionPlan } fr
 export { tenantSubscriptions, type TenantSubscription, type NewTenantSubscription } from './tenant-subscriptions';
 export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
 export { supportTicketMessages, type SupportTicketMessage, type NewSupportTicketMessage } from './support-ticket-messages';
-export { accessCredentials, type AccessCredential, type NewAccessCredential } from './access-credentials';
-export { credentialScans, type CredentialScan, type NewCredentialScan } from './credential-scans';

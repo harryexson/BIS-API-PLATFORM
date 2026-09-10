@@ -21,11 +21,3 @@ export { subscriptionPlanRepository } from './subscription-plans';
 export { tenantSubscriptionRepository } from './tenant-subscriptions';
 export { supportTicketRepository } from './support-tickets';
 export { supportTicketMessageRepository } from './support-ticket-messages';
-export { accessCredentialRepository } from './access-credentials';
-export { credentialScanRepository } from './credential-scans';
-export {
-  verifyCredentialScan,
-  type ScanResult,
-  type VerifyScanInput,
-  type VerifyScanOutput,
-} from './credential-verification';

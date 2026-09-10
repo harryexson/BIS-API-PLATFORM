@@ -1,32 +1,33 @@
 # BIS API Platform — Mobile
 
-Expo (React Native, SDK 57) app for issuing and verifying the platform's
-NFC/QR credentials — the same primitive used for event check-in, asset/
-shipment tracking, and membership/loyalty cards. It talks directly to the
-`/v1/api/gateway/credentials*` endpoints in `services/api-gateway`.
+Expo (React Native, SDK 57) app shell for connecting to the BIS API Platform
+gateway. Scaffolded via the official create-expo-app CLI so dependency
+versions resolve against whatever is actually current rather than guessed
+version numbers pinned from training data.
 
 ## Screens
 
 - **Setup** — enter the gateway URL, application API key, and tenant ID.
   Stored in the OS keychain/keystore via `expo-secure-store`, never in
   plain state or AsyncStorage.
-- **Home** — two actions: issue a credential, or scan/verify one.
-- **Issue** (encode) — pick a purpose (check-in / asset tracking /
-  membership) and owner, then either render the resulting token as a QR
-  code (`react-native-qrcode-svg`) or write it to an NFC tag
-  (`react-native-nfc-manager`).
-- **Scan** (read) — camera-based QR scanning (`expo-camera`'s
-  `CameraView.onBarcodeScanned`) or an NFC tap-to-read, both resolving to
-  the same `POST /v1/api/gateway/credentials/verify` call and the same
-  valid / expired / revoked / unknown result display.
+- **Home** — confirms the active gateway connection; sign-out returns to Setup.
+
+This is currently a connection shell with no feature screens beyond that —
+add resource modules under `src/api/` and screens under `src/screens/` as
+features are built, following the existing `request()` helper in
+`src/api/client.ts` (auth + tenant headers, flat error unwrapping) for any
+new gateway calls.
 
 ## Monorepo integration
 
 This app lives inside the repo's npm workspaces (`apps/*`). npm hoists
 whatever it can to the workspace root's `node_modules` and leaves the rest
-nested under `apps/mobile/node_modules` — `metro.config.js` adds the
-workspace root to Metro's resolver search path on top of its normal
-hierarchical lookup so both cases resolve.
+nested inside `apps/mobile/node_modules/expo/node_modules` — Metro's default
+resolver only searches the project's own node_modules, so most packages
+failed to resolve. `metro.config.js` points the resolver at the workspace
+root in addition to (not instead of) Metro's normal hierarchical lookup; an
+initial attempt that set `disableHierarchicalLookup: true` broke resolution
+of expo's own nested `expo-modules-core`, so that flag is not used.
 
 ## Running it
 
@@ -43,15 +44,13 @@ On first launch you'll land on **Setup**. Point it at a running
 
 ## What's verified vs. not
 
-**Verified in this environment:** `tsc --noEmit` passes; `expo export`
-successfully bundles both the Android and iOS JS targets through Metro
-(3000+ modules resolved, real Hermes bytecode produced) — this exercises
-the full dependency graph and monorepo resolution, not just syntax.
+**Verified in this environment:** `tsc --noEmit` passes; `expo export
+--platform ios --platform android` (this workspace's `build` script, and
+part of the root type-check/build:all chains) successfully bundles both
+targets through Metro — real Hermes bytecode produced, exercising the full
+dependency graph and monorepo resolution, not just syntax.
 
 **Not verified here (no device, simulator, or EAS access in this
-sandbox):** on-device behavior of camera scanning, NFC read/write against
-real hardware, iOS/Android permission prompts, `expo prebuild`/native
-build output, and app store submission. Test all of these on real hardware
-before shipping — NFC and camera behavior in particular varies enough
-across devices that bundling successfully is necessary but not sufficient
-evidence they work.
+sandbox):** on-device behavior, OS permission prompts, `expo prebuild`
+native output, and app store submission. Test all of these on real
+hardware before shipping.
