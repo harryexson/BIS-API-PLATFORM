@@ -8,6 +8,15 @@ info:
     payments, sending messages, managing providers, and receiving asynchronous
     event notifications (webhooks).
 
+    > ⚠️ **STALE — DOES NOT MATCH THE IMPLEMENTED GATEWAY**: the Payments,
+    > Messages, Conversations, and Providers sections below document an
+    > idealized contract (e.g. `/payments`, `/messages`,
+    > `/conversations/{id}`, `/providers`) that predates the real routes
+    > implemented in `services/api-gateway/src/app.ts` (e.g.
+    > `/v1/api/gateway/payment`). The Auth and Billing sections have been
+    > corrected to match the real `/api/auth/*` and `/api/billing/*` routes;
+    > the rest still needs the same pass.
+
     All requests are routed through a central API gateway which handles
     authentication, rate limiting, request/correlation IDs, and dispatch to the
     appropriate provider adapter. Client applications never interact with
@@ -80,7 +89,7 @@ security:
   - bearerAuth: []
 
 paths:
-  /auth/signup:
+  /api/auth/signup:
     post:
       tags: [Auth]
       operationId: signup
@@ -117,15 +126,15 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /auth/login:
+  /api/auth/login:
     post:
       tags: [Auth]
       operationId: login
       summary: Log in with email and password
       description: |
         Returns an opaque, revocable session token (not a JWT) — send it as
-        `Authorization: Bearer <token>` on `/auth/me`, `/auth/logout`, and
-        `/auth/resend-verification`. Accounts lock temporarily after
+        `Authorization: Bearer <token>` on `/api/auth/me`, `/api/auth/logout`,
+        and `/api/auth/resend-verification`. Accounts lock temporarily after
         repeated failed attempts.
       security: []
       requestBody:
@@ -151,7 +160,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /auth/logout:
+  /api/auth/logout:
     post:
       tags: [Auth]
       operationId: logout
@@ -161,7 +170,7 @@ paths:
         '204': { description: Session revoked. }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /auth/me:
+  /api/auth/me:
     get:
       tags: [Auth]
       operationId: getCurrentUser
@@ -178,7 +187,7 @@ paths:
                   user: { $ref: '#/components/schemas/User' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /auth/verify-email:
+  /api/auth/verify-email:
     post:
       tags: [Auth]
       operationId: verifyEmail
@@ -208,7 +217,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /auth/resend-verification:
+  /api/auth/resend-verification:
     post:
       tags: [Auth]
       operationId: resendVerification
@@ -218,7 +227,7 @@ paths:
         '200': { description: Verification requested. }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /auth/request-password-reset:
+  /api/auth/request-password-reset:
     post:
       tags: [Auth]
       operationId: requestPasswordReset
@@ -240,7 +249,7 @@ paths:
         '200': { description: Reset requested (generic — see description). }
         '400': { $ref: '#/components/responses/BadRequest' }
 
-  /auth/reset-password:
+  /api/auth/reset-password:
     post:
       tags: [Auth]
       operationId: resetPassword
@@ -266,7 +275,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /billing/plans:
+  /api/billing/plans:
     get:
       tags: [Billing]
       operationId: listPlans
@@ -284,7 +293,7 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/Plan' }
 
-  /billing/subscription:
+  /api/billing/subscription:
     get:
       tags: [Billing]
       operationId: getSubscription
@@ -303,7 +312,7 @@ paths:
                     allOf: [{ $ref: '#/components/schemas/Subscription' }]
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /billing/subscribe:
+  /api/billing/subscribe:
     post:
       tags: [Billing]
       operationId: subscribe
@@ -334,7 +343,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /billing/cancel:
+  /api/billing/cancel:
     post:
       tags: [Billing]
       operationId: cancelSubscription
@@ -366,7 +375,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /billing/webhooks/stripe:
+  /api/billing/webhooks/stripe:
     post:
       tags: [Billing]
       operationId: stripeBillingWebhook
@@ -803,7 +812,7 @@ components:
       scheme: bearer
       bearerFormat: SESSION_TOKEN
       description: |
-        Opaque, revocable session token returned by `POST /auth/login`
+        Opaque, revocable session token returned by `POST /api/auth/login`
         (`sess_...`). Distinct from `bearerAuth` — a session authenticates
         a person (account owner), not an application.
 
