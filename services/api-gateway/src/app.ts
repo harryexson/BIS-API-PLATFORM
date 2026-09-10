@@ -1360,7 +1360,20 @@ async function enqueueProviderWebhook(input: {
 // DASHBOARD MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
 
-app.use('/api/dashboard', mw.admin);
+// P0: was `mw.admin`, which checks `x-admin-key`/`Authorization` against
+// PLATFORM_ADMIN_KEY — a *different* header and env var than the one every
+// dashboard route (via requireAdmin below) and the entire admin-console
+// frontend actually use (`x-admin-token` / ADMIN_API_TOKEN). Because this
+// blanket check ran first and always failed against the frontend's header,
+// no request from the admin console could ever authenticate against any
+// /api/dashboard/* route — including every route added in this session's
+// own auth/billing/CRM work, which already (correctly) used requireAdmin
+// per-route but never got reached. Found via a parallel session working
+// the same repo that verified this live in a browser; confirmed here by
+// direct code inspection before applying. requireAdmin is the credential
+// the UI is actually built against; standardizing on it here is what
+// makes every /api/dashboard/* route reachable at all.
+app.use('/api/dashboard', requireAdmin);
 
 app.get('/api/dashboard/providers', (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());

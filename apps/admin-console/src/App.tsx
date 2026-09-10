@@ -40,7 +40,14 @@ export const App: React.FC = () => {
 
   const fetchProviders = async () => {
     try {
-      const res = await fetch('/api/dashboard/providers');
+      const res = await fetch('/api/dashboard/providers', {
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
+      // Every /api/dashboard/* route requires an admin token. Without one
+      // (or with an invalid one) this 403s/503s — bail out rather than
+      // setting the error body as state, which crashed every child
+      // expecting an array/object shape.
+      if (!res.ok) return;
       const data = await res.json();
       setProviders(data);
     } catch (err) {
@@ -50,7 +57,10 @@ export const App: React.FC = () => {
 
   const fetchLogs = async () => {
     try {
-      const res = await fetch('/api/dashboard/logs');
+      const res = await fetch('/api/dashboard/logs', {
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
+      if (!res.ok) return;
       const data = await res.json();
       setLogs(data);
     } catch (err) {
@@ -60,7 +70,10 @@ export const App: React.FC = () => {
 
   const fetchMetrics = async () => {
     try {
-      const res = await fetch('/api/dashboard/metrics');
+      const res = await fetch('/api/dashboard/metrics', {
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
+      if (!res.ok) return;
       const data = await res.json();
       setMetrics(data);
     } catch (err) {
@@ -120,7 +133,10 @@ export const App: React.FC = () => {
   // Clears active logs
   const handleClearLogs = async () => {
     try {
-      const res = await fetch('/api/dashboard/logs/clear', { method: 'POST' });
+      const res = await fetch('/api/dashboard/logs/clear', {
+        method: 'POST',
+        headers: token ? { 'x-admin-token': token } : undefined,
+      });
       if (res.ok) {
         setLogs([]);
         setMetrics(INITIAL_METRICS);
@@ -132,12 +148,24 @@ export const App: React.FC = () => {
     }
   };
 
-  // Establish SSE Connection
+  // Every /api/dashboard/* route requires an admin token (by design — this
+  // used to leak cross-tenant traffic to anyone with the URL, since these
+  // fetches ran unconditionally before admin login existed as a gate).
+  // Don't attempt any of this until logged in, and re-fetch once a token
+  // becomes available.
   useEffect(() => {
+    if (!isAdmin) return;
+
     fetchProviders();
     fetchLogs();
     fetchMetrics();
 
+    // NOTE: the browser EventSource API cannot attach the x-admin-token
+    // header this endpoint requires, so this stream will not connect even
+    // when logged in — it fails safely to "disconnected" rather than
+    // crashing. Needs a deliberate token-carrying transport (a short-lived
+    // signed stream ticket, or a fetch-based ReadableStream) to actually
+    // work; not attempted here.
     const eventSource = new EventSource('/api/dashboard/stream');
 
     eventSource.onopen = () => setSseConnected(true);
@@ -162,7 +190,8 @@ export const App: React.FC = () => {
     return () => {
       eventSource.close();
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
 
   return (
     <div className="main-layout">
@@ -253,7 +282,21 @@ export const App: React.FC = () => {
         <TabButton active={tab === 'observability'} onClick={() => setTab('observability')} icon={<Activity className="w-4 h-4" />} label="Observability" />
       </div>
 
-      {tab === 'operations' && (
+      {tab === 'operations' && !isAdmin && (
+        <div className="glass-card" style={{ padding: '24px', textAlign: 'center' }}>
+          <ShieldCheck className="w-8 h-8" style={{ color: 'var(--text-muted)', margin: '0 auto 12px' }} />
+          <h3 style={{ margin: 0, fontWeight: 700 }}>Operations Dashboard</h3>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '13px', marginBottom: '16px' }}>
+            All dashboard data requires administrator login — it used to be readable
+            without one, which leaked cross-tenant traffic to anyone with the URL.
+          </p>
+          <button onClick={() => setShowLogin(true)} style={{ ...iconBtn, width: 'auto', padding: '8px 16px' }}>
+            Admin Login
+          </button>
+        </div>
+      )}
+
+      {tab === 'operations' && isAdmin && (
         <>
           <MetricCards metrics={metrics} />
 

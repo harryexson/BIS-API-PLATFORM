@@ -280,9 +280,11 @@ describe('L) SSRF surface (control)', () => {
 describe('M) Provider secret endpoint (control)', () => {
   it('does not leak a raw provider secret', async () => {
     const res = await runtime.get('/api/dashboard/providers/stripe/secrets');
-    if (res.status === 401 || res.status === 403) {
+    // 503 when ADMIN_API_TOKEN isn't configured, 401/403 when configured but
+    // the request carries no/wrong token — all three deny access equally.
+    if (res.status === 401 || res.status === 403 || res.status === 503) {
       console.warn('[OK] secret endpoint requires admin auth');
-      expect([401, 403]).toContain(res.status);
+      expect([401, 403, 503]).toContain(res.status);
       return;
     }
     expect(res.status).toBe(200);
