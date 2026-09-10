@@ -32,6 +32,11 @@ export interface PaymentError {
   message?: string;
 }
 
+// 'unknown' is a real, distinct outcome (a payment provider timeout, for
+// example) — never treat it as a synonym for 'failed'. See
+// RoutingEngine.routePayment / @company/schemas for the full rationale.
+export type TransactionStatus = 'success' | 'failed' | 'unknown';
+
 export interface PaymentCreate {
   app_id: string;
   amount: number;

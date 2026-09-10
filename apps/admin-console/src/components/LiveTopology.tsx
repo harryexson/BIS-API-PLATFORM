@@ -7,13 +7,19 @@ interface LiveTopologyProps {
   lastEvent: TransactionEvent | null;
 }
 
+// 'unknown' (an ambiguous provider timeout) must render as its own
+// distinct state, not fall back into the same red as a confirmed failure.
+function flowColor<T>(status: string | undefined, success: T, unknown: T, failed: T): T {
+  return status === 'success' ? success : status === 'unknown' ? unknown : failed;
+}
+
 export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent }) => {
   const [activeFlow, setActiveFlow] = useState<{
     id: string;
     appX: number;
     routerX: number;
     providerX: number;
-    status: 'success' | 'failed';
+    status: 'success' | 'failed' | 'unknown';
   } | null>(null);
 
   // App coordinates (X values out of 1000)
@@ -194,14 +200,14 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
               <path
                 d={`M ${activeFlow.appX} 40 L 500 160 L ${activeFlow.routerX} 280 L ${activeFlow.providerX} 420`}
                 fill="none"
-                stroke={activeFlow.status === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}
+                stroke={flowColor(activeFlow.status, 'var(--accent-green)', 'var(--accent-yellow)', 'var(--accent-red)')}
                 strokeWidth="3.5"
                 filter="url(#glow)"
                 style={{ opacity: 0.8 }}
               />
 
               {/* Glowing animated packet */}
-              <circle r="7" fill={activeFlow.status === 'success' ? '#34d399' : '#f87171'} filter="url(#glow)">
+              <circle r="7" fill={flowColor(activeFlow.status, '#34d399', '#fbbf24', '#f87171')} filter="url(#glow)">
                 <animateMotion
                   key={activeFlow.id}
                   dur="1s"
@@ -297,8 +303,8 @@ export const LiveTopology: React.FC<LiveTopologyProps> = ({ providers, lastEvent
                   width: '36px',
                   height: '36px',
                   borderWidth: '2px',
-                  animation: isActive 
-                    ? (activeFlow?.status === 'success' ? 'pulse-green 1s infinite' : 'pulse-red 1s infinite')
+                  animation: isActive
+                    ? flowColor(activeFlow?.status, 'pulse-green 1s infinite', 'pulse-yellow 1s infinite', 'pulse-red 1s infinite')
                     : undefined
                 }}
               >

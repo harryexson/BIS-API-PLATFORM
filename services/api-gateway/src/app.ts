@@ -4,7 +4,7 @@ import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine, ConsentBlockedError } from '@company/routing';
 import { EventBus } from '@company/events';
-import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch } from '@company/schemas';
+import { TransactionEvent, TransactionStatusResponse, TransactionStatus, ProviderCapabilityMatch } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
 import {
   TenantRegistry,
@@ -168,11 +168,18 @@ function observe(event: TransactionEvent) {
   setContextField('providerId', event.providerId);
   setContextField('applicationId', event.appId);
 
-  const success = event.status === 'success';
+  // 'unknown' (an ambiguous provider timeout — see RoutingEngine.routePayment)
+  // is neither a success nor a confirmed failure. Counting it as either
+  // would misrepresent provider reliability and paper over outcomes that
+  // still need reconciliation.
   if (event.category === 'payment') {
-    metrics.increment(success ? 'paymentSuccess' : 'paymentFailure');
+    metrics.increment(
+      event.status === 'success' ? 'paymentSuccess' : event.status === 'unknown' ? 'paymentUnknown' : 'paymentFailure',
+    );
   } else if (event.category === 'messaging') {
-    metrics.increment(success ? 'messageSuccess' : 'messageFailure');
+    metrics.increment(
+      event.status === 'success' ? 'messageSuccess' : event.status === 'unknown' ? 'messageUnknown' : 'messageFailure',
+    );
   }
 
   logger.info('gateway operation completed', {
@@ -180,7 +187,7 @@ function observe(event: TransactionEvent) {
     providerId: event.providerId,
     status: event.status,
     latency: event.latency,
-    errorCode: success ? undefined : 'OPERATION_FAILED',
+    errorCode: event.status === 'success' ? undefined : event.status === 'unknown' ? 'OPERATION_AMBIGUOUS' : 'OPERATION_FAILED',
   });
 }
 
@@ -288,8 +295,13 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
 }
 
 // Records live traffic outcomes against the provider management stats.
-function recordTrafficResult(providerId: string | undefined, status: 'success' | 'failed', latency: number) {
+function recordTrafficResult(providerId: string | undefined, status: TransactionStatus, latency: number) {
   if (!providerId) return;
+  // An ambiguous ('unknown') outcome doesn't tell us anything about the
+  // provider's actual reliability — recording it as either a success or a
+  // failure would skew their measured error rate over something that may
+  // not even be their fault (a network blip between us and them).
+  if (status === 'unknown') return;
   registry.recordTraffic(providerId, status === 'success', latency);
 }
 
@@ -766,7 +778,13 @@ app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantCon
       paymentIdempotencyCache.set(idempotencyKey, event);
     }
 
-    return res.json(event);
+    // 202: outcome is genuinely unresolved (provider timeout) — distinct
+    // from 200 (resolved, success or failed) so a client can't mistake an
+    // ambiguous result for a definite one just by checking the status code.
+    // The client must poll GET /transaction/:id or wait for the provider's
+    // webhook to find out what actually happened; retrying this request is
+    // not automatically safe unless it does so with the same idempotency key.
+    return res.status(event.status === 'unknown' ? 202 : 200).json(event);
   } catch (err: any) {
     const errorEvent = {
       id: 'err_' + randomUUID(),

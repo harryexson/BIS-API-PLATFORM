@@ -79,6 +79,15 @@ body {
   }
 }
 
+@keyframes pulse-yellow {
+  0%, 100% {
+    box-shadow: 0 0 4px #f59e0b, inset 0 0 2px #f59e0b;
+  }
+  50% {
+    box-shadow: 0 0 16px #f59e0b, inset 0 0 8px #f59e0b;
+  }
+}
+
 @keyframes flow-dash {
   to {
     stroke-dashoffset: -40;

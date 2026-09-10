@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { RoutingEngine } from './index';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { RoutingEngine, ProviderTimeoutError } from './index';
 import { ProviderRegistry } from '@company/providers';
 
 describe('RoutingEngine', () => {
@@ -313,6 +313,59 @@ describe('RoutingEngine', () => {
         providerOverride: 'stripe',
       });
       expect(result.providerId).not.toBe('stripe');
+    });
+  });
+
+  describe('ambiguous payment outcomes (provider timeout)', () => {
+    it('never fails over to a second provider on a timeout — a timeout may already have charged the card', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const stripe = registry.getProvider('stripe')!;
+      const nmi = registry.getProvider('nmi')!;
+
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockRejectedValueOnce(
+        new ProviderTimeoutError('Provider request timed out after 30000ms'),
+      );
+      const nmiSpy = vi.spyOn(nmi, 'processRequest');
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      expect(result.status).toBe('unknown');
+      expect(result.providerId).toBe('stripe');
+      expect(stripeSpy).toHaveBeenCalledTimes(1);
+      // The critical assertion: no other payment provider was ever invoked
+      // for this payment. A retry via a different provider here would risk
+      // a real double charge on money whose status we don't actually know.
+      expect(nmiSpy).not.toHaveBeenCalled();
+
+      stripeSpy.mockRestore();
+      nmiSpy.mockRestore();
+    });
+
+    it('still fails over to a second provider for a definite (non-timeout) pre-flight failure', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const stripe = registry.getProvider('stripe')!;
+
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockRejectedValueOnce(
+        new Error('Provider Stripe is currently OFFLINE'),
+      );
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      // A non-ambiguous failure is still safe to retry via another provider.
+      expect(result.status).toBe('success');
+      expect(result.providerId).not.toBe('stripe');
+
+      stripeSpy.mockRestore();
     });
   });
 });
