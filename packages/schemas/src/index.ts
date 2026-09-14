@@ -116,6 +116,14 @@ export interface PaymentRequest {
   paymentMethod: string;
   phoneNumber?: string;
   metadata?: Record<string, unknown>;
+  // A pre-tokenized payment instrument reference the selected provider's
+  // own API understands (e.g. a Stripe PaymentMethod id created client-side
+  // via Stripe.js/Elements — this gateway never touches raw card data, so
+  // it cannot create that token itself). Optional and provider-specific:
+  // a real-HTTP adapter that needs one to actually move money (Stripe,
+  // NMI) falls back to simulated processing when it's absent, rather than
+  // fabricating a charge with no instrument to charge.
+  paymentToken?: string;
 }
 
 export interface PaymentResponse {

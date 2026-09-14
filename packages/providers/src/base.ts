@@ -156,6 +156,32 @@ export abstract class BaseProvider {
     return timingSafeEqual(a, b);
   }
 
+  /**
+   * Encodes params as application/x-www-form-urlencoded, the body format
+   * several payment gateways (Stripe, NMI) require instead of JSON — a
+   * JSON body against those APIs is rejected outright, not merely
+   * misparsed. One level of nested-object flattening via bracket notation
+   * (e.g. { metadata: { appId: 'x' } } -> "metadata[appId]=x"), which is
+   * as deep as this platform's provider payloads currently nest. Skips
+   * undefined/null values rather than serializing them as the literal
+   * strings "undefined"/"null".
+   */
+  protected toFormBody(params: Record<string, unknown>): string {
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'object' && !Array.isArray(value)) {
+        for (const [nestedKey, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+          if (nestedValue === undefined || nestedValue === null) continue;
+          parts.push(`${encodeURIComponent(key)}[${encodeURIComponent(nestedKey)}]=${encodeURIComponent(String(nestedValue))}`);
+        }
+      } else {
+        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+      }
+    }
+    return parts.join('&');
+  }
+
   // Simulates provider processing delay (for simulated mode)
   protected async simulateLatency(): Promise<number> {
     const min = this.config.latencyMin;
