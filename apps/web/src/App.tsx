@@ -98,19 +98,20 @@ export default function App() {
 
 function Nav() {
   return (
-    <header style={{ borderBottom: '1px solid var(--border)', position: 'sticky', top: 0, background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(8px)', zIndex: 10 }}>
-      <div className="container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: '72px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontWeight: 800, fontSize: '17px' }}>
-          <div style={{ width: '32px', height: '32px', borderRadius: '9px', background: 'linear-gradient(135deg, var(--accent), var(--accent-2))', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Network className="w-4 h-4" style={{ color: 'white' }} />
+    <header style={{ borderBottom: '1px solid var(--border)', position: 'sticky', top: 0, background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(10px)', zIndex: 10 }}>
+      <div className="container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', minHeight: '76px', paddingBlock: '14px', gap: '16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: 'clamp(15px, 4vw, 19px)', whiteSpace: 'nowrap', minWidth: 0 }}>
+          <div style={{ width: '38px', height: '38px', borderRadius: '11px', background: 'linear-gradient(135deg, var(--accent), var(--accent-2))', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 20px -8px var(--accent-glow)', flexShrink: 0 }}>
+            <Network style={{ color: 'white', width: '19px', height: '19px' }} />
           </div>
-          BIS API Platform
+          <span className="nav-wordmark nav-wordmark-full">BIS API Platform</span>
+          <span className="nav-wordmark nav-wordmark-short">BIS API</span>
         </div>
-        <nav style={{ display: 'flex', alignItems: 'center', gap: '28px', fontSize: '14px', fontWeight: 600, color: 'var(--text-secondary)' }}>
-          <a href="#features">Platform</a>
-          <a href="#how-it-works">How it works</a>
-          <a href="#pricing">Pricing</a>
-          <a href="/admin" className="btn btn-secondary" style={{ padding: '8px 16px' }}>Admin console</a>
+        <nav className="nav-actions" style={{ display: 'flex', alignItems: 'center', gap: '36px', fontSize: '15.5px', fontWeight: 600, color: 'var(--text-secondary)', flexShrink: 0 }}>
+          <a href="#features" className="nav-link">Platform</a>
+          <a href="#how-it-works" className="nav-link">How it works</a>
+          <a href="#pricing" className="nav-link">Pricing</a>
+          <a href="/admin" className="btn btn-secondary" style={{ padding: '11px 22px', fontSize: '15px', whiteSpace: 'nowrap' }}>Admin console</a>
         </nav>
       </div>
     </header>
@@ -119,20 +120,43 @@ function Nav() {
 
 function Hero() {
   return (
-    <section style={{ padding: '96px 0 80px', background: 'radial-gradient(circle at 20% 0%, var(--accent-soft) 0%, transparent 55%)' }}>
-      <div className="container" style={{ maxWidth: '760px' }}>
-        <span className="pill"><Webhook className="w-3.5 h-3.5" /> One gateway for every BIS application</span>
-        <h1 style={{ fontSize: '52px', lineHeight: 1.08, fontWeight: 800, letterSpacing: '-1.5px', margin: '24px 0 20px' }}>
-          Payments, messaging, and credentials — one API, every provider.
+    <section style={{ position: 'relative', padding: '120px 0 100px', overflow: 'hidden' }}>
+      <div className="bg-grid" style={{ position: 'absolute', inset: 0, zIndex: 0 }} />
+      <div
+        style={{
+          position: 'absolute',
+          top: '-180px',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          width: '900px',
+          height: '600px',
+          background: 'radial-gradient(circle, var(--accent-glow) 0%, transparent 65%)',
+          filter: 'blur(40px)',
+          zIndex: 0,
+        }}
+      />
+      <div className="container" style={{ position: 'relative', zIndex: 1, maxWidth: '840px' }}>
+        <span className="pill"><Webhook className="w-4 h-4" /> One gateway for every BIS application</span>
+        <h1
+          style={{
+            fontSize: 'clamp(2.75rem, 6vw, 4.75rem)',
+            lineHeight: 1.05,
+            fontWeight: 800,
+            letterSpacing: '-2px',
+            margin: '32px 0 26px',
+          }}
+        >
+          Payments, messaging, and credentials —<br />
+          <span className="gradient-text">one API, every provider.</span>
         </h1>
-        <p style={{ fontSize: '19px', color: 'var(--text-secondary)', maxWidth: '620px', marginBottom: '36px' }}>
+        <p style={{ fontSize: '21px', lineHeight: 1.6, color: 'var(--text-secondary)', maxWidth: '660px', marginBottom: '44px' }}>
           Reach Church, Afribook, HaulPro, and every future BIS application connect once
           and get provider failover, multi-tenant isolation, and durable event processing
           for free.
         </p>
-        <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
-          <a href="#pricing" className="btn btn-primary">Get started <ArrowRight className="w-4 h-4" /></a>
-          <a href="/admin" className="btn btn-secondary">Open admin console</a>
+        <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+          <a href="#pricing" className="btn btn-primary btn-lg">Get started <ArrowRight className="w-5 h-5" /></a>
+          <a href="/admin" className="btn btn-secondary btn-lg">Open admin console</a>
         </div>
       </div>
     </section>
@@ -142,13 +166,13 @@ function Hero() {
 function LogoStrip() {
   return (
     <section style={{ borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)', background: 'var(--bg-subtle)' }}>
-      <div className="container" style={{ display: 'flex', alignItems: 'center', gap: '32px', padding: '24px', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: '13px', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+      <div className="container" style={{ display: 'flex', alignItems: 'center', gap: '40px', padding: '30px 28px', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: '14px', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>
           Running production traffic for
         </span>
         {APPLICATIONS.map((app) => (
-          <span key={app} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 700, color: 'var(--text-secondary)' }}>
-            <Building2 className="w-4 h-4" /> {app}
+          <span key={app} style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '17px', fontWeight: 700, color: 'var(--text-secondary)' }}>
+            <Building2 className="w-5 h-5" style={{ width: '22px', height: '22px' }} /> {app}
           </span>
         ))}
       </div>
@@ -158,17 +182,17 @@ function LogoStrip() {
 
 function Features() {
   return (
-    <section id="features" style={{ padding: '96px 0' }}>
+    <section id="features" style={{ padding: '112px 0' }}>
       <div className="container">
         <SectionHeading eyebrow="Platform" title="Everything a BIS application needs from day one" />
-        <div className="grid grid-3" style={{ marginTop: '48px' }}>
+        <div className="grid grid-3" style={{ marginTop: '56px' }}>
           {FEATURES.map((f) => (
-            <div key={f.title} className="card">
-              <div style={{ width: '40px', height: '40px', borderRadius: '10px', background: 'var(--accent-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '16px' }}>
-                <f.icon className="w-5 h-5" style={{ color: 'var(--accent)' }} />
+            <div key={f.title} className="card card-hover">
+              <div className="icon-box" style={{ marginBottom: '22px' }}>
+                <f.icon />
               </div>
-              <h3 style={{ fontSize: '17px', marginBottom: '8px' }}>{f.title}</h3>
-              <p style={{ fontSize: '14px', color: 'var(--text-secondary)', margin: 0 }}>{f.body}</p>
+              <h3 style={{ fontSize: '20px', fontWeight: 700, marginBottom: '10px' }}>{f.title}</h3>
+              <p style={{ fontSize: '15.5px', lineHeight: 1.6, color: 'var(--text-secondary)', margin: 0 }}>{f.body}</p>
             </div>
           ))}
         </div>
@@ -179,15 +203,33 @@ function Features() {
 
 function HowItWorks() {
   return (
-    <section id="how-it-works" style={{ padding: '96px 0', background: 'var(--bg-subtle)', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }}>
+    <section id="how-it-works" style={{ padding: '112px 0', background: 'var(--bg-subtle)', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }}>
       <div className="container">
         <SectionHeading eyebrow="How it works" title="Integrate once, route everywhere" />
-        <div className="grid grid-4" style={{ marginTop: '48px' }}>
+        <div className="grid grid-4" style={{ marginTop: '56px' }}>
           {STEPS.map((step, i) => (
             <div key={step.title}>
-              <div style={{ fontSize: '13px', fontWeight: 800, color: 'var(--accent)', marginBottom: '10px' }}>STEP {i + 1}</div>
-              <h3 style={{ fontSize: '16px', marginBottom: '6px' }}>{step.title}</h3>
-              <p style={{ fontSize: '14px', color: 'var(--text-secondary)', margin: 0 }}>{step.body}</p>
+              <div
+                style={{
+                  width: '48px',
+                  height: '48px',
+                  borderRadius: '14px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '18px',
+                  fontWeight: 800,
+                  fontFamily: 'var(--font-display)',
+                  color: 'white',
+                  background: 'linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%)',
+                  boxShadow: '0 10px 22px -10px var(--accent-glow)',
+                  marginBottom: '18px',
+                }}
+              >
+                {i + 1}
+              </div>
+              <h3 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px' }}>{step.title}</h3>
+              <p style={{ fontSize: '15px', lineHeight: 1.6, color: 'var(--text-secondary)', margin: 0 }}>{step.body}</p>
             </div>
           ))}
         </div>
@@ -198,27 +240,30 @@ function HowItWorks() {
 
 function Pricing() {
   return (
-    <section id="pricing" style={{ padding: '96px 0' }}>
+    <section id="pricing" style={{ padding: '112px 0' }}>
       <div className="container">
         <SectionHeading eyebrow="Pricing" title="Simple pricing that scales with your traffic" />
-        <div className="grid grid-3" style={{ marginTop: '48px', alignItems: 'stretch' }}>
+        <div className="grid grid-3" style={{ marginTop: '56px', alignItems: 'stretch' }}>
           {PLANS.map((plan) => (
             <div
               key={plan.name}
-              className="card"
-              style={plan.highlighted ? { borderColor: 'var(--accent)', boxShadow: '0 20px 40px -20px rgba(124,58,237,0.35)' } : undefined}
+              className="card card-hover"
+              style={plan.highlighted ? { borderColor: 'var(--accent)', boxShadow: '0 24px 48px -20px rgba(124,58,237,0.35)' } : undefined}
             >
-              {plan.highlighted && <span className="pill" style={{ marginBottom: '16px', borderColor: 'var(--accent)', color: 'var(--accent)' }}>Most popular</span>}
-              <h3 style={{ fontSize: '20px', marginBottom: '4px' }}>{plan.name}</h3>
-              <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginBottom: '20px' }}>{plan.description}</p>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px', marginBottom: '24px' }}>
-                <span style={{ fontSize: '34px', fontWeight: 800 }}>{plan.price}</span>
-                <span style={{ color: 'var(--text-muted)', fontSize: '14px' }}>{plan.period}</span>
+              {plan.highlighted && <span className="pill" style={{ marginBottom: '20px', borderColor: 'var(--accent)', color: 'var(--accent)' }}>Most popular</span>}
+              <h3 style={{ fontSize: '23px', fontWeight: 700, marginBottom: '6px' }}>{plan.name}</h3>
+              <p style={{ fontSize: '15px', color: 'var(--text-secondary)', marginBottom: '26px' }}>{plan.description}</p>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', marginBottom: '28px' }}>
+                <span style={{ fontSize: '42px', fontWeight: 800, fontFamily: 'var(--font-display)' }}>{plan.price}</span>
+                <span style={{ color: 'var(--text-muted)', fontSize: '15px' }}>{plan.period}</span>
               </div>
-              <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 28px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 32px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 {plan.features.map((f) => (
-                  <li key={f} style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '14px' }}>
-                    <Check className="w-4 h-4" style={{ color: 'var(--accent)', flexShrink: 0, marginTop: '2px' }} /> {f}
+                  <li key={f} style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '15px' }}>
+                    <span style={{ width: '22px', height: '22px', borderRadius: '999px', background: 'var(--accent-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: '1px' }}>
+                      <Check className="w-3.5 h-3.5" style={{ color: 'var(--accent-2)', width: '13px', height: '13px' }} />
+                    </span>
+                    {f}
                   </li>
                 ))}
               </ul>
@@ -235,28 +280,41 @@ function Pricing() {
 
 function CTA() {
   return (
-    <section style={{ padding: '80px 0' }}>
+    <section style={{ padding: '96px 0' }}>
       <div className="container">
         <div
           className="card"
           style={{
+            position: 'relative',
+            overflow: 'hidden',
             background: 'var(--bg-dark)',
             borderColor: 'var(--bg-dark)',
             color: 'white',
-            padding: '56px 48px',
+            padding: '64px 56px',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             flexWrap: 'wrap',
-            gap: '24px',
+            gap: '28px',
           }}
         >
-          <div>
-            <h2 style={{ fontSize: '26px', margin: '0 0 8px' }}>Ready to connect your application?</h2>
-            <p style={{ color: '#94a3b8', margin: 0 }}>Support for new applications is coordinated through the admin console.</p>
+          <div
+            style={{
+              position: 'absolute',
+              top: '-120px',
+              right: '-80px',
+              width: '420px',
+              height: '420px',
+              background: 'radial-gradient(circle, rgba(124,58,237,0.45) 0%, transparent 70%)',
+              filter: 'blur(20px)',
+            }}
+          />
+          <div style={{ position: 'relative', zIndex: 1 }}>
+            <h2 style={{ fontSize: 'clamp(1.75rem, 3vw, 2.25rem)', fontWeight: 700, margin: '0 0 12px' }}>Ready to connect your application?</h2>
+            <p style={{ color: '#94a3b8', fontSize: '17px', margin: 0 }}>Support for new applications is coordinated through the admin console.</p>
           </div>
-          <a href="/admin" className="btn btn-primary">
-            Open admin console <ArrowRight className="w-4 h-4" />
+          <a href="/admin" className="btn btn-primary btn-lg" style={{ position: 'relative', zIndex: 1 }}>
+            Open admin console <ArrowRight className="w-5 h-5" />
           </a>
         </div>
       </div>
@@ -266,12 +324,12 @@ function CTA() {
 
 function Footer() {
   return (
-    <footer style={{ borderTop: '1px solid var(--border)', padding: '40px 0' }}>
-      <div className="container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
-        <span style={{ fontSize: '14px', color: 'var(--text-muted)' }}>© {new Date().getFullYear()} BIS API Platform</span>
-        <div style={{ display: 'flex', gap: '20px', fontSize: '14px', color: 'var(--text-secondary)' }}>
-          <a href="/admin" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><ShieldCheck className="w-3.5 h-3.5" /> Admin console</a>
-          <a href="#pricing" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><LifeBuoy className="w-3.5 h-3.5" /> Support</a>
+    <footer style={{ borderTop: '1px solid var(--border)', padding: '48px 0' }}>
+      <div className="container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '18px' }}>
+        <span style={{ fontSize: '15px', color: 'var(--text-muted)' }}>© {new Date().getFullYear()} BIS API Platform</span>
+        <div style={{ display: 'flex', gap: '24px', fontSize: '15px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+          <a href="/admin" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><ShieldCheck className="w-4 h-4" /> Admin console</a>
+          <a href="#pricing" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><LifeBuoy className="w-4 h-4" /> Support</a>
         </div>
       </div>
     </footer>
@@ -280,9 +338,9 @@ function Footer() {
 
 function SectionHeading({ eyebrow, title }: { eyebrow: string; title: string }) {
   return (
-    <div style={{ maxWidth: '560px' }}>
+    <div style={{ maxWidth: '620px' }}>
       <span className="pill">{eyebrow}</span>
-      <h2 style={{ fontSize: '32px', fontWeight: 800, letterSpacing: '-0.5px', margin: '16px 0 0' }}>{title}</h2>
+      <h2 style={{ fontSize: 'clamp(1.9rem, 3.4vw, 2.75rem)', fontWeight: 700, letterSpacing: '-1px', lineHeight: 1.15, margin: '20px 0 0' }}>{title}</h2>
     </div>
   );
 }
