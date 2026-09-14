@@ -105,8 +105,10 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | Email | `messaging/email.ts` | **Simulated** |
 | FutureSMS | `messaging/futuresms.ts` | **Simulated**, explicitly a placeholder/example provider |
 | Example (messaging) | `messaging/example.ts` | **Simulated**, reference implementation only |
-| Stripe | `payments/stripe.ts` | **Simulated** (idempotency logic is real; no live Stripe SDK/HTTP call) |
-| NMI, Flutterwave, PawaPay, PayChangu, Airwallex | `payments/*.ts` | **Simulated** |
+| Stripe | `payments/stripe.ts` | **Real HTTP** (2026-09-14) — PaymentIntents API; falls back to simulated when no API key **or** no `PaymentRequest.paymentToken` (this gateway never collects raw card data). Corrects an earlier version of this file that called a real endpoint with the wrong body encoding (JSON instead of form-urlencoded) and would have failed on every live call |
+| NMI | `payments/nmi.ts` | **Real HTTP** (2026-09-14) — Direct Post/Gateway API; same paymentToken-gated fallback. Previously fully simulated with no real-HTTP path at all |
+| Flutterwave | `payments/flutterwave.ts` | **Real HTTP** (2026-09-14) — v3 tokenized-charges API; same paymentToken-gated fallback (also requires a customer email, read from `payload.metadata.email`). Previously fully simulated with no real-HTTP path at all |
+| PawaPay, PayChangu, Airwallex | `payments/*.ts` | **Simulated** |
 | Example (payments) | `payments/example.ts` | **Simulated**, reference implementation only |
 
 **No adapter exists yet for Trembi** — no file, no env vars in
@@ -229,13 +231,23 @@ checks inside each simulated adapter, not at boot. Tracked gap.
 These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 `PRODUCTION_READINESS_REPORT.md` and re-verified as still open:
 
-1. **Real provider adapters** — payment adapters are all still simulated;
-   messaging: Infobip, Africa's Talking, Sinch, and Vibes are now real HTTP
-   integrations (2026-09-08/09, verified via WebSearch against current
-   public docs — see §6 item 1 and the changelog; Vibes at materially
-   lower confidence than the other three — see its adapter file's class
-   comment), SignalHouse/FutureSMS/generic SMS/email remain simulated.
-   This is still the largest gap in the whole plan.
+1. **Real provider adapters** — messaging: Infobip, Africa's Talking,
+   Sinch, and Vibes are real HTTP integrations (2026-09-08/09); payments:
+   Stripe, NMI, and Flutterwave are now also real HTTP integrations
+   (2026-09-14, verified via WebSearch against current public docs — see
+   §6 item 1 and the changelog; Vibes at materially lower confidence than
+   the other messaging adapters — see its adapter file's class comment).
+   SignalHouse/FutureSMS/generic-SMS/email (messaging) and
+   PawaPay/PayChangu/Airwallex (payments) remain simulated; Trembi has no
+   adapter at all. Every real payment adapter shares one honest,
+   structural limitation, not a per-provider gap: this gateway's
+   `PaymentRequest` never collects raw card data (by design — PCI scope),
+   so a real charge additionally requires a pre-tokenized
+   `paymentToken` the caller obtained client-side (e.g. via Stripe.js);
+   without one, even a fully-credentialed adapter has nothing to charge
+   and falls back to simulated rather than fabricating a charge. This is
+   still the largest remaining gap in the whole plan, now roughly half
+   closed by count rather than almost entirely open.
 2. ~~No Africa's Talking / Trembi adapters~~ — **Africa's Talking closed
    2026-09-08, Sinch and Vibes closed 2026-09-09** (real adapters +
    registry entries, see item 1). **Trembi not attempted.**
@@ -357,16 +369,22 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     handling at all.
 
 14. ~~No customer signup/login~~ — **closed 2026-09-09.** See the changelog
-    ("Customer Account Auth: Signup/Login"). One real, remaining gap
-    within it: no transactional email sending is wired up, so verification/
-    reset tokens are only returned in the API response outside production
-    — production has no delivery path for them yet (item 15 below).
-15. **No transactional email integration** — nothing in this codebase
-    sends a real email (the `EmailProvider` messaging adapter is fully
-    simulated, and the new auth flows added 2026-09-09 don't attempt to
-    send one either — see item 14). Needed before password reset / email
-    verification are usable by an actual person in production, not just
-    testable via the API response.
+    ("Customer Account Auth: Signup/Login"). The transactional-email gap
+    noted here originally is now closed too — see item 15.
+15. ~~No transactional email integration~~ — **closed 2026-09-14.**
+    `packages/shared/src/email.ts` sends real verification/password-reset
+    emails via Resend's HTTP API, wired into signup,
+    `/resend-verification`, and `/request-password-reset`. Fire-and-forget
+    (never blocks the request it's attached to); the dev-only token echo
+    in the API response is kept as a fallback. Real, remaining gap within
+    it: no frontend page exists yet in this repo to land a verify-email/
+    reset-password link on (`PLATFORM_APP_URL` is a placeholder for
+    wherever that page eventually lives) — the email always also includes
+    the raw token as plain text so it stays actionable via a
+    support-assisted API call in the meantime. The `EmailProvider`
+    messaging adapter (client apps' own outbound email, a different
+    concern from this platform's own transactional email) remains
+    simulated — unchanged, not in scope here.
 16. ~~No subscription/billing model for platform customers~~ — **Phase B
     done, 2026-09-09.** `plans` + `subscriptions` tables, a real
     Stripe Customers/Subscriptions integration (`SubscriptionRegistry`,
@@ -387,6 +405,19 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     field the person types in, not tied to an account). The admin
     console itself (Phase D) still has no router and remains 4 in-memory
     tabs — see §2's Admin Console section.
+18. ~~A single failed async route handler could crash the entire
+    gateway~~ — **closed 2026-09-14.** Found live while running the app
+    for a preview, not by static review: opening the admin console's
+    Customers tab triggered an unhandled promise rejection that killed
+    the whole Node process, not just that request — every tenant, every
+    route, down at once. Express 4 doesn't route a rejected promise from
+    an async handler to `app.use((err, ...))` unless the handler calls
+    `next(err)` itself; 12 of 32 async route handlers in `app.ts` (auth,
+    billing, customers, tickets, consent, messaging-profiles, webhooks)
+    had neither a try/catch nor that call. Added an `asyncHandler()`
+    wrapper and applied it to exactly those 12. Verified live: the same
+    request that previously killed the gateway now returns a normal 500
+    and every other route keeps serving right after.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 
@@ -468,12 +499,25 @@ safety):
     library) and why.
     All 4 phases of the original request are now done. Real gaps
     remaining, none silently dropped:
-    - A real transactional email integration (§4 item 15) — verification/
-      reset tokens (Phases A/B) have no delivery path outside dev/test.
+    - ~~A real transactional email integration~~ — **closed 2026-09-14**,
+      see §4 item 15.
     - Plan usage-limit enforcement (§4 item 16) — limits are stored but
       nothing in the gateway enforces them.
     - Admin console routing (this item) — still 4 in-memory tabs via
       `useState`, not URLs; no deep-linking or browser back/forward.
+11. ~~Real payment adapters~~ — **Stripe, NMI, and Flutterwave closed
+    2026-09-14** (§4 item 1), same WebSearch-verification method as the
+    messaging adapters above, same paymentToken-gated simulated fallback
+    across all three. **PawaPay, PayChangu, Airwallex, and Trembi not yet
+    attempted** — highest-value next real-provider work, in roughly that
+    order (PawaPay/PayChangu are the remaining African mobile-money/card
+    processors already wired into the fee-tier logic; Airwallex is a
+    larger multi-currency processor; Trembi has no adapter file at all
+    yet, net-new work).
+12. Landing page (`apps/web`) visual redesign — done 2026-09-14 per user
+    request (larger type/icon scale, real font loading, a responsive nav
+    that previously broke at phone widths). Cosmetic, not a production-
+    readiness gap, but tracked here since it was done in the same pass.
 
 ## 7. Relationship to Prior Reports
 

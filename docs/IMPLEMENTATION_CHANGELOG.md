@@ -6,6 +6,104 @@ tests cover it.
 
 ---
 
+## 2026-09-14 — Real Payment Adapters, Transactional Email, Gateway Crash Fix, Landing Page Redesign
+
+**Context:** user asked to (1) re-check the codebase against the master
+plan for anything not yet fully implemented, (2) get the platform closer
+to production-ready specifically so real payment providers can be
+plugged in, and (3) improve the marketing landing page's visual design
+(text/icons read as too small, wanted a more modern look). Re-reading
+`docs/IMPLEMENTATION_BASELINE.md` §4/§6 against the current repo found
+its single largest standing gap unchanged since 2026-09-08: every
+payment adapter was still fully simulated, with no live-provider code
+path at all (unlike the messaging adapters, several of which were
+already real by this point).
+
+### What was done
+- **Landing page redesign** (`apps/web`) — larger fluid type scale
+  (hero headline `clamp(2.75rem, 6vw, 4.75rem)`, up from a flat 52px),
+  60px gradient-tinted icon boxes (up from 40px flat-tint), real Inter/
+  Lexend font loading (the design tokens referenced 'Inter' but nothing
+  ever loaded it), a dot-grid + radial-glow hero background, hover-lift
+  cards. Found and fixed live: the nav had no responsive handling at all
+  and broke (wordmark and "Admin console" button overlapping) at phone
+  widths — added a breakpoint that hides the secondary nav links and
+  swaps to a short wordmark under 430px, verified with Playwright
+  screenshots at 360/390/768/1440px.
+- **Real Stripe adapter** (`payments/stripe.ts`) — rewritten on the
+  PaymentIntents API. The previous version already called a live Stripe
+  endpoint when credentials were set, but sent a JSON body against an
+  API that requires `application/x-www-form-urlencoded` and hit the
+  deprecated Charges endpoint — every "real" call it ever made would
+  have failed. Added `BaseProvider.toFormBody()`, a shared form-encoding
+  helper.
+- **Real NMI adapter** (`payments/nmi.ts`) — previously fully simulated
+  with no real-HTTP path at all. Rewritten against NMI's Direct Post API
+  (`POST /api/transact.php`), which is form-urlencoded in *both*
+  directions — the response is a query string, not JSON.
+- **Real Flutterwave adapter** (`payments/flutterwave.ts`) — also
+  previously fully simulated. Rewritten against v3's tokenized-charges
+  API. The easy-to-miss trap here: a 200 response with top-level
+  `status: "success"` only means the request was accepted, not that the
+  charge succeeded — the real outcome is `data.status`.
+- **`PaymentRequest.paymentToken`** (new, `@company/schemas`) — this
+  gateway never collected raw card data or a provider token before now,
+  so no payment adapter, real or not, ever had anything to actually
+  charge. All three real adapters above are gated on it being present
+  (a pre-tokenized instrument the caller obtained client-side, e.g. via
+  Stripe.js): without one, they fall back to simulated rather than
+  fabricating a charge against nothing. This is a structural,
+  cross-provider limitation, not fixed by any one adapter — a real
+  end-to-end charge additionally needs a client-side tokenization step
+  this repo doesn't include yet.
+- **Real transactional email** (`packages/shared/src/email.ts`) — closes
+  §4 item 15: verification/password-reset tokens previously had zero
+  delivery path to a real inbox. Sends via Resend's HTTP API directly
+  (matching the no-SDK pattern of every provider adapter), wired into
+  signup, `/resend-verification`, and `/request-password-reset` as a
+  fire-and-forget send that never blocks the request. Honestly flagged,
+  not worked around: this repo has no frontend page yet to land a
+  verify-email/reset-password link on, so the email always also includes
+  the raw token as plain text alongside the link.
+- **Gateway crash fix** (`services/api-gateway/src/app.ts`) — found live
+  while running the app to demonstrate the above, not by static review:
+  opening the admin console's Customers tab crashed the *entire* gateway
+  process, not just that request, because a DB query error in an async
+  route handler with no try/catch became an unhandled promise rejection
+  (Express 4 doesn't forward those to its error middleware on its own).
+  12 of 32 async handlers had this gap. Added an `asyncHandler()`
+  wrapper and applied it to exactly those 12; verified the same request
+  that previously killed the gateway now returns a normal 500 and every
+  other route keeps serving right after.
+
+### Verification
+Every adapter change has its own test file exercising the simulated
+fallback, the real request shape, and each documented outcome/error case
+(Stripe 8 tests, NMI 9, Flutterwave 10, email 7 — 34 new tests total).
+Full suite run repeatedly across the session, always green (grew from
+403 to 440 passing as work progressed), `tsc --noEmit` clean throughout,
+`npm run lint` 0 errors throughout. The landing page and the gateway
+crash fix were both verified live: a real headless-Chromium pass for the
+former, and a real `npm run dev` (gateway + admin console, live Neon
+connection) session for the latter, where the crash was originally
+found and the fix re-verified against the identical failing request.
+
+### Deliberately not done in this pass
+- PawaPay, PayChangu, Airwallex, and Trembi remain simulated/unbuilt —
+  see `docs/IMPLEMENTATION_BASELINE.md` §6 item 11 for the recommended
+  order.
+- No client-side tokenization flow (Stripe.js/Elements or equivalent) was
+  built — without one, `paymentToken` is never actually populated by a
+  real caller yet, so today's real adapters are correct but currently
+  unreachable end-to-end outside a direct API test that supplies a token
+  by hand.
+- Plan usage-limit enforcement, admin console routing, Drizzle migration
+  history divergence, and the gateway's Redis-only inbound-webhook
+  enqueue path are unchanged — see `docs/IMPLEMENTATION_BASELINE.md` §4/§6
+  for the full standing list.
+
+---
+
 ## 2026-09-10 — Consolidated a Sibling Session's Parallel Branch
 
 **Context:** two Claude Code Remote sessions had independently been working
