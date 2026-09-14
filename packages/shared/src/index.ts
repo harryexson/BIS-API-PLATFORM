@@ -24,3 +24,10 @@ export {
   assertStartupConfig,
   type StartupConfigResult,
 } from './startup-config';
+export {
+  sendTransactionalEmail,
+  verificationEmailHtml,
+  passwordResetEmailHtml,
+  type SendEmailParams,
+  type SendEmailResult,
+} from './email';

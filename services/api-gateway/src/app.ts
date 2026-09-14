@@ -44,6 +44,7 @@ import {
   getContext,
   setContextField,
 } from '@company/observability';
+import { sendTransactionalEmail, verificationEmailHtml, passwordResetEmailHtml } from '@company/shared';
 
 const app = express();
 
@@ -201,6 +202,44 @@ function observe(event: TransactionEvent) {
     status: event.status,
     latency: event.latency,
     errorCode: event.status === 'success' ? undefined : event.status === 'unknown' ? 'OPERATION_AMBIGUOUS' : 'OPERATION_FAILED',
+  });
+}
+
+// This repo does not yet include the customer-facing frontend page that
+// would handle a verify-email/reset-password link click (no such page
+// exists under apps/ today) — PLATFORM_APP_URL lets a deployment point at
+// wherever that page actually lives once built. Without it, the link
+// falls back to a relative path so the email is still well-formed, and
+// the raw token is always included as plain text too so the email stays
+// actionable (e.g. via a support-assisted API call) even before that
+// frontend page exists.
+function buildAccountLink(path: string, token: string): string {
+  const base = (process.env.PLATFORM_APP_URL || '').replace(/\/+$/, '');
+  return `${base}${path}?token=${encodeURIComponent(token)}`;
+}
+
+// Fire-and-forget email sends for account flows — a failed/unconfigured
+// send must never block signup, verification-resend, or a password-reset
+// request. Errors are logged, not thrown.
+function sendAccountEmail(kind: 'verify' | 'reset', to: string, token: string) {
+  const url = kind === 'verify' ? buildAccountLink('/verify-email', token) : buildAccountLink('/reset-password', token);
+  const html =
+    (kind === 'verify' ? verificationEmailHtml(url) : passwordResetEmailHtml(url)) +
+    `<p style="color:#64748b;font-size:13px">Token: <code>${token}</code></p>`;
+
+  sendTransactionalEmail({
+    to,
+    subject: kind === 'verify' ? 'Verify your email' : 'Reset your password',
+    html,
+  }).then((result) => {
+    if (!result.sent) {
+      logger.warn('transactional email not sent', {
+        operation: kind === 'verify' ? 'auth-verification-email' : 'auth-password-reset-email',
+        errorCode: 'EMAIL_NOT_SENT',
+        status: 'failed',
+        error: result.error,
+      });
+    }
   });
 }
 
@@ -377,14 +416,16 @@ app.post('/v1/api/auth/signup', async (req: Request, res: Response) => {
       applicationId: result.application.id,
       status: 'success',
     });
+    sendAccountEmail('verify', result.user.email, result.emailVerificationToken);
     return res.status(201).json({
       user: result.user,
       application: result.application,
       apiKey: result.apiKey,
-      // A real transactional email send isn't built in this pass (see
-      // docs/IMPLEMENTATION_BASELINE.md) — the token is only surfaced here
-      // outside production so signup/verification stays testable end to
-      // end today, rather than fabricating an email that was never sent.
+      // The token is also surfaced directly outside production, in
+      // addition to the real send above — keeps signup/verification
+      // testable end to end without depending on a real inbox, and gives
+      // a fallback if RESEND_API_KEY isn't configured in a dev/staging
+      // environment.
       ...(process.env.NODE_ENV !== 'production'
         ? { emailVerificationToken: result.emailVerificationToken }
         : {}),
@@ -441,6 +482,7 @@ app.post('/v1/api/auth/verify-email', async (req: Request, res: Response) => {
 app.post('/v1/api/auth/resend-verification', requireSession, asyncHandler(async (req: Request, res: Response) => {
   const user = (req as SessionAuthedRequest).user!;
   const { token } = await authRegistry.resendEmailVerification(user.id);
+  sendAccountEmail('verify', user.email, token);
   return res.json({
     message: 'Verification email requested',
     ...(process.env.NODE_ENV !== 'production' ? { emailVerificationToken: token } : {}),
@@ -451,6 +493,7 @@ app.post('/v1/api/auth/request-password-reset', asyncHandler(async (req: Request
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'email is required' });
   const result = await authRegistry.requestPasswordReset(email);
+  if (result) sendAccountEmail('reset', email, result.token);
   // Always a generic success — never reveal whether the account exists.
   return res.json({
     message: 'If an account exists for this email, a password reset link has been sent.',
