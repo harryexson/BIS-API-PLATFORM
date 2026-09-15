@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users } from 'lucide-react';
 import { MetricCards } from './components/MetricCards';
 import { LiveTopology } from './components/LiveTopology';
@@ -23,9 +24,31 @@ const INITIAL_METRICS: DashboardMetrics = {
 
 type Tab = 'operations' | 'management' | 'customers' | 'observability';
 
+const TAB_PATHS: Record<Tab, string> = {
+  operations: '/',
+  management: '/providers',
+  customers: '/customers',
+  observability: '/observability',
+};
+
+function tabFromPathname(pathname: string): Tab {
+  switch (pathname) {
+    case '/providers':
+      return 'management';
+    case '/customers':
+      return 'customers';
+    case '/observability':
+      return 'observability';
+    default:
+      return 'operations';
+  }
+}
+
 export const App: React.FC = () => {
   const { token, isAdmin, logout } = useAuth();
-  const [tab, setTab] = useState<Tab>('operations');
+  const location = useLocation();
+  const navigate = useNavigate();
+  const tab = tabFromPathname(location.pathname);
   const [showLogin, setShowLogin] = useState(false);
 
   const [providers, setProviders] = useState<ProviderManagementType[]>([]);
@@ -277,10 +300,10 @@ export const App: React.FC = () => {
 
       {/* Tabs */}
       <div style={{ display: 'flex', gap: '8px', marginBottom: '24px' }}>
-        <TabButton active={tab === 'operations'} onClick={() => setTab('operations')} icon={<Cpu className="w-4 h-4" />} label="Operations Dashboard" />
-        <TabButton active={tab === 'management'} onClick={() => setTab('management')} icon={<Server className="w-4 h-4" />} label="Provider Management" />
-        <TabButton active={tab === 'customers'} onClick={() => setTab('customers')} icon={<Users className="w-4 h-4" />} label="Customers" />
-        <TabButton active={tab === 'observability'} onClick={() => setTab('observability')} icon={<Activity className="w-4 h-4" />} label="Observability" />
+        <TabButton active={tab === 'operations'} onClick={() => navigate(TAB_PATHS.operations)} icon={<Cpu className="w-4 h-4" />} label="Operations Dashboard" />
+        <TabButton active={tab === 'management'} onClick={() => navigate(TAB_PATHS.management)} icon={<Server className="w-4 h-4" />} label="Provider Management" />
+        <TabButton active={tab === 'customers'} onClick={() => navigate(TAB_PATHS.customers)} icon={<Users className="w-4 h-4" />} label="Customers" />
+        <TabButton active={tab === 'observability'} onClick={() => navigate(TAB_PATHS.observability)} icon={<Activity className="w-4 h-4" />} label="Observability" />
       </div>
 
       {tab === 'operations' && !isAdmin && (

@@ -6,6 +6,82 @@ tests cover it.
 
 ---
 
+## 2026-09-15 — Admin Console Real Routing (react-router-dom)
+
+**Context:** next item down the user's explicit priority-ordered punch
+list: "the admin console... still in-memory tabs, no real URLs."
+
+### What changed
+`apps/admin-console`'s 4 tabs (Operations, Provider Management, Customers,
+Observability) were a single `useState<Tab>` in `App.tsx` — switching tabs
+never touched the URL, so there was no deep-linking, no bookmarking a
+specific tab, and browser back/forward did nothing (both buttons just sat
+on `/` regardless of which tab was showing).
+
+Added `react-router-dom` (`^7.18.3`) and wrapped `<App />` in
+`<BrowserRouter>` (`main.tsx`). `App.tsx` now derives the active tab from
+`useLocation().pathname` via a small `tabFromPathname()` mapping instead
+of local state, and the tab buttons call `useNavigate()` instead of
+`setTab()`:
+- `/` → Operations Dashboard
+- `/providers` → Provider Management
+- `/customers` → Customers
+- `/observability` → Observability
+
+An unrecognized path falls back to Operations rather than a blank page —
+deliberately simple (no `<Routes>`/`<Route>` table, since all 4 "pages"
+were already conditionally-rendered JSX blocks in one component; only the
+source of truth for *which* block renders changed) rather than a bigger
+restructure the ask didn't call for.
+
+Added `apps/admin-console/vercel.json` with a SPA rewrite
+(`/(.*) → /index.html`). This wasn't needed before (every tab lived at
+`/`), but is now required for the production Vercel deploy: a direct
+load or hard refresh on `/providers` etc. would otherwise 404, since
+Vercel's static file server has no fallback of its own. The Vite dev
+server already does this by default, which is why it wasn't visible
+locally.
+
+### A real regression, found and fixed
+`tests/smoke.spec.ts`'s tab-switching assertions (e.g. click "Provider
+Management" then immediately assert `getByText('Stripe', { exact: true
+})`) started failing intermittently once routing went in — not a test
+bug, a real timing change: with `useState`, clicking a tab button
+re-rendered synchronously within the same click handler; with
+`useNavigate()`, the URL and the re-render it triggers are not
+guaranteed synchronous with the click. For a brief window the previous
+tab's DOM (which also renders "Stripe" — once in the topology graph,
+once in a `<select>` option) can still be attached, so an exact-text
+locator briefly resolves to multiple elements. Playwright's `toBeVisible()`
+retries on "not found," but **not** on a strict-mode multiple-match
+violation — it fails immediately instead of waiting out the render.
+Fixed by adding `page.waitForURL()` after each tab click (confirms the
+route committed) plus a short `page.waitForTimeout(150)` before the one
+assertion that's ambiguous mid-transition — verified stable across 3
+repeated full runs after the fix, not just the first green run.
+
+### Verification
+- `apps/admin-console`'s own `npm run type-check`: clean.
+- `npx playwright test` (6 tests): all pass, stable across 3 runs.
+- Manual live-browser check (real dev server, not just the mocked
+  Playwright suite): direct navigation to `/observability` correctly
+  highlights the Observability tab and renders its content; clicking
+  Customers then using the browser's Back button correctly returns to
+  `/observability`, and Forward correctly returns to `/customers`.
+- Root `npm run type-check`, `npm run lint` (0 errors), `npm test` (482
+  passed, unrelated to this change but re-run to confirm no regression),
+  `npm run build:all`: all clean.
+
+**Files changed:**
+- `apps/admin-console/src/main.tsx` — wrap `<App />` in `<BrowserRouter>`
+- `apps/admin-console/src/App.tsx` — `useState<Tab>` → `useLocation()`/
+  `useNavigate()`, `tabFromPathname()`/`TAB_PATHS` mapping
+- `apps/admin-console/vercel.json` (new) — SPA rewrite for production
+- `apps/admin-console/tests/smoke.spec.ts` — `waitForURL()` after each
+  tab-switching click, plus the settle-time fix described above
+- `apps/admin-console/package.json`, `package-lock.json` —
+  `react-router-dom` dependency
+
 ## 2026-09-15 — Client-Side Tokenization, Plan Limit Enforcement, Migration History Consolidation
 
 **Context:** continuing down the user's explicit priority-ordered punch

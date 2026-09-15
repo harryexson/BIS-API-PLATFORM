@@ -179,12 +179,23 @@ headless-browser regression pass (mocked backend, same constraint as
 above) plus a permanent automated suite: `apps/admin-console/tests/
 smoke.spec.ts` (`@playwright/test`, run via `npm run test:e2e` in that
 workspace), 6 tests, stable across 3 runs. Found and fixed one genuine
-bug in the process — see the changelog for detail. **Deliberately still
-no router library** (4 in-memory tabs via `useState`, not real routes) —
-this was explicitly scoped out of Phase D (the user's ask was
-verification, not a routing rewrite) rather than silently dropped; still
-the one remaining gap. The root `tsc --noEmit` does **not** typecheck
-this app (`tsconfig.json`'s `include` covers `packages/**` and
+bug in the process — see the changelog for detail.
+~~Deliberately still no router library~~ — **closed, 2026-09-15**: the 4
+tabs now route through `react-router-dom` (`BrowserRouter` in `main.tsx`,
+`useLocation`/`useNavigate` in `App.tsx`) with real, deep-linkable,
+bookmarkable URLs — `/` (Operations), `/providers` (Provider Management),
+`/customers` (Customers), `/observability` (Observability) — instead of
+an in-memory `useState<Tab>`. Back/forward navigation and hard-refresh on
+a non-root path both work correctly (verified live, not just by code
+review — see the changelog). `vercel.json` (new) adds the SPA rewrite
+(`/(.*)` → `/index.html`) the production Vercel deploy needs so a direct
+load or refresh on `/providers` etc. doesn't 404 — Vite's own dev server
+already does this by default, which is why it wasn't visible locally
+before. `tests/smoke.spec.ts` was updated to `waitForURL()` after each
+tab click (the route change and its re-render are no longer synchronous
+with the click, unlike the old `setState` tabs) — see the changelog for
+the specific race this fixed. The root `tsc --noEmit` does **not**
+typecheck this app (`tsconfig.json`'s `include` covers `packages/**` and
 `services/**` only) — use `apps/admin-console`'s own `npm run type-check`.
 
 ### Testing
@@ -257,17 +268,28 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    payment provider** (see the adapter table above and §4 item 1a) — no
    adapter was built, and none should be; this is investigated and closed,
    not outstanding work.
-1a. **No client-side card tokenization flow** — the structural limitation
-    named in item 1: nothing in this platform (no page under `apps/`, no
-    SDK helper) ever produces a `PaymentRequest.paymentToken`. Today's
-    four card-based adapters are correct but currently unreachable
-    end-to-end outside a direct API call that supplies a token by hand
-    (e.g. a test using a known Stripe test PaymentMethod id). Closing
-    this for real needs a client-side integration (Stripe.js/Elements or
-    equivalent per provider) on whatever frontend actually collects a
-    customer's card — this repo has no such page yet (`apps/web` is
-    marketing-only, `apps/admin-console` is an internal ops tool, neither
-    is a customer checkout flow).
+1a. ~~**No client-side card tokenization flow**~~ — **closed, 2026-09-15.**
+    `apps/admin-console`'s Request Playground (`RequestPlayground.tsx`) now
+    mounts real Stripe Elements when the "card" payment rail is selected
+    and `VITE_STRIPE_PUBLISHABLE_KEY` is configured (documented in the
+    new `.env.example`) — `stripe.js` (`https://js.stripe.com/v3/`, loaded
+    directly from Stripe's own domain per their fraud-detection/PCI
+    requirements) is injected **dynamically** on demand, not as a static
+    `<script>` tag, so the console still works with zero console errors
+    when the key isn't set. `handleSubmit` calls
+    `stripe.createPaymentMethod()` to obtain a real `paymentToken` before
+    dispatching, which the gateway then passes straight through to
+    whichever card adapter (Stripe/NMI/Flutterwave/Airwallex) is selected
+    or auto-routed to. Without a key configured, the UI says so plainly
+    and the request still dispatches with no token — same honest
+    simulated-fallback behavior as before, just now reachable end-to-end
+    when a real key is present. This closes the adapters' one remaining
+    structural gap: they had nothing real to charge before this. (Still
+    only wired into the internal admin console's playground, not a
+    customer-facing checkout page — `apps/web` remains marketing-only —
+    but the playground is this platform's only page that collects payment
+    input at all, and this is what makes a real end-to-end charge provable
+    without one.)
 2. ~~No Africa's Talking / Trembi adapters~~ — **Africa's Talking closed
    2026-09-08, Sinch and Vibes closed 2026-09-09** (real adapters +
    registry entries, see item 1). **Trembi not attempted.**
@@ -438,10 +460,25 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     with the same simulated-fallback pattern as every provider adapter),
     and a correctly-signature-verified `/v1/api/billing/webhooks/stripe`
     route — see the changelog ("Subscription Billing: Plans, Stripe
-    Subscriptions"). **Remaining gap within it**: plan usage limits
+    Subscriptions"). ~~**Remaining gap within it**: plan usage limits
     (`messageLimit`, `paymentVolumeLimitCents`) are stored but not
     enforced anywhere in the gateway/routing path — a `starter`-plan
-    application can send unlimited messages today.
+    application can send unlimited messages today.~~ **Closed,
+    2026-09-15**: `/v1/api/gateway/payment` and `/v1/api/gateway/messaging`
+    both now call a `checkPlanLimit()` helper in `app.ts` before routing —
+    it looks up the application's active subscription and plan, sums real
+    durable usage for the current billing period (`transactions` with
+    `status='success'` for payment volume, `events` with
+    `category='messaging'` and `status='success'` for message count —
+    both scoped to `subscription.currentPeriodStart`, not an in-memory
+    counter), and returns HTTP 402 with a plain-English reason once the
+    plan's limit would be exceeded. A subscription with no limit set on
+    a given dimension (`null`) is left unrestricted, matching the existing
+    plan model. The messaging route previously never wrote to the `events`
+    table at all (a separate pre-existing gap fixed as part of this, since
+    it made message-count enforcement impossible without it). See the
+    changelog ("Plan Usage-Limit Enforcement") for the query shape and the
+    7 simulation tests covering both dimensions.
 17. ~~No CRM/support back office~~ — **Phase C done, 2026-09-09.**
     `customer_notes`/`support_tickets`/`ticket_comments` tables, a
     `CrmRegistry`, `requireAdmin`-gated `/api/dashboard/customers*` and
@@ -449,9 +486,9 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     tab — see the changelog ("Developer CRM / Support Back Office").
     Admin auth is still the single shared-secret token
     (no per-admin identity, so ticket/note authorship is a free-text
-    field the person types in, not tied to an account). The admin
+    field the person types in, not tied to an account). ~~The admin
     console itself (Phase D) still has no router and remains 4 in-memory
-    tabs — see §2's Admin Console section.
+    tabs~~ — **closed 2026-09-15**, see §2's Admin Console section.
 18. ~~A single failed async route handler could crash the entire
     gateway~~ — **closed 2026-09-14.** Found live while running the app
     for a preview, not by static review: opening the admin console's
@@ -548,18 +585,17 @@ safety):
     remaining, none silently dropped:
     - ~~A real transactional email integration~~ — **closed 2026-09-14**,
       see §4 item 15.
-    - Plan usage-limit enforcement (§4 item 16) — limits are stored but
-      nothing in the gateway enforces them.
-    - Admin console routing (this item) — still 4 in-memory tabs via
-      `useState`, not URLs; no deep-linking or browser back/forward.
+    - ~~Plan usage-limit enforcement~~ — **closed 2026-09-15**, see §4
+      item 16.
+    - ~~Admin console routing~~ — **closed 2026-09-15**, see §2's Admin
+      Console section.
 11. ~~Real payment adapters~~ — **all six done: Stripe/NMI/Flutterwave
     closed 2026-09-14, PawaPay/PayChangu/Airwallex closed 2026-09-15**
     (§4 item 1), same WebSearch-verification method as the messaging
     adapters above. **Trembi investigated and found not to be a payment
     provider** (§4 item 1, adapter table above) — nothing left to build
-    here. The real remaining work is §4 item 1a (client-side card
-    tokenization) — without it the four card-based adapters have no real
-    caller that can ever populate `paymentToken`.
+    here. ~~The real remaining work is §4 item 1a (client-side card
+    tokenization)~~ — **closed 2026-09-15**, see §4 item 1a.
 12. Landing page (`apps/web`) visual redesign — done 2026-09-14 per user
     request (larger type/icon scale, real font loading, a responsive nav
     that previously broke at phone widths). Cosmetic, not a production-

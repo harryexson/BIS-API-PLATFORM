@@ -132,6 +132,15 @@ test.describe('Admin console — all tabs render with real data and no errors', 
     await loginAsAdmin(page);
 
     await page.getByRole('button', { name: 'Provider Management' }).click();
+    await page.waitForURL('**/providers');
+    // The route change and the React re-render it triggers are not
+    // synchronous with the click (unlike the old useState-based tabs) — for
+    // a brief window after the URL updates, the previous tab's DOM (which
+    // also renders "Stripe", in the topology graph and a <select> option)
+    // can still be attached, making an exact-text locator briefly resolve
+    // to multiple elements and fail strict mode instead of retrying. Give
+    // the render a moment to settle before asserting on it.
+    await page.waitForTimeout(150);
     await expect(page.getByText('Stripe', { exact: true })).toBeVisible();
     await expect(page.getByText('Infobip', { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Manage' }).first()).toBeVisible();
@@ -144,6 +153,7 @@ test.describe('Admin console — all tabs render with real data and no errors', 
     await loginAsAdmin(page);
 
     await page.getByRole('button', { name: 'Customers' }).click();
+    await page.waitForURL('**/customers');
     await expect(page.getByText('Reach Church')).toBeVisible();
     await expect(page.getByText('GROWTH')).toBeVisible();
 
@@ -160,6 +170,7 @@ test.describe('Admin console — all tabs render with real data and no errors', 
     await page.goto('/');
 
     await page.getByRole('button', { name: 'Customers' }).click();
+    await page.waitForURL('**/customers');
     await expect(page.getByText('Administrator login is required')).toBeVisible();
     expect(errors).toEqual([]);
   });
@@ -170,6 +181,7 @@ test.describe('Admin console — all tabs render with real data and no errors', 
     await loginAsAdmin(page);
 
     await page.getByRole('button', { name: 'Observability' }).click();
+    await page.waitForURL('**/observability');
     await expect(page.getByText('API Errors')).toBeVisible();
     await expect(page.getByText('132', { exact: true })).toBeVisible();
     await expect(page.getByText('stripe')).toBeVisible();
@@ -181,8 +193,16 @@ test.describe('Admin console — all tabs render with real data and no errors', 
     await mockBackend(page);
     await loginAsAdmin(page);
 
+    const tabRoutes: Record<string, string> = {
+      'Provider Management': '**/providers',
+      'Customers': '**/customers',
+      'Observability': '**/observability',
+      'Operations Dashboard': '**/',
+    };
+
     for (const label of ['Provider Management', 'Customers', 'Observability', 'Operations Dashboard']) {
       await page.getByRole('button', { name: label }).click();
+      await page.waitForURL(tabRoutes[label]);
       await page.waitForTimeout(150);
     }
     expect(errors).toEqual([]);
