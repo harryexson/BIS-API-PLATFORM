@@ -58,6 +58,10 @@ export class AfricasTalkingProvider extends BaseProvider {
     return this.secrets.username || process.env.AFRICASTALKING_USERNAME || '';
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.apiKey) && Boolean(this.username);
+  }
+
   private get baseUrl(): string {
     return this.config.environment === 'live' ? LIVE_BASE_URL : SANDBOX_BASE_URL;
   }

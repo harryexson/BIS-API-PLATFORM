@@ -34,6 +34,18 @@ describe('NMIProvider', () => {
     else process.env.NMI_GATEWAY_ID = originalGatewayId;
   });
 
+  describe('isConfigured()', () => {
+    it('depends only on the API key — gateway_id has a working default', () => {
+      delete process.env.NMI_API_KEY;
+      delete process.env.NMI_GATEWAY_ID;
+      const provider = new NMIProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.NMI_API_KEY = 'test-key';
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.NMI_API_KEY;

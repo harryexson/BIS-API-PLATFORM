@@ -183,17 +183,29 @@ There are **two** webhook directions:
 
 ### 9a. Inbound provider webhooks (platform receives)
 
-Providers call `POST /v1/webhooks/{provider}` (e.g. `/v1/webhooks/stripe`). These
-are authenticated by **provider signature**, not by your API key:
+Providers call `POST /v1/api/webhooks/{provider}` (e.g.
+`/v1/api/webhooks/stripe`). These are **not** authenticated by your API key,
+and — despite what an earlier version of this doc claimed — **not** by each
+provider's own native signature scheme either. Every inbound provider
+webhook, regardless of provider, is verified against one shared,
+platform-wide secret: an `x-webhook-signature` header holding an
+HMAC-SHA256 of the raw request body, keyed by this platform's own
+`WEBHOOK_HMAC_SECRET` (not Stripe's `Stripe-Signature`, not Flutterwave's
+`verif-hash`, etc.). This is a real, currently-open gap for going live with
+any provider that signs its own outbound webhooks with its own secret: this
+platform's inbound route does not verify Stripe's real `Stripe-Signature`
+header, Flutterwave's real `verif-hash`, PayChangu's real
+`X-PayChangu-Signature`, or PawaPay's real signed JWT — something upstream
+of this endpoint would need to re-sign the delivery with
+`WEBHOOK_HMAC_SECRET` before it reaches this platform, or this route needs
+per-provider native verification added (not yet built). See
+`docs/providers/ADDING_A_PROVIDER.md` for detail.
 
-- **Stripe** — `Stripe-Signature` HMAC header.
-- **Flutterwave** — `verif-hash` header equality.
-- **PayChangu** — `X-PayChangu-Signature` (`sha256=...`) HMAC.
-- **PawaPay** — `Authorization: Bearer <JWT>` signed with their key.
-
-The raw body is verified **before** parsing, and each event is deduplicated by
-`(provider, provider_event_id)` so duplicates are safe. You do not call this
-endpoint yourself.
+The raw body is verified **before** parsing. Deliveries are deduplicated
+in-memory at the gateway by the payload's own `id` field (a 5-minute
+window) and, independently, by the worker that processes the enqueued job
+(a durable, longer-lived idempotency key). You do not call this endpoint
+yourself.
 
 ### 9b. Outbound platform webhooks (you receive)
 

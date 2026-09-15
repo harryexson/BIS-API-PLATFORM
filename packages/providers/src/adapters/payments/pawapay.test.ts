@@ -25,6 +25,21 @@ describe('PawaPayProvider', () => {
     else process.env.PAWAPAY_API_KEY = originalApiKey;
   });
 
+  describe('isConfigured()', () => {
+    it('is false with no credentials, true once set via env or setSecrets()', () => {
+      delete process.env.PAWAPAY_API_KEY;
+      const provider = new PawaPayProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.PAWAPAY_API_KEY = 'test-key';
+      expect(provider.isConfigured()).toBe(true);
+
+      delete process.env.PAWAPAY_API_KEY;
+      provider.setSecrets({ api_key: 'from_admin' });
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.PAWAPAY_API_KEY;

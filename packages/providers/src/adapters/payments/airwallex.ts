@@ -56,6 +56,10 @@ export class AirwallexProvider extends BaseProvider {
     return this.secrets.api_key || process.env.AIRWALLEX_API_KEY || '';
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.clientId) && Boolean(this.apiKey);
+  }
+
   // Reuses a cached token until ~1 minute before it expires, per
   // Airwallex's own guidance against calling /login on every request.
   private async getAccessToken(): Promise<string> {

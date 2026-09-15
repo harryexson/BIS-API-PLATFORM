@@ -32,6 +32,21 @@ describe('SinchProvider', () => {
     else process.env.SINCH_REGION = originalRegion;
   });
 
+  describe('isConfigured()', () => {
+    it('requires both api_token and service_plan_id', () => {
+      delete process.env.SINCH_API_TOKEN;
+      delete process.env.SINCH_SERVICE_PLAN_ID;
+      const provider = new SinchProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.SINCH_API_TOKEN = 'token_123';
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.SINCH_SERVICE_PLAN_ID = 'plan_123';
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without credentials configured (simulated fallback)', () => {
     beforeEach(() => {
       delete process.env.SINCH_API_TOKEN;

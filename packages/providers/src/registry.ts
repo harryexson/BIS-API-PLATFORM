@@ -71,6 +71,29 @@ export class ProviderRegistry {
 
   private constructor() {
     this.initializeProviders();
+    this.warnUnconfiguredLiveProviders();
+  }
+
+  // P0: There was previously zero registration-time validation of any
+  // kind — a 'live'-environment provider with a missing/wrong credential
+  // silently fell back to simulated processing on every real request, with
+  // no signal anywhere except the admin console's Provider Management tab
+  // (which an operator has to think to check). This doesn't block startup
+  // (a genuinely broken provider shouldn't take the whole gateway down —
+  // other providers still need to serve traffic), but it does put the gap
+  // in the startup logs where an operator deploying a new provider will
+  // actually see it.
+  private warnUnconfiguredLiveProviders(): void {
+    for (const [id, provider] of this.providers) {
+      const state = this.management.get(id);
+      if (state?.environment === 'live' && !provider.isConfigured()) {
+        console.warn(
+          `[providers] '${id}' is registered as environment: 'live' but has no real credentials configured — ` +
+          `every request will silently fall back to simulated processing until an admin adds its secret(s) ` +
+          `(POST /api/dashboard/providers/${id}/secrets) or the matching env var(s) are set.`,
+        );
+      }
+    }
   }
 
   public static getInstance(): ProviderRegistry {
@@ -303,7 +326,14 @@ export class ProviderRegistry {
   }) {
     this.providers.set(provider.config.id, provider);
     const id = provider.config.id;
-    const generated = 'sk_' + randomUUID().replace(/-/g, '').slice(0, 32);
+    // No secrets at registration time — real credentials come from the
+    // adapter's own process.env fallback (documented in .env.example) until
+    // an admin adds one via addSecret(), which syncs into the adapter's
+    // real BaseProvider.setSecrets(). This used to seed a fake random
+    // 'sk_...' secret here that nothing ever consumed — purely decorative,
+    // and actively dangerous once addSecret()/setSecrets() were wired for
+    // real: it would have shadowed every adapter's process.env fallback
+    // with garbage the moment secrets syncing went live.
     this.management.set(id, {
       environment: managementDefaults.environment,
       countries: managementDefaults.countries,
@@ -317,16 +347,25 @@ export class ProviderRegistry {
       circuitState: 'closed',
       consecutiveFailures: 0,
       circuitOpenedAt: null,
-      secrets: [{
-        meta: {
-          id: `${id}_api_key`,
-          label: 'API Key',
-          masked: this.maskSecret(generated),
-          lastUpdated: new Date().toISOString()
-        },
-        value: generated
-      }]
+      secrets: [],
     });
+  }
+
+  // Rebuilds the { field: value } map the adapter's real HTTP calls read
+  // (this.secrets.<field> — see BaseProvider.setSecrets()) from whatever
+  // secrets are currently stored for this provider, and pushes it into the
+  // live provider instance. Called after every add/delete so the adapter's
+  // next request sees the change immediately — no restart required.
+  private syncSecrets(id: string): void {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return;
+
+    const record: Record<string, string> = {};
+    for (const s of state.secrets) {
+      record[s.meta.field] = s.value;
+    }
+    provider.setSecrets(record);
   }
 
   public getProvider(id: string): BaseProvider | undefined {
@@ -471,7 +510,8 @@ export class ProviderRegistry {
       errorRate: state.errorRate,
       routingRules: state.routingRules,
       circuitState: state.circuitState,
-      consecutiveFailures: state.consecutiveFailures
+      consecutiveFailures: state.consecutiveFailures,
+      configured: provider.isConfigured(),
     };
   }
 
@@ -553,18 +593,27 @@ export class ProviderRegistry {
 
   public addSecret(
     id: string,
-    input: { label: string; value: string }
+    input: { field: string; label: string; value: string }
   ): ProviderSecretMeta | null {
     const state = this.management.get(id);
     if (!state) return null;
 
+    // Upsert by field: setting the same field again (e.g. rotating an API
+    // key) replaces the previous entry rather than leaving a stale
+    // duplicate that syncSecrets() would silently shadow anyway (a
+    // Record<field,value> can only hold one value per field — the last one
+    // written wins, so an unreplaced duplicate would be confusing dead
+    // weight in the admin console's secrets list for no reason).
     const meta: ProviderSecretMeta = {
       id: 'sec_' + randomUUID().replace(/-/g, '').slice(0, 12),
+      field: input.field,
       label: input.label,
       masked: this.maskSecret(input.value),
       lastUpdated: new Date().toISOString()
     };
+    state.secrets = state.secrets.filter(s => s.meta.field !== input.field);
     state.secrets.push({ meta, value: input.value });
+    this.syncSecrets(id);
     return meta;
   }
 
@@ -573,7 +622,9 @@ export class ProviderRegistry {
     if (!state) return false;
     const before = state.secrets.length;
     state.secrets = state.secrets.filter(s => s.meta.id !== secretId);
-    return state.secrets.length < before;
+    const removed = state.secrets.length < before;
+    if (removed) this.syncSecrets(id);
+    return removed;
   }
 
   // ----------------------------------------------------

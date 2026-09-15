@@ -71,7 +71,7 @@ describe('ProviderRegistry management surface', () => {
   });
 
   it('adds, lists and deletes a secret (metadata only)', () => {
-    const meta = registry.addSecret('stripe', { label: 'Live Key', value: 'sk_live_abcdef123456' });
+    const meta = registry.addSecret('stripe', { field: 'api_key', label: 'Live Key', value: 'sk_live_abcdef123456' });
     expect(meta).not.toBeNull();
     expect(meta!.label).toBe('Live Key');
     expect(meta!.masked).not.toContain('abcdef123456');
@@ -145,7 +145,7 @@ describe('Provider Addition Dry Run (Phase 16)', () => {
   });
 
   it('new providers support secrets management', () => {
-    const meta = registry.addSecret('example-pay', { label: 'API Key', value: 'ex_test_key_12345' });
+    const meta = registry.addSecret('example-pay', { field: 'api_key', label: 'API Key', value: 'ex_test_key_12345' });
     expect(meta).not.toBeNull();
     expect(meta!.masked).toContain('••••');
 

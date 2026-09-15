@@ -55,6 +55,12 @@ export class NMIProvider extends BaseProvider {
     return raw.replace(/^https?:\/\//, '').replace(/\/+$/, '') || 'secure.nmi.com';
   }
 
+  public isConfigured(): boolean {
+    // gateway_id/hostname has a working default ('secure.nmi.com') — only
+    // the API key is actually required.
+    return Boolean(this.apiKey);
+  }
+
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 

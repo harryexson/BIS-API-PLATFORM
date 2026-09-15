@@ -43,6 +43,42 @@ const HEALTH_COLOR: Record<ProviderHealthStatus, string> = {
   unknown: 'var(--text-muted)',
 };
 
+// The named secret fields each real adapter's HTTP calls actually read
+// (this.secrets.<field> in packages/providers/src/adapters/**) — lets the
+// Add Secret form guide an admin to the right field name instead of a blind
+// free-text box. Providers not listed here are simulation-only and don't
+// need real credentials (their isConfigured() always returns true).
+const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]> = {
+  stripe: [{ field: 'api_key', label: 'Secret Key' }],
+  nmi: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'gateway_id', label: 'Gateway Hostname (optional, defaults to secure.nmi.com)' },
+  ],
+  flutterwave: [{ field: 'api_key', label: 'Secret Key' }],
+  pawapay: [{ field: 'api_key', label: 'API Key' }],
+  paychangu: [{ field: 'api_key', label: 'API Key' }],
+  airwallex: [
+    { field: 'client_id', label: 'Client ID' },
+    { field: 'api_key', label: 'API Key' },
+  ],
+  infobip: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'base_url', label: 'Base URL (e.g. xxxx.api.infobip.com)' },
+  ],
+  africastalking: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'username', label: 'Username' },
+  ],
+  sinch: [
+    { field: 'api_key', label: 'API Token' },
+    { field: 'service_plan_id', label: 'Service Plan ID' },
+  ],
+  vibes: [
+    { field: 'username', label: 'Username' },
+    { field: 'password', label: 'Password' },
+  ],
+};
+
 function parseList(value: string): string[] {
   return value
     .split(',')
@@ -199,25 +235,29 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
   };
 
   // ---- Secret handlers ----
+  const [newSecretField, setNewSecretField] = useState('');
   const [newSecretLabel, setNewSecretLabel] = useState('');
   const [newSecretValue, setNewSecretValue] = useState('');
 
   const addSecret = async (providerId: string) => {
-    if (!newSecretLabel || !newSecretValue) {
-      setError('Secret label and value are required');
+    if (!newSecretField || !newSecretLabel || !newSecretValue) {
+      setError('Field, label, and value are all required');
       return;
     }
     setBusyId(providerId);
     setError(null);
     try {
       await mutate(`/api/dashboard/providers/${providerId}/secrets`, 'POST', {
+        field: newSecretField,
         label: newSecretLabel,
         value: newSecretValue,
       });
+      setNewSecretField('');
       setNewSecretLabel('');
       setNewSecretValue('');
       const data = await mutate(`/api/dashboard/providers/${providerId}/secrets`, 'GET');
       setSecrets(data);
+      await onRefresh();
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -260,6 +300,8 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
         onDeleteRule={(rule) => deleteRule(selected.id, rule.id)}
         onAddSecret={() => addSecret(selected.id)}
         onDeleteSecret={(secretId) => deleteSecret(selected.id, secretId)}
+        newSecretField={newSecretField}
+        setNewSecretField={setNewSecretField}
         newSecretLabel={newSecretLabel}
         setNewSecretLabel={setNewSecretLabel}
         newSecretValue={newSecretValue}
@@ -315,6 +357,7 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
               <Th>Currencies</Th>
               <Th>Capabilities</Th>
               <Th>Priority</Th>
+              <Th>Configured</Th>
               <Th>Health</Th>
               <Th>Last Success</Th>
               <Th>Err Rate</Th>
@@ -335,6 +378,7 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
                 <Td>{chips(p.currencies, 'var(--accent-yellow)')}</Td>
                 <Td>{chips(p.capabilities, 'var(--accent-purple)')}</Td>
                 <Td><span style={{ fontWeight: '700' }}>{p.priority}</span></Td>
+                <Td><ConfiguredBadge configured={p.configured} providerId={p.id} /></Td>
                 <Td>
                   <span style={{ color: HEALTH_COLOR[p.health || 'unknown'], fontWeight: '600', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                     <HeartPulse className="w-3.5 h-3.5" />
@@ -384,6 +428,8 @@ interface DetailProps {
   onDeleteRule: (rule: RoutingRule) => void;
   onAddSecret: () => void;
   onDeleteSecret: (secretId: string) => void;
+  newSecretField: string;
+  setNewSecretField: (v: string) => void;
   newSecretLabel: string;
   setNewSecretLabel: (v: string) => void;
   newSecretValue: string;
@@ -408,11 +454,15 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
     onDeleteRule,
     onAddSecret,
     onDeleteSecret,
+    newSecretField,
+    setNewSecretField,
     newSecretLabel,
     setNewSecretLabel,
     newSecretValue,
     setNewSecretValue,
   } = props;
+
+  const knownFields = PROVIDER_SECRET_FIELDS[provider.id];
 
   const [localCountries, setLocalCountries] = useState(provider.countries.join(', '));
   const [localCurrencies, setLocalCurrencies] = useState(provider.currencies.join(', '));
@@ -517,6 +567,11 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
           <StatusBadge status={provider.status} />
         </Field>
 
+        {/* Configured */}
+        <Field label="Credentials" icon={<KeyRound className="w-4 h-4" />}>
+          <ConfiguredBadge configured={provider.configured} providerId={provider.id} />
+        </Field>
+
         {/* Error rate */}
         <Field label="Error Rate" icon={<AlertTriangle className="w-4 h-4" />}>
           <span style={{ color: (provider.errorRate || 0) >= 20 ? 'var(--accent-red)' : 'var(--accent-green)', fontWeight: 700 }}>
@@ -614,6 +669,32 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
 
           {isAdmin && (
             <div style={{ display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' }}>
+              {knownFields ? (
+                <select
+                  value={newSecretField}
+                  disabled={disabled}
+                  onChange={(e) => {
+                    const field = e.target.value;
+                    setNewSecretField(field);
+                    const known = knownFields.find((f) => f.field === field);
+                    if (known && !newSecretLabel) setNewSecretLabel(known.label);
+                  }}
+                  style={selectStyle}
+                >
+                  <option value="">Field…</option>
+                  {knownFields.map((f) => (
+                    <option key={f.field} value={f.field}>{f.field} — {f.label}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  placeholder="Field (e.g. api_key)"
+                  value={newSecretField}
+                  disabled={disabled}
+                  onChange={(e) => setNewSecretField(e.target.value)}
+                  style={inputStyle}
+                />
+              )}
               <input
                 placeholder="Label (e.g. Live API Key)"
                 value={newSecretLabel}
@@ -635,7 +716,8 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
             </div>
           )}
           <div style={{ fontSize: '10px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-            <Shield className="w-3 h-3" /> Secret values are masked and never exposed to the client.
+            <Shield className="w-3 h-3" /> Secret values are masked and never exposed to the client. Adding or replacing
+            a field here takes effect immediately — the adapter reads it on its very next request, no restart required.
           </div>
         </div>
       </Section>
@@ -691,6 +773,27 @@ function EnvBadge({ environment }: { environment: ProviderEnvironment }) {
 function StatusBadge({ status }: { status: string }) {
   const color = status === 'online' ? 'var(--accent-green)' : status === 'offline' ? 'var(--accent-red)' : 'var(--accent-yellow)';
   return <span style={{ fontSize: '11px', color, fontWeight: 700, textTransform: 'capitalize' }}>{status}</span>;
+}
+
+// Whether the adapter has real credentials to make a live API call with —
+// distinct from Health, which only reflects past traffic (and a provider
+// that's never been called stays "unknown" forever). A simulation-only
+// provider (no real HTTP integration — configured is always true for those)
+// shows nothing here rather than a misleading "Configured" badge.
+function ConfiguredBadge({ configured, providerId }: { configured?: boolean; providerId: string }) {
+  const hasRealIntegration = providerId in PROVIDER_SECRET_FIELDS;
+  if (!hasRealIntegration) {
+    return <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>— (simulated)</span>;
+  }
+  return configured ? (
+    <span style={{ fontSize: '11px', color: 'var(--accent-green)', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+      <CheckCircle2 className="w-3.5 h-3.5" /> Configured
+    </span>
+  ) : (
+    <span style={{ fontSize: '11px', color: 'var(--accent-red)', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="No real credentials — every request falls back to simulated processing">
+      <XCircle className="w-3.5 h-3.5" /> Not Configured
+    </span>
+  );
 }
 
 function Field({ label, icon, children }: { label: string; icon: React.ReactNode; children: React.ReactNode }) {

@@ -28,6 +28,14 @@ export interface RoutingRule {
 // Secret metadata only. The plaintext secret value is NEVER exposed to clients.
 export interface ProviderSecretMeta {
   id: string;
+  // The named field on BaseProvider.secrets this value populates (e.g.
+  // 'api_key', 'client_id', 'username', 'password', 'gateway_id',
+  // 'service_plan_id', 'base_url') — this is what actually makes a secret
+  // entered through the admin console reach the adapter's real HTTP calls
+  // (via ProviderRegistry syncing it into BaseProvider.setSecrets()), not
+  // just display metadata. Each adapter's own `this.secrets.<field>` reads
+  // document which field names it expects.
+  field: string;
   label: string; // e.g. "Live API Key"
   masked: string; // masked representation, e.g. "sk_live_••••••••••1234"
   lastUpdated?: string; // ISO timestamp
@@ -87,6 +95,13 @@ export interface ProviderManagement extends ProviderConfig {
   routingRules: RoutingRule[];
   circuitState: ProviderCircuitState;
   consecutiveFailures: number;
+  // Whether this adapter currently has real credentials to make a live API
+  // call with (BaseProvider.isConfigured()) — distinct from `health`, which
+  // is a rolling reflection of past traffic outcomes and stays "unknown"
+  // forever for a provider that has never been called. A 'live'-environment
+  // provider with configured: false will silently fall back to simulated
+  // processing on every real request until this is fixed.
+  configured: boolean;
 }
 
 export interface HealthCheckSummary {

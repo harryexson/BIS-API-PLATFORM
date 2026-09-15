@@ -29,6 +29,21 @@ describe('VibesProvider', () => {
     else process.env.VIBES_PASSWORD = originalPassword;
   });
 
+  describe('isConfigured()', () => {
+    it('requires both username and password', () => {
+      delete process.env.VIBES_USERNAME;
+      delete process.env.VIBES_PASSWORD;
+      const provider = new VibesProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.VIBES_USERNAME = 'user_123';
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.VIBES_PASSWORD = 'pass_123';
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without credentials configured (simulated fallback)', () => {
     beforeEach(() => {
       delete process.env.VIBES_USERNAME;

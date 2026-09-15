@@ -40,6 +40,21 @@ describe('AirwallexProvider', () => {
     else process.env.AIRWALLEX_API_KEY = originalApiKey;
   });
 
+  describe('isConfigured()', () => {
+    it('requires both client_id and api_key', () => {
+      delete process.env.AIRWALLEX_CLIENT_ID;
+      delete process.env.AIRWALLEX_API_KEY;
+      const provider = new AirwallexProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.AIRWALLEX_CLIENT_ID = 'client_123';
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.AIRWALLEX_API_KEY = 'key_123';
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without credentials configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.AIRWALLEX_CLIENT_ID;

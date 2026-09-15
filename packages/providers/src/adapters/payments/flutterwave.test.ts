@@ -24,6 +24,21 @@ describe('FlutterwaveProvider', () => {
     else process.env.FLUTTERWAVE_SECRET_KEY = originalApiKey;
   });
 
+  describe('isConfigured()', () => {
+    it('is false with no credentials, true once set via env or setSecrets()', () => {
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      const provider = new FlutterwaveProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      expect(provider.isConfigured()).toBe(true);
+
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      provider.setSecrets({ api_key: 'FLWSECK_from_admin' });
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.FLUTTERWAVE_SECRET_KEY;

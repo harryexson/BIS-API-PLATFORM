@@ -196,6 +196,19 @@ export abstract class BaseProvider {
     return this.simulateLatency();
   }
 
+  // Whether this adapter currently has the real credentials it needs to
+  // make a live API call — i.e. the same condition each adapter's
+  // processRequest() already checks before falling back to simulated
+  // processing (see each adapter's own `if (!this.apiKey ...)` guard).
+  // Default true: simulation-only adapters (no real HTTP integration,
+  // e.g. SignalHouse/FutureSMS/Email/the example adapters) never need real
+  // credentials, so there's nothing to be "unconfigured" about. Adapters
+  // with a real HTTP integration override this with their own credential
+  // check — see registry.ts's getManagementView() for where this surfaces.
+  public isConfigured(): boolean {
+    return true;
+  }
+
   // Checks status, throwing error if not online
   protected verifyAvailability() {
     if (this.config.status === 'offline') {

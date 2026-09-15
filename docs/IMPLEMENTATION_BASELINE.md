@@ -85,9 +85,20 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 
 ### Provider Registry & Routing (`packages/providers`, `packages/routing`)
 - `ProviderRegistry` holds messaging + payment provider definitions
-  (capabilities, countries, environments, health status); DB-backed via
+  (capabilities, countries, environments, health status) — **as an
+  in-memory singleton, not DB-backed.** ~~DB-backed via
   `packages/database/src/repositories/providers.ts` and
-  `provider-configs.ts` (encrypted secrets, AES-256-GCM).
+  `provider-configs.ts` (encrypted secrets, AES-256-GCM)~~ — this earlier
+  claim was inaccurate: `providerConfigRepository` is exported from
+  `packages/database` but never imported anywhere (confirmed by a
+  full-repo search, 2026-09-15) — no encryption, no persistence, dead
+  code. `providerRepository`/`providerHealthRepository` *are* used, but
+  only by the worker's `provider_health` job to record a durable
+  health-check history against a DB row keyed by provider slug — not for
+  config or secrets. All provider config, management state, and secrets
+  live only in `ProviderRegistry`'s in-memory `Map`s and are lost on
+  gateway restart — see §4 item 19 for the secrets-pipeline fix this
+  informed, and its noted remaining persistence gap.
 - `RoutingEngine` does capability-aware selection (channel, country,
   provider health, priority) with failover across a provider list.
 - Conversation resolver + keyword engine (`keywords.ts`) implement
@@ -101,7 +112,7 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | Africa's Talking | `messaging/africastalking.ts` | **Real HTTP** (2026-09-08) — falls back to simulated when credentials unset |
 | Sinch | `messaging/sinch.ts` | **Real HTTP** (2026-09-09) — falls back to simulated when credentials unset |
 | Vibes | `messaging/vibes.ts` | **Real HTTP** (2026-09-09) — **lower confidence**: submit path and response schema inferred, not directly observed; see the adapter's class comment. Falls back to simulated when credentials unset |
-| Generic SMS | `messaging/sms.ts` | **Simulated** |
+| ~~Generic SMS~~ | ~~`messaging/sms.ts`~~ | **Removed 2026-09-15** — dead code: never imported by `registry.ts` or exported from the package's `index.ts`, so it was permanently unreachable; its `.env.example` gap the earlier audit found was this file's, and it's gone with it |
 | Email | `messaging/email.ts` | **Simulated** |
 | FutureSMS | `messaging/futuresms.ts` | **Simulated**, explicitly a placeholder/example provider |
 | Example (messaging) | `messaging/example.ts` | **Simulated**, reference implementation only |
@@ -534,6 +545,76 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     wrapper and applied it to exactly those 12. Verified live: the same
     request that previously killed the gateway now returns a normal 500
     and every other route keeps serving right after.
+19. ~~**Provider secrets configured through the admin console had zero
+    real effect**~~ — **closed 2026-09-15.** Found while auditing what
+    "ready to add providers" actually requires operationally, not just at
+    the code level: `BaseProvider.setSecrets()` — what actually populates
+    the `this.secrets.<field>` every real adapter's HTTP calls read — was
+    never called anywhere outside test files. The admin console's Add/
+    Delete Secret UI and `POST /api/dashboard/providers/:id/secrets`
+    wrote to `ProviderRegistry`'s own `ManagementState.secrets` array,
+    which nothing downstream ever consumed — entering a real API key
+    through the console did *nothing*; every adapter still only ever read
+    its hardcoded `process.env.<PROVIDER>_API_KEY`. Compounding it:
+    `register()` auto-generated a fake random `sk_...` "secret" for every
+    provider at startup that nothing used either — purely decorative, and
+    would have actively broken every adapter's env-var fallback the
+    moment secrets syncing went live, by shadowing it with garbage.
+    Fixed:
+    - `ProviderSecretMeta` gained a `field` property (`packages/schemas`)
+      naming which `this.secrets.<field>` key a value populates.
+    - `ProviderRegistry.addSecret()`/`deleteSecret()` now rebuild a
+      `{field: value}` record from whatever's stored and call the live
+      provider instance's real `setSecrets()` — takes effect on the
+      adapter's very next request, no restart.
+    - The fake auto-generated secret is gone; a provider starts with no
+      secrets and relies on its env-var fallback until an admin adds one.
+    - `BaseProvider.isConfigured()` (default `true`, i.e. harmless for
+      simulation-only adapters) was added and overridden on all 10 real
+      HTTP adapters, reusing each one's own existing credential-presence
+      check (the same condition it already used to decide
+      simulated-vs-real) — no new judgment calls invented. Exposed as
+      `ProviderManagement.configured` and shown as a "Configured"/"Not
+      Configured" badge in the admin console (list + detail view), plus a
+      startup `console.warn` for any `'live'`-environment provider that's
+      unconfigured — replacing total silence (a broken provider previously
+      gave no signal anywhere until its first real request quietly fell
+      back to simulated) with a signal in two places an operator would
+      actually see it.
+    - The admin console's Add Secret form gained a `field` selector,
+      populated per-provider from a `PROVIDER_SECRET_FIELDS` map (falls
+      back to free text for providers not in the map) so an admin is
+      guided to the exact field name an adapter expects instead of
+      guessing.
+    - `docs/adr/ADR-005-provider-adapters.md`'s "Adding a New Provider"
+      section was stale on several points beyond secrets entirely
+      (`packages/config` doesn't exist, wrong file paths, a test-folder
+      convention this repo doesn't use) — amended in place, with the
+      authoritative current process moved to the new
+      `docs/providers/ADDING_A_PROVIDER.md`. `docs/DEVELOPER_GUIDE.md`
+      separately claimed inbound provider webhooks are authenticated by
+      each provider's own native signature (Stripe's `Stripe-Signature`,
+      etc.) — also false: every provider's inbound webhook is verified
+      against one shared, platform-wide `WEBHOOK_HMAC_SECRET` HMAC, not
+      any provider's real scheme. Corrected, and flagged as a real, open
+      gap for going live with a provider that signs its own webhooks.
+    - `messaging/sms.ts` (dead code — unregistered, unexported, the
+      source of a `.env.example` gap an earlier audit flagged) was
+      deleted rather than fixed; it added nothing the registered
+      `example.ts` template doesn't already cover.
+    - **Real, remaining gap, noted rather than silently left**: secrets
+      (and all provider management state) still live only in
+      `ProviderRegistry`'s in-memory `Map`s — see this doc's corrected
+      "Provider Registry & Routing" note above. A secret added through
+      the admin console does not survive a gateway restart; only the
+      env-var fallback does. Wiring real persistence (the DB-backed,
+      AES-256-GCM-encrypted design an earlier version of this document
+      incorrectly claimed already existed) is unbuilt and out of scope
+      for this pass.
+    10 new `isConfigured()` unit tests (one per real adapter) plus a new
+    Playwright regression test
+    (`apps/admin-console/tests/provider-secrets.spec.ts`) cover this —
+    see the changelog.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 

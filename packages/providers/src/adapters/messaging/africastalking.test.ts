@@ -29,6 +29,21 @@ describe('AfricasTalkingProvider', () => {
     else process.env.AFRICASTALKING_USERNAME = originalUsername;
   });
 
+  describe('isConfigured()', () => {
+    it('requires both api_key and username', () => {
+      delete process.env.AFRICASTALKING_API_KEY;
+      delete process.env.AFRICASTALKING_USERNAME;
+      const provider = new AfricasTalkingProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.AFRICASTALKING_API_KEY = 'key_123';
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.AFRICASTALKING_USERNAME = 'sandbox';
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without credentials configured (simulated fallback)', () => {
     beforeEach(() => {
       delete process.env.AFRICASTALKING_API_KEY;

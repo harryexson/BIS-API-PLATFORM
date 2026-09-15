@@ -51,6 +51,10 @@ export class PawaPayProvider extends BaseProvider {
     return this.secrets.api_key || process.env.PAWAPAY_API_KEY || '';
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.apiKey);
+  }
+
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 

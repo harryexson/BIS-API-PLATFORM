@@ -25,21 +25,35 @@ describe('ProviderRegistry management surface', () => {
     }
   });
 
-  it('seeds a masked secret per provider and never exposes the plaintext', () => {
+  it('has no secrets until an admin adds one, and never exposes plaintext once added', () => {
+    // No more fake auto-generated secret at registration — see registry.ts's
+    // register(): a random 'sk_...' value nothing ever consumed was purely
+    // decorative, and would have shadowed the adapter's real process.env
+    // fallback with garbage once addSecret()/setSecrets() were wired live.
+    expect(registry.getSecrets('stripe')).toEqual([]);
+
+    const meta = registry.addSecret('stripe', { field: 'api_key', label: 'Test Key', value: 'super-secret-value' });
+    expect(meta).not.toBeNull();
+    expect(meta!.masked).toContain('•');
+    expect((meta as any).value).toBeUndefined();
+
     const secrets = registry.getSecrets('stripe');
-    expect(secrets).not.toBeNull();
-    expect(secrets!.length).toBeGreaterThan(0);
+    expect(secrets!.length).toBe(1);
     for (const s of secrets!) {
       expect(s).not.toHaveProperty('value');
       expect(s.masked).toContain('•');
     }
+
+    expect(registry.deleteSecret('stripe', meta!.id)).toBe(true);
   });
 
-  it('addSecret returns only masked metadata', () => {
-    const meta = registry.addSecret('stripe', { label: 'Test Key', value: 'super-secret-value' });
-    expect(meta).not.toBeNull();
-    expect(meta!.masked).toContain('•');
-    expect((meta as any).value).toBeUndefined();
+  it('addSecret syncs the real value into the adapter so it actually gets used', () => {
+    const provider = registry.getProvider('stripe')! as any;
+    const meta = registry.addSecret('stripe', { field: 'api_key', label: 'Live Key', value: 'sk_live_real_value' });
+    expect(provider.secrets.api_key).toBe('sk_live_real_value');
+
+    registry.deleteSecret('stripe', meta!.id);
+    expect(provider.secrets.api_key).toBeUndefined();
   });
 
   it('syncs priority changes to the underlying routing weight', () => {

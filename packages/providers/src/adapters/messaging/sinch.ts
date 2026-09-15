@@ -52,6 +52,10 @@ export class SinchProvider extends BaseProvider {
     return this.secrets.service_plan_id || process.env.SINCH_SERVICE_PLAN_ID || '';
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.apiToken) && Boolean(this.servicePlanId);
+  }
+
   private get region(): string {
     return process.env.SINCH_REGION || 'us';
   }

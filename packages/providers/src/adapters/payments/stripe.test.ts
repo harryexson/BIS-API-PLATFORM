@@ -26,6 +26,22 @@ describe('StripeProvider', () => {
     else process.env.STRIPE_SECRET_KEY = originalApiKey;
   });
 
+  describe('isConfigured()', () => {
+    it('is false with no credentials, true once set via env or setSecrets()', () => {
+      delete process.env.STRIPE_SECRET_KEY;
+      const provider = new StripeProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      expect(provider.isConfigured()).toBe(true);
+
+      delete process.env.STRIPE_SECRET_KEY;
+      expect(provider.isConfigured()).toBe(false);
+      provider.setSecrets({ api_key: 'sk_live_from_admin_console' });
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.STRIPE_SECRET_KEY;

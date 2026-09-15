@@ -16,6 +16,10 @@ export interface RoutingRule {
 
 export interface ProviderSecretMeta {
   id: string;
+  // The named field on the adapter's secrets this value populates (e.g.
+  // 'api_key', 'client_id', 'username'). Required — this is what makes a
+  // secret actually reach the adapter's real HTTP calls.
+  field: string;
   label: string;
   masked: string;
   lastUpdated?: string;
@@ -53,6 +57,10 @@ export interface ProviderManagement extends ProviderConfig {
   lastSuccessfulRequest: string | null;
   errorRate: number;
   routingRules: RoutingRule[];
+  // Whether the adapter currently has real credentials configured — distinct
+  // from `health`, which reflects past traffic and stays "unknown" until
+  // the provider has actually been called.
+  configured: boolean;
 }
 
 export interface HealthCheckSummary {

@@ -65,6 +65,10 @@ export class VibesProvider extends BaseProvider {
     return this.secrets.password || process.env.VIBES_PASSWORD || '';
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.username) && Boolean(this.password);
+  }
+
   private buildRequestXml(submitterMessageId: string, recipient: string, from: string, content: string): string {
     const escape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     return (

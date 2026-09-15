@@ -67,6 +67,10 @@ export class InfobipProvider extends BaseProvider {
     return raw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.apiKey) && Boolean(this.baseUrl);
+  }
+
   async processRequest(appId: string, payload: MessageRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 

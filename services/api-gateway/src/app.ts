@@ -1641,11 +1641,11 @@ app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res
 });
 
 app.post('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
-  const { label, value } = req.body || {};
-  if (!label || !value) {
-    return res.status(400).json({ error: 'Missing parameters: label and value are required' });
+  const { field, label, value } = req.body || {};
+  if (!field || !label || !value) {
+    return res.status(400).json({ error: 'Missing parameters: field, label, and value are required' });
   }
-  const meta = registry.addSecret(req.params.id, { label, value });
+  const meta = registry.addSecret(req.params.id, { field, label, value });
   if (!meta) {
     return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
   }

@@ -6,6 +6,119 @@ tests cover it.
 
 ---
 
+## 2026-09-15 — Provider Onboarding Readiness: Real Secrets Pipeline, isConfigured(), Docs
+
+**Context:** the user asked to "continue building and complete all the
+components and elements so that the platform is ready to add providers" —
+an audit of what that actually requires (beyond "write an adapter class,"
+which already worked) turned up a load-bearing gap: admin-console-managed
+secrets never reached the adapters at all.
+
+### The core finding
+`BaseProvider.setSecrets()` — what populates `this.secrets.<field>`, which
+every real adapter's HTTP calls read before falling back to their raw
+`process.env.*` var — was never called anywhere outside test files. The
+admin console's Secrets UI and `POST /api/dashboard/providers/:id/secrets`
+wrote to `ProviderRegistry`'s own `ManagementState.secrets`, which nothing
+downstream consumed. Entering a real API key through the console did
+nothing. `ProviderRegistry.register()` additionally auto-generated a fake
+random `sk_...` secret for every provider at startup that nothing used
+either — purely decorative today, but would have actively broken every
+adapter's env-var fallback (shadowing it with garbage) the moment secrets
+syncing went live, so it had to go, not just be left alone.
+
+### Fix
+- `ProviderSecretMeta` (`packages/schemas`) gained a required `field`
+  property naming which `this.secrets.<field>` a value populates.
+- `ProviderRegistry.addSecret()`/`deleteSecret()` now rebuild a
+  `{field: value}` record from whatever's currently stored and call the
+  live provider instance's real `setSecrets()` — the adapter's very next
+  request sees the change, no restart. `addSecret()` upserts by field
+  (replacing, not duplicating, on key rotation).
+- The fake auto-generated secret at registration is gone.
+- `BaseProvider.isConfigured()` (new; default `true`) was overridden on
+  all 10 real-HTTP-integration adapters (stripe, nmi, flutterwave,
+  pawapay, paychangu, airwallex, infobip, africastalking, sinch, vibes),
+  each reusing its own already-existing credential-presence check — the
+  same condition each adapter already used to decide simulated-vs-real,
+  not a new judgment call. Exposed via `ProviderManagement.configured` and
+  a "Configured"/"Not Configured" badge in the admin console (provider
+  list + detail drawer). A `'live'`-environment provider that's
+  unconfigured now also gets a `console.warn` at registry startup.
+- Admin console's Add Secret form gained a `field` selector — a dropdown
+  of known field names per provider (`PROVIDER_SECRET_FIELDS` in
+  `ProviderManagement.tsx`, e.g. Airwallex needs `client_id` **and**
+  `api_key`), falling back to free text for a provider not in the map —
+  auto-fills the label when a known field is picked.
+
+### Docs corrected, not just added
+- `docs/adr/ADR-005-provider-adapters.md`'s "Adding a New Provider"
+  section referenced a `packages/config` package that doesn't exist,
+  wrong file paths, and a test-folder convention this repo doesn't use —
+  amended in place with pointers to the new authoritative doc rather than
+  silently rewritten (ADRs record a decision's rationale, which is still
+  valid; the how-to living doc is separate).
+- New `docs/providers/ADDING_A_PROVIDER.md`: the accurate, current,
+  step-by-step process — adapter class → registry → `.env.example` →
+  admin-console field mapping → tests → the webhook-signature caveat
+  below — kept in sync with the code rather than re-litigated per-ADR.
+- `docs/DEVELOPER_GUIDE.md` claimed inbound provider webhooks are
+  authenticated by each provider's own native signature scheme (a real
+  `Stripe-Signature` header, Flutterwave's `verif-hash`, etc.). False:
+  `services/api-gateway/src/app.ts`'s `/v1/api/webhooks/:provider` route
+  verifies every provider's webhook against one shared, platform-wide
+  `WEBHOOK_HMAC_SECRET` HMAC — not any provider's real scheme. Corrected,
+  and flagged as a genuine open gap for going live with a provider that
+  signs its own outbound webhooks (documented, not silently worked
+  around).
+- `docs/IMPLEMENTATION_BASELINE.md`'s "Provider Registry & Routing"
+  section separately claimed the registry was "DB-backed... encrypted
+  secrets, AES-256-GCM" via `packages/database`'s `provider-configs.ts`.
+  Also false — confirmed by a full-repo search that `providerConfigRepository`
+  is exported but never imported anywhere. All provider config/management
+  state/secrets are in-memory only and don't survive a gateway restart —
+  corrected, and left as a documented, not-yet-built gap rather than
+  quietly fixed by inventing real persistence in the same pass.
+- `packages/providers/src/adapters/messaging/sms.ts` — dead code, never
+  registered or exported, the source of a `.env.example` gap an earlier
+  audit flagged — deleted rather than fixed; `example.ts` already serves
+  as the registered, tested "how to build a real provider" template.
+
+### Verification
+10 new `isConfigured()` unit tests (one per real adapter, each proving
+both the env-var path and the `setSecrets()` path). New Playwright
+regression test (`apps/admin-console/tests/provider-secrets.spec.ts`):
+opens a provider's detail view, confirms the "Not Configured" badge,
+confirms the field selector shows the adapter's real known field(s),
+picks one, and asserts the POST body carries `field`+`label`+`value`
+end-to-end through a mocked backend. Full suite: 492 passed (up from 482 —
+10 new tests, existing coverage unchanged), `tsc --noEmit` clean (root +
+admin-console + web), `npm run lint` 0 errors (290 pre-existing warnings,
+unchanged), `npm run build:all` clean, admin-console Playwright suite (7
+tests, including the new one) stable across repeated runs.
+
+**Files changed:**
+- `packages/schemas/src/index.ts` — `ProviderSecretMeta.field`,
+  `ProviderManagement.configured`
+- `packages/providers/src/base.ts` — `isConfigured()` default
+- `packages/providers/src/registry.ts` — fake-secret removal, real
+  `setSecrets()` sync on add/delete, `configured` in management view,
+  startup unconfigured-live-provider warning
+- `packages/providers/src/adapters/{payments,messaging}/*.ts` (10 files)
+  — `isConfigured()` overrides
+- `packages/providers/src/adapters/messaging/sms.ts` — deleted
+- `packages/providers/src/{management,providerRegistry}.test.ts` +
+  10 adapter test files — updated/new tests
+- `services/api-gateway/src/app.ts` — `field` required on the secrets
+  POST route
+- `apps/admin-console/src/types.ts`,
+  `apps/admin-console/src/components/ProviderManagement.tsx` — field
+  selector, Configured badge
+- `apps/admin-console/tests/provider-secrets.spec.ts` (new)
+- `docs/adr/ADR-005-provider-adapters.md`,
+  `docs/providers/ADDING_A_PROVIDER.md` (new),
+  `docs/DEVELOPER_GUIDE.md`, `docs/IMPLEMENTATION_BASELINE.md`
+
 ## 2026-09-15 — Gateway Inbound-Webhook Enqueue: Real Job Queue, Not Raw ioredis
 
 **Context:** last item on the user's explicit priority-ordered punch list:

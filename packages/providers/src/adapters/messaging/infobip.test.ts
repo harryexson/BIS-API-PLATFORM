@@ -28,6 +28,21 @@ describe('InfobipProvider', () => {
     else process.env.INFOBIP_BASE_URL = originalBaseUrl;
   });
 
+  describe('isConfigured()', () => {
+    it('requires both api_key and base_url', () => {
+      delete process.env.INFOBIP_API_KEY;
+      delete process.env.INFOBIP_BASE_URL;
+      const provider = new InfobipProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.INFOBIP_API_KEY = 'key_123';
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.INFOBIP_BASE_URL = 'xxxx.api.infobip.com';
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
   describe('without credentials configured (simulated fallback)', () => {
     beforeEach(() => {
       delete process.env.INFOBIP_API_KEY;
