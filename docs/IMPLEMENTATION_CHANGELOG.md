@@ -34,9 +34,14 @@ suggestions (confirmed live). Replaced it with a single fresh
 database before committing (not assumed) — the old files are archived,
 not deleted. Two tables in the live DB with no schema file
 (`checkout_sessions`, `webhook_jobs`) are confirmed orphaned and
-deliberately left alone. One thing intentionally *not* done: reconciling
-the live database's own migration-tracking table, which needs a live
-write this pass declined to make without human confirmation first.
+deliberately left alone. The live database's own migration-tracking
+table (`drizzle.__drizzle_migrations`) needed a live write to reconcile
+— held for explicit human confirmation first (per this session's
+standing rule), then done once approved: its 14 old rows replaced with
+the single row matching the new baseline's hash. Verified immediately
+after that no application data changed (row counts on `applications`,
+`users`, `transactions`, and the two orphaned tables all identical
+before/after) — only Drizzle's own bookkeeping table was touched.
 
 ### Client-side card tokenization (previous entry, cross-referenced here)
 Already covered in its own commit message — added real Stripe.js/

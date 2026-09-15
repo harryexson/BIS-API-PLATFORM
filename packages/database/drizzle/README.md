@@ -69,15 +69,20 @@ A **fresh** deployment (`drizzle-kit migrate` against an empty
 database) now works correctly against `0000_baseline.sql` — that part
 of the original gap is closed.
 
-The **existing live database** (already has all 28 tables, obviously)
-still has the old, inconsistent set of rows in
-`drizzle.__drizzle_migrations` (14 rows, not lining up cleanly with any
-single set of local files). That table is Drizzle's own bookkeeping,
-not application data — but updating it is still a live-database write,
-and this pass deliberately stopped short of making it without a human
-in the loop first. Once approved, reconciling it is a single, low-risk
-statement: delete the existing rows and insert one row recording
-`0000_baseline` as applied (using the hash `drizzle-kit` computed into
-`meta/0000_snapshot.json`), so a future `drizzle-kit migrate` against
-*this* database correctly sees "already up to date" instead of trying
-to re-run (or erroring on) 14 stale entries.
+The **existing live database** (already had all 28 tables, obviously)
+had the old, inconsistent set of rows in `drizzle.__drizzle_migrations`
+(14 rows, not lining up cleanly with any single set of local files).
+That table is Drizzle's own bookkeeping, not application data — but
+updating it is still a live-database write, so this was held for
+explicit human confirmation rather than done automatically. **Done,
+2026-09-15, once approved:** its 14 rows were replaced with a single row
+recording `0000_baseline` as applied, using the real `sha256` hash
+computed from `0000_baseline.sql`
+(`aee892a1c5b0b81c0ff9b0ecedc66f2f3d04782fda814ef6a9bb982e186b3790`) and
+the timestamp from `meta/_journal.json`. Verified immediately after by
+direct query that no application data changed (row counts on
+`applications`, `users`, `transactions`, `checkout_sessions`, and
+`webhook_jobs` were identical before and after — only this one
+bookkeeping table was touched). A `drizzle-kit migrate` run against this
+database now correctly sees "already up to date" instead of a
+mismatched 14-row history.

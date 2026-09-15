@@ -376,19 +376,21 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     produces the current schema correctly — that part of the gap is
     closed. Full rationale in `packages/database/drizzle/README.md`.
 
-    **Deliberately not done in this pass:** the live database's own
-    `drizzle.__drizzle_migrations` bookkeeping table (14 rows, still
-    reflecting the old fragmented history plus some raw-SQL-applied
-    migrations that never matched any committed file's hash) was left
-    untouched — reconciling it needs a live-database write, and this
-    pass stopped short of making one without a human confirming it
-    first, per this session's standing rule to never run destructive/
-    consequential SQL against the live database autonomously. The
-    `README.md` above documents the exact single-statement fix once
-    approved. Until then, `drizzle-kit migrate` run against *this*
-    specific existing database (not a fresh one) would still see a
-    mismatched history — `drizzle-kit push` remains the safe way to
-    sync schema changes onto it directly, as before.
+    ~~Deliberately not done in this pass~~ — **also closed, 2026-09-15,
+    after explicit human confirmation.** The live database's own
+    `drizzle.__drizzle_migrations` bookkeeping table (14 rows, reflecting
+    the old fragmented history plus some raw-SQL-applied migrations that
+    never matched any committed file's hash) held a live-database write
+    this pass had stopped short of making autonomously, per this
+    session's standing rule against running consequential SQL against
+    the live database without asking first. Once approved: its 14 rows
+    replaced with a single row recording the new baseline's real
+    `sha256` hash. Verified immediately after, by direct query, that no
+    application data changed — row counts on `applications`, `users`,
+    `transactions`, and the two orphaned tables below were identical
+    before and after; only this one bookkeeping table was touched.
+    `drizzle-kit migrate` run against this database now correctly sees
+    "already up to date" instead of a mismatched history.
 
     Also confirmed still true: two tables in the live DB
     (`checkout_sessions`, `webhook_jobs`) have no corresponding schema
