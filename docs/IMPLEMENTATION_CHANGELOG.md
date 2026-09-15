@@ -6,6 +6,55 @@ tests cover it.
 
 ---
 
+## 2026-09-15 — Client-Side Tokenization, Plan Limit Enforcement, Migration History Consolidation
+
+**Context:** continuing down the user's explicit priority-ordered punch
+list from the previous entry: client-side card tokenization, plan
+usage-limit enforcement, and the Drizzle migration-history divergence.
+
+### Plan usage-limit enforcement
+`plans.messageLimit`/`paymentVolumeLimitCents` were stored but never
+checked. Added `checkPlanLimit()` in the gateway, called before routing
+on both `/v1/api/gateway/payment` and `/v1/api/gateway/messaging`; an
+application with no active subscription or a null-limit plan stays
+unrestricted (nothing to enforce, not a bug). Message counts now come
+from a real `events` table write the messaging route never made before
+(added, mirroring the payment route's existing transaction-record
+pattern); payment volume comes from the existing `transactions` table.
+Both only count/sum `'success'` rows. 7 new simulation tests exercise
+this through the real gateway routes.
+
+### Drizzle migration-history consolidation
+See `packages/database/drizzle/README.md` for the full writeup.
+Short version: the old 13-file migration history had snapshot files only
+through migration 0001 despite SQL files through 0012, which made
+`drizzle-kit generate` produce nonsensical, potentially destructive
+suggestions (confirmed live). Replaced it with a single fresh
+`0000_baseline.sql`, verified column-for-column against the live
+database before committing (not assumed) — the old files are archived,
+not deleted. Two tables in the live DB with no schema file
+(`checkout_sessions`, `webhook_jobs`) are confirmed orphaned and
+deliberately left alone. One thing intentionally *not* done: reconciling
+the live database's own migration-tracking table, which needs a live
+write this pass declined to make without human confirmation first.
+
+### Client-side card tokenization (previous entry, cross-referenced here)
+Already covered in its own commit message — added real Stripe.js/
+Elements tokenization to the admin console's Request Playground (which
+was separately found to be entirely non-functional — it called a route
+that never existed) so `PaymentRequest.paymentToken` has a real producer
+for the first time.
+
+### Verification
+Full suite grew from 467 to 482 passing across this entry (7 new
+plan-limit tests), `tsc --noEmit` clean, `npm run lint` 0 errors, clean
+build. The migration consolidation was additionally verified read-only
+against the live Neon database (table counts and column-level diffs on
+4 representative tables) rather than assumed correct from the generated
+SQL alone.
+
+---
+
 ## 2026-09-15 — Remaining Real Payment Adapters (PawaPay, PayChangu, Airwallex) + Trembi Investigation
 
 **Context:** direct continuation of 2026-09-14's real-payment-adapter

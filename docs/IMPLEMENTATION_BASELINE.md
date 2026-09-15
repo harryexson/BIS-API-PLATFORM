@@ -347,35 +347,60 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     requires an express major-version bump, out of scope for this pass.
     Everything else flagged by `npm audit` (vite, vitest, esbuild,
     drizzle-kit) is dev/build tooling, not shipped to production.
-12. **Drizzle migration *files* have diverged from reality — corrected
-    2026-09-08 after connecting to the real Neon database.** Original
-    finding (static analysis only, before DB access) overstated the
-    danger: it's re-verified now that the **live database's `tenants`,
-    `conversations`, and `tenant_application_links` tables all already
-    match the current TypeScript schema exactly** — there's no live data
-    at risk. The real, still-open problem is that the *migration files in
-    this repo* don't explain how the live DB got there:
-    `drizzle/meta/*.json` snapshots only exist through migration 0001
-    even though the journal and SQL files go to 0007+ (so `drizzle-kit
-    generate` can't be trusted — confirmed it prompts nonsensically about
-    renaming `tenants` columns that don't exist), and the live DB's own
-    `drizzle.__drizzle_migrations` tracking table has **3 more applied
-    migrations (ids 9–11) than this repo has files for** — someone ran
-    migrations directly against this database that were never committed.
-    Also found: two tables in the live DB (`checkout_sessions`,
-    `webhook_jobs`) have no corresponding schema file in the current
-    codebase at all — orphaned, not used by any current repository code,
-    but not cleaned up either. Practical impact: **a fresh database
-    bootstrapped from this repo's committed migrations alone would not
-    match the live DB or current schema** — someone doing that today
-    needs `drizzle-kit push` (direct schema sync) instead of
-    `drizzle:migrate`, not the committed migration history. This repo's
-    own two new tables from this session (`consent_records`,
-    `messaging_profiles`) were applied directly to the live DB via raw
-    SQL (not `drizzle-kit migrate`, for the reasons above) and verified
-    working with a real insert/select round-trip. Full detail, including
-    exact table diffs, in `docs/IMPLEMENTATION_CHANGELOG.md` ("Neon
-    Database Connected — Corrected Migration-Drift Diagnosis").
+12. ~~Drizzle migration *files* have diverged from reality~~ — **the
+    file-side problem closed 2026-09-15**, the live-database side has
+    one deliberately-deferred follow-up. Original finding (2026-09-08,
+    static analysis before DB access) overstated the danger: the live
+    database's `tenants`, `conversations`, and `tenant_application_links`
+    tables always matched the current TypeScript schema — there was
+    never live data at risk. The real problem was that the migration
+    *files* didn't explain how the live DB got there: `drizzle/meta/
+    *.json` snapshots only existed through migration 0001 even though
+    SQL files went to 0012, so `drizzle-kit generate` couldn't be
+    trusted (confirmed live: it prompted to satisfy `tenants.country_
+    code` by *renaming* three unrelated columns that don't exist on
+    that table — accepting it would have generated a wrong, destructive
+    migration).
+
+    **Fix:** consolidated the fragmented 13-file history into one
+    `0000_baseline.sql` (+ matching snapshot), freshly generated from
+    the current schema — the old files are preserved, not deleted, in
+    `packages/database/drizzle/_archive_pre_baseline_2026-09-15/`.
+    Verified against the live database before committing (not assumed):
+    the live DB has exactly 30 tables — the 28 this baseline creates,
+    plus two confirmed-orphaned ones (below) — and four representative
+    tables (`tenants`, `applications`, `users`, `provider_configs`) were
+    spot-checked column-for-column, matching exactly (only column
+    *order* differed, which Postgres attaches no meaning to). A fresh
+    deployment (`drizzle-kit migrate` against an empty database) now
+    produces the current schema correctly — that part of the gap is
+    closed. Full rationale in `packages/database/drizzle/README.md`.
+
+    **Deliberately not done in this pass:** the live database's own
+    `drizzle.__drizzle_migrations` bookkeeping table (14 rows, still
+    reflecting the old fragmented history plus some raw-SQL-applied
+    migrations that never matched any committed file's hash) was left
+    untouched — reconciling it needs a live-database write, and this
+    pass stopped short of making one without a human confirming it
+    first, per this session's standing rule to never run destructive/
+    consequential SQL against the live database autonomously. The
+    `README.md` above documents the exact single-statement fix once
+    approved. Until then, `drizzle-kit migrate` run against *this*
+    specific existing database (not a fresh one) would still see a
+    mismatched history — `drizzle-kit push` remains the safe way to
+    sync schema changes onto it directly, as before.
+
+    Also confirmed still true: two tables in the live DB
+    (`checkout_sessions`, `webhook_jobs`) have no corresponding schema
+    file in the current codebase and no reader/writer anywhere in the
+    repo (re-verified via a full-repo search) — orphaned, holding
+    negligible data (1 row and 0 rows respectively), intentionally left
+    alone rather than dropped (that direction can't be undone, and
+    confirming they're truly dead deserves a human decision). This
+    repo's `consent_records`/`messaging_profiles` tables (added
+    2026-09-08/09) were applied directly to the live DB via raw SQL at
+    the time, for the reasons above — now correctly represented in the
+    new baseline like every other current table.
 13. **Gateway inbound-webhook enqueue silently no-ops without `REDIS_URL`**
     — `services/api-gateway/src/app.ts`'s `enqueueInboundMessage()` (and
     its `enqueuePaymentWebhook`/`enqueueProviderWebhook` siblings) use a
