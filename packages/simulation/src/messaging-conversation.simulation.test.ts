@@ -26,7 +26,6 @@ import {
   enqueueReceipt,
   drain,
   waitFor,
-  counts,
   sleep,
   stopWorker,
   findConversation,
@@ -47,6 +46,13 @@ const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'afri
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
+// Attached to the SAME store/keys the real gateway enqueues into (see
+// SimRuntime.gatewayStore/gatewayKeys) — unlike `pipeline` above, which is
+// its own isolated queue used by the enqueueXxx() bypass helpers throughout
+// this file. gatewayPipeline exercises the real end-to-end path: a real
+// HTTP webhook delivery (deliverWebhook) all the way through to a worker
+// actually processing the job the gateway itself enqueued.
+let gatewayPipeline: WorkerHandle;
 
 const patches: Array<() => void> = [];
 
@@ -55,10 +61,12 @@ beforeAll(async () => {
   seedReachChurch();
   runtime = await createSimulation();
   pipeline = await runtime.makeWorker({});
+  gatewayPipeline = await runtime.makeWorker({ store: runtime.gatewayStore, keys: runtime.gatewayKeys });
 }, 30_000);
 
 afterAll(async () => {
   await stopWorker(pipeline);
+  await stopWorker(gatewayPipeline);
   await runtime.close();
 }, 15_000);
 
@@ -298,22 +306,26 @@ describe('Delivery Event -> Platform Webhook (worker durable path)', () => {
     void job1;
   });
 
-  it('the gateway accepts a correctly signed inbound webhook but never enqueues it (documented gap)', async () => {
-    const qBefore = await counts(pipeline, 'provider_webhook');
+  it('the gateway accepts a correctly signed inbound webhook and really enqueues it for worker processing', async () => {
+    // Previously "documented gap": the gateway's enqueueProviderWebhook used
+    // a raw ioredis client that silently no-opped with no REDIS_URL
+    // configured, so a verified webhook was acked then dropped. It now goes
+    // through the real shared job queue (see app.ts's getGatewayQueueForTests
+    // and SimRuntime.gatewayStore/gatewayKeys), so a worker attached to that
+    // same queue (gatewayPipeline, not the isolated `pipeline` the
+    // enqueueXxx() bypass helpers elsewhere in this file use) really
+    // processes it end-to-end from a real HTTP delivery.
+    const rowsBefore = dbState.events.filter((r) => r.category === 'provider_webhook').length;
     const token = mark();
 
     const delivery = await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ text: 'STOP' }));
     expect(delivery.status).toBe(200);
     expect(delivery.json.received).toBe(true);
 
-    await sleep(200);
-    const qAfter = await counts(pipeline, 'provider_webhook');
-    expect(qAfter.ready).toBe(0);
-    expect(qAfter.delayed).toBe(0);
-    expect(qAfter.dead).toBe(qBefore.dead);
-    expect(busEventsAfter(token, 'messaging').length).toBe(0);
+    await drain(gatewayPipeline, ['provider_webhook']);
 
-    console.warn('[gap] gateway verifies inbound webhook HMAC but does not enqueue provider_webhook: inbound messages are acked then dropped');
+    expect(dbState.events.filter((r) => r.category === 'provider_webhook').length).toBe(rowsBefore + 1);
+    expect(busEventsAfter(token).some((e: any) => e.decisionReason === 'provider_webhook_processed')).toBe(true);
   });
 });
 
@@ -348,74 +360,104 @@ describe('Conversation Update (ConversationManager record + continuity)', () => 
 });
 
 describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS MY DRIVER?', () => {
+  // `handled` reflects whether packages/routing/src/keywords.ts's
+  // handleKeyword() actually has a case for this keyword today — CHECK IN
+  // and WHERE IS MY DRIVER? fall through to `{ handled: false }`, a
+  // separate, still-open gap (no app-specific keyword handler exists for
+  // either) that this file doesn't attempt to close. What this describe
+  // block used to document as "no keyword handler runs" for ALL of these
+  // was really one gap upstream of that: the inbound webhook never reached
+  // handleKeyword() at all (see the enqueue-path fix below).
   const KEYWORDS = [
-    { keyword: 'YES', compliant: 'acknowledge/confirm the intent and auto-reply with a confirmation' },
-    { keyword: 'NO', compliant: 'acknowledge the cancellation and halt the confirmation flow' },
-    { keyword: 'HELP', compliant: 'reply with the help text including the STOP opt-out' },
-    { keyword: 'STOP', compliant: 'record opt-out consent and block all further outbound messaging to this recipient' },
-    { keyword: 'PRAY', compliant: 'log a prayer request and reply with a confirmation + guidance' },
-    { keyword: 'CHECK IN', compliant: 'respond with the member’s check-in status' },
-    { keyword: 'WHERE IS MY DRIVER?', compliant: 'resolve the trip and reply with the driver/location update' },
+    { keyword: 'YES', compliant: 'acknowledge/confirm the intent and auto-reply with a confirmation', handled: true, phone: '+15556010001' },
+    { keyword: 'NO', compliant: 'acknowledge the cancellation and halt the confirmation flow', handled: true, phone: '+15556010002' },
+    { keyword: 'HELP', compliant: 'reply with the help text including the STOP opt-out', handled: true, phone: '+15556010003' },
+    { keyword: 'STOP', compliant: 'record opt-out consent and block all further outbound messaging to this recipient', handled: true, phone: '+15556010004' },
+    { keyword: 'PRAY', compliant: 'log a prayer request and reply with a confirmation + guidance', handled: true, phone: '+15556010005' },
+    { keyword: 'CHECK IN', compliant: 'respond with the member’s check-in status', handled: false, phone: '+15556010006' },
+    { keyword: 'WHERE IS MY DRIVER?', compliant: 'resolve the trip and reply with the driver/location update', handled: false, phone: '+15556010007' },
   ];
 
   it.each(KEYWORDS)(
-    'inbound "$keyword" is verified+acked, but no keyword handler runs — documented gap',
-    async ({ keyword, compliant }) => {
+    'inbound "$keyword" is verified, really enqueued, and routed through handleKeyword() end-to-end',
+    async ({ keyword, compliant, handled, phone }) => {
+      // Provider -> Platform Webhook only delivers a reply for a number the
+      // app has an active conversation with; seed one via an outbound send
+      // (mirrors what ConversationResolver requires — see inboundMessage.ts).
+      await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
+
       const token = mark();
-      const inbound = buildInboundSms({ text: keyword });
+      const inbound = buildInboundSms({ from: phone, text: keyword });
 
       // Provider -> Platform Webhook (real HMAC verification).
       const delivery = await deliverWebhook(runtime, 'signalhouse', inbound);
       expect(delivery.status).toBe(200);
       expect(delivery.json.received).toBe(true);
 
-      // Give any (non-existent) async handling a chance to run.
-      await sleep(150);
+      // Previously "documented gap": the gateway's enqueueInboundMessage used
+      // a raw ioredis client that silently no-opped with no REDIS_URL
+      // configured, so this webhook was acked then dropped before ever
+      // reaching handleKeyword(). It now goes through the real shared job
+      // queue, so a worker attached to that same queue (gatewayPipeline)
+      // really processes it.
+      await drain(gatewayPipeline, ['inbound_message']);
 
-      expect(busEventsAfter(token, 'messaging').length).toBe(0);
-      expect((await counts(pipeline, 'provider_webhook')).ready).toBe(0);
-
-      console.warn(`[gap] inbound "${keyword}" is verified but dropped; a compliant platform would: ${compliant}`);
+      const events = busEventsAfter(token, 'messaging');
+      expect(events.length).toBeGreaterThan(0);
+      if (handled) {
+        expect(events.some((e: any) => String(e.decisionReason).startsWith('keyword_response:'))).toBe(true);
+      } else {
+        // Reaches handleKeyword() for real now, but there's no case for this
+        // keyword — falls through to the generic "inbound_routed" event
+        // (inboundMessage.ts Step 5), same as any unrecognized text.
+        expect(events.some((e: any) => String(e.decisionReason).startsWith('inbound_routed:'))).toBe(true);
+        console.warn(`[gap] "${keyword}" reaches handleKeyword() for real now, but no handler exists for it — a compliant platform would: ${compliant}`);
+      }
     },
   );
 
-  it('inbound STOP via the real webhook route is never processed — the gateway does not enqueue it (documented gap, separate from consent enforcement)', async () => {
-    await sendMessage(runtime, { recipient: DONOR_PHONE, content: 'Keeping you in the loop.' });
+  it('inbound STOP via the real webhook route is really processed end-to-end: consent recorded, conversation stays active', async () => {
+    // ConversationResolver matches sender+provider, so the seed send must
+    // use the same provider ('signalhouse') the inbound webhook arrives on.
+    await sendMessage(runtime, { recipient: DONOR_PHONE, content: 'Keeping you in the loop.', providerOverride: 'signalhouse' });
 
     const before = findConversation(APP_SLUG, DONOR_PHONE);
     expect(before?.status).toBe('active');
 
     const delivery = await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ text: 'STOP' }));
     expect(delivery.status).toBe(200);
-    await sleep(150);
+
+    // Previously "documented gap, separate from consent enforcement": the
+    // gateway's enqueueInboundMessage silently no-opped without REDIS_URL,
+    // so this STOP never reached handleKeyword() via the real webhook route
+    // at all — only the direct-queue bypass path (see "Consent enforcement"
+    // below) could exercise it. It now really does.
+    await drain(gatewayPipeline, ['inbound_message']);
 
     // The conversation stays active regardless — that's correct behavior by
-    // design (see "Consent enforcement" below), not the gap. The actual gap:
-    // this webhook never reaches handleKeyword() at all in this environment
-    // (services/api-gateway/src/app.ts's enqueueInboundMessage() uses a raw
-    // ioredis client with no REDIS_URL configured here, so it silently
-    // no-ops — same root cause as the "documented gap" tests above). No
-    // consent record gets created via this path, unlike the direct-queue
-    // path the "Consent enforcement" tests below use to bypass it.
+    // design (handleStop() deliberately doesn't close it — see
+    // packages/routing/src/keywords.ts — so a later JOIN can still route).
     const after = findConversation(APP_SLUG, DONOR_PHONE);
     expect(after?.status).toBe('active');
     expect(after?.providerId).toBe(before?.providerId);
     expect(after?.channel).toBe(before?.channel);
-    expect(dbState.consentRecords.find((c) => c.recipient === DONOR_PHONE)).toBeUndefined();
-    console.warn('[gap] gateway does not enqueue inbound webhooks without REDIS_URL — STOP sent via the real webhook route never reaches handleKeyword()');
+
+    const consent = dbState.consentRecords.find((c) => c.recipient === DONOR_PHONE);
+    expect(consent?.status).toBe('opted_out');
+    expect(consent?.source).toBe('keyword');
   });
 });
 
 // ---------------------------------------------------------------------------
 // Consent enforcement (STOP blocks sends; JOIN restores them)
 // ---------------------------------------------------------------------------
-// The two "documented gap" describe blocks above show inbound webhooks never
-// reach the worker in this environment (the gateway's inbound enqueue uses a
-// raw ioredis client with no REDIS_URL configured here — a separate,
-// pre-existing gap). enqueueInboundMessage() reaches the worker's
-// inbound_message processor directly, the same way enqueueProviderWebhook
-// already bypasses the same gap for provider_webhook jobs, so keyword
-// handling and the consent enforcement it feeds can be tested end-to-end.
+// The describe blocks above now exercise the real gateway webhook route
+// end-to-end (deliverWebhook + a worker attached to the gateway's own
+// queue — see gatewayPipeline). These tests below still use the direct
+// enqueueInboundMessage(pipeline.queue, ...) bypass instead, deliberately —
+// it's a faster, more direct way to drive keyword handling and the consent
+// enforcement it feeds without the extra HTTP round trip, now that both
+// paths are known to reach the same inbound_message processor.
 describe('Consent enforcement: STOP blocks outbound sends, JOIN restores them', () => {
   it('STOP records opt-out and a subsequent send to that recipient is blocked with 403', async () => {
     const phone = '+15556667777';
@@ -446,8 +488,7 @@ describe('Consent enforcement: STOP blocks outbound sends, JOIN restores them', 
 
     // Inbound routing matches sender -> active conversation -> owning app,
     // so a conversation must exist before an inbound STOP can be attributed
-    // to this app (see the "documented gap" tests above for why the real
-    // gateway webhook path can't establish this in this environment either).
+    // to this app.
     const seed = await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
     expect(seed.status).toBe(200);
 

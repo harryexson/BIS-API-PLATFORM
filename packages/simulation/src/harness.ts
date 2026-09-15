@@ -107,6 +107,14 @@ export interface SimRuntime {
   server: Server;
   bus: EventBus;
   registry: ProviderRegistry;
+  // The exact store/keys the real gateway's enqueueInboundMessage/
+  // enqueuePaymentWebhook/enqueueProviderWebhook (services/api-gateway/src/
+  // app.ts) enqueue jobs into — pass these to makeWorker() to attach a
+  // worker to jobs the gateway itself enqueued via a real HTTP request
+  // (e.g. through deliverWebhook), rather than the bypass helpers below
+  // that enqueue directly onto an arbitrary queue.
+  gatewayStore: KVStore;
+  gatewayKeys: Keys;
   // stop the booted HTTP server
   close(): Promise<void>;
   // spawn an isolated worker (own store/keys unless supplied) against the
@@ -130,11 +138,14 @@ export async function createSimulation(
   process.env.WEBHOOK_HMAC_SECRET = WEBHOOK_SECRET;
   if (!process.env.RATE_LIMIT_MAX_REQUESTS) process.env.RATE_LIMIT_MAX_REQUESTS = '100000';
 
+  const gatewayModule = await import('../../../services/api-gateway/src/app');
   if (bootedApp === null) {
-    const module = await import('../../../services/api-gateway/src/app');
-    bootedApp = module.default;
+    bootedApp = gatewayModule.default;
   }
   const app = bootedApp as { listen: (port: number, cb: () => void) => Server };
+  const { store: gatewayStore, keys: gatewayKeys } = await (
+    gatewayModule as unknown as { getGatewayQueueForTests(): Promise<{ store: KVStore; keys: Keys }> }
+  ).getGatewayQueueForTests();
 
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
@@ -196,7 +207,7 @@ export async function createSimulation(
     return fetch(`${baseUrl}${path}`, { method: 'GET', headers });
   }
 
-  return { baseUrl, server, bus, registry, close, makeWorker, request, post, postText, get };
+  return { baseUrl, server, bus, registry, gatewayStore, gatewayKeys, close, makeWorker, request, post, postText, get };
 }
 
 // ---------------------------------------------------------------------------
@@ -296,9 +307,15 @@ export async function deliverWebhook(
 }
 
 /**
- * Wire the envelope that the gateway currently does NOT send: hand the
- * verified webhook to the worker so it can be parsed, idempotency-checked,
- * recorded ("Transaction Update") and emitted ("Event Processing").
+ * Directly enqueues a payment_webhook job with a richer payload than the
+ * real gateway route builds (full parsed webhook body + appId, vs. the
+ * gateway's leaner rawBody/signature/providerEventId/applicationId — see
+ * the "receipt auto-send" gap noted in
+ * application-certification.simulation.test.ts) so the worker side
+ * (idempotency check, "Transaction Update", "Event Processing" emit) can be
+ * exercised precisely. For the real end-to-end gateway path, use
+ * deliverWebhook() + a worker attached to
+ * runtime.gatewayStore/runtime.gatewayKeys instead.
  */
 export function enqueuePaymentWebhook(
   queue: JobQueue,
@@ -389,10 +406,15 @@ export function buildInboundSms(overrides: Record<string, unknown> = {}) {
 }
 
 /**
- * Bridge the inbound webhook envelope to the real provider_webhook worker job
- * (the same production gap as payment webhooks — the gateway verifies but does
- * not enqueue). The worker re-verifies the HMAC, dedupes by id, and records
- * the "Delivery Event".
+ * Directly enqueues a provider_webhook job onto an arbitrary queue (usually
+ * an isolated one from makeWorker(), not the gateway's own). Convenient for
+ * tests that only care about worker-side processing (HMAC re-verification,
+ * dedupe-by-id, "Delivery Event" recording) without going through a real
+ * HTTP request. As of the gateway's real job-queue enqueue (see
+ * getGatewayQueueForTests()/SimRuntime.gatewayStore), a real end-to-end path
+ * also exists — deliverWebhook() + a worker attached via
+ * makeWorker({ store: runtime.gatewayStore, keys: runtime.gatewayKeys }) —
+ * used where the test specifically wants to exercise that path.
  */
 export function enqueueProviderWebhook(
   queue: JobQueue,
@@ -402,15 +424,12 @@ export function enqueueProviderWebhook(
 }
 
 /**
- * Directly enqueues an inbound_message job, matching the shape
- * services/api-gateway/src/app.ts's enqueueInboundMessage() pushes when
- * Redis is available. In this environment (no REDIS_URL) that gateway path
- * silently no-ops — see "the gateway accepts a correctly signed inbound
- * webhook but never enqueues it (documented gap)" in
- * messaging-conversation.simulation.test.ts — so this helper reaches the
- * worker's inbound_message processor directly, the same way
- * enqueueProviderWebhook/enqueuePaymentWebhook bypass the same gap for
- * their job types, to exercise keyword handling end-to-end.
+ * Directly enqueues an inbound_message job onto an arbitrary queue, matching
+ * the shape services/api-gateway/src/app.ts's enqueueInboundMessage() pushes.
+ * Same bypass-vs-real-path relationship as enqueueProviderWebhook above: use
+ * this to exercise keyword handling without a real HTTP round trip; use
+ * deliverWebhook() + a worker attached to runtime.gatewayStore/gatewayKeys
+ * to exercise the real gateway enqueue path end-to-end.
  */
 export function enqueueInboundMessage(
   queue: JobQueue,

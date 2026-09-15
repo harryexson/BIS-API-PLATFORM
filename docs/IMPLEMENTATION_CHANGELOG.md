@@ -6,6 +6,91 @@ tests cover it.
 
 ---
 
+## 2026-09-15 — Gateway Inbound-Webhook Enqueue: Real Job Queue, Not Raw ioredis
+
+**Context:** last item on the user's explicit priority-ordered punch list:
+"the gateway and the ready on the inbound webhook path."
+
+### What changed
+`services/api-gateway/src/app.ts`'s `enqueueInboundMessage()`,
+`enqueuePaymentWebhook()`, and `enqueueProviderWebhook()` used a hand-rolled
+raw `ioredis` client (`getRedisClient()`) that constructed its own ad hoc
+Redis key names and fully no-opped — silently dropping the message,
+including a STOP opt-out request, with **zero** durability — whenever
+`REDIS_URL` wasn't set or wasn't reachable at that exact moment. Replaced
+with `@company/workers`'s own `createStore()`/`JobQueue`/`createKeys()` —
+the exact abstraction `services/worker/src/index.ts` already uses to build
+its own queue. `createStore()` degrades a configured-but-unreachable Redis
+to an ephemeral in-memory store (logging a warning), the same way the rest
+of the platform already behaves in that situation, instead of dropping the
+job outright. A new `getGatewayQueueForTests()` export exposes the gateway's
+own store/keys/config for `packages/simulation`'s test harness only — no
+production code path uses it.
+
+`GET /ready`'s existing `unconfigured` (REDIS_URL unset — a known, accepted
+degraded mode) vs. `unreachable` (REDIS_URL set but the connection is
+actually down — a real failure) distinction for the `queue` dependency
+carries over unchanged, now checking the shared store's own
+`RedisStore`/`isConnected()` state instead of a second ad hoc client.
+Verified live both ways: unset `REDIS_URL` → `{"queue":"unconfigured"}` /
+200; a configured-but-dead `REDIS_URL` → `{"queue":"unreachable"}` / 503.
+
+### A real bug found and fixed along the way
+Making the enqueue path actually work (rather than a no-op) surfaced a
+genuine, previously-undetectable bug: `packages/workers/src/jobs/
+providerWebhook.ts` and `paymentWebhook.ts` both computed their idempotency
+key as `webhook:${eventId}`. The gateway enqueues one `provider_webhook` job
+and one `payment_webhook` job per inbound webhook delivery, and both carry
+the *same* upstream event id (it's one HTTP request) — so whichever job
+type's processor claimed that shared key first made the *other* type fail
+on every retry with a false "Replay detected" error and dead-letter after 5
+attempts. This bug already existed in the pre-fix raw-ioredis code (it built
+the identical shared key), including in any real deployment with `REDIS_URL`
+actually configured — it just could never be observed or tested, because the
+enqueue itself never worked in any environment this session could reach.
+Fixed by namespacing each processor's idempotency key by its own job type
+(`provider_webhook:${eventId}` / `payment_webhook:${eventId}`).
+
+### Simulation test changes
+Two pre-existing "documented gap" tests plus a 7-keyword `it.each` block in
+`packages/simulation/src/messaging-conversation.simulation.test.ts`
+specifically asserted the old no-op behavior (a real HTTP webhook delivery,
+verified, acked 200, then silently dropped). They now assert the real
+end-to-end path instead: `deliverWebhook()` (real HTTP + HMAC) followed by
+`drain()` against a new `gatewayPipeline` worker — attached to the exact
+same store/keys the gateway's own `getGatewayQueueForTests()` returns (see
+`SimRuntime.gatewayStore`/`gatewayKeys` in `harness.ts`), as opposed to the
+isolated `pipeline` worker the file's other tests use with the
+`enqueueInboundMessage`/`enqueueProviderWebhook` bypass helpers (kept
+as-is, still a legitimate faster way to drive worker-side logic directly).
+`CHECK IN` and `WHERE IS MY DRIVER?` now correctly reach `handleKeyword()`
+for real, confirming there's genuinely no case for either yet — flagged as
+a separate, still-open, honestly-labeled gap rather than something invented
+a fix for here.
+
+### Verification
+Full suite: 482 passed (no count change — existing tests rewritten in
+place, not added), `tsc --noEmit` clean (root + admin-console + web),
+`npm run lint` 0 errors, `npm run build:all` clean. `packages/simulation/
+src/messaging-conversation.simulation.test.ts` re-run 2x standalone to
+confirm stability post-fix. Live-verified `/ready`'s unconfigured/
+unreachable split via a standalone script hitting the real Express app with
+and without a (dead) `REDIS_URL` set.
+
+**Files changed:**
+- `services/api-gateway/src/app.ts` — real `JobQueue` via `@company/workers`
+  replacing `getRedisClient()`; `/ready`'s queue check now uses the shared
+  store; new `getGatewayQueueForTests()` export
+- `services/api-gateway/package.json` — `@company/workers` dependency
+- `packages/workers/src/jobs/providerWebhook.ts`,
+  `paymentWebhook.ts` — namespaced idempotency keys (the collision fix)
+- `packages/simulation/src/harness.ts` — `SimRuntime.gatewayStore`/
+  `gatewayKeys`, sourced from the gateway module's new test export
+- `packages/simulation/src/messaging-conversation.simulation.test.ts` —
+  the two "documented gap" tests and the keyword `it.each` block now
+  exercise the real end-to-end path; stale comments elsewhere in the file
+  updated to match
+
 ## 2026-09-15 — Admin Console Real Routing (react-router-dom)
 
 **Context:** next item down the user's explicit priority-ordered punch

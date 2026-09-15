@@ -20,10 +20,17 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
       throw new Error('provider_webhook requires providerId');
     }
 
+    // P0 FIX: Namespace by job type, not just the provider's raw event id.
+    // The gateway enqueues a provider_webhook AND a payment_webhook job for
+    // the same inbound webhook delivery, both carrying the same upstream
+    // event id (it's one HTTP request) — a shared `webhook:${eventId}` key
+    // meant "dedupe within this job type" but actually caused whichever job
+    // type claimed it first to permanently fail the OTHER type as a false
+    // replay, every retry, until it dead-lettered.
     const eventId = id || job.payload.eventId;
     if (eventId && ctx?.store) {
       const seen = await ctx.store.setNx(
-        deps.keys.idempotency(`webhook:${eventId}`),
+        deps.keys.idempotency(`provider_webhook:${eventId}`),
         '1',
         deps.config.idempotencyTtlMs,
       );

@@ -23,11 +23,16 @@ export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
       throw new Error('payment_webhook requires provider');
     }
 
-    // P0: Idempotency check using provider event ID
+    // P0: Idempotency check using provider event ID. Namespaced by job type
+    // (see the matching fix in jobs/providerWebhook.ts) — the gateway
+    // enqueues a payment_webhook AND a provider_webhook job for the same
+    // inbound delivery, both carrying the same upstream event id, so a
+    // shared `webhook:${eventId}` key made whichever job type claimed it
+    // first falsely dead-letter the other as a replay.
     const eventId = providerEventId || job.payload.id;
     if (eventId && ctx?.store) {
       const seen = await ctx.store.setNx(
-        deps.keys.idempotency(`webhook:${eventId}`),
+        deps.keys.idempotency(`payment_webhook:${eventId}`),
         '1',
         deps.config.idempotencyTtlMs,
       );

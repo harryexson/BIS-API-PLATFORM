@@ -45,6 +45,16 @@ import {
   setContextField,
 } from '@company/observability';
 import { sendTransactionalEmail, verificationEmailHtml, passwordResetEmailHtml } from '@company/shared';
+import {
+  createStore,
+  createKeys,
+  createWorkerConfig,
+  JobQueue,
+  RedisStore,
+  type KVStore,
+  type Keys,
+  type WorkerConfig,
+} from '@company/workers';
 
 const app = express();
 
@@ -812,10 +822,16 @@ app.get('/ready', async (req: Request, res: Response) => {
   // fail readiness.
   if (process.env.REDIS_URL) {
     try {
-      const client = getRedisClient();
-      if (!client) throw new Error('redis client unavailable');
+      const { store } = await getGatewayQueue();
+      // createStore() itself degrades a configured-but-unreachable Redis to
+      // an in-memory fallback rather than throwing — so an unreachable
+      // Redis wouldn't otherwise surface here as anything but 'healthy'.
+      // Check the store's own connection state, not just that it exists.
+      if (!(store instanceof RedisStore) || !store.isConnected()) {
+        throw new Error('redis store unavailable — degraded to in-memory');
+      }
       await Promise.race([
-        client.ping(),
+        store.ping(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('ping timeout')), 2000)),
       ]);
       deps.queue = 'healthy';
@@ -1400,54 +1416,47 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   return res.json({ received: true });
 }));
 
-// P0: Lightweight helper to enqueue inbound messages to the worker queue.
-// Uses Redis directly if available; falls back to no-op if Redis is down.
-// The worker polls from this queue and routes inbound messages to apps.
-let _redisClient: any = null;
-function getRedisClient(): any {
-  if (_redisClient !== null) return _redisClient === false ? null : _redisClient;
-  const redisUrl = process.env.REDIS_URL;
-  if (!redisUrl) { _redisClient = false; return null; }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const Redis = require('ioredis');
-    _redisClient = new Redis(redisUrl, {
-      maxRetriesPerRequest: 3,
-      enableOfflineQueue: false,
-      lazyConnect: true,
-    });
-    return _redisClient;
-  } catch {
-    _redisClient = false;
-    return null;
+// P0: Enqueue inbound webhooks through the platform's real, shared job
+// queue (@company/workers) — the same JobQueue/KVStore abstraction the
+// worker service itself uses (services/worker/src/index.ts), instead of a
+// hand-rolled raw ioredis client. The previous implementation constructed
+// its own ad hoc key names (which happened to match @company/workers's
+// scheme, but with no shared code to guarantee it stayed that way) and
+// fully no-opped — silently dropping the message, including a STOP
+// opt-out request, with no durability at all — whenever REDIS_URL wasn't
+// set or wasn't reachable at that exact moment. createStore() degrades the
+// same way the rest of the platform already does when Redis is
+// unavailable (falls back to an ephemeral in-memory store, logging a
+// warning) rather than dropping the job outright.
+let _gatewayQueuePromise: Promise<{
+  queue: JobQueue;
+  store: KVStore;
+  keys: Keys;
+  config: WorkerConfig;
+}> | null = null;
+
+function getGatewayQueue() {
+  if (!_gatewayQueuePromise) {
+    _gatewayQueuePromise = (async () => {
+      const config = createWorkerConfig();
+      const store = await createStore(config.redisUrl);
+      const keys = createKeys(config.queuePrefix);
+      return { queue: new JobQueue(store, keys, config), store, keys, config };
+    })();
   }
+  return _gatewayQueuePromise;
+}
+
+// Exposed only so packages/simulation's test harness can attach a worker to
+// the exact same store/keys this gateway enqueues into — see
+// packages/simulation/src/harness.ts. Not used by any production code path.
+export async function getGatewayQueueForTests() {
+  return getGatewayQueue();
 }
 
 async function enqueueInboundMessage(providerId: string, payload: any): Promise<void> {
-  const client = getRedisClient();
-  if (!client) return; // No Redis — inbound message persisted to DB only
-
-  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
-  const jobId = `job_${randomUUID()}`;
-  const job = {
-    id: jobId,
-    type: 'inbound_message',
-    payload: { providerId, payload },
-    attempts: 0,
-    maxAttempts: 5,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    runAt: Date.now(),
-  };
-
-  try {
-    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
-    await client.rpush(`${queuePrefix}:ready:inbound_message`, jobId);
-    await client.publish(`${queuePrefix}:notify:inbound_message`, jobId);
-  } catch (err) {
-    console.error('[webhook] Failed to enqueue inbound_message to Redis', err);
-  }
+  const { queue } = await getGatewayQueue();
+  await queue.enqueue('inbound_message', { providerId, payload });
 }
 
 // P0: Enqueue payment webhooks for worker processing.
@@ -1460,36 +1469,14 @@ async function enqueuePaymentWebhook(input: {
   providerEventId?: string;
   applicationId?: string;
 }): Promise<void> {
-  const client = getRedisClient();
-  if (!client) return;
-
-  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
-  const jobId = `job_${randomUUID()}`;
-  const job = {
-    id: jobId,
-    type: 'payment_webhook',
-    payload: {
-      provider: input.providerId,
-      rawBody: input.rawBody,
-      signature: input.signature,
-      providerEventId: input.providerEventId,
-      applicationId: input.applicationId || 'webhook',
-    },
-    attempts: 0,
-    maxAttempts: 5,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    runAt: Date.now(),
-  };
-
-  try {
-    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
-    await client.rpush(`${queuePrefix}:ready:payment_webhook`, jobId);
-    await client.publish(`${queuePrefix}:notify:payment_webhook`, jobId);
-  } catch (err) {
-    console.error('[webhook] Failed to enqueue payment_webhook to Redis', err);
-  }
+  const { queue } = await getGatewayQueue();
+  await queue.enqueue('payment_webhook', {
+    provider: input.providerId,
+    rawBody: input.rawBody,
+    signature: input.signature,
+    providerEventId: input.providerEventId,
+    applicationId: input.applicationId || 'webhook',
+  });
 }
 
 // P0: Enqueue provider webhooks (delivery status, etc.) for worker processing.
@@ -1500,36 +1487,14 @@ async function enqueueProviderWebhook(input: {
   providerEventId?: string;
   status?: string;
 }): Promise<void> {
-  const client = getRedisClient();
-  if (!client) return;
-
-  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
-  const jobId = `job_${randomUUID()}`;
-  const job = {
-    id: jobId,
-    type: 'provider_webhook',
-    payload: {
-      providerId: input.providerId,
-      rawBody: input.rawBody,
-      signature: input.signature,
-      eventId: input.providerEventId,
-      status: input.status,
-    },
-    attempts: 0,
-    maxAttempts: 5,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    runAt: Date.now(),
-  };
-
-  try {
-    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
-    await client.rpush(`${queuePrefix}:ready:provider_webhook`, jobId);
-    await client.publish(`${queuePrefix}:notify:provider_webhook`, jobId);
-  } catch (err) {
-    console.error('[webhook] Failed to enqueue provider_webhook to Redis', err);
-  }
+  const { queue } = await getGatewayQueue();
+  await queue.enqueue('provider_webhook', {
+    providerId: input.providerId,
+    rawBody: input.rawBody,
+    signature: input.signature,
+    eventId: input.providerEventId,
+    status: input.status,
+  });
 }
 
 // ----------------------------------------------------

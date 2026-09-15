@@ -425,17 +425,49 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     2026-09-08/09) were applied directly to the live DB via raw SQL at
     the time, for the reasons above — now correctly represented in the
     new baseline like every other current table.
-13. **Gateway inbound-webhook enqueue silently no-ops without `REDIS_URL`**
-    — `services/api-gateway/src/app.ts`'s `enqueueInboundMessage()` (and
-    its `enqueuePaymentWebhook`/`enqueueProviderWebhook` siblings) use a
-    raw `ioredis` client with no fallback. Without Redis configured, no
-    inbound message — including STOP — ever reaches the worker via the
-    real webhook route. Already independently documented by two
-    pre-existing "documented gap" tests in
-    `packages/simulation/src/messaging-conversation.simulation.test.ts`;
-    surfaced again while adding consent-enforcement tests, which had to
-    bypass it (enqueue directly onto the worker queue) to test keyword
-    handling at all.
+13. ~~**Gateway inbound-webhook enqueue silently no-ops without
+    `REDIS_URL`**~~ — **closed, 2026-09-15.**
+    `services/api-gateway/src/app.ts`'s `enqueueInboundMessage()` (and its
+    `enqueuePaymentWebhook`/`enqueueProviderWebhook` siblings) used a raw
+    `ioredis` client with no fallback — without Redis configured, no
+    inbound message (including STOP) ever reached the worker via the real
+    webhook route. Replaced with `@company/workers`'s own
+    `createStore()`/`JobQueue` — the same abstraction the worker service
+    itself uses (`services/worker/src/index.ts`) — which degrades to an
+    ephemeral in-memory store the same way the rest of the platform
+    already does when Redis is unavailable, instead of dropping the job
+    outright. `GET /ready`'s `unconfigured` vs. `unreachable` distinction
+    for the `queue` dependency is preserved exactly (verified live both
+    ways: unset `REDIS_URL` → `unconfigured`/200; a configured-but-dead
+    `REDIS_URL` → `unreachable`/503).
+
+    **A real, previously-undetectable bug found and fixed while closing
+    this**: `packages/workers/src/jobs/providerWebhook.ts` and
+    `paymentWebhook.ts` both used a shared `webhook:${eventId}` idempotency
+    key. The gateway enqueues one `provider_webhook` job and one
+    `payment_webhook` job per inbound delivery, both carrying the *same*
+    upstream event id (it's one HTTP request) — so whichever job type's
+    processor claimed the key first made the *other* type fail every
+    retry as a false "replay detected" and dead-letter. This bug already
+    existed in the original raw-ioredis code (it built the exact same
+    shared key), but could never manifest because the enqueue was a
+    complete no-op in every environment tested — this fix is what finally
+    made it observable. Fixed by namespacing each job type's idempotency
+    key by its own type (`provider_webhook:${eventId}` /
+    `payment_webhook:${eventId}`).
+
+    The two pre-existing "documented gap" tests in
+    `packages/simulation/src/messaging-conversation.simulation.test.ts`
+    (plus the 7-keyword `it.each` block) now assert the real end-to-end
+    path instead: a real HTTP webhook delivery, enqueued through the
+    gateway's real queue, processed by a worker attached to that same
+    queue (see `SimRuntime.gatewayStore`/`gatewayKeys` and
+    `getGatewayQueueForTests()` in `app.ts`, exposed only for this
+    harness). `CHECK IN` and `WHERE IS MY DRIVER?` now correctly reach
+    `handleKeyword()` for real too, but that function still has no case
+    for either — a separate, still-open, honestly-flagged gap (no
+    app-specific keyword handler exists yet for either), not something
+    this pass invents a fix for.
 
 14. ~~No customer signup/login~~ — **closed 2026-09-09.** See the changelog
     ("Customer Account Auth: Signup/Login"). The transactional-email gap
@@ -558,19 +590,18 @@ safety):
 5. ~~STOP consent enforcement on outbound sends~~ — done, see §4 item 9.
 6. ~~A2P/10DLC `MessagingProfile` registration model~~ — done (CRUD only,
    not enforcement), see §4 item 9.
-7. **Drizzle migration history divergence** (§4 item 12) — newly found,
-   high severity, needs a real database to fix safely. Recommend
-   prioritizing this above new feature work: it means a from-scratch
-   deployment is currently broken for two actively-used tables.
-8. Gateway inbound-webhook enqueue path (§4 item 13) — replace the raw
-   ioredis calls in `services/api-gateway/src/app.ts` with the same
-   abstracted job queue the rest of the system uses, so STOP/inbound
-   messages work end-to-end without depending on a specific enqueue
-   mechanism having Redis reachable at that exact call site. Deliberately
-   deferred once its real scope became clear — it would require updating
-   several existing "documented gap" tests across multiple simulation
-   files that specifically assert today's no-op behavior, not just a
-   gateway code change.
+7. ~~**Drizzle migration history divergence**~~ (§4 item 12) — **closed
+   2026-09-15**, including the live database's own migration-bookkeeping
+   reconciliation (done with explicit human approval).
+8. ~~Gateway inbound-webhook enqueue path~~ (§4 item 13) — **closed
+   2026-09-15**: the raw ioredis calls in
+   `services/api-gateway/src/app.ts` now go through the same abstracted
+   job queue (`@company/workers`) the rest of the system uses, so
+   STOP/inbound messages work end-to-end without depending on Redis being
+   reachable at that exact call site. Closing this also surfaced and fixed
+   a real, previously-undetectable idempotency-key collision between the
+   `provider_webhook` and `payment_webhook` job processors — see §4 item
+   13 for detail.
 9. Payment reconciliation / connected-account model.
 10. ~~Customer signup/login~~ — **Phase A done, 2026-09-09** (§4 item 14).
     ~~Subscription/billing~~ — **Phase B done, 2026-09-09** (§4 item 16).
