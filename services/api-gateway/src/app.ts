@@ -523,6 +523,51 @@ app.post('/v1/api/auth/reset-password', async (req: Request, res: Response) => {
 // route is signature-verified instead, since Stripe calls it directly.
 const subscriptionRegistry = new SubscriptionRegistry(planRepository, subscriptionRepository, applicationRepository);
 
+// Plan usage-limit enforcement. Previously messageLimit/
+// paymentVolumeLimitCents were stored on the plans table and never
+// checked anywhere — a starter-plan application could send unlimited
+// messages/payment volume. An application with no active subscription
+// (most of them today — signup doesn't auto-subscribe to a plan) or
+// whose plan has a null limit is intentionally unrestricted: there is no
+// limit to enforce, not a bug to work around. Counts/sums only
+// successful sends within the subscription's current billing period —
+// a failed attempt never consumed the resource it would be charged
+// against.
+async function checkPlanLimit(
+  appId: string,
+  kind: 'message' | 'payment',
+  amount?: number,
+): Promise<{ blocked: boolean; reason?: string }> {
+  const subscription = await subscriptionRepository.findByApplicationId(appId);
+  if (!subscription || subscription.status !== 'active' || !subscription.currentPeriodStart) {
+    return { blocked: false };
+  }
+  const plan = await planRepository.findById(subscription.planId);
+  if (!plan) return { blocked: false };
+
+  if (kind === 'message') {
+    if (plan.messageLimit == null) return { blocked: false };
+    const used = await eventRepository.countSuccessfulByCategorySince(appId, 'messaging', subscription.currentPeriodStart);
+    if (used >= plan.messageLimit) {
+      return {
+        blocked: true,
+        reason: `Plan message limit reached (${plan.messageLimit} messages this billing period). Upgrade your plan to send more.`,
+      };
+    }
+  } else {
+    if (plan.paymentVolumeLimitCents == null) return { blocked: false };
+    const usedCents = await transactionRepository.sumSuccessfulAmountCentsSince(appId, subscription.currentPeriodStart);
+    const projectedCents = usedCents + Math.round((amount ?? 0) * 100);
+    if (projectedCents > plan.paymentVolumeLimitCents) {
+      return {
+        blocked: true,
+        reason: `Plan payment volume limit reached ($${(plan.paymentVolumeLimitCents / 100).toFixed(2)} this billing period). Upgrade your plan to process more.`,
+      };
+    }
+  }
+  return { blocked: false };
+}
+
 app.get('/v1/api/billing/plans', asyncHandler(async (_req: Request, res: Response) => {
   const plans = await subscriptionRegistry.listPlans();
   return res.json({ plans });
@@ -814,6 +859,11 @@ app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantCon
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
   }
 
+  const limitCheck = await checkPlanLimit(appId, 'payment', Number(amount));
+  if (limitCheck.blocked) {
+    return res.status(402).json({ error: limitCheck.reason });
+  }
+
   // P1: Idempotency check — if we've seen this key recently, return the cached result
   if (idempotencyKey) {
     const existing = paymentIdempotencyCache.get(idempotencyKey);
@@ -901,6 +951,11 @@ app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenant
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
   }
 
+  const limitCheck = await checkPlanLimit(appId, 'message');
+  if (limitCheck.blocked) {
+    return res.status(402).json({ error: limitCheck.reason });
+  }
+
   try {
     const event = await routingEngine.routeMessage(appId, {
       recipient,
@@ -908,6 +963,27 @@ app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenant
       providerOverride,
       tenantId, // Pass authenticated tenant to routing engine
     });
+
+    // Durable record of the send — the only source countSuccessfulByCategorySince
+    // (plan message-limit enforcement, above) has to count against. Best-
+    // effort: a failure here must not fail a message that already sent.
+    try {
+      await eventRepository.create({
+        appId,
+        tenantId: tenantId || 'default',
+        category: 'messaging',
+        providerId: event.providerId,
+        status: event.status,
+        latency: event.latency,
+        cost: String(event.cost),
+        decisionReason: event.decisionReason,
+        payload: event.payload as any,
+        response: event.response as any,
+        error: event.error,
+      });
+    } catch (recordErr) {
+      console.error('[messaging] Failed to create event record', recordErr);
+    }
 
     eventBus.emit(event);
     observe(event);

@@ -133,6 +133,23 @@ export interface DbState {
   customerNotes: CustomerNoteRow[];
   supportTickets: SupportTicketRow[];
   ticketComments: TicketCommentRow[];
+  transactions: TransactionRow[];
+}
+
+export interface TransactionRow {
+  id: string;
+  appId: string;
+  tenantId: string;
+  providerId: string;
+  providerTransactionId: string | null;
+  status: string;
+  amount: string;
+  currency: string;
+  paymentMethod: string | null;
+  idempotencyKey: string | null;
+  metadata: unknown;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface CustomerNoteRow {
@@ -264,6 +281,7 @@ export const dbState: DbState = {
   customerNotes: [],
   supportTickets: [],
   ticketComments: [],
+  transactions: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -363,6 +381,7 @@ export function clearDb(): void {
   dbState.customerNotes = [];
   dbState.supportTickets = [];
   dbState.ticketComments = [];
+  dbState.transactions = [];
 }
 
 // Mirrors the seed plans inserted by migration 0011_add_subscriptions.sql
@@ -574,6 +593,15 @@ export function installDatabaseMock(): Record<string, unknown> {
       },
       async countSince(since: Date, appId?: string): Promise<number> {
         return dbState.events.filter((e) => e.createdAt >= since && (!appId || e.appId === appId)).length;
+      },
+      // Plan message-limit enforcement — mirrors
+      // packages/database/src/repositories/events.ts's real
+      // implementation (count only 'success' rows in one category since
+      // a given time).
+      async countSuccessfulByCategorySince(appId: string, category: string, since: Date): Promise<number> {
+        return dbState.events.filter(
+          (e) => e.appId === appId && e.category === category && e.status === 'success' && e.createdAt >= since,
+        ).length;
       },
       async findLatest(limit = 100, appId?: string): Promise<EventRow[]> {
         let events = dbState.events;
@@ -1067,13 +1095,13 @@ export function installDatabaseMock(): Record<string, unknown> {
     // P0: Mock transaction repository for payment state tracking
     transactionRepository: {
       async findById(id: string) {
-        return undefined;
+        return dbState.transactions.find((t) => t.id === id);
       },
-      async findByProviderTransactionId(_providerTxId: string) {
-        return undefined;
+      async findByProviderTransactionId(providerTxId: string) {
+        return dbState.transactions.find((t) => t.providerTransactionId === providerTxId);
       },
       async create(data: Record<string, unknown>) {
-        const row = {
+        const row: TransactionRow = {
           id: `tx_${randomUUID().slice(0, 12)}`,
           appId: String(data.appId ?? ''),
           tenantId: String(data.tenantId ?? 'default'),
@@ -1088,19 +1116,32 @@ export function installDatabaseMock(): Record<string, unknown> {
           createdAt: new Date(),
           updatedAt: new Date(),
         };
+        dbState.transactions.push(row);
         return row as any;
       },
-      async updateStatus(_id: string, _status: string) {
-        return undefined;
+      async updateStatus(id: string, status: string) {
+        const row = dbState.transactions.find((t) => t.id === id);
+        if (!row) return undefined;
+        row.status = status;
+        row.updatedAt = new Date();
+        return row;
       },
-      async findByAppAndIdempotencyKey(_appId: string, _tenantId: string, _key: string) {
-        return undefined;
+      async findByAppAndIdempotencyKey(appId: string, tenantId: string, key: string) {
+        return dbState.transactions.find((t) => t.appId === appId && t.tenantId === tenantId && t.idempotencyKey === key);
       },
-      async findByAppId(_appId: string, _limit = 50) {
-        return [];
+      async findByAppId(appId: string, limit = 50) {
+        return dbState.transactions.filter((t) => t.appId === appId).slice(0, limit);
       },
       async count() {
-        return 0;
+        return dbState.transactions.length;
+      },
+      // Plan payment-volume-limit enforcement — mirrors
+      // packages/database/src/repositories/transactions.ts's real
+      // implementation (sum only 'success' rows since a given time).
+      async sumSuccessfulAmountCentsSince(appId: string, since: Date) {
+        return dbState.transactions
+          .filter((t) => t.appId === appId && t.status === 'success' && t.createdAt >= since)
+          .reduce((sum, t) => sum + Math.round(Number(t.amount) * 100), 0);
       },
     },
     // P0: Mock outbox event repository for transactional outbox pattern
