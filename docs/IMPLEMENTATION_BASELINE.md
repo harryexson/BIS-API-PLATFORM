@@ -108,7 +108,10 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | Stripe | `payments/stripe.ts` | **Real HTTP** (2026-09-14) — PaymentIntents API; falls back to simulated when no API key **or** no `PaymentRequest.paymentToken` (this gateway never collects raw card data). Corrects an earlier version of this file that called a real endpoint with the wrong body encoding (JSON instead of form-urlencoded) and would have failed on every live call |
 | NMI | `payments/nmi.ts` | **Real HTTP** (2026-09-14) — Direct Post/Gateway API; same paymentToken-gated fallback. Previously fully simulated with no real-HTTP path at all |
 | Flutterwave | `payments/flutterwave.ts` | **Real HTTP** (2026-09-14) — v3 tokenized-charges API; same paymentToken-gated fallback (also requires a customer email, read from `payload.metadata.email`). Previously fully simulated with no real-HTTP path at all |
-| PawaPay, PayChangu, Airwallex | `payments/*.ts` | **Simulated** |
+| PawaPay | `payments/pawapay.ts` | **Real HTTP** (2026-09-15) — v2 Merchant API; no card token needed (mobile-money, phone-authorized), but gated on `payload.metadata.pawapayProvider` (an operator+country code this platform can't safely derive from a phone number) — falls back to simulated without it. A synchronous `ACCEPTED` maps to this platform's `unknown` status, not a fabricated success — PawaPay's deposit flow is async and only a callback/status-check (not built) knows the real outcome |
+| PayChangu | `payments/paychangu.ts` | **Real HTTP** (2026-09-15) — Mobile Money API; same operator-code gating pattern as PawaPay (`payload.metadata.paychanguOperatorRefId`). **Lower confidence on the error envelope specifically** — its success shape was directly confirmed, its non-2xx error shape was inferred from the same pattern, not directly observed |
+| Airwallex | `payments/airwallex.ts` | **Real HTTP** (2026-09-15) — PaymentIntents API, a 3-call flow (login for a cached Bearer token, create, confirm); same `paymentToken`-gated fallback as Stripe, plus a required `payload.metadata.airwallexCustomerId`. No 3D-Secure/`next_action` relay built — a `REQUIRES_CUSTOMER_ACTION` result reports as `unknown`, honestly, but nothing resolves it |
+| Trembi | *(no file)* | **Not a payment provider** — investigated 2026-09-15 (see §4 item 1a): trembi.com is a sales/marketing automation platform (leads, email/SMS/WhatsApp campaigns) with its own "Messaging API," and itself uses a third party (ElemiTech) for its own payment processing. No payments API exists to build an adapter against. Flagging this rather than leaving it as unstarted work, so a future pass doesn't retry the same dead end |
 | Example (payments) | `payments/example.ts` | **Simulated**, reference implementation only |
 
 **No adapter exists yet for Trembi** — no file, no env vars in
@@ -233,21 +236,38 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
 
 1. **Real provider adapters** — messaging: Infobip, Africa's Talking,
    Sinch, and Vibes are real HTTP integrations (2026-09-08/09); payments:
-   Stripe, NMI, and Flutterwave are now also real HTTP integrations
-   (2026-09-14, verified via WebSearch against current public docs — see
-   §6 item 1 and the changelog; Vibes at materially lower confidence than
-   the other messaging adapters — see its adapter file's class comment).
-   SignalHouse/FutureSMS/generic-SMS/email (messaging) and
-   PawaPay/PayChangu/Airwallex (payments) remain simulated; Trembi has no
-   adapter at all. Every real payment adapter shares one honest,
-   structural limitation, not a per-provider gap: this gateway's
-   `PaymentRequest` never collects raw card data (by design — PCI scope),
-   so a real charge additionally requires a pre-tokenized
-   `paymentToken` the caller obtained client-side (e.g. via Stripe.js);
-   without one, even a fully-credentialed adapter has nothing to charge
-   and falls back to simulated rather than fabricating a charge. This is
-   still the largest remaining gap in the whole plan, now roughly half
-   closed by count rather than almost entirely open.
+   **all six** documented payment providers (Stripe, NMI, Flutterwave,
+   PawaPay, PayChangu, Airwallex) are now real HTTP integrations
+   (2026-09-14/15, verified via WebSearch against current public docs —
+   see §6 item 1 and the changelog; Vibes and PayChangu's error envelope
+   at materially lower confidence than the rest — see each adapter's
+   class comment). SignalHouse/FutureSMS/generic-SMS/email (messaging)
+   remain simulated. The card-based payment adapters (Stripe, NMI,
+   Flutterwave, Airwallex) share one honest, structural limitation, not a
+   per-provider gap: this gateway's `PaymentRequest` never collects raw
+   card data (by design — PCI scope), so a real charge additionally
+   requires a pre-tokenized `paymentToken` the caller obtained
+   client-side (e.g. via Stripe.js); without one, even a
+   fully-credentialed adapter has nothing to charge and falls back to
+   simulated rather than fabricating a charge — see §4 item 1a below for
+   what that gap actually requires to close. The mobile-money adapters
+   (PawaPay, PayChangu) don't need a card token but do need an
+   operator/country code this platform can't safely derive from a phone
+   number, gated the same way via `payload.metadata`. **Trembi is not a
+   payment provider** (see the adapter table above and §4 item 1a) — no
+   adapter was built, and none should be; this is investigated and closed,
+   not outstanding work.
+1a. **No client-side card tokenization flow** — the structural limitation
+    named in item 1: nothing in this platform (no page under `apps/`, no
+    SDK helper) ever produces a `PaymentRequest.paymentToken`. Today's
+    four card-based adapters are correct but currently unreachable
+    end-to-end outside a direct API call that supplies a token by hand
+    (e.g. a test using a known Stripe test PaymentMethod id). Closing
+    this for real needs a client-side integration (Stripe.js/Elements or
+    equivalent per provider) on whatever frontend actually collects a
+    customer's card — this repo has no such page yet (`apps/web` is
+    marketing-only, `apps/admin-console` is an internal ops tool, neither
+    is a customer checkout flow).
 2. ~~No Africa's Talking / Trembi adapters~~ — **Africa's Talking closed
    2026-09-08, Sinch and Vibes closed 2026-09-09** (real adapters +
    registry entries, see item 1). **Trembi not attempted.**
@@ -505,15 +525,14 @@ safety):
       nothing in the gateway enforces them.
     - Admin console routing (this item) — still 4 in-memory tabs via
       `useState`, not URLs; no deep-linking or browser back/forward.
-11. ~~Real payment adapters~~ — **Stripe, NMI, and Flutterwave closed
-    2026-09-14** (§4 item 1), same WebSearch-verification method as the
-    messaging adapters above, same paymentToken-gated simulated fallback
-    across all three. **PawaPay, PayChangu, Airwallex, and Trembi not yet
-    attempted** — highest-value next real-provider work, in roughly that
-    order (PawaPay/PayChangu are the remaining African mobile-money/card
-    processors already wired into the fee-tier logic; Airwallex is a
-    larger multi-currency processor; Trembi has no adapter file at all
-    yet, net-new work).
+11. ~~Real payment adapters~~ — **all six done: Stripe/NMI/Flutterwave
+    closed 2026-09-14, PawaPay/PayChangu/Airwallex closed 2026-09-15**
+    (§4 item 1), same WebSearch-verification method as the messaging
+    adapters above. **Trembi investigated and found not to be a payment
+    provider** (§4 item 1, adapter table above) — nothing left to build
+    here. The real remaining work is §4 item 1a (client-side card
+    tokenization) — without it the four card-based adapters have no real
+    caller that can ever populate `paymentToken`.
 12. Landing page (`apps/web`) visual redesign — done 2026-09-14 per user
     request (larger type/icon scale, real font loading, a responsive nav
     that previously broke at phone widths). Cosmetic, not a production-

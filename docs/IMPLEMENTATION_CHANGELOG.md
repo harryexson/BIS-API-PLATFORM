@@ -6,6 +6,74 @@ tests cover it.
 
 ---
 
+## 2026-09-15 — Remaining Real Payment Adapters (PawaPay, PayChangu, Airwallex) + Trembi Investigation
+
+**Context:** direct continuation of 2026-09-14's real-payment-adapter
+work, at the user's "keep going" — closing out the rest of the payment
+provider punch list from that entry's §6.
+
+### What was done
+- **Real PawaPay adapter** (`payments/pawapay.ts`) — v2 Merchant API
+  (`POST /v2/deposits`). Architecturally different from the card
+  adapters: mobile-money needs no pre-tokenized instrument (the customer
+  approves on their own phone), but does need PawaPay's own
+  operator+country provider code, which this platform can't safely
+  derive from a phone number — read from
+  `payload.metadata.pawapayProvider` rather than guessed; without it,
+  falls back to simulated. The synchronous response only ever reports
+  `ACCEPTED` (queued) or `REJECTED` (rejected outright) — `ACCEPTED`
+  maps to this platform's `unknown` outcome, not a fabricated success,
+  since the real result arrives later via callback/status-check (not
+  wired up).
+- **Real PayChangu adapter** (`payments/paychangu.ts`) — Mobile Money API
+  (`POST /mobile-money/payments/initialize`). Same operator-code gating
+  pattern as PawaPay (`payload.metadata.paychanguOperatorRefId`); same
+  "top-level success just means accepted" trap as Flutterwave
+  (`data.status` is the real outcome). One thing flagged as
+  lower-confidence rather than asserted: PayChangu's error envelope
+  shape was inferred from its confirmed success shape, not directly
+  observed.
+- **Real Airwallex adapter** (`payments/airwallex.ts`) — PaymentIntents
+  API, a genuinely more complex 3-call flow: `/authentication/login` for
+  a Bearer token (cached in-memory per Airwallex's own guidance, reused
+  until ~1 minute before its 30-minute expiry), `/payment_intents/create`,
+  then `/payment_intents/{id}/confirm`. Confirms against an
+  already-tokenized instrument like Stripe (`paymentToken` ->
+  `payment_consent_id`), additionally requiring a `customer_id`
+  (`payload.metadata.airwallexCustomerId`). No 3D-Secure/`next_action`
+  relay built — a `REQUIRES_CUSTOMER_ACTION` result reports as `unknown`
+  honestly, but nothing resolves it.
+- **Trembi — investigated, not built.** WebSearch found trembi.com is a
+  sales/marketing automation platform (leads, email/SMS/WhatsApp
+  campaigns) with its own "Messaging API," not a payment gateway — it
+  uses a third party (ElemiTech) for its *own* payment processing.
+  Building a "Trembi payment adapter" would mean fabricating an
+  integration against an API that doesn't exist, which the master plan
+  explicitly prohibits. Documented in
+  `docs/IMPLEMENTATION_BASELINE.md`'s adapter table and gap list so a
+  future pass doesn't retry the same dead end.
+
+With this, all six payment providers named in `.env.example` (Stripe,
+NMI, Flutterwave, PawaPay, PayChangu, Airwallex) now have real HTTP
+integrations — the payment side of "real provider adapters" is closed by
+count, matching the messaging side's four real adapters
+(Infobip/Africa's Talking/Sinch/Vibes). What remains is §4 item 1a
+(client-side card tokenization) — without it, the four card-based
+adapters have no real caller that can ever populate `paymentToken`.
+
+### Verification
+Each adapter has its own test file: PawaPay 8 tests, PayChangu 9,
+Airwallex 10 (27 new tests total) — each covering the simulated
+fallback, the real request shape, every documented status outcome, the
+error envelope, 5xx retry, and offline/maintenance short-circuit.
+Airwallex's suite additionally verifies its 3-call sequence and that a
+second payment reuses the cached access token rather than logging in
+again. Full suite grew from 440 to 467 passing across this entry, always
+green; `tsc --noEmit` clean and `npm run lint` 0 errors after every
+commit.
+
+---
+
 ## 2026-09-14 — Real Payment Adapters, Transactional Email, Gateway Crash Fix, Landing Page Redesign
 
 **Context:** user asked to (1) re-check the codebase against the master
