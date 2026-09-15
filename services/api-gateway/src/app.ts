@@ -806,7 +806,7 @@ app.get('/ready', async (req: Request, res: Response) => {
 
 app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
-  const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
+  const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken } = req.body;
   // P1: Accept idempotency key from header — prevents duplicate charges on retries
   const idempotencyKey = req.header('x-idempotency-key');
   
@@ -829,7 +829,8 @@ app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantCon
       currency,
       paymentMethod,
       providerOverride,
-      phoneNumber
+      phoneNumber,
+      paymentToken
     });
 
     // P0: Create a transaction record for state tracking.
@@ -1476,6 +1477,71 @@ app.use('/api/dashboard', requireAdmin);
 
 app.get('/api/dashboard/providers', (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());
+});
+
+// Backs the admin console's "Interactive Request Playground" — an
+// admin-authenticated way to exercise real routing decisions without a
+// per-application API key. Previously the playground called
+// /api/gateway/{category} (no /v1 prefix), which was never a real route
+// on this gateway — every "Dispatch Request" click 404'd silently
+// against the frontend's own catch block. Routes through the same
+// routingEngine.route*() calls the real, API-key-authed
+// /v1/api/gateway/* routes use (and emits the same events), so a
+// dispatched request shows up in Observability/AuditLogs/LiveTopology
+// exactly like real traffic would.
+app.post('/api/dashboard/playground/dispatch', async (req: Request, res: Response) => {
+  const { category, appId, ...fields } = req.body || {};
+
+  if (!appId || !category) {
+    return res.status(400).json({ error: 'appId and category are required' });
+  }
+
+  try {
+    let event: TransactionEvent;
+    if (category === 'payment') {
+      const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken } = fields;
+      event = await routingEngine.routePayment(appId, {
+        amount: Number(amount),
+        currency,
+        paymentMethod,
+        providerOverride,
+        phoneNumber,
+        paymentToken,
+      });
+    } else if (category === 'messaging') {
+      const { recipient, content, providerOverride } = fields;
+      event = await routingEngine.routeMessage(appId, { recipient, content, providerOverride });
+    } else if (category === 'other') {
+      const { serviceType, payload, providerOverride } = fields;
+      event = await routingEngine.routeOther(appId, { serviceType, payload, providerOverride });
+    } else {
+      return res.status(400).json({ error: `Unknown category: ${category}` });
+    }
+
+    eventBus.emit(event);
+    observe(event);
+    return res.status(event.status === 'unknown' ? 202 : 200).json(event);
+  } catch (err: any) {
+    const isConsentBlock = err instanceof ConsentBlockedError;
+    const errorEvent = {
+      id: 'err_' + randomUUID(),
+      timestamp: new Date().toISOString(),
+      appId,
+      category,
+      providerId: fields.providerOverride || 'failed_route',
+      status: 'failed' as const,
+      latency: 30,
+      cost: 0,
+      decisionReason: isConsentBlock ? 'consent_blocked' : 'routing_failure',
+      payload: {},
+      response: null,
+      error: isConsentBlock ? 'Recipient has opted out' : err.message || 'Routing failed',
+    };
+    eventBus.emit(errorEvent);
+    observeFailure(category, errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
+    observe(errorEvent);
+    return res.status(isConsentBlock ? 403 : 503).json({ error: errorEvent.error, id: errorEvent.id });
+  }
 });
 
 app.patch('/api/dashboard/providers/:id', requireAdmin, (req: Request, res: Response) => {

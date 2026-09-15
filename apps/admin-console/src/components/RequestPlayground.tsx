@@ -1,6 +1,38 @@
-import React, { useState } from 'react';
-import { Send, Terminal, Play, Cpu, AlertTriangle } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Send, Terminal, Play, Cpu, AlertTriangle, CreditCard } from 'lucide-react';
 import { ProviderConfig } from '../types';
+
+// Public by design — a Stripe *publishable* key is meant to ship to the
+// browser (unlike the secret key the gateway itself uses server-side).
+// Unset in most deployments today, since no real checkout flow exists
+// elsewhere in this repo yet; when it is set, this becomes the one place
+// in the whole platform that can produce a real PaymentRequest.paymentToken
+// end to end, rather than every payment adapter having a correct real-HTTP
+// path with no real caller that can ever reach it.
+const STRIPE_PUBLISHABLE_KEY = import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY as string | undefined;
+
+const STRIPE_JS_SRC = 'https://js.stripe.com/v3/';
+let stripeJsPromise: Promise<void> | null = null;
+
+// Loads Stripe.js once and caches the in-flight/settled promise across
+// mounts, so switching the "card" rail off and back on doesn't inject a
+// second <script> tag or re-fetch it.
+function loadStripeJs(): Promise<void> {
+  if (window.Stripe) return Promise.resolve();
+  if (stripeJsPromise) return stripeJsPromise;
+
+  stripeJsPromise = new Promise((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>(`script[src="${STRIPE_JS_SRC}"]`);
+    const script = existing || document.createElement('script');
+    script.addEventListener('load', () => resolve(), { once: true });
+    script.addEventListener('error', () => reject(new Error('Failed to load Stripe.js')), { once: true });
+    if (!existing) {
+      script.src = STRIPE_JS_SRC;
+      document.head.appendChild(script);
+    }
+  });
+  return stripeJsPromise;
+}
 
 interface RequestPlaygroundProps {
   providers: ProviderConfig[];
@@ -30,6 +62,57 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
   // Custom Overrides
   const [providerOverride, setProviderOverride] = useState('');
 
+  // Real Stripe.js card tokenization — only active when both the "card"
+  // rail is selected and VITE_STRIPE_PUBLISHABLE_KEY is configured.
+  const cardElementRef = useRef<HTMLDivElement>(null);
+  const stripeRef = useRef<Stripe | null>(null);
+  const cardRef = useRef<StripeCardElement | null>(null);
+  const [cardComplete, setCardComplete] = useState(false);
+  const [cardError, setCardError] = useState<string | null>(null);
+  const [tokenizing, setTokenizing] = useState(false);
+  const cardTokenizationActive = category === 'payment' && paymentMethod === 'card' && !!STRIPE_PUBLISHABLE_KEY;
+
+  useEffect(() => {
+    if (!cardTokenizationActive) return;
+    let cancelled = false;
+    let card: StripeCardElement | null = null;
+
+    // Loaded on demand rather than unconditionally in index.html — most
+    // deployments won't have VITE_STRIPE_PUBLISHABLE_KEY configured (no
+    // checkout flow exists elsewhere in this repo yet), and an
+    // unconditional <script src="https://js.stripe.com/v3/"> would fail
+    // to load — and log a console error — in any environment that can't
+    // reach js.stripe.com, including this one. Still loaded directly from
+    // Stripe's own domain either way, which is what their PCI/fraud-
+    // detection requirement actually calls for (not bundling/proxying
+    // it), not that the <script> tag be static.
+    loadStripeJs()
+      .then(() => {
+        if (cancelled || !cardElementRef.current) return;
+        if (!stripeRef.current) {
+          stripeRef.current = window.Stripe!(STRIPE_PUBLISHABLE_KEY!);
+        }
+        card = stripeRef.current.elements().create('card');
+        card.mount(cardElementRef.current);
+        card.on('change', (event) => {
+          setCardComplete(!event.error);
+          setCardError(event.error?.message || null);
+        });
+        cardRef.current = card;
+      })
+      .catch(() => {
+        if (!cancelled) setCardError('Stripe.js failed to load (js.stripe.com may be unreachable from this environment).');
+      });
+
+    return () => {
+      cancelled = true;
+      card?.unmount();
+      cardRef.current = null;
+    };
+    // Re-mount whenever the card field toggles into/out of view.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cardTokenizationActive]);
+
   const apps = [
     { id: 'reachchurch', name: 'ReachChurch' },
     { id: 'afribook', name: 'Afribook' },
@@ -51,7 +134,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     let payload: any = { appId };
     if (providerOverride) {
       payload.providerOverride = providerOverride;
@@ -65,6 +148,30 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
         paymentMethod,
         phoneNumber
       };
+
+      // Real card tokenization: exchange the card details entered into
+      // the Stripe Elements field for a PaymentMethod id, client-side,
+      // via Stripe.js — this backend never sees or touches raw card data.
+      // That id becomes paymentToken, the one thing every real card-based
+      // payment adapter (Stripe/NMI/Flutterwave/Airwallex) needs and has
+      // never had a real caller supply before now.
+      if (cardTokenizationActive) {
+        if (!cardComplete || !stripeRef.current || !cardRef.current) {
+          setCardError(cardError || 'Enter complete card details before dispatching.');
+          return;
+        }
+        setTokenizing(true);
+        try {
+          const result = await stripeRef.current.createPaymentMethod({ type: 'card', card: cardRef.current });
+          if (result.error || !result.paymentMethod) {
+            setCardError(result.error?.message || 'Card tokenization failed.');
+            return;
+          }
+          payload.paymentToken = result.paymentMethod.id;
+        } finally {
+          setTokenizing(false);
+        }
+      }
     } else if (category === 'messaging') {
       payload = {
         ...payload,
@@ -254,6 +361,39 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
                 </div>
               </div>
 
+              {paymentMethod === 'card' && (
+                <div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>
+                    <CreditCard className="w-3 h-3" /> Card details {STRIPE_PUBLISHABLE_KEY ? '(real Stripe.js tokenization)' : ''}
+                  </label>
+                  {STRIPE_PUBLISHABLE_KEY ? (
+                    <>
+                      <div
+                        ref={cardElementRef}
+                        style={{
+                          background: 'var(--bg-tertiary)',
+                          border: `1px solid ${cardError ? 'var(--accent-red)' : 'var(--glass-border)'}`,
+                          borderRadius: '6px',
+                          padding: '10px',
+                        }}
+                      />
+                      {cardError ? (
+                        <p style={{ margin: '4px 0 0', fontSize: '10px', color: 'var(--accent-red)' }}>{cardError}</p>
+                      ) : (
+                        <p style={{ margin: '4px 0 0', fontSize: '10px', color: 'var(--text-muted)' }}>
+                          Test card: 4242 4242 4242 4242, any future expiry, any CVC.
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: '10px', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                      Set <code>VITE_STRIPE_PUBLISHABLE_KEY</code> to test a real tokenized charge here —
+                      without it, this request has no card to charge and every real adapter falls back to simulated.
+                    </p>
+                  )}
+                </div>
+              )}
+
               {paymentMethod === 'mobile_money' && (
                 <div>
                   <label style={{ display: 'block', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>Phone Number (MSISDN)</label>
@@ -407,7 +547,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || tokenizing || (cardTokenizationActive && !cardComplete)}
             style={{
               background: 'linear-gradient(90deg, #10b981 0%, #059669 100%)',
               border: 'none',
@@ -415,7 +555,8 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
               padding: '10px 16px',
               borderRadius: '8px',
               fontWeight: '700',
-              cursor: loading ? 'not-allowed' : 'pointer',
+              cursor: loading || tokenizing ? 'not-allowed' : 'pointer',
+              opacity: cardTokenizationActive && !cardComplete ? 0.5 : 1,
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -429,7 +570,7 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
             onMouseUp={(e) => !loading && (e.currentTarget.style.transform = 'scale(1)')}
           >
             <Send className="w-4 h-4" />
-            {loading ? 'Routing Request...' : 'Dispatch Request'}
+            {tokenizing ? 'Tokenizing card...' : loading ? 'Routing Request...' : 'Dispatch Request'}
           </button>
         </form>
 

@@ -112,13 +112,14 @@ export const App: React.FC = () => {
     setPlaygroundLoading(true);
     setPlaygroundResponse(null);
 
-    const endpoint = `/api/gateway/${category === 'payment' ? 'payment' : category === 'messaging' ? 'messaging' : 'other'}`;
-
     try {
-      const res = await fetch(endpoint, {
+      const res = await fetch('/api/dashboard/playground/dispatch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'x-admin-token': token } : {}),
+        },
+        body: JSON.stringify({ category, ...payload }),
       });
       const data = await res.json();
       setPlaygroundResponse(data);
