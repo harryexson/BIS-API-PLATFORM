@@ -620,10 +620,14 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
       `docs/providers/ADDING_A_PROVIDER.md`. `docs/DEVELOPER_GUIDE.md`
       separately claimed inbound provider webhooks are authenticated by
       each provider's own native signature (Stripe's `Stripe-Signature`,
-      etc.) — also false: every provider's inbound webhook is verified
-      against one shared, platform-wide `WEBHOOK_HMAC_SECRET` HMAC, not
-      any provider's real scheme. Corrected, and flagged as a real, open
-      gap for going live with a provider that signs its own webhooks.
+      etc.) — at the time, false: every provider's inbound webhook was
+      verified against one shared, platform-wide `WEBHOOK_HMAC_SECRET`
+      HMAC, not any provider's real scheme. Corrected then; a later pass
+      (see this doc's "Native per-provider inbound webhook signature
+      verification" entry, and `IMPLEMENTATION_CHANGELOG.md`) closed the
+      gap for 5 of the 6 real payment providers — this doc and
+      `DEVELOPER_GUIDE.md` §9a were both updated again at that point to
+      reflect it.
     - `messaging/sms.ts` (dead code — unregistered, unexported, the
       source of a `.env.example` gap an earlier audit flagged) was
       deleted rather than fixed; it added nothing the registered
@@ -641,6 +645,58 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     Playwright regression test
     (`apps/admin-console/tests/provider-secrets.spec.ts`) cover this —
     see the changelog.
+20. ~~**Inbound provider webhooks verified against one shared, generic
+    HMAC — never each provider's own real signature scheme**~~ —
+    **closed for 5 of 6 real payment providers, 2026-09-17.**
+    `BaseProvider` gained `verifyProviderWebhookSignature(rawBody, headers)`
+    (default: returns `null`, meaning "no native scheme available"),
+    overridden with each provider's real, WebSearch-verified scheme in
+    `stripe.ts` (`Stripe-Signature`: `t=`/`v1=`, HMAC-SHA256 of
+    `${timestamp}.${rawBody}`, 300s replay window), `nmi.ts`
+    (`Webhook-Signature`: `t=`/`s=`, HMAC-SHA256 of `${nonce}.${rawBody}` —
+    `t` is a nonce, not a timestamp, so no replay window applies),
+    `flutterwave.ts` (`verif-hash`: a static configured value, *not* a
+    computed HMAC — direct constant-time comparison; one source disputes
+    whether it's the raw value or its SHA-256, flagged inline since this
+    environment couldn't reach flutterwave.com to confirm), `paychangu.ts`
+    (`Signature`: plain HMAC-SHA256, identical shape to the platform's own
+    generic scheme, just keyed by PayChangu's own secret), and
+    `airwallex.ts` (`x-timestamp`/`x-signature`: HMAC-SHA256 of
+    `${timestamp}${rawBody}` with no separator). `services/api-gateway/src/
+    app.ts`'s `/v1/api/webhooks/:provider` route now calls the native check
+    first and only falls back to the generic `WEBHOOK_HMAC_SECRET` check
+    when it returns `null`; a native check returning `false` rejects the
+    delivery outright and never falls through to the weaker generic check.
+    **PawaPay is the deliberate exception, not an oversight**: its real
+    scheme is RFC-9421 HTTP Message Signatures — asymmetric, keyed by
+    PawaPay's own published public key with its own canonicalization
+    rules — a materially larger, riskier undertaking with no live sandbox
+    in this environment to validate against; documented in `pawapay.ts`'s
+    class comment rather than guessed at. PawaPay webhooks still use the
+    generic fallback. A secondary defense-in-depth interaction was found
+    and fixed while wiring this up: `packages/workers/src/jobs/
+    {paymentWebhook,providerWebhook}.ts` each independently re-verify a
+    webhook's signature against `WEBHOOK_HMAC_SECRET` before processing
+    it (a real, separate safety net against a bug in the enqueue path) —
+    which would have wrongly rejected every natively-verified delivery,
+    since a provider's real signature (e.g. Stripe's) isn't the platform's
+    generic HMAC. Fixed by adding `verificationMethod: 'native' | 'platform'`
+    to `ProviderWebhookEvent` (`packages/schemas`), set by the gateway and
+    threaded through the enqueued job payload; the worker's generic
+    re-check now only runs for `'platform'`-verified deliveries, trusting
+    a `'native'` verification as already done (correctly) at the gateway.
+    `docs/DEVELOPER_GUIDE.md` §9a and `docs/providers/ADDING_A_PROVIDER.md`
+    §6 (both previously described this as entirely unimplemented) and
+    `.env.example` (new `STRIPE_WEBHOOK_SECRET`, `NMI_WEBHOOK_SIGNING_KEY`,
+    `FLUTTERWAVE_SECRET_HASH`, `PAYCHANGU_WEBHOOK_SECRET`,
+    `AIRWALLEX_WEBHOOK_SECRET`) were updated to match. New tests: a
+    `verifyProviderWebhookSignature()` suite per adapter (null when
+    unconfigured, true for a correct signature, false for a tampered body
+    or missing header — plus Stripe's replay-window case and PawaPay's
+    always-`null` case), and `packages/workers/src/jobs/
+    {paymentWebhook,providerWebhook}.test.ts` (new files) proving the
+    native-verified path is trusted and the platform-verified path still
+    fails closed on a bad or missing signature.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 

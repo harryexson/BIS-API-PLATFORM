@@ -157,6 +157,38 @@ export abstract class BaseProvider {
   }
 
   /**
+   * Verifies this provider's own native inbound-webhook signature scheme
+   * — the real header format and algorithm the provider itself documents
+   * (e.g. Stripe's `Stripe-Signature: t=...,v1=...`), not the platform's
+   * generic `WEBHOOK_HMAC_SECRET` fallback every provider uses today.
+   *
+   * Returns:
+   *   - `null` — no real per-provider scheme is implemented for this
+   *     adapter, OR one is implemented but no webhook secret is
+   *     configured for it. The caller (the gateway's webhook route)
+   *     should fall back to the generic platform HMAC check.
+   *   - `true`/`false` — a real scheme ran and the request did or didn't
+   *     pass it. Once a provider's native secret is configured, this is
+   *     authoritative — the caller must not additionally fall back to
+   *     the generic check on `false` (that would let an attacker bypass
+   *     the provider's real protection by supplying a valid platform
+   *     signature instead of a valid provider one).
+   *
+   * Each adapter's override was verified against that provider's real,
+   * current documentation (WebSearch, 2026-09-17) before being written —
+   * see docs/providers/ADDING_A_PROVIDER.md and each override's own
+   * comment for the source. The default here (no override) is honest:
+   * this base class has no way to know a provider's real scheme, so it
+   * always defers to the platform fallback rather than guessing.
+   */
+  public async verifyProviderWebhookSignature(
+    _rawBody: string,
+    _headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    return null;
+  }
+
+  /**
    * Encodes params as application/x-www-form-urlencoded, the body format
    * several payment gateways (Stripe, NMI) require instead of JSON — a
    * JSON body against those APIs is rejected outright, not merely

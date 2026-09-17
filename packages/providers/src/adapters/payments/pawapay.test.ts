@@ -40,6 +40,14 @@ describe('PawaPayProvider', () => {
     });
   });
 
+  describe('verifyProviderWebhookSignature()', () => {
+    it('returns null (no native RFC-9421 scheme implemented — see BaseProvider default and the comment in pawapay.ts) so the gateway falls back to the generic platform HMAC check', async () => {
+      const provider = new PawaPayProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {});
+      expect(result).toBeNull();
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.PAWAPAY_API_KEY;

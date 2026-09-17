@@ -184,22 +184,35 @@ There are **two** webhook directions:
 ### 9a. Inbound provider webhooks (platform receives)
 
 Providers call `POST /v1/api/webhooks/{provider}` (e.g.
-`/v1/api/webhooks/stripe`). These are **not** authenticated by your API key,
-and — despite what an earlier version of this doc claimed — **not** by each
-provider's own native signature scheme either. Every inbound provider
-webhook, regardless of provider, is verified against one shared,
-platform-wide secret: an `x-webhook-signature` header holding an
-HMAC-SHA256 of the raw request body, keyed by this platform's own
-`WEBHOOK_HMAC_SECRET` (not Stripe's `Stripe-Signature`, not Flutterwave's
-`verif-hash`, etc.). This is a real, currently-open gap for going live with
-any provider that signs its own outbound webhooks with its own secret: this
-platform's inbound route does not verify Stripe's real `Stripe-Signature`
-header, Flutterwave's real `verif-hash`, PayChangu's real
-`X-PayChangu-Signature`, or PawaPay's real signed JWT — something upstream
-of this endpoint would need to re-sign the delivery with
-`WEBHOOK_HMAC_SECRET` before it reaches this platform, or this route needs
-per-provider native verification added (not yet built). See
-`docs/providers/ADDING_A_PROVIDER.md` for detail.
+`/v1/api/webhooks/stripe`). These are **not** authenticated by your API key.
+The gateway verifies each delivery in one of two ways, in this order:
+
+1. **Native, provider-specific verification** — when the adapter for that
+   provider implements `verifyProviderWebhookSignature()`
+   (`BaseProvider`/each adapter in `packages/providers/src/adapters/
+   payments/*.ts`) *and* its own webhook secret is configured, the delivery
+   is checked against that provider's own real signature scheme: Stripe's
+   `Stripe-Signature` (`t=`/`v1=` HMAC-SHA256, 300s replay window), NMI's
+   `Webhook-Signature` (`t=`/`s=`, nonce-keyed HMAC-SHA256), Flutterwave's
+   `verif-hash` (a static configured value, not a computed HMAC), PayChangu's
+   `Signature` (plain HMAC-SHA256), or Airwallex's `x-timestamp`/
+   `x-signature` (HMAC-SHA256 of the concatenated timestamp+body). Once a
+   native check is available it is authoritative — failing it rejects the
+   delivery outright and never falls through to step 2.
+2. **Generic platform fallback** — used only when no native scheme applies
+   (the adapter has none, or its webhook secret isn't configured): an
+   `x-webhook-signature` header holding an HMAC-SHA256 of the raw request
+   body, keyed by this platform's own `WEBHOOK_HMAC_SECRET`.
+
+**PawaPay is the one remaining gap**: its real scheme is RFC-9421 HTTP
+Message Signatures (asymmetric, keyed by PawaPay's own published public key,
+with its own canonicalization rules) — deliberately not implemented, since a
+wrong implementation of an asymmetric scheme would silently degrade
+security rather than honestly fall back. PawaPay webhooks are verified via
+the generic platform fallback only. See
+`packages/providers/src/adapters/payments/pawapay.ts` and
+`docs/providers/ADDING_A_PROVIDER.md` §6 for detail, including how to add a
+native check for a new adapter.
 
 The raw body is verified **before** parsing. Deliveries are deduplicated
 in-memory at the gateway by the payload's own `id` field (a 5-minute

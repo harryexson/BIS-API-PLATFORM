@@ -211,28 +211,60 @@ established shape and helpers.
 
 ---
 
-## 6. Inbound webhooks — read this before assuming it "just works"
+## 6. Inbound webhooks — native-first, with a generic fallback
 
 `POST /v1/api/webhooks/:provider` (`services/api-gateway/src/app.ts`) is
-**generic by code** — any provider id registered in step 2 can receive
-webhooks there with zero gateway changes — but it is **not generic by
-protocol**. Every inbound webhook, regardless of provider, is verified
-against one shared, platform-wide `x-webhook-signature` HMAC-SHA256 header
-keyed by `WEBHOOK_HMAC_SECRET`. It does **not** verify your provider's own
-native webhook signature scheme (e.g. a real Stripe `Stripe-Signature`
-header, a real Flutterwave `verif-hash`). If your provider needs to
-deliver real inbound webhooks, either:
+generic by code — any provider id registered in step 2 can receive webhooks
+there with zero gateway changes — and, as of this pass, generic by protocol
+too: it calls `known.verifyProviderWebhookSignature(rawBody, headers)` on
+your adapter first, and only falls back to the shared, platform-wide
+`x-webhook-signature` HMAC-SHA256 (`WEBHOOK_HMAC_SECRET`) check when that
+returns `null` (meaning "no native scheme configured/available", not "the
+signature failed"). A native check that returns `false` rejects the
+delivery outright — it never falls through to the weaker generic check.
 
-- the provider supports configuring its own outbound signing to match
-  this platform's HMAC scheme (rare), or
-- something upstream of this endpoint re-signs the delivery with
-  `WEBHOOK_HMAC_SECRET` before forwarding it here, or
-- you extend the route with real per-provider native verification (not
-  built today — this is a known, open gap, not a design you should assume
-  exists).
+**To add native verification for your provider:**
+
+1. Look up your provider's real webhook signing scheme (header name(s),
+   algorithm, what exactly gets signed) — verify it against current
+   documentation the same way you verified the payment API in step 0. Do
+   not guess or reuse another provider's scheme "because it's probably
+   similar" — Stripe, NMI, Flutterwave, PayChangu, and Airwallex all turned
+   out to differ in some way (timestamp vs. nonce, separator vs. none,
+   computed HMAC vs. a static echoed value) despite looking superficially
+   alike.
+2. Add a `private get webhookSecret()` (or similarly named) getter reading
+   `this.secrets.webhook_secret || process.env.YOUR_PROVIDER_WEBHOOK_SECRET`
+   — reuse the `webhook_secret` field name so it fits the existing
+   admin-console secret UI and `ProviderSecretMeta` contract; add a new env
+   var name in `.env.example` and document it in your adapter's file-level
+   comment.
+3. Override `verifyProviderWebhookSignature(rawBody, headers)`:
+   `return null` when your webhook secret isn't configured (defer to the
+   generic fallback); `return false` when the header is missing or doesn't
+   match; `return true` when it does. See
+   `packages/providers/src/adapters/payments/stripe.ts` (timestamped HMAC
+   with a replay window), `nmi.ts` (nonce-keyed HMAC), `flutterwave.ts`
+   (static value comparison, not an HMAC), or `airwallex.ts`
+   (no-separator concatenation) for the range of real shapes this can
+   take.
+4. Add `webhook_secret` to your provider's entry in `PROVIDER_SECRET_FIELDS`
+   in `apps/admin-console/src/components/ProviderManagement.tsx` so an
+   operator has a field to enter it.
+5. Write tests mirroring the `describe('verifyProviderWebhookSignature()', ...)`
+   blocks in the existing adapter `*.test.ts` files: null when unconfigured,
+   true for a correctly computed signature, false for a tampered body and
+   for a missing header.
+
+If your provider's real scheme is something this platform genuinely
+shouldn't attempt without a live sandbox to validate against (see
+`pawapay.ts` for PawaPay's RFC-9421 asymmetric signatures as the precedent),
+document that decision in your adapter's file-level comment instead of
+guessing — the generic fallback is a legitimate, honest degrade, a wrong
+implementation is not.
 
 See `docs/DEVELOPER_GUIDE.md` §9a for the customer-facing version of this
-same caveat.
+same explanation.
 
 ---
 

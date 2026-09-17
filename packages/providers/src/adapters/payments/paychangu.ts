@@ -39,7 +39,10 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * failure.
  *
  * Environment variables:
- *   PAYCHANGU_API_KEY — secret key, sent as Bearer auth
+ *   PAYCHANGU_API_KEY        — secret key, sent as Bearer auth
+ *   PAYCHANGU_WEBHOOK_SECRET — the "web secret key" from the dashboard's
+ *     API Keys & Webhooks settings, used only by
+ *     verifyProviderWebhookSignature() below.
  */
 export class PayChanguProvider extends BaseProvider {
   private baseUrl = 'https://api.paychangu.com';
@@ -52,8 +55,33 @@ export class PayChanguProvider extends BaseProvider {
     return this.secrets.api_key || process.env.PAYCHANGU_API_KEY || '';
   }
 
+  private get webhookSecret(): string {
+    return this.secrets.webhook_secret || process.env.PAYCHANGU_WEBHOOK_SECRET || '';
+  }
+
   public isConfigured(): boolean {
     return Boolean(this.apiKey);
+  }
+
+  /**
+   * Verifies PayChangu's real `Signature` header — verified via
+   * WebSearch, 2026-09-17: a plain HMAC-SHA256(payload, web secret key)
+   * hex digest, no timestamp/nonce framing — exactly
+   * BaseProvider.verifyWebhookSignature's existing generic
+   * implementation, just keyed by PayChangu's own secret instead of the
+   * shared platform one.
+   */
+  public async verifyProviderWebhookSignature(
+    rawBody: string,
+    headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    const secret = this.webhookSecret;
+    if (!secret) return null;
+
+    const header = headers['signature'];
+    if (!header) return false;
+
+    return this.verifyWebhookSignature(rawBody, header, secret);
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

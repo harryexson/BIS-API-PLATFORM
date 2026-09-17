@@ -35,6 +35,10 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  *
  * Environment variables:
  *   STRIPE_SECRET_KEY — sk_test_... or sk_live_...
+ *   STRIPE_WEBHOOK_SECRET — whsec_... (from the Stripe dashboard's webhook
+ *     endpoint settings), used only by verifyProviderWebhookSignature()
+ *     below to verify Stripe's own Stripe-Signature header, separate from
+ *     the payment API credential above.
  */
 export class StripeProvider extends BaseProvider {
   private baseUrl = 'https://api.stripe.com/v1';
@@ -47,8 +51,49 @@ export class StripeProvider extends BaseProvider {
     return this.secrets.api_key || process.env.STRIPE_SECRET_KEY || '';
   }
 
+  private get webhookSecret(): string {
+    return this.secrets.webhook_secret || process.env.STRIPE_WEBHOOK_SECRET || '';
+  }
+
   public isConfigured(): boolean {
     return Boolean(this.apiKey);
+  }
+
+  /**
+   * Verifies Stripe's real `Stripe-Signature` header — verified against
+   * Stripe's current documentation via WebSearch, 2026-09-17: a
+   * comma-separated `t=<unix seconds>,v1=<hex hmac>[,v0=...]` value. The
+   * signed payload is `"${timestamp}.${rawBody}"`, HMAC-SHA256'd with the
+   * endpoint's signing secret. Stripe documents rejecting signatures more
+   * than 300 seconds old as replay protection, applied here too.
+   */
+  public async verifyProviderWebhookSignature(
+    rawBody: string,
+    headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    const secret = this.webhookSecret;
+    if (!secret) return null;
+
+    const header = headers['stripe-signature'];
+    if (!header) return false;
+
+    const parts: Record<string, string> = {};
+    for (const part of header.split(',')) {
+      const [key, value] = part.split('=');
+      if (key && value) parts[key] = value;
+    }
+    const timestamp = parts.t;
+    const v1 = parts.v1;
+    if (!timestamp || !v1) return false;
+
+    const ageSeconds = Math.abs(Date.now() / 1000 - Number(timestamp));
+    if (!Number.isFinite(ageSeconds) || ageSeconds > 300) return false;
+
+    const { createHmac, timingSafeEqual } = await import('crypto');
+    const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(v1, 'hex');
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

@@ -39,6 +39,42 @@ describe('FlutterwaveProvider', () => {
     });
   });
 
+  describe('verifyProviderWebhookSignature()', () => {
+    const originalHash = process.env.FLUTTERWAVE_SECRET_HASH;
+    afterEach(() => {
+      if (originalHash === undefined) delete process.env.FLUTTERWAVE_SECRET_HASH;
+      else process.env.FLUTTERWAVE_SECRET_HASH = originalHash;
+    });
+
+    it('returns null when no secret hash is configured', async () => {
+      delete process.env.FLUTTERWAVE_SECRET_HASH;
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'verif-hash': 'anything' });
+      expect(result).toBeNull();
+    });
+
+    it('returns true when verif-hash matches the configured secret hash verbatim', async () => {
+      process.env.FLUTTERWAVE_SECRET_HASH = 'my-dashboard-secret-hash';
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'verif-hash': 'my-dashboard-secret-hash' });
+      expect(result).toBe(true);
+    });
+
+    it('returns false when verif-hash does not match', async () => {
+      process.env.FLUTTERWAVE_SECRET_HASH = 'my-dashboard-secret-hash';
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'verif-hash': 'wrong-value' });
+      expect(result).toBe(false);
+    });
+
+    it('returns false when the header is missing', async () => {
+      process.env.FLUTTERWAVE_SECRET_HASH = 'my-dashboard-secret-hash';
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {});
+      expect(result).toBe(false);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.FLUTTERWAVE_SECRET_KEY;

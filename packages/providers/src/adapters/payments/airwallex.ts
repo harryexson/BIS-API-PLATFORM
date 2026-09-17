@@ -37,8 +37,11 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * resolve it.
  *
  * Environment variables:
- *   AIRWALLEX_CLIENT_ID — x-client-id
- *   AIRWALLEX_API_KEY   — x-api-key
+ *   AIRWALLEX_CLIENT_ID     — x-client-id
+ *   AIRWALLEX_API_KEY       — x-api-key
+ *   AIRWALLEX_WEBHOOK_SECRET — the notification URL's own secret key
+ *     (each webhook subscription has its own, per Airwallex's docs), used
+ *     only by verifyProviderWebhookSignature() below.
  */
 export class AirwallexProvider extends BaseProvider {
   private baseUrl = 'https://api.airwallex.com';
@@ -56,8 +59,36 @@ export class AirwallexProvider extends BaseProvider {
     return this.secrets.api_key || process.env.AIRWALLEX_API_KEY || '';
   }
 
+  private get webhookSecret(): string {
+    return this.secrets.webhook_secret || process.env.AIRWALLEX_WEBHOOK_SECRET || '';
+  }
+
   public isConfigured(): boolean {
     return Boolean(this.clientId) && Boolean(this.apiKey);
+  }
+
+  /**
+   * Verifies Airwallex's real `x-signature`/`x-timestamp` headers —
+   * verified via WebSearch, 2026-09-17: HMAC-SHA256 of
+   * `x-timestamp + raw_body` (concatenated directly, no separator),
+   * keyed by the notification URL's own secret, hex-encoded.
+   */
+  public async verifyProviderWebhookSignature(
+    rawBody: string,
+    headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    const secret = this.webhookSecret;
+    if (!secret) return null;
+
+    const timestamp = headers['x-timestamp'];
+    const signature = headers['x-signature'];
+    if (!timestamp || !signature) return false;
+
+    const { createHmac, timingSafeEqual } = await import('crypto');
+    const expected = createHmac('sha256', secret).update(`${timestamp}${rawBody}`, 'utf8').digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(signature, 'hex');
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   // Reuses a cached token until ~1 minute before it expires, per

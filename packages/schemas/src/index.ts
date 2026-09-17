@@ -233,5 +233,6 @@ export interface ProviderWebhookEvent {
 
   // Webhook verification
   rawBody?: string;               // Raw webhook body for HMAC verification
-  signature?: string;             // Webhook signature for verification
+  signature?: string;             // Generic platform HMAC signature (x-webhook-signature); absent when verificationMethod is 'native'
+  verificationMethod?: 'native' | 'platform'; // How the gateway verified this webhook before enqueueing it — see BaseProvider.verifyProviderWebhookSignature
 }

@@ -51,6 +51,21 @@ export class PawaPayProvider extends BaseProvider {
     return this.secrets.api_key || process.env.PAWAPAY_API_KEY || '';
   }
 
+  // No verifyProviderWebhookSignature() override here — deliberately, not
+  // an oversight. Verified via WebSearch, 2026-09-17: PawaPay signs its
+  // callbacks using RFC-9421 HTTP Message Signatures — an asymmetric
+  // scheme (their public key, fetched from a dedicated Public Keys
+  // endpoint, not a shared secret) with its own canonicalization rules
+  // for constructing the signature base from the Signature-Input
+  // structured-field header. That's a materially different, larger, and
+  // riskier undertaking than the HMAC-based schemes every other adapter
+  // here implements (key fetching/caching, correct RFC-9421 base-string
+  // construction, no live PawaPay sandbox in this environment to test
+  // against) — a wrong implementation would silently degrade security
+  // rather than honestly fall back, which is worse than not attempting
+  // it. Inbound PawaPay webhooks fall back to the gateway's generic
+  // WEBHOOK_HMAC_SECRET check (see BaseProvider's default), same as
+  // before this pass — see docs/providers/ADDING_A_PROVIDER.md §6.
   public isConfigured(): boolean {
     return Boolean(this.apiKey);
   }

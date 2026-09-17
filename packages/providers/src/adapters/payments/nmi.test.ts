@@ -46,6 +46,55 @@ describe('NMIProvider', () => {
     });
   });
 
+  describe('verifyProviderWebhookSignature()', () => {
+    const originalSigningKey = process.env.NMI_WEBHOOK_SIGNING_KEY;
+    afterEach(() => {
+      if (originalSigningKey === undefined) delete process.env.NMI_WEBHOOK_SIGNING_KEY;
+      else process.env.NMI_WEBHOOK_SIGNING_KEY = originalSigningKey;
+    });
+
+    it('returns null when no signing key is configured', async () => {
+      delete process.env.NMI_WEBHOOK_SIGNING_KEY;
+      const provider = new NMIProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'webhook-signature': 't=nonce,s=deadbeef' });
+      expect(result).toBeNull();
+    });
+
+    it('returns true for a correctly computed t=/s= signature (t is a nonce, not a timestamp)', async () => {
+      process.env.NMI_WEBHOOK_SIGNING_KEY = 'signing-key';
+      const provider = new NMIProvider(makeConfig());
+      const rawBody = '{"event":"transaction.sale.success"}';
+      const nonce = 'abc123';
+      const { createHmac } = await import('crypto');
+      const sig = createHmac('sha256', 'signing-key').update(`${nonce}.${rawBody}`, 'utf8').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature(rawBody, {
+        'webhook-signature': `t=${nonce},s=${sig}`,
+      });
+      expect(result).toBe(true);
+    });
+
+    it('returns false for a tampered body', async () => {
+      process.env.NMI_WEBHOOK_SIGNING_KEY = 'signing-key';
+      const provider = new NMIProvider(makeConfig());
+      const nonce = 'abc123';
+      const { createHmac } = await import('crypto');
+      const sig = createHmac('sha256', 'signing-key').update(`${nonce}.{"event":"original"}`, 'utf8').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature('{"event":"tampered"}', {
+        'webhook-signature': `t=${nonce},s=${sig}`,
+      });
+      expect(result).toBe(false);
+    });
+
+    it('returns false when the header is missing', async () => {
+      process.env.NMI_WEBHOOK_SIGNING_KEY = 'signing-key';
+      const provider = new NMIProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {});
+      expect(result).toBe(false);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.NMI_API_KEY;

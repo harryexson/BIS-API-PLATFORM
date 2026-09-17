@@ -43,7 +43,10 @@ const CURRENCY_TO_COUNTRY: Record<string, string> = {
  * processing exactly like it does when no API key is configured.
  *
  * Environment variables:
- *   FLUTTERWAVE_SECRET_KEY — FLWSECK_...
+ *   FLUTTERWAVE_SECRET_KEY  — FLWSECK_...
+ *   FLUTTERWAVE_SECRET_HASH — the "secret hash" configured on the
+ *     Flutterwave dashboard's webhook settings, used only by
+ *     verifyProviderWebhookSignature() below.
  */
 export class FlutterwaveProvider extends BaseProvider {
   private baseUrl = 'https://api.flutterwave.com/v3';
@@ -56,8 +59,44 @@ export class FlutterwaveProvider extends BaseProvider {
     return this.secrets.api_key || process.env.FLUTTERWAVE_SECRET_KEY || '';
   }
 
+  private get webhookHash(): string {
+    return this.secrets.webhook_secret || process.env.FLUTTERWAVE_SECRET_HASH || '';
+  }
+
   public isConfigured(): boolean {
     return Boolean(this.apiKey);
+  }
+
+  /**
+   * Verifies Flutterwave's real `verif-hash` header — verified via
+   * WebSearch, 2026-09-17. Unlike every other provider here, this is
+   * *not* a computed HMAC of the payload: Flutterwave's own
+   * documentation and multiple independent sources describe the
+   * `verif-hash` value as static — the exact same "secret hash" string
+   * configured on the dashboard, echoed back verbatim on every webhook
+   * delivery from that merchant account (one source additionally
+   * describes it as SHA-256(secretHash) rather than the raw value; the
+   * sources disagree on this specific point and this environment cannot
+   * reach flutterwave.com to check directly — if live traffic shows this
+   * comparison failing against real Flutterwave webhooks, hashing
+   * `webhookHash` with SHA-256 before comparing is the documented
+   * alternative to try first). Implemented here as a direct constant-time
+   * string comparison, the majority-documented behavior.
+   */
+  public async verifyProviderWebhookSignature(
+    _rawBody: string,
+    headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    const secret = this.webhookHash;
+    if (!secret) return null;
+
+    const header = headers['verif-hash'];
+    if (!header) return false;
+
+    const { timingSafeEqual } = await import('crypto');
+    const a = Buffer.from(header, 'utf8');
+    const b = Buffer.from(secret, 'utf8');
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

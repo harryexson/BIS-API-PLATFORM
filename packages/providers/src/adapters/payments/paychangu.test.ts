@@ -40,6 +40,49 @@ describe('PayChanguProvider', () => {
     });
   });
 
+  describe('verifyProviderWebhookSignature()', () => {
+    const originalWebhookSecret = process.env.PAYCHANGU_WEBHOOK_SECRET;
+    afterEach(() => {
+      if (originalWebhookSecret === undefined) delete process.env.PAYCHANGU_WEBHOOK_SECRET;
+      else process.env.PAYCHANGU_WEBHOOK_SECRET = originalWebhookSecret;
+    });
+
+    it('returns null when no webhook secret is configured', async () => {
+      delete process.env.PAYCHANGU_WEBHOOK_SECRET;
+      const provider = new PayChanguProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { signature: 'deadbeef' });
+      expect(result).toBeNull();
+    });
+
+    it('returns true for a correctly computed plain HMAC-SHA256 signature', async () => {
+      process.env.PAYCHANGU_WEBHOOK_SECRET = 'web-secret-key';
+      const provider = new PayChanguProvider(makeConfig());
+      const rawBody = '{"event_type":"charge.success"}';
+      const { createHmac } = await import('crypto');
+      const sig = createHmac('sha256', 'web-secret-key').update(rawBody).digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature(rawBody, { signature: sig });
+      expect(result).toBe(true);
+    });
+
+    it('returns false for a tampered body', async () => {
+      process.env.PAYCHANGU_WEBHOOK_SECRET = 'web-secret-key';
+      const provider = new PayChanguProvider(makeConfig());
+      const { createHmac } = await import('crypto');
+      const sig = createHmac('sha256', 'web-secret-key').update('{"event_type":"original"}').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature('{"event_type":"tampered"}', { signature: sig });
+      expect(result).toBe(false);
+    });
+
+    it('returns false when the header is missing', async () => {
+      process.env.PAYCHANGU_WEBHOOK_SECRET = 'web-secret-key';
+      const provider = new PayChanguProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {});
+      expect(result).toBe(false);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.PAYCHANGU_API_KEY;

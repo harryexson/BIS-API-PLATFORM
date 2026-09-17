@@ -42,6 +42,69 @@ describe('StripeProvider', () => {
     });
   });
 
+  describe('verifyProviderWebhookSignature()', () => {
+    const originalSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    afterEach(() => {
+      if (originalSecret === undefined) delete process.env.STRIPE_WEBHOOK_SECRET;
+      else process.env.STRIPE_WEBHOOK_SECRET = originalSecret;
+    });
+
+    it('returns null when no webhook secret is configured', async () => {
+      delete process.env.STRIPE_WEBHOOK_SECRET;
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'stripe-signature': 't=1,v1=deadbeef' });
+      expect(result).toBeNull();
+    });
+
+    it('returns true for a correctly computed t=/v1= signature', async () => {
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test';
+      const provider = new StripeProvider(makeConfig());
+      const rawBody = '{"id":"evt_1"}';
+      const timestamp = Math.floor(Date.now() / 1000);
+      const { createHmac } = await import('crypto');
+      const v1 = createHmac('sha256', 'whsec_test').update(`${timestamp}.${rawBody}`, 'utf8').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature(rawBody, {
+        'stripe-signature': `t=${timestamp},v1=${v1}`,
+      });
+      expect(result).toBe(true);
+    });
+
+    it('returns false for a tampered body', async () => {
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test';
+      const provider = new StripeProvider(makeConfig());
+      const timestamp = Math.floor(Date.now() / 1000);
+      const { createHmac } = await import('crypto');
+      const v1 = createHmac('sha256', 'whsec_test').update(`${timestamp}.{"id":"evt_1"}`, 'utf8').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature('{"id":"evt_TAMPERED"}', {
+        'stripe-signature': `t=${timestamp},v1=${v1}`,
+      });
+      expect(result).toBe(false);
+    });
+
+    it('returns false for a signature older than the 300s replay window', async () => {
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test';
+      const provider = new StripeProvider(makeConfig());
+      const rawBody = '{"id":"evt_1"}';
+      const timestamp = Math.floor(Date.now() / 1000) - 400;
+      const { createHmac } = await import('crypto');
+      const v1 = createHmac('sha256', 'whsec_test').update(`${timestamp}.${rawBody}`, 'utf8').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature(rawBody, {
+        'stripe-signature': `t=${timestamp},v1=${v1}`,
+      });
+      expect(result).toBe(false);
+    });
+
+    it('returns false when the header is missing', async () => {
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test';
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {});
+      expect(result).toBe(false);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.STRIPE_SECRET_KEY;

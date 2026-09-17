@@ -55,6 +55,62 @@ describe('AirwallexProvider', () => {
     });
   });
 
+  describe('verifyProviderWebhookSignature()', () => {
+    const originalWebhookSecret = process.env.AIRWALLEX_WEBHOOK_SECRET;
+    afterEach(() => {
+      if (originalWebhookSecret === undefined) delete process.env.AIRWALLEX_WEBHOOK_SECRET;
+      else process.env.AIRWALLEX_WEBHOOK_SECRET = originalWebhookSecret;
+    });
+
+    it('returns null when no webhook secret is configured', async () => {
+      delete process.env.AIRWALLEX_WEBHOOK_SECRET;
+      const provider = new AirwallexProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {
+        'x-timestamp': '1700000000',
+        'x-signature': 'deadbeef',
+      });
+      expect(result).toBeNull();
+    });
+
+    it('returns true for a correctly computed x-timestamp+rawBody signature', async () => {
+      process.env.AIRWALLEX_WEBHOOK_SECRET = 'notification-secret';
+      const provider = new AirwallexProvider(makeConfig());
+      const rawBody = '{"name":"payment_intent.succeeded"}';
+      const timestamp = '1700000000';
+      const { createHmac } = await import('crypto');
+      const sig = createHmac('sha256', 'notification-secret').update(`${timestamp}${rawBody}`, 'utf8').digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature(rawBody, {
+        'x-timestamp': timestamp,
+        'x-signature': sig,
+      });
+      expect(result).toBe(true);
+    });
+
+    it('returns false for a tampered body', async () => {
+      process.env.AIRWALLEX_WEBHOOK_SECRET = 'notification-secret';
+      const provider = new AirwallexProvider(makeConfig());
+      const timestamp = '1700000000';
+      const { createHmac } = await import('crypto');
+      const sig = createHmac('sha256', 'notification-secret')
+        .update(`${timestamp}{"name":"original"}`, 'utf8')
+        .digest('hex');
+
+      const result = await provider.verifyProviderWebhookSignature('{"name":"tampered"}', {
+        'x-timestamp': timestamp,
+        'x-signature': sig,
+      });
+      expect(result).toBe(false);
+    });
+
+    it('returns false when a header is missing', async () => {
+      process.env.AIRWALLEX_WEBHOOK_SECRET = 'notification-secret';
+      const provider = new AirwallexProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'x-timestamp': '1700000000' });
+      expect(result).toBe(false);
+    });
+  });
+
   describe('without credentials configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.AIRWALLEX_CLIENT_ID;

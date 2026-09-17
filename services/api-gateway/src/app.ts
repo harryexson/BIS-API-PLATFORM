@@ -1273,7 +1273,6 @@ setInterval(() => {
 app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Response) => {
   const provider = req.params.provider;
   setContextField('providerId', provider);
-  const signature = req.header('x-webhook-signature');
   const known = registry.getProvider(provider);
 
   if (!known) {
@@ -1287,35 +1286,71 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
     return res.status(401).json({ error: 'Unknown provider' });
   }
 
-  const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
-  if (!webhookSecret) {
-    metrics.increment('webhookFailures');
-    logger.error('webhook rejected — no secret configured', {
-      operation: 'webhook',
-      providerId: provider,
-      errorCode: 'NO_WEBHOOK_SECRET',
-      status: 'failed',
-    });
-    return res.status(503).json({ error: 'Webhook verification not configured' });
-  }
-
-  if (!signature) {
-    metrics.increment('webhookFailures');
-    logger.error('webhook rejected', {
-      operation: 'webhook',
-      providerId: provider,
-      errorCode: 'MISSING_SIGNATURE',
-      status: 'failed',
-    });
-    return res.status(401).json({ error: 'Missing webhook signature' });
-  }
-
-  // Timing-safe HMAC verification
   const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-  const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(signature, 'hex');
-  const valid = a.length === b.length && timingSafeEqual(a, b);
+
+  // P0: Prefer the provider's own real, native webhook signature scheme
+  // when one is implemented and configured (see BaseProvider.
+  // verifyProviderWebhookSignature and each real adapter's override) —
+  // this is what actually lets this platform ingest a genuine webhook
+  // from that provider, which signs with its own secret in its own
+  // format, not this platform's. Falls back to the generic platform-wide
+  // WEBHOOK_HMAC_SECRET check only when no native scheme applies
+  // (verifyProviderWebhookSignature returns null, not false) — once a
+  // native check is available it is authoritative: failing it must never
+  // fall through to the weaker generic check, or a compromised
+  // WEBHOOK_HMAC_SECRET could be used to forge webhooks for a provider
+  // that has its own, separate, real protection configured.
+  const normalizedHeaders: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    normalizedHeaders[key] = Array.isArray(value) ? value[0] : value;
+  }
+  const nativeResult = await known.verifyProviderWebhookSignature(rawBody, normalizedHeaders);
+
+  let valid: boolean;
+  let verificationMethod: 'native' | 'platform';
+  // Only populated on the 'platform' path — a native check uses the
+  // provider's own scheme/header(s), not this generic one, so there is no
+  // single "the signature" to hand the worker's defense-in-depth re-check.
+  // See the enqueue calls below and packages/workers/src/jobs/
+  // {paymentWebhook,providerWebhook}.ts for how verificationMethod is used
+  // to decide whether that re-check applies.
+  let signature: string | undefined;
+
+  if (nativeResult !== null) {
+    verificationMethod = 'native';
+    valid = nativeResult;
+  } else {
+    verificationMethod = 'platform';
+    const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
+    if (!webhookSecret) {
+      metrics.increment('webhookFailures');
+      logger.error('webhook rejected — no secret configured', {
+        operation: 'webhook',
+        providerId: provider,
+        errorCode: 'NO_WEBHOOK_SECRET',
+        status: 'failed',
+      });
+      return res.status(503).json({ error: 'Webhook verification not configured' });
+    }
+
+    signature = req.header('x-webhook-signature');
+    if (!signature) {
+      metrics.increment('webhookFailures');
+      logger.error('webhook rejected', {
+        operation: 'webhook',
+        providerId: provider,
+        errorCode: 'MISSING_SIGNATURE',
+        status: 'failed',
+      });
+      return res.status(401).json({ error: 'Missing webhook signature' });
+    }
+
+    // Timing-safe HMAC verification
+    const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(signature, 'hex');
+    valid = a.length === b.length && timingSafeEqual(a, b);
+  }
 
   if (!valid) {
     metrics.increment('webhookFailures');
@@ -1324,6 +1359,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
       providerId: provider,
       errorCode: 'INVALID_SIGNATURE',
       status: 'failed',
+      verificationMethod,
     });
     return res.status(401).json({ error: 'Invalid webhook signature' });
   }
@@ -1384,7 +1420,8 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   enqueuePaymentWebhook({
     providerId: provider,
     rawBody: typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
-    signature: signature || '',
+    signature,
+    verificationMethod,
     providerEventId: providerEventId || req.body?.id,
     applicationId: req.body?.data?.object?.metadata?.appId,
   }).catch((err) => {
@@ -1401,7 +1438,8 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   enqueueProviderWebhook({
     providerId: provider,
     rawBody: typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
-    signature: signature || '',
+    signature,
+    verificationMethod,
     providerEventId: providerEventId || req.body?.id,
     status: req.body?.type,
   }).catch((err) => {
@@ -1465,7 +1503,8 @@ async function enqueueInboundMessage(providerId: string, payload: any): Promise<
 async function enqueuePaymentWebhook(input: {
   providerId: string;
   rawBody: string;
-  signature: string;
+  signature?: string;
+  verificationMethod: 'native' | 'platform';
   providerEventId?: string;
   applicationId?: string;
 }): Promise<void> {
@@ -1474,6 +1513,7 @@ async function enqueuePaymentWebhook(input: {
     provider: input.providerId,
     rawBody: input.rawBody,
     signature: input.signature,
+    verificationMethod: input.verificationMethod,
     providerEventId: input.providerEventId,
     applicationId: input.applicationId || 'webhook',
   });
@@ -1483,7 +1523,8 @@ async function enqueuePaymentWebhook(input: {
 async function enqueueProviderWebhook(input: {
   providerId: string;
   rawBody: string;
-  signature: string;
+  signature?: string;
+  verificationMethod: 'native' | 'platform';
   providerEventId?: string;
   status?: string;
 }): Promise<void> {
@@ -1492,6 +1533,7 @@ async function enqueueProviderWebhook(input: {
     providerId: input.providerId,
     rawBody: input.rawBody,
     signature: input.signature,
+    verificationMethod: input.verificationMethod,
     eventId: input.providerEventId,
     status: input.status,
   });

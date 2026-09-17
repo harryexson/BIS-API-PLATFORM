@@ -6,6 +6,125 @@ tests cover it.
 
 ---
 
+## 2026-09-17 — Native Per-Provider Inbound Webhook Signature Verification
+
+**Context:** continuing "complete the remaining production-readiness
+gaps" — the correction note added to `IMPLEMENTATION_BASELINE.md` §4 item
+19 flagged this as a real, open gap: every inbound provider webhook was
+verified against one shared, platform-wide `WEBHOOK_HMAC_SECRET` HMAC,
+never the provider's own real signature scheme, despite an earlier
+(already-corrected) doc claiming otherwise.
+
+### What changed
+
+**`BaseProvider.verifyProviderWebhookSignature(rawBody, headers)`**
+(`packages/providers/src/base.ts`) — new method, default implementation
+returns `null` ("no native scheme configured/available for this
+provider"), distinct from `true`/`false`. Overridden with each provider's
+real scheme, verified via WebSearch against current public documentation
+on 2026-09-17 (this environment's outbound network access to each
+provider's domain is restricted — same constraint noted for the payment
+adapters themselves):
+
+- **Stripe** (`stripe.ts`) — `Stripe-Signature: t=<unix seconds>,v1=<hex
+  hmac>`; signed content `${timestamp}.${rawBody}`, HMAC-SHA256; rejects
+  signatures older than Stripe's documented 300s replay window.
+- **NMI** (`nmi.ts`) — `Webhook-Signature: t=<nonce>,s=<hex hmac>`; `t` is
+  a per-delivery nonce, *not* a timestamp (no replay window applies);
+  signed content `${nonce}.${rawBody}`, HMAC-SHA256.
+- **Flutterwave** (`flutterwave.ts`) — `verif-hash`: **not** a computed
+  HMAC — a static value equal to the dashboard-configured "secret hash",
+  echoed back verbatim; direct constant-time string comparison. One
+  source describes it as SHA-256(secret hash) instead; flagged inline as
+  a genuine, unresolved ambiguity since this environment couldn't reach
+  flutterwave.com to confirm — documented as the first thing to try if
+  live traffic fails this check.
+- **PayChangu** (`paychangu.ts`) — `Signature`: plain HMAC-SHA256 of the
+  raw body, keyed by the dashboard's "web secret key" — identical shape
+  to the platform's own pre-existing generic `verifyWebhookSignature()`
+  helper, just keyed by PayChangu's own secret.
+- **Airwallex** (`airwallex.ts`) — `x-timestamp` + `x-signature`:
+  HMAC-SHA256 of `${timestamp}${rawBody}` (concatenated directly, no
+  separator — differs from Stripe/NMI's `.`-joined scheme).
+
+**PawaPay (`pawapay.ts`) — deliberately not implemented.** Its real scheme
+is RFC-9421 HTTP Message Signatures: asymmetric, keyed by PawaPay's own
+public key (fetched from a dedicated endpoint), with its own
+canonicalization rules for building the signature base. Building this
+without a live PawaPay sandbox to validate against risked shipping a
+wrong implementation of an asymmetric scheme — which would silently
+degrade security while looking done — rather than an honest fallback.
+Documented at length in the adapter's class comment; PawaPay webhooks
+continue to use the generic platform fallback.
+
+**Gateway** (`services/api-gateway/src/app.ts`, `POST
+/v1/api/webhooks/:provider`) — now calls
+`known.verifyProviderWebhookSignature(rawBody, normalizedHeaders)` first.
+A non-`null` result is authoritative: `true` accepts, `false` rejects
+outright with no fallback (a native check must never be weakened by
+falling through to the generic HMAC — that would let a compromised
+`WEBHOOK_HMAC_SECRET` forge webhooks for a provider with its own, separate
+real protection). Only a `null` result (no native scheme
+configured/available) falls back to the pre-existing generic
+`x-webhook-signature` / `WEBHOOK_HMAC_SECRET` check. The chosen
+`verificationMethod` (`'native' | 'platform'`) is logged on rejection and
+threaded into both enqueued jobs.
+
+**Worker-side defense-in-depth interaction (found and fixed while wiring
+this up):** `packages/workers/src/jobs/paymentWebhook.ts` and
+`providerWebhook.ts` each independently re-verify a webhook's signature
+against `WEBHOOK_HMAC_SECRET` before processing — a real safety net
+against a bug in the gateway's enqueue path, not dead code. Left
+unchanged, this would have rejected every natively-verified delivery,
+since a provider's real signature (e.g. Stripe's `t=`/`v1=` HMAC) is not
+the platform's generic HMAC and the job never carried a `signature` value
+in that shape to re-check. Fixed by adding `verificationMethod: 'native' |
+'platform'` to `ProviderWebhookEvent` (`packages/schemas/src/index.ts`),
+populated by the gateway and read by both job processors: the generic
+re-check now runs only for `'platform'`-verified deliveries (and for
+older jobs with no `verificationMethod` at all, treated as `'platform'`
+for back-compatibility) — trusting a `'native'` verification as already
+correctly done at the gateway, since the worker has no way to redo a
+provider-specific check without the full request headers, which aren't
+threaded through the job queue.
+
+Also updated to match: `.env.example` (new `STRIPE_WEBHOOK_SECRET`,
+`NMI_WEBHOOK_SIGNING_KEY`, `FLUTTERWAVE_SECRET_HASH`,
+`PAYCHANGU_WEBHOOK_SECRET`, `AIRWALLEX_WEBHOOK_SECRET` — no PawaPay
+signing var, per the decision above); `PROVIDER_SECRET_FIELDS` in
+`apps/admin-console/src/components/ProviderManagement.tsx` (adds a
+`webhook_secret` field entry for the 5 native-verified providers so an
+operator has somewhere to enter it); `docs/DEVELOPER_GUIDE.md` §9a and
+`docs/providers/ADDING_A_PROVIDER.md` §6 (both previously described
+webhook verification as entirely generic/unimplemented — now explain the
+native-first/fallback behavior and how to add a native check for a new
+adapter).
+
+### Tests
+
+- A `describe('verifyProviderWebhookSignature()', ...)` block added to
+  each of `stripe.test.ts`, `nmi.test.ts`, `flutterwave.test.ts`,
+  `paychangu.test.ts`, `airwallex.test.ts`: null when unconfigured, true
+  for a correctly computed signature, false for a tampered body and for a
+  missing header; Stripe's suite additionally covers the 300s replay
+  window. `pawapay.test.ts` gained one test confirming it inherits
+  `BaseProvider`'s default `null` (no native scheme).
+- New `packages/workers/src/jobs/paymentWebhook.test.ts` and
+  `providerWebhook.test.ts`: prove a `'native'`-verified job with no
+  generic `signature` at all still processes successfully (the bug this
+  pass fixed), a `'platform'`-verified job with a bad signature still
+  fails closed, a valid `'platform'` signature still processes, and (for
+  `paymentWebhook.ts`) a legacy job with no `verificationMethod` still
+  requires a valid generic signature — no accidental unauthenticated
+  bypass for old-shaped jobs.
+- Full suite: `npm run type-check`, `npm run lint` (0 errors; warnings
+  292 vs. a 290 baseline — the +2 is the pre-existing `delete (clean as
+  any).<field>` pattern gaining one more field, matching existing style),
+  `npm test` (521 passed, 12 skipped — unrelated), `npm run build:all`
+  all clean.
+
+---
+
 ## 2026-09-17 — Referential Integrity: `events.app_id` Foreign Key
 
 **Context:** continuing the user's ask to "complete the remaining

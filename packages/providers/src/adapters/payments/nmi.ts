@@ -37,9 +37,12 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * it does when no API key is configured.
  *
  * Environment variables:
- *   NMI_API_KEY    — NMI's `security_key`
- *   NMI_GATEWAY_ID — optional custom gateway hostname (see above); defaults
- *                    to secure.nmi.com
+ *   NMI_API_KEY            — NMI's `security_key`
+ *   NMI_GATEWAY_ID         — optional custom gateway hostname (see above);
+ *                            defaults to secure.nmi.com
+ *   NMI_WEBHOOK_SIGNING_KEY — the signing key from the merchant control
+ *                            panel's Settings > Webhooks, used only by
+ *                            verifyProviderWebhookSignature() below.
  */
 export class NMIProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
@@ -55,10 +58,48 @@ export class NMIProvider extends BaseProvider {
     return raw.replace(/^https?:\/\//, '').replace(/\/+$/, '') || 'secure.nmi.com';
   }
 
+  private get webhookSigningKey(): string {
+    return this.secrets.webhook_secret || process.env.NMI_WEBHOOK_SIGNING_KEY || '';
+  }
+
   public isConfigured(): boolean {
     // gateway_id/hostname has a working default ('secure.nmi.com') — only
     // the API key is actually required.
     return Boolean(this.apiKey);
+  }
+
+  /**
+   * Verifies NMI's real `Webhook-Signature` header — verified against
+   * NMI's current documentation via WebSearch, 2026-09-17: `t=<nonce>,
+   * s=<hex hmac>`. `t` is a random per-delivery nonce, *not* a timestamp
+   * (NMI documents no replay/timestamp tolerance window on it — don't
+   * treat it as one). Signed content is `<nonce>.<raw_body>`,
+   * HMAC-SHA256'd with the signing key.
+   */
+  public async verifyProviderWebhookSignature(
+    rawBody: string,
+    headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    const secret = this.webhookSigningKey;
+    if (!secret) return null;
+
+    const header = headers['webhook-signature'];
+    if (!header) return false;
+
+    const parts: Record<string, string> = {};
+    for (const part of header.split(',')) {
+      const [key, value] = part.split('=');
+      if (key && value) parts[key] = value;
+    }
+    const nonce = parts.t;
+    const sig = parts.s;
+    if (!nonce || !sig) return false;
+
+    const { createHmac, timingSafeEqual } = await import('crypto');
+    const expected = createHmac('sha256', secret).update(`${nonce}.${rawBody}`, 'utf8').digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(sig, 'hex');
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

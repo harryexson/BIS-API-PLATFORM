@@ -14,7 +14,7 @@ function verifySignature(secret: string, rawBody: string, signature: string): bo
 
 export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
   return async (job, ctx: WorkerContext) => {
-    const { providerId, rawBody, signature, status, id } = job.payload;
+    const { providerId, rawBody, signature, status, id, verificationMethod } = job.payload;
 
     if (!providerId) {
       throw new Error('provider_webhook requires providerId');
@@ -39,20 +39,26 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
       }
     }
 
-    const secret = process.env.WEBHOOK_HMAC_SECRET;
-    if (secret) {
-      if (!signature || !rawBody) {
-        throw new Error('provider_webhook signature required');
+    // P0: See the matching comment in jobs/paymentWebhook.ts — a 'native'
+    // check was already done at the gateway using the provider's own
+    // scheme and is trusted as-is; only the 'platform' fallback is
+    // re-verified here as defense in depth.
+    if (verificationMethod !== 'native') {
+      const secret = process.env.WEBHOOK_HMAC_SECRET;
+      if (secret) {
+        if (!signature || !rawBody) {
+          throw new Error('provider_webhook signature required');
+        }
+        if (!verifySignature(secret, rawBody, signature)) {
+          throw new Error('provider_webhook signature verification failed');
+        }
+      } else {
+        // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
+        console.error(
+          '[provider_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
+        );
+        throw new Error('provider_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
       }
-      if (!verifySignature(secret, rawBody, signature)) {
-        throw new Error('provider_webhook signature verification failed');
-      }
-    } else {
-      // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
-      console.error(
-        '[provider_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
-      );
-      throw new Error('provider_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
     const owner = `webhook_${providerId}_${Math.random().toString(36).slice(2, 8)}`;
@@ -67,6 +73,7 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
     const clean = { ...job.payload };
     delete (clean as any).rawBody;
     delete (clean as any).signature;
+    delete (clean as any).verificationMethod;
 
     try {
       await eventRepository.create({

@@ -49,17 +49,28 @@ const HEALTH_COLOR: Record<ProviderHealthStatus, string> = {
 // free-text box. Providers not listed here are simulation-only and don't
 // need real credentials (their isConfigured() always returns true).
 const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]> = {
-  stripe: [{ field: 'api_key', label: 'Secret Key' }],
+  stripe: [
+    { field: 'api_key', label: 'Secret Key' },
+    { field: 'webhook_secret', label: 'Webhook Signing Secret (whsec_...)' },
+  ],
   nmi: [
     { field: 'api_key', label: 'API Key' },
     { field: 'gateway_id', label: 'Gateway Hostname (optional, defaults to secure.nmi.com)' },
+    { field: 'webhook_secret', label: 'Webhook Signing Key' },
   ],
-  flutterwave: [{ field: 'api_key', label: 'Secret Key' }],
+  flutterwave: [
+    { field: 'api_key', label: 'Secret Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret Hash (from dashboard webhook settings)' },
+  ],
   pawapay: [{ field: 'api_key', label: 'API Key' }],
-  paychangu: [{ field: 'api_key', label: 'API Key' }],
+  paychangu: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret (web secret key)' },
+  ],
   airwallex: [
     { field: 'client_id', label: 'Client ID' },
     { field: 'api_key', label: 'API Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret (per notification URL)' },
   ],
   infobip: [
     { field: 'api_key', label: 'API Key' },
