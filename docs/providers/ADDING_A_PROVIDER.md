@@ -183,6 +183,18 @@ wiring didn't exist at all — see `docs/IMPLEMENTATION_CHANGELOG.md` — so
 if you're referencing older code or docs for how this works, don't trust
 them.)
 
+**Does it survive a gateway restart?** As of 2026-09-17, yes. The gateway
+(`services/api-gateway/src/app.ts`) calls
+`registry.exportSecretsForPersistence(id)` after every successful add/
+delete and stores the full set, AES-256-GCM encrypted, in the
+`provider_configs` table — automatically, nothing your adapter or this
+step needs to do anything for. It reads the same way at startup via
+`registry.hydrateSecrets(id, secrets)`, before any real request can reach
+your adapter. This is skipped (not an error) whenever
+`SECRET_ENCRYPTION_KEY` isn't set, which is most non-production
+environments — the process.env fallback you built in step 1 is exactly
+what covers that gap, same as before this existed.
+
 ---
 
 ## 5. Write tests

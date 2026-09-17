@@ -11,6 +11,9 @@ import {
   generateSessionToken,
   generateVerificationToken,
   generateApiKey,
+  encryptSecret,
+  decryptSecret,
+  type EncryptedPayload,
 } from '../../database/src/crypto';
 
 const MESSAGING_PROFILE_COMPLIANCE_STATUSES = new Set(['unregistered', 'pending', 'approved', 'rejected', 'suspended']);
@@ -134,6 +137,28 @@ export interface DbState {
   supportTickets: SupportTicketRow[];
   ticketComments: TicketCommentRow[];
   transactions: TransactionRow[];
+  providers: ProviderRow[];
+  providerConfigs: ProviderConfigRow[];
+}
+
+export interface ProviderRow {
+  id: string;
+  slug: string;
+  name: string;
+  category: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ProviderConfigRow {
+  id: string;
+  providerId: string;
+  environment: string;
+  encryptedSecret: string | null;
+  secretIv: string | null;
+  secretTag: string | null;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface TransactionRow {
@@ -282,6 +307,8 @@ export const dbState: DbState = {
   supportTickets: [],
   ticketComments: [],
   transactions: [],
+  providers: [],
+  providerConfigs: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -382,6 +409,8 @@ export function clearDb(): void {
   dbState.supportTickets = [];
   dbState.ticketComments = [];
   dbState.transactions = [];
+  dbState.providers = [];
+  dbState.providerConfigs = [];
 }
 
 // Mirrors the seed plans inserted by migration 0011_add_subscriptions.sql
@@ -1852,6 +1881,165 @@ export function installDatabaseMock(): Record<string, unknown> {
         record.usedAt = new Date();
         return this.toPublic(user);
       }
+    },
+    // Backs packages/providers' ProviderRegistry secrets-persistence
+    // round trip (exportSecretsForPersistence/hydrateSecrets on the
+    // registry side; ensureProviderRow/persistProviderSecrets/
+    // loadAllProviderSecrets here) — see services/api-gateway/src/app.ts's
+    // hydrateProviderSecretsFromDb()/persistProviderSecretsAsync(). Mirrors
+    // the real packages/database/src/provider-secrets.ts logic against
+    // dbState instead of Postgres; uses the real encryptSecret/
+    // decryptSecret so a round trip here behaves identically to
+    // production, including failing to decrypt if SECRET_ENCRYPTION_KEY
+    // isn't set.
+    providerRepository: {
+      async findById(id: string) {
+        return dbState.providers.find((p) => p.id === id);
+      },
+      async findBySlug(slug: string) {
+        return dbState.providers.find((p) => p.slug === slug);
+      },
+      async findAll() {
+        return dbState.providers.slice();
+      },
+      async create(data: { slug: string; name: string; category: string }) {
+        const row: ProviderRow = {
+          id: `prov_${randomUUID().slice(0, 8)}`,
+          slug: data.slug,
+          name: data.name,
+          category: data.category,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.providers.push(row);
+        return row;
+      },
+      async upsertBySlug(data: { slug: string; name: string; category: string }) {
+        const existing = dbState.providers.find((p) => p.slug === data.slug);
+        if (existing) {
+          existing.name = data.name;
+          existing.category = data.category;
+          existing.updatedAt = new Date();
+          return existing;
+        }
+        const row: ProviderRow = {
+          id: `prov_${randomUUID().slice(0, 8)}`,
+          slug: data.slug,
+          name: data.name,
+          category: data.category,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.providers.push(row);
+        return row;
+      },
+    },
+    providerConfigRepository: {
+      async findByProviderAndEnvironment(providerId: string, environment: string) {
+        return dbState.providerConfigs.find((c) => c.providerId === providerId && c.environment === environment);
+      },
+      async create(data: {
+        providerId: string;
+        environment: string;
+        encryptedSecret?: string | null;
+        secretIv?: string | null;
+        secretTag?: string | null;
+      }) {
+        const row: ProviderConfigRow = {
+          id: `pcfg_${randomUUID().slice(0, 8)}`,
+          providerId: data.providerId,
+          environment: data.environment,
+          encryptedSecret: data.encryptedSecret ?? null,
+          secretIv: data.secretIv ?? null,
+          secretTag: data.secretTag ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.providerConfigs.push(row);
+        return row;
+      },
+      async update(id: string, data: Partial<ProviderConfigRow>) {
+        const row = dbState.providerConfigs.find((c) => c.id === id);
+        if (!row) return undefined;
+        Object.assign(row, data, { updatedAt: new Date() });
+        return row;
+      },
+    },
+    encryptSecret,
+    decryptSecret,
+    currentDeploymentTier(): 'live' | 'test' {
+      return process.env.NODE_ENV === 'production' ? 'live' : 'test';
+    },
+    async ensureProviderRow(input: { slug: string; name: string; category: string }): Promise<string> {
+      const existing = dbState.providers.find((p) => p.slug === input.slug);
+      if (existing) {
+        existing.name = input.name;
+        existing.category = input.category;
+        existing.updatedAt = new Date();
+        return existing.id;
+      }
+      const row: ProviderRow = {
+        id: `prov_${randomUUID().slice(0, 8)}`,
+        slug: input.slug,
+        name: input.name,
+        category: input.category,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      dbState.providers.push(row);
+      return row.id;
+    },
+    async persistProviderSecrets(
+      slug: string,
+      secrets: { field: string; label: string; value: string }[],
+    ): Promise<void> {
+      if (!process.env.SECRET_ENCRYPTION_KEY) return;
+      const provider = dbState.providers.find((p) => p.slug === slug);
+      if (!provider) return;
+
+      const environment = process.env.NODE_ENV === 'production' ? 'live' : 'test';
+      const payload: EncryptedPayload = encryptSecret(JSON.stringify(secrets));
+      const existing = dbState.providerConfigs.find(
+        (c) => c.providerId === provider.id && c.environment === environment,
+      );
+      if (existing) {
+        existing.encryptedSecret = payload.encrypted;
+        existing.secretIv = payload.iv;
+        existing.secretTag = payload.tag;
+        existing.updatedAt = new Date();
+      } else {
+        dbState.providerConfigs.push({
+          id: `pcfg_${randomUUID().slice(0, 8)}`,
+          providerId: provider.id,
+          environment,
+          encryptedSecret: payload.encrypted,
+          secretIv: payload.iv,
+          secretTag: payload.tag,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+      }
+    },
+    async loadAllProviderSecrets(): Promise<Record<string, { field: string; label: string; value: string }[]>> {
+      if (!process.env.SECRET_ENCRYPTION_KEY) return {};
+      const environment = process.env.NODE_ENV === 'production' ? 'live' : 'test';
+      const snapshot: Record<string, { field: string; label: string; value: string }[]> = {};
+
+      for (const provider of dbState.providers) {
+        const config = dbState.providerConfigs.find(
+          (c) => c.providerId === provider.id && c.environment === environment,
+        );
+        if (!config?.encryptedSecret || !config.secretIv || !config.secretTag) continue;
+        try {
+          const json = decryptSecret({ encrypted: config.encryptedSecret, iv: config.secretIv, tag: config.secretTag });
+          const parsed = JSON.parse(json);
+          if (Array.isArray(parsed)) snapshot[provider.slug] = parsed;
+        } catch {
+          // Same as the real implementation: skip a row that fails to
+          // decrypt rather than blocking every other provider's secrets.
+        }
+      }
+      return snapshot;
     },
     checkDatabaseHealth: async () => {
       if (dbState.failEventWrites) {

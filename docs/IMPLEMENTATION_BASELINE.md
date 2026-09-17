@@ -85,20 +85,24 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 
 ### Provider Registry & Routing (`packages/providers`, `packages/routing`)
 - `ProviderRegistry` holds messaging + payment provider definitions
-  (capabilities, countries, environments, health status) — **as an
-  in-memory singleton, not DB-backed.** ~~DB-backed via
-  `packages/database/src/repositories/providers.ts` and
-  `provider-configs.ts` (encrypted secrets, AES-256-GCM)~~ — this earlier
-  claim was inaccurate: `providerConfigRepository` is exported from
-  `packages/database` but never imported anywhere (confirmed by a
-  full-repo search, 2026-09-15) — no encryption, no persistence, dead
-  code. `providerRepository`/`providerHealthRepository` *are* used, but
-  only by the worker's `provider_health` job to record a durable
-  health-check history against a DB row keyed by provider slug — not for
-  config or secrets. All provider config, management state, and secrets
-  live only in `ProviderRegistry`'s in-memory `Map`s and are lost on
-  gateway restart — see §4 item 19 for the secrets-pipeline fix this
-  informed, and its noted remaining persistence gap.
+  (capabilities, countries, environments, health status, secrets) — **as
+  an in-memory singleton** (a synchronous constructor, shared by every
+  `packages/simulation` test — see §4 item 21 for why it stays that way)
+  — **whose secrets are now also durably persisted, as of 2026-09-17,
+  by the gateway layer, not by this package itself.** `providerRepository`
+  and `provider-configs.ts`'s `providerConfigRepository` (encrypted
+  secrets, AES-256-GCM via the existing `encryptSecret`/`decryptSecret`)
+  were exported from `packages/database` but never imported anywhere
+  (confirmed by a full-repo search, 2026-09-15) until this pass wired
+  them up from `services/api-gateway` — see §4 item 21 for the full
+  design (and the `providers` table's own missing-seed prerequisite this
+  surfaced and fixed along the way). `providerHealthRepository` is used
+  by the worker's `provider_health` job the same way it always was — a
+  durable health-check history keyed by provider slug, unrelated to
+  secrets. Non-secret management state (routing rules, priority, health
+  counters) still lives only in `ProviderRegistry`'s in-memory `Map`s and
+  is lost on restart — that remains out of scope; only secrets durability
+  was the documented gap this closed.
 - `RoutingEngine` does capability-aware selection (channel, country,
   provider health, priority) with failover across a provider list.
 - Conversation resolver + keyword engine (`keywords.ts`) implement
@@ -632,15 +636,13 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
       source of a `.env.example` gap an earlier audit flagged) was
       deleted rather than fixed; it added nothing the registered
       `example.ts` template doesn't already cover.
-    - **Real, remaining gap, noted rather than silently left**: secrets
-      (and all provider management state) still live only in
-      `ProviderRegistry`'s in-memory `Map`s — see this doc's corrected
-      "Provider Registry & Routing" note above. A secret added through
-      the admin console does not survive a gateway restart; only the
-      env-var fallback does. Wiring real persistence (the DB-backed,
-      AES-256-GCM-encrypted design an earlier version of this document
-      incorrectly claimed already existed) is unbuilt and out of scope
-      for this pass.
+    - **Real, remaining gap at the time, noted rather than silently
+      left**: secrets (and all provider management state) still lived
+      only in `ProviderRegistry`'s in-memory `Map`s — see this doc's
+      corrected "Provider Registry & Routing" note above. A secret added
+      through the admin console did not survive a gateway restart; only
+      the env-var fallback did. **Closed 2026-09-17** — see item 21
+      below.
     10 new `isConfigured()` unit tests (one per real adapter) plus a new
     Playwright regression test
     (`apps/admin-console/tests/provider-secrets.spec.ts`) cover this —
@@ -697,6 +699,59 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     {paymentWebhook,providerWebhook}.test.ts` (new files) proving the
     native-verified path is trusted and the platform-verified path still
     fails closed on a bad or missing signature.
+21. ~~**Provider secrets configured through the admin console lived only
+    in `ProviderRegistry`'s in-memory `Map`s — never survived a
+    restart**~~ — **closed 2026-09-17.** `packages/providers` stays fully
+    DB-free by design (`ProviderRegistry`'s constructor is synchronous and
+    the class is a process-wide singleton shared by every
+    `packages/simulation` test) — it gained two new pure in-memory
+    methods instead, `exportSecretsForPersistence(id)` (the current
+    plaintext secrets, for a caller to encrypt and store) and
+    `hydrateSecrets(id, secrets)` (restores them, never clobbering a
+    secret already added this process). `services/api-gateway`, which
+    already depends on both `packages/providers` and `@company/database`,
+    owns the actual persistence: a new `packages/database/src/
+    provider-secrets.ts` (`ensureProviderRow`, `persistProviderSecrets`,
+    `loadAllProviderSecrets`) encrypts the full current secrets set with
+    the existing (previously fully unused) `encryptSecret`/`decryptSecret`
+    AES-256-GCM helpers and writes it to the existing (also previously
+    unused) `provider_configs` table, one row per (provider, deployment
+    tier — `'live'` in production, `'test'` elsewhere, not the
+    provider's own admin-toggleable `'live'`/`'test'` environment field,
+    to avoid secrets becoming unreachable if that changes mid-life).
+    `provider_configs.provider_id` is a real FK to `providers.id`, a table
+    with no seeding path anywhere in the codebase before this — confirmed
+    empty on the live DB (`SELECT count(*) FROM providers` → 0) — so
+    `providerRepository` gained an atomic `upsertBySlug()` (`ON CONFLICT
+    DO UPDATE`, verified against the live `providers_slug_unique`
+    constraint), called from the gateway's secrets-add/delete routes
+    themselves (not only once at startup — an admin adding a provider's
+    very first secret can't wait on a separate startup loop that may not
+    have reached that provider yet) so the row is seeded exactly when
+    it's first needed, idempotently. Both directions are fire-and-forget
+    from the gateway's perspective: persistence failing (e.g.
+    `SECRET_ENCRYPTION_KEY` unset, the normal case outside production)
+    never blocks or fails the add/delete HTTP response, since the
+    in-memory registry state — what every real adapter call actually
+    reads — is already correct the moment `addSecret()`/`deleteSecret()`
+    returns; hydration failing at startup falls back to exactly the
+    env-var behavior that existed before this pass. No new migration was
+    needed — both `providers` and `provider_configs` already existed on
+    the live database from an earlier, never-wired pass. New tests:
+    `packages/providers/src/providerRegistry.test.ts` gained coverage for
+    `exportSecretsForPersistence`/`hydrateSecrets` (including the
+    never-clobber guarantee); a new
+    `packages/simulation/src/provider-secrets-persistence.simulation.test.ts`
+    drives the real HTTP secrets routes end-to-end and decrypts what
+    landed in the (mocked) `provider_configs` table to prove it round-
+    trips correctly, including that a delete persists an empty set rather
+    than leaving a stale one. `packages/simulation/src/db.ts`'s
+    `installDatabaseMock()` was extended with `providerRepository`,
+    `providerConfigRepository`, and mirrors of the three
+    `provider-secrets.ts` functions (backed by new `dbState.providers`/
+    `providerConfigs` arrays) — without this, every simulation test that
+    boots the gateway would have hit an unmocked `undefined` the moment
+    this pass wired the persistence calls into the secrets routes.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 

@@ -84,6 +84,58 @@ describe('ProviderRegistry management surface', () => {
     expect(registry.getSecrets('stripe')!.some(s => s.id === meta!.id)).toBe(false);
   });
 
+  it('exportSecretsForPersistence returns null for an unknown provider, [] for one with no secrets', () => {
+    expect(registry.exportSecretsForPersistence('ghost')).toBeNull();
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([]);
+  });
+
+  it('exportSecretsForPersistence mirrors the current plaintext secrets after addSecret/deleteSecret', () => {
+    const meta = registry.addSecret('example-msg', { field: 'api_key', label: 'API Key', value: 'em_live_abc123' });
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([
+      { field: 'api_key', label: 'API Key', value: 'em_live_abc123' },
+    ]);
+
+    registry.deleteSecret('example-msg', meta!.id);
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([]);
+  });
+
+  it('hydrateSecrets restores secrets and syncs them into the live adapter instance', () => {
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([]);
+
+    registry.hydrateSecrets('example-msg', [
+      { field: 'api_key', label: 'API Key', value: 'em_hydrated_key' },
+    ]);
+
+    const secrets = registry.getSecrets('example-msg');
+    expect(secrets).toHaveLength(1);
+    expect(secrets![0].field).toBe('api_key');
+    expect(secrets![0].masked).not.toContain('em_hydrated_key');
+
+    // Cleanup so this doesn't leak into other tests sharing the singleton.
+    registry.deleteSecret('example-msg', secrets![0].id);
+  });
+
+  it('hydrateSecrets never clobbers a secret already added this process', () => {
+    const meta = registry.addSecret('example-msg', { field: 'api_key', label: 'API Key', value: 'em_added_first' });
+
+    registry.hydrateSecrets('example-msg', [
+      { field: 'api_key', label: 'API Key', value: 'em_from_disk_should_be_ignored' },
+    ]);
+
+    const secrets = registry.getSecrets('example-msg');
+    expect(secrets).toHaveLength(1);
+    expect(secrets![0].id).toBe(meta!.id);
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([
+      { field: 'api_key', label: 'API Key', value: 'em_added_first' },
+    ]);
+
+    registry.deleteSecret('example-msg', meta!.id);
+  });
+
+  it('hydrateSecrets no-ops for an unknown provider', () => {
+    expect(() => registry.hydrateSecrets('ghost', [{ field: 'api_key', label: 'x', value: 'y' }])).not.toThrow();
+  });
+
   it('adds, updates and deletes routing rules', () => {
     const rule = registry.addRoutingRule('stripe', { match: 'currency == MWK', target: 'pawapay', enabled: true });
     expect(rule!.id).toBeDefined();

@@ -83,6 +83,16 @@ export {
   type ApplicationLookupForBilling,
 } from './subscription-registry';
 
+// Provider secrets persistence (survives a restart for packages/providers'
+// in-memory ProviderRegistry — see docstring in provider-secrets.ts)
+export {
+  ensureProviderRow,
+  persistProviderSecrets,
+  loadAllProviderSecrets,
+  currentDeploymentTier,
+  type PersistableSecret,
+} from './provider-secrets';
+
 // CRM Registry (developer/support back office — see docstring in
 // crm-registry.ts)
 export {

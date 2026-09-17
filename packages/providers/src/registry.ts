@@ -40,6 +40,18 @@ interface StoredSecret {
   value: string;
 }
 
+// Plain, DB-shape-agnostic form of a secret used only at the
+// export/hydrate boundary with whatever's calling this package (see
+// exportSecretsForPersistence/hydrateSecrets below) — deliberately not the
+// same type as ProviderSecretMeta, which also carries the masked/id/
+// lastUpdated fields this package derives itself, not a persistence
+// layer's job to supply.
+export interface PersistableProviderSecret {
+  field: string;
+  label: string;
+  value: string;
+}
+
 export interface ManagementState {
   environment: ProviderEnvironment;
   countries: string[];
@@ -625,6 +637,49 @@ export class ProviderRegistry {
     const removed = state.secrets.length < before;
     if (removed) this.syncSecrets(id);
     return removed;
+  }
+
+  // ----------------------------------------------------
+  // SECRETS PERSISTENCE (caller-driven — this package stays DB-free)
+  // ----------------------------------------------------
+  // packages/providers has no dependency on @company/database (see
+  // docs/providers/ADDING_A_PROVIDER.md) and ProviderRegistry's
+  // constructor is synchronous, so it cannot load from a real DB itself.
+  // Instead, services/api-gateway (which already depends on both
+  // packages) calls exportSecretsForPersistence() after every
+  // addSecret()/deleteSecret() to get what to encrypt and store, and
+  // calls hydrateSecrets() once at startup with whatever it decrypts back
+  // — this stays a plain in-memory operation either way, so
+  // packages/simulation's tests need no special-casing to exercise it.
+
+  // Exposes the current plaintext secrets for a provider so the caller can
+  // encrypt and persist them. Not a new trust boundary: every value here
+  // is exactly what the caller's own prior addSecret() call already
+  // supplied in plaintext.
+  public exportSecretsForPersistence(id: string): PersistableProviderSecret[] | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+    return state.secrets.map(s => ({ field: s.meta.field, label: s.meta.label, value: s.value }));
+  }
+
+  // Restores secrets loaded from persisted storage at startup. Never
+  // clobbers secrets already present — a fresh addSecret() call earlier in
+  // this same process (e.g. from a test, or a request that raced startup)
+  // always wins over what was loaded from disk.
+  public hydrateSecrets(id: string, secrets: PersistableProviderSecret[]): void {
+    const state = this.management.get(id);
+    if (!state || state.secrets.length > 0 || secrets.length === 0) return;
+    state.secrets = secrets.map(s => ({
+      meta: {
+        id: 'sec_' + randomUUID().replace(/-/g, '').slice(0, 12),
+        field: s.field,
+        label: s.label,
+        masked: this.maskSecret(s.value),
+        lastUpdated: new Date().toISOString(),
+      },
+      value: s.value,
+    }));
+    this.syncSecrets(id);
   }
 
   // ----------------------------------------------------

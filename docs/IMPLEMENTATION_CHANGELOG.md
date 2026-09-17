@@ -6,6 +6,113 @@ tests cover it.
 
 ---
 
+## 2026-09-17 — Provider Secrets Now Survive a Restart (DB Persistence)
+
+**Context:** continuing "complete the remaining production-readiness
+gaps" — the last open item from the provider-secrets pipeline fix
+(`IMPLEMENTATION_BASELINE.md` §4 item 19): a secret added through the
+admin console lived only in `ProviderRegistry`'s in-memory `Map`s and
+reverted to the env-var fallback (or nothing) on every restart.
+
+### What changed
+
+**`packages/providers` stays fully DB-free** — its design constraint,
+not an oversight: `ProviderRegistry`'s constructor is synchronous and it
+is a process-wide singleton shared by every `packages/simulation` test
+file, so it cannot itself await a real DB call. It gained two new,
+still-pure-in-memory methods instead: `exportSecretsForPersistence(id)`
+(the provider's current plaintext secrets, as `{field, label, value}[]`
+— not a new trust boundary, since it's exactly what the caller's own
+prior `addSecret()` calls already supplied) and `hydrateSecrets(id,
+secrets)` (restores them; a no-op if that provider already has secrets
+from this same process, so a fresh `addSecret()` call always wins over
+whatever was loaded from disk).
+
+**`services/api-gateway`**, which already depends on both
+`packages/providers` and `@company/database`, owns the actual
+persistence — the only place this needed to be wired. New
+`packages/database/src/provider-secrets.ts`:
+- `persistProviderSecrets(slug, secrets)` — encrypts the *full* current
+  set as one JSON blob with the existing (previously completely unused)
+  `encryptSecret`/AES-256-GCM helper and upserts it into the existing
+  (also previously unused) `provider_configs` table, keyed by
+  `(providerId, environment)`. `environment` here is the *deployment
+  tier* (`'live'` in production, `'test'` elsewhere) — deliberately not
+  the provider's own admin-toggleable `ManagementState.environment`
+  field, so secrets can't become unreachable if an admin flips that
+  value mid-life.
+- `loadAllProviderSecrets()` — the read side; decrypts every
+  `provider_configs` row for the current tier, skipping (not throwing
+  on) a row that fails to decrypt so one bad row can't block every other
+  provider's secrets from loading.
+- `ensureProviderRow(slug, name, category)` — `provider_configs.
+  provider_id` is a real FK to `providers.id`, and nothing in the
+  codebase had ever seeded that table: confirmed empty on the live DB
+  (`SELECT count(*) FROM providers` → `0`) before writing this. Fixed by
+  adding an atomic `providerRepository.upsertBySlug()` (`ON CONFLICT
+  (slug) DO UPDATE`, verified against the live `providers_slug_unique`
+  constraint) and calling it from the gateway's secrets routes
+  themselves — not only once at startup, since an admin can add a
+  provider's very first secret before a separate startup loop has
+  necessarily reached that provider yet (a real race caught by this
+  pass's own new simulation test failing before the fix, not a
+  hypothetical).
+
+**Wiring in `app.ts`**: `hydrateProviderSecretsFromDb()` runs once,
+fire-and-forget, right after `ProviderRegistry.getInstance()` —
+non-blocking (`app.listen()` must not wait on a DB round trip) and a
+no-op wherever `SECRET_ENCRYPTION_KEY` isn't set (most non-production
+environments), which is expected, not an error: the process.env fallback
+still works exactly as before this existed.
+`persistProviderSecretsAsync(id)` runs the same way after every
+`addSecret()`/`deleteSecret()` on `/api/dashboard/providers/:id/secrets`
+— never blocks or fails the HTTP response, since the in-memory registry
+(what every real adapter call actually reads) is already correct the
+moment those calls return; a persistence failure only affects whether
+that state survives the *next* restart.
+
+No new migration: both `providers` and `provider_configs` already
+existed on the live database (Drizzle schema + an earlier, never-wired
+pass), confirmed by direct query before writing any code against them.
+
+**`packages/simulation/src/db.ts`**'s `installDatabaseMock()` — every
+simulation test that boots the gateway replaces `@company/database`
+wholesale with this in-memory double; without extending it, the moment
+this pass wired real persistence calls into the secrets routes, every
+such test would have hit an unmocked `undefined` the instant an
+`addSecret()` call fired. Added `providerRepository`,
+`providerConfigRepository`, and mirrors of all three
+`provider-secrets.ts` functions, backed by new `dbState.providers`/
+`providerConfigs` arrays, using the *real* `encryptSecret`/
+`decryptSecret` (imported via relative path, same pattern already used
+for `hashPassword` etc. in this file) so a round trip here behaves
+identically to production.
+
+### Tests
+
+- `packages/providers/src/providerRegistry.test.ts`: new coverage for
+  `exportSecretsForPersistence`/`hydrateSecrets`, including the
+  never-clobber guarantee (a secret added this process always beats one
+  loaded from disk) and the unknown-provider no-op case.
+- New `packages/simulation/src/provider-secrets-persistence.simulation.test.ts`:
+  drives the real `POST`/`DELETE /api/dashboard/providers/:id/secrets`
+  routes end-to-end and decrypts what actually landed in the (mocked)
+  `provider_configs` table — proves the stored blob doesn't contain the
+  plaintext value anywhere (i.e. it's genuinely encrypted, not just
+  encoded), that adding a second field re-encrypts the *full* set rather
+  than losing the first, that deleting the only secret persists an empty
+  set rather than leaving a stale one, and that `loadAllProviderSecrets()`
+  decrypts back to exactly what `addSecret()` produced.
+- Full suite: `npm run type-check`, `npm run lint` (0 errors; warnings
+  unchanged at 292 vs. the post-webhook-signature-pass baseline), `npm
+  test` (530 passed, 12 skipped — unrelated), `npm run build:all` all
+  clean. Verified directly against the live Neon database (read-only:
+  table existence, `providers_slug_unique`, `provider_configs` column
+  shapes, and that `providers` was genuinely empty) before writing any
+  code that assumed those facts.
+
+---
+
 ## 2026-09-17 — Native Per-Provider Inbound Webhook Signature Verification
 
 **Context:** continuing "complete the remaining production-readiness

@@ -36,6 +36,9 @@ import {
   customerNoteRepository,
   supportTicketRepository,
   ticketCommentRepository,
+  ensureProviderRow,
+  persistProviderSecrets,
+  loadAllProviderSecrets,
 } from '@company/database';
 import {
   logger,
@@ -308,6 +311,75 @@ app.use('/v1/api/gateway/*', (req, res, next) => {
 const registry = ProviderRegistry.getInstance();
 const routingEngine = new RoutingEngine();
 const eventBus = EventBus.getInstance();
+
+// P0: Provider secrets added through the admin console previously lived
+// only in ProviderRegistry's in-memory Map — a real gap this platform
+// documented rather than hid (see docs/IMPLEMENTATION_BASELINE.md, "Provider
+// secrets DB persistence"): a secret survived until the next restart, then
+// silently reverted to whatever the process.env fallback provided (or
+// nothing). packages/providers stays DB-free by design (a synchronous
+// singleton constructor, shared by every packages/simulation test, that
+// cannot itself await a real DB call) — this gateway, which already
+// depends on both packages, owns bridging the two: read back every
+// already-persisted provider's secrets into the registry once at startup,
+// and persist the full current set — seeding that provider's `providers`
+// row first, idempotently, if this is its very first secret — after every
+// admin add/delete (see the /api/dashboard/providers/:id/secrets routes
+// below).
+//
+// Fire-and-forget and non-blocking — server startup (app.listen in
+// index.ts) must not wait on a DB round trip, and a provider with no
+// persisted secrets yet (or SECRET_ENCRYPTION_KEY unset, e.g. most
+// non-production environments) is expected, not an error: the adapter's
+// process.env fallback still works exactly as before this existed.
+async function hydrateProviderSecretsFromDb(): Promise<void> {
+  try {
+    const snapshot = await loadAllProviderSecrets();
+    for (const [slug, secrets] of Object.entries(snapshot)) {
+      registry.hydrateSecrets(slug, secrets);
+    }
+  } catch (err) {
+    logger.warn('provider secrets hydration failed — adapters still work via env-var fallback', {
+      operation: 'startup',
+      errorCode: 'PROVIDER_SECRETS_HYDRATE_FAILED',
+      status: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+void hydrateProviderSecretsFromDb();
+
+// Encrypts and stores the provider's full current secrets set — called
+// fire-and-forget after every successful addSecret()/deleteSecret() below.
+// Never blocks or fails the HTTP response: the in-memory registry (what
+// every real adapter call actually reads) is already correct the moment
+// addSecret()/deleteSecret() returns; this only affects whether that state
+// survives the *next* restart, not the current request.
+//
+// Seeds this provider's `providers` row on every call (upsert, so a
+// repeat is a cheap no-op) rather than relying on startup hydration having
+// already done it — an admin can add a secret before that fire-and-forget
+// loop finishes, or (for a provider that has never had a secret before)
+// there may be no row yet at all.
+function persistProviderSecretsAsync(id: string): void {
+  const secrets = registry.exportSecretsForPersistence(id);
+  if (secrets === null) return;
+  const config = registry.getAllConfigs().find((c) => c.id === id);
+  if (!config) return;
+
+  (async () => {
+    await ensureProviderRow({ slug: id, name: config.name, category: config.category });
+    await persistProviderSecrets(id, secrets);
+  })().catch((err) => {
+    logger.warn('provider secrets persistence failed — in-memory state is still correct', {
+      operation: 'provider_secrets_persist',
+      providerId: id,
+      errorCode: 'PROVIDER_SECRETS_PERSIST_FAILED',
+      status: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
 
 // ----------------------------------------------------
 // P0-4: TENANT ISOLATION MIDDLEWARE (ENFORCED)
@@ -1691,6 +1763,7 @@ app.post('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, re
   if (!meta) {
     return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
   }
+  persistProviderSecretsAsync(req.params.id);
   return res.status(201).json(meta);
 });
 
@@ -1699,6 +1772,7 @@ app.delete('/api/dashboard/providers/:id/secrets/:secretId', requireAdmin, (req:
   if (!removed) {
     return res.status(404).json({ error: `Secret '${req.params.secretId}' not found for provider '${req.params.id}'` });
   }
+  persistProviderSecretsAsync(req.params.id);
   return res.json({ success: true });
 });
 

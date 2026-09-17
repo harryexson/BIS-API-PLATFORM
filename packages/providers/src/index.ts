@@ -1,5 +1,5 @@
 export { BaseProvider } from './base';
-export { ProviderRegistry } from './registry';
+export { ProviderRegistry, type PersistableProviderSecret } from './registry';
 
 export { StripeProvider } from './adapters/payments/stripe';
 export { NMIProvider } from './adapters/payments/nmi';
