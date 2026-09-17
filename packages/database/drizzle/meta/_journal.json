@@ -8,6 +8,13 @@
       "when": 1789440725222,
       "tag": "0000_baseline",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789505410008,
+      "tag": "0001_events_app_id_fk",
+      "breakpoints": true
     }
   ]
 }

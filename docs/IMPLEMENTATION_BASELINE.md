@@ -321,7 +321,33 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    non-throwing result as `'healthy'`, so a `degraded`/`unhealthy` DB
    status (returned, not thrown, by that function) never actually
    surfaced — see `docs/IMPLEMENTATION_CHANGELOG.md` for the fix.)*
-4. **`events.app_id` has no FK constraint** — referential integrity gap.
+4. ~~**`events.app_id` has no FK constraint**~~ — **closed 2026-09-17.**
+   `events.app_id` actually holds the application's *slug* (e.g.
+   `'reach-church'`), not its UUID primary key — every real caller
+   resolves it that way (`services/api-gateway/src/auth.ts`'s
+   `authenticateApplication` sets `appId = application.slug`), so the FK
+   references `applications.slug` (a unique column), not `applications.id`.
+   Two sentinel values were already in real use for events with no owning
+   tenant app — `'system'` (provider-level events: `provider_webhook`
+   processing, the reconciliation job) and `'webhook'` (a payment webhook
+   whose payload carried no `metadata.appId`) — confirmed via a full-repo
+   search for every literal `appId:` value written to the `events` table.
+   Rather than special-case these in application code, the migration
+   (`packages/database/drizzle/0001_events_app_id_fk.sql`) seeds them as
+   real `applications` rows first (idempotent, `ON CONFLICT DO NOTHING`),
+   then adds the constraint — every `events.app_id` is now a genuinely
+   valid reference, no exceptions. Verified live before applying: the
+   `events` table was completely empty (0 rows), so there was no orphaned
+   data to reconcile. Applied to the live database with explicit
+   confirmation (same standing rule as every other live-DB write this
+   session), and `drizzle.__drizzle_migrations` updated to match (hash
+   `b62092211d3befab6e23351076eb6f4ed2e43b3e80c5c6755fb316e76841f283`) —
+   verified immediately after: both sentinel rows exist, the constraint
+   exists (`pg_constraint` lookup), `applications` row count is exactly
+   the expected 4 real + 2 sentinel = 6. This is also the first real
+   incremental migration generated against the single-baseline history
+   from item 12 below — confirms that consolidation actually works for
+   ongoing schema changes, not just a fresh deploy.
 5. ~~No API-key scope enforcement~~ — **closed 2026-09-08.**
    `ApplicationRegistry.authenticateApplication` now surfaces the matched
    key's `scopes`; the gateway's `mw.apiKey(requiredScope)` middleware

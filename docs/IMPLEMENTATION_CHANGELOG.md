@@ -6,6 +6,55 @@ tests cover it.
 
 ---
 
+## 2026-09-17 — Referential Integrity: `events.app_id` Foreign Key
+
+**Context:** continuing the user's ask to "complete the remaining
+production-readiness gaps" — the next item on `IMPLEMENTATION_BASELINE.md`'s
+open-gaps list, §4 item 4.
+
+### What changed
+`events.app_id` was a plain `text` column with no foreign key — nothing
+stopped an orphaned or misspelled app id from being written. It holds the
+application's *slug*, not its UUID id (confirmed by reading
+`authenticateApplication` in `services/api-gateway/src/auth.ts`), so the
+new constraint references `applications.slug`, a unique column, not
+`applications.id`.
+
+A full-repo search for every literal `appId:` value written via
+`eventRepository.create()` turned up two sentinel values already in real
+production use for events with no owning tenant app: `'system'`
+(`provider_webhook` job processing, the reconciliation job) and
+`'webhook'` (a payment webhook whose payload carried no
+`metadata.appId`). Rather than special-case these in application code
+(which would mean the FK "mostly" holds, with silent exceptions), the
+migration seeds them as real `applications` rows first
+(`ON CONFLICT DO NOTHING`, idempotent) before adding the constraint — the
+FK now holds with zero exceptions.
+
+### Verification and live application
+Checked the live database for orphaned `events.app_id` values before
+writing the migration — the `events` table had 0 rows, so nothing needed
+reconciling. Generated via `drizzle-kit generate` against the single-
+baseline history from the 2026-09-15 migration-consolidation pass (see
+that entry) — this is the first real incremental migration since that
+consolidation, and it worked cleanly, confirming the baseline is actually
+usable going forward, not just for a fresh deploy. Applied to the live
+database with explicit human confirmation (same standing rule as every
+other live-DB write this session); `drizzle.__drizzle_migrations` updated
+to record it. Verified immediately after: both sentinel `applications`
+rows exist, the constraint exists in `pg_constraint`, and `applications`
+row count is exactly 6 (4 real + 2 sentinel) as expected. Full test suite
+(492 tests) re-run after the schema change: no regressions — the
+simulation harness's DB mock doesn't enforce FKs (by design, it's a
+behavioral simulation, not a schema-constraint simulation), so this was
+purely a real-Postgres-side change.
+
+**Files changed:**
+- `packages/database/src/schema/events.ts` — `appId` now
+  `.references(() => applications.slug)`
+- `packages/database/drizzle/0001_events_app_id_fk.sql` (new),
+  `drizzle/meta/0001_snapshot.json` (new), `drizzle/meta/_journal.json`
+
 ## 2026-09-15 — Provider Onboarding Readiness: Real Secrets Pipeline, isConfigured(), Docs
 
 **Context:** the user asked to "continue building and complete all the
