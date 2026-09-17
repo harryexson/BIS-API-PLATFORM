@@ -2,6 +2,15 @@ import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
 import { ProviderConfig, TransactionEvent, MessageRequest } from '@company/schemas';
 
+/**
+ * Simulated-only messaging provider — deliberately, not an oversight.
+ * "SignalHouse" is not a real, findable SMS/messaging vendor (confirmed
+ * via WebSearch, 2026-09-08 and reconfirmed 2026-09-17): there is no
+ * public API documentation to verify a real integration against, and the
+ * master plan explicitly prohibits guessing a provider's contract. See
+ * docs/IMPLEMENTATION_BASELINE.md §6 item 1 for the same finding on
+ * FutureSMS.
+ */
 export class SignalHouseProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);

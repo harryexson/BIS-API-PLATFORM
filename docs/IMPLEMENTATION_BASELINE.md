@@ -267,8 +267,14 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    (2026-09-14/15, verified via WebSearch against current public docs —
    see §6 item 1 and the changelog; Vibes and PayChangu's error envelope
    at materially lower confidence than the rest — see each adapter's
-   class comment). SignalHouse/FutureSMS/generic-SMS/email (messaging)
-   remain simulated. The card-based payment adapters (Stripe, NMI,
+   class comment). Email (messaging) closed 2026-09-17 — real send via
+   Resend (`@company/shared`'s existing `sendTransactionalEmail`, the same
+   integration §4 item 15 built for account-lifecycle email), reused
+   rather than duplicated. SignalHouse/FutureSMS remain, and will stay,
+   simulated — both reconfirmed via WebSearch, 2026-09-17, as not real,
+   findable vendors; there is no real API to verify an integration
+   against, so building one would mean guessing a contract, which the
+   master plan prohibits. The card-based payment adapters (Stripe, NMI,
    Flutterwave, Airwallex) share one honest, structural limitation, not a
    per-provider gap: this gateway's `PaymentRequest` never collects raw
    card data (by design — PCI scope), so a real charge additionally
@@ -401,9 +407,11 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
    integration with a real carrier/registrar API to verify status
    automatically. See `docs/IMPLEMENTATION_CHANGELOG.md` ("Phase 40/41:
    A2P/10DLC Messaging Profiles").
-10. **No payment reconciliation/settlement model** beyond a `reconciliation`
-    job stub — no connected-account onboarding flow for merchant-owned
-    payment accounts.
+10. ~~No payment reconciliation/settlement model~~ beyond a `reconciliation`
+    job stub — **detection-and-reporting closed 2026-09-17** (see §4 item
+    23). No connected-account onboarding flow for merchant-owned payment
+    accounts remains genuinely out of scope — that's a distinct feature
+    (multi-tenant payment ownership), not a reconciliation gap.
 11. **npm audit**: `qs` (via `express`) has two moderate DoS advisories
     (GHSA-x5fp-wj9c-mxmx, GHSA-4mjr-xmp4-gh2g) with no non-breaking fix
     available in the express 4.x line at time of audit — remediating fully
@@ -752,6 +760,104 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     `providerConfigs` arrays) — without this, every simulation test that
     boots the gateway would have hit an unmocked `undefined` the moment
     this pass wired the persistence calls into the secrets routes.
+22. **New: real payment refund capability** — closed 2026-09-17. There was
+    no way to initiate a refund anywhere in the real gateway before this —
+    `docs/openapi.yaml` documented a `Refunds` tag with a `POST /refunds`
+    route, but no such route (or any refund route at all) existed in
+    `services/api-gateway/src/app.ts`. Added `BaseProvider.processRefund()`
+    (default: an honest `status: 'failed'` with an explanatory error, not
+    a silent no-op or a fabricated success) and real, WebSearch-verified
+    implementations for Stripe (`POST /v1/refunds`), NMI (`type=refund` on
+    the same `transact.php` endpoint charges use), and Flutterwave
+    (`POST /v3/transactions/{id}/refund`, whose real settlement is
+    async — reported as `'unknown'`, not a fabricated `'success'`). New
+    `POST /v1/api/gateway/refund` route: looks up the transaction by the
+    same provider-side id clients already have (not this platform's
+    internal database id), enforces it's currently `'success'`, enforces
+    a partial-refund amount doesn't exceed the original, and on a
+    confirmed-success result transitions the transaction to `'refunded'`
+    (an `'unknown'` result is left alone — the existing `charge.refunded`
+    webhook handling in `packages/workers/src/jobs/paymentWebhook.ts`
+    already resolves it once the provider confirms, the same path a
+    dashboard-initiated refund already used). `packages/api-client`
+    gained a matching `payments.refund()` method. Tests: a
+    `processRefund()` suite per adapter (Stripe/NMI/Flutterwave, plus
+    PawaPay's inherited default), and a new
+    `packages/simulation/src/refund.simulation.test.ts` driving the real
+    end-to-end route (partial refund, over-amount rejection, double-refund
+    rejection, cross-application ownership rejection).
+23. **New: real payment reconciliation (detection, not silent
+    auto-resolution)** — closed 2026-09-17.
+    `packages/workers/src/jobs/reconciliation.ts` was, despite its name, a
+    system/queue health report generator with zero payment-specific logic
+    — confirmed by reading it directly. Added
+    `transactionRepository.findStaleUnresolved(olderThanMs)`: transactions
+    stuck in `pending`/`processing`/`unknown` past a configurable
+    threshold (`RECONCILIATION_STALE_THRESHOLD_MS`, default 1 hour).
+    Deliberately detection-only — auto-resolving a stuck transaction's
+    outcome from internal state alone would be exactly the kind of
+    fabrication this platform's master plan prohibits for a real charge;
+    only the provider (its dashboard, or the webhook this platform already
+    ingests) actually knows what happened. The reconciliation job now
+    includes a `payments` section in its report (and audit-log entry) with
+    every stale transaction's id/provider/amount; a new on-demand
+    `GET /api/dashboard/reconciliation` route (admin-gated) exposes the
+    same query without waiting for the next scheduled run. Tests: a new
+    `packages/workers/src/jobs/reconciliation.test.ts` and
+    `packages/simulation/src/reconciliation.simulation.test.ts` (stale
+    pending/unknown transactions reported; recent, resolved, or
+    already-refunded ones are not).
+24. **New finding: outbound platform webhooks are more built than "not
+    implemented" but still not reachable end-to-end** — found and
+    documented (not built further) 2026-09-17, while reconciling
+    `docs/openapi.yaml` and `docs/DEVELOPER_GUIDE.md` §9b against the real
+    gateway. Both docs previously presented a working "register a URL,
+    receive a signed `WebhookEvent` envelope" feature as current — false.
+    What's actually real: `packages/events/src/webhook-delivery.ts`'s
+    `WebhookDelivery` class is a genuine, working outbound POST engine
+    (exponential-backoff retry, 5 attempts) — but it is never instantiated
+    or called anywhere in `services/api-gateway` or `packages/workers`,
+    and there is no schema, admin-console UI, or API route for a developer
+    to register a callback URL in the first place, so nothing ever
+    supplies it a target. It also sends no signature today (`X-Webhook-Id`/
+    `X-Webhook-Attempt` headers only) despite `packages/api-client`'s
+    `WebhooksResource.verify()`/`constructEvent()` already being built,
+    unused, to check one. The remaining work to finish it is well-scoped:
+    a `webhook_endpoints` table + admin-console CRUD, an
+    `EventBus.subscribe()` listener wired to `WebhookDelivery.enqueue()`
+    for the right event types, and HMAC signing added to
+    `processQueue()`. Deliberately not attempted this pass (a live-database
+    migration plus a new customer-facing feature, on top of everything
+    else already shipped this pass) — corrected in both docs rather than
+    left presented as current, and tracked here as the next well-defined
+    pickup.
+25. **`docs/openapi.yaml` and `docs/DEVELOPER_GUIDE.md` reconciled with the
+    real gateway** — closed 2026-09-17. Both documents' own text had
+    already flagged this as a known, unfinished correction (openapi.yaml's
+    top-of-file note said "Payments/Refunds/Messages/Conversations/
+    Providers sections still need the same pass" as Auth/Billing already
+    got). Rewrote: every path from a fictional `/payments`,`/refunds`,
+    `/messages/{id}`, `/conversations/{id}`, `/providers/{id}` REST-resource
+    design to the real `/v1/api/gateway/{payment,refund,messaging,
+    transaction/{id},providers}` routes (plus the new refund route from
+    item 22); the base-URL/server convention (`/health`+`/ready` sit
+    outside `/v1`, everything else is under it — previously wrong for
+    both); the error envelope (flat `{error: string}`, not a nested
+    `{error:{code,message,request_id}}` object with a fabricated code
+    enum); the idempotency model (`x-idempotency-key`, payment-create
+    only, replay-cache semantics — not a `409 idempotency_conflict` that
+    never happens in the real gateway); cross-cutting headers (only
+    `X-Request-Id` is a real response header — `X-Correlation-Id` is
+    request-only, never echoed back, contrary to the prior claim); amounts
+    (major currency unit, e.g. `49.99`, not minor-unit cents); and
+    identifiers (adapter/provider-generated, no fixed `pay_`/`msg_`/`ref_`
+    prefix scheme). Confirmed there is no real pagination anywhere, and no
+    real `GET` read API for an individual message or a conversation
+    thread. `packages/api-client` (a separate, already-accurate rewrite
+    from an earlier pass) needed only the new `payments.refund()` method
+    to stay in sync — everything else it already documented matched.
+    Verified every schema/parameter/response `$ref` in the rewritten YAML
+    resolves (a small script, not manual inspection) after the rewrite.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 

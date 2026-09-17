@@ -48,6 +48,15 @@ describe('PawaPayProvider', () => {
     });
   });
 
+  describe('processRefund()', () => {
+    it('reports failed with an explanatory error (BaseProvider default — no real refund API implemented for PawaPay)', async () => {
+      const provider = new PawaPayProvider(makeConfig());
+      const result = await provider.processRefund('dep-123', 100, 'KES');
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/does not support refunds/i);
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.PAWAPAY_API_KEY;

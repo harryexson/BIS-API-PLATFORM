@@ -1,4 +1,4 @@
-import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, OtherRequest } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, OtherRequest, RefundResult } from '@company/schemas';
 
 export interface HttpRequestOptions {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
@@ -186,6 +186,35 @@ export abstract class BaseProvider {
     _headers: Record<string, string | undefined>,
   ): Promise<boolean | null> {
     return null;
+  }
+
+  /**
+   * Refunds a previously successful charge. `providerTransactionId` is
+   * this adapter's own id for that charge (whatever it returned as
+   * TransactionEvent.id when it succeeded — e.g. Stripe's PaymentIntent
+   * id) — the caller (services/api-gateway's /v1/api/gateway/refund
+   * route) resolves that from the platform's own `transactions` table,
+   * never from client input directly.
+   *
+   * The default here is honest, not a stub to silently fall through:
+   * most adapters in this package have never had their refund API
+   * verified against real documentation, so claiming to support refunds
+   * without that verification would be exactly the kind of fabrication
+   * the master plan prohibits for charges. Override only once a
+   * provider's real refund endpoint has been verified the same way its
+   * charge endpoint was (see docs/providers/ADDING_A_PROVIDER.md).
+   */
+  public async processRefund(
+    _providerTransactionId: string,
+    amount: number,
+    currency: string,
+  ): Promise<RefundResult> {
+    return {
+      status: 'failed',
+      amount,
+      currency,
+      error: `${this.config.name} does not support refunds through this platform yet`,
+    };
   }
 
   /**

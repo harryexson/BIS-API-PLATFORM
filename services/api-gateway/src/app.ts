@@ -1029,6 +1029,115 @@ app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantCon
   }
 });
 
+// P0: Refund a previously successful payment. This capability was
+// entirely absent before this pass — docs/openapi.yaml documented a
+// Refunds tag but no such route existed anywhere in the real gateway
+// (see docs/IMPLEMENTATION_BASELINE.md). Reuses the 'payments:send' scope
+// — a refund is a payment-writing action, not a separate capability an
+// API key would reasonably be granted independently of send access.
+app.post('/v1/api/gateway/refund', mw.apiKey('payments:send'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { transactionId, amount, reason } = req.body || {};
+
+  if (!transactionId) {
+    return res.status(400).json({ error: 'Missing parameter: transactionId is required' });
+  }
+
+  // transactionId here is the id the client actually has — the same
+  // `id` field GET /v1/api/gateway/transaction/:id already keys off and
+  // the original POST /v1/api/gateway/payment response returned (each
+  // adapter's own provider-side id, e.g. Stripe's PaymentIntent id, not
+  // this platform's internal transactions.id UUID the client never sees).
+  const transaction = await transactionRepository.findByProviderTransactionId(transactionId);
+  // P0: Ownership check — a refund must never be issued against another
+  // application's (or another tenant's) transaction just because the
+  // caller guessed a valid id.
+  if (!transaction || transaction.appId !== appId || transaction.tenantId !== tenantId) {
+    return res.status(404).json({ error: `Transaction '${transactionId}' not found` });
+  }
+
+  // Only a confirmed-successful charge can be refunded — 'pending'/
+  // 'unknown' hasn't definitely moved money yet, and 'failed'/'refunded'
+  // either never moved money or already gave it back. The transactions
+  // table's own state machine (packages/database/src/repositories/
+  // transactions.ts) agrees: only 'success' → 'refunded' is a normal
+  // transition here (its 'processing' → 'refunded' entry exists for a
+  // provider-initiated refund arriving via webhook mid-flight, not for
+  // this caller-initiated route).
+  if (transaction.status !== 'success') {
+    return res.status(409).json({ error: `Transaction '${transactionId}' is '${transaction.status}', not 'success' — only a confirmed-successful charge can be refunded` });
+  }
+
+  const provider = registry.getProvider(transaction.providerId);
+  if (!provider) {
+    return res.status(404).json({ error: `Provider '${transaction.providerId}' not found` });
+  }
+
+  const originalAmount = Number(transaction.amount);
+  const refundAmount = amount !== undefined ? Number(amount) : originalAmount;
+  if (!Number.isFinite(refundAmount) || refundAmount <= 0 || refundAmount > originalAmount) {
+    return res.status(400).json({ error: `Invalid refund amount — must be > 0 and <= the original amount (${originalAmount})` });
+  }
+
+  // Type-narrowing only, not a reachable branch in practice: the lookup
+  // above matched on this exact field, so a non-null transaction always
+  // has a non-null providerTransactionId.
+  if (!transaction.providerTransactionId) {
+    return res.status(409).json({ error: `Transaction '${transactionId}' has no provider transaction id on record — cannot refund` });
+  }
+
+  const startTime = Date.now();
+  const result = await provider.processRefund(transaction.providerTransactionId, refundAmount, transaction.currency);
+  const latency = Date.now() - startTime;
+
+  // Only a confirmed 'success' updates the transaction's own status here.
+  // An 'unknown' (async, e.g. Flutterwave's refund settling in 3-15 days)
+  // is left as-is — the existing charge.refunded webhook handling in
+  // packages/workers/src/jobs/paymentWebhook.ts already transitions it to
+  // 'refunded' once the provider confirms it, the same real, already-built
+  // path a webhook-only refund (e.g. one issued from a provider's own
+  // dashboard) already goes through.
+  if (result.status === 'success') {
+    await transactionRepository.updateStatus(transaction.id, 'refunded').catch((err) => {
+      logger.error('refund succeeded but failed to update transaction status', {
+        operation: 'refund',
+        providerId: transaction.providerId,
+        errorCode: 'REFUND_STATUS_UPDATE_FAILED',
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  const event: TransactionEvent = {
+    id: result.refundId || `refund_${randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    appId,
+    category: 'payment',
+    providerId: transaction.providerId,
+    status: result.status,
+    amount: result.amount,
+    currency: result.currency,
+    latency,
+    cost: 0,
+    decisionReason: reason || 'refund_requested',
+    payload: { transactionId, amount: refundAmount },
+    response: result.response ?? null,
+    ...(result.error ? { error: result.error } : {}),
+  };
+  eventBus.emit(event);
+  observe(event);
+
+  if (result.status === 'failed') {
+    return res.status(502).json(event);
+  }
+  // 202 for 'unknown' — same convention as the payment route: the outcome
+  // is genuinely unresolved until the provider's own webhook confirms it,
+  // not something a client should treat as done.
+  return res.status(result.status === 'unknown' ? 202 : 200).json(event);
+}));
+
 app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { recipient, content, providerOverride } = req.body;
@@ -1925,6 +2034,32 @@ app.get('/api/dashboard/metrics', requireAdmin, (req: Request, res: Response) =>
     volumePerApp
   });
 });
+
+// P0: On-demand version of packages/workers/src/jobs/reconciliation.ts's
+// periodic stale-transaction report — an operator investigating "why
+// hasn't this payment settled" shouldn't have to wait for (or dig through
+// audit log entries from) the next scheduled run. Same detection-only
+// contract: lists what's unresolved, does not guess an outcome.
+app.get('/api/dashboard/reconciliation', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const thresholdMs = Number(req.query.thresholdMs) || Number(process.env.RECONCILIATION_STALE_THRESHOLD_MS) || 60 * 60_000;
+  const stale = await transactionRepository.findStaleUnresolved(thresholdMs);
+
+  return res.json({
+    generatedAt: new Date().toISOString(),
+    staleThresholdMs: thresholdMs,
+    staleCount: stale.length,
+    stale: stale.map((t) => ({
+      id: t.id,
+      appId: t.appId,
+      providerId: t.providerId,
+      providerTransactionId: t.providerTransactionId,
+      status: t.status,
+      amount: t.amount,
+      currency: t.currency,
+      updatedAt: t.updatedAt,
+    })),
+  });
+}));
 
 app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => {
   res.writeHead(200, {

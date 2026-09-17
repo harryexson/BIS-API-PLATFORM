@@ -95,6 +95,57 @@ describe('NMIProvider', () => {
     });
   });
 
+  describe('processRefund()', () => {
+    it('returns a labeled simulated success with no API key configured, never calling fetch', async () => {
+      delete process.env.NMI_API_KEY;
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new NMIProvider(makeConfig());
+      const result = await provider.processRefund('nmi_txn_1', 10, 'USD');
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe('success');
+      expect(result.refundId).toMatch(/^nmi_sim_/);
+      expect(result.response.simulated).toBe(true);
+    });
+
+    it('POSTs type=refund with the original transactionid, on success', async () => {
+      process.env.NMI_API_KEY = 'test-key';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        formResponse({ response: '1', responsetext: 'SUCCESS', transactionid: 'nmi_refund_1' }),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new NMIProvider(makeConfig());
+      const result = await provider.processRefund('nmi_txn_1', 10, 'USD');
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toBe('https://secure.nmi.com/api/transact.php');
+      const params = new URLSearchParams(opts.body);
+      expect(params.get('type')).toBe('refund');
+      expect(params.get('transactionid')).toBe('nmi_txn_1');
+      expect(params.get('amount')).toBe('10.00');
+
+      expect(result.status).toBe('success');
+      expect(result.refundId).toBe('nmi_refund_1');
+    });
+
+    it('reports failed for a declined refund', async () => {
+      process.env.NMI_API_KEY = 'test-key';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        formResponse({ response: '2', responsetext: 'DECLINED' }),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new NMIProvider(makeConfig());
+      const result = await provider.processRefund('nmi_txn_1', 10, 'USD');
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('DECLINED');
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.NMI_API_KEY;

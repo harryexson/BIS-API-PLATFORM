@@ -75,6 +75,63 @@ describe('FlutterwaveProvider', () => {
     });
   });
 
+  describe('processRefund()', () => {
+    it('returns a labeled simulated success with no API key configured, never calling fetch', async () => {
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.processRefund('123456', 1000, 'NGN');
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe('success');
+      expect(result.refundId).toMatch(/^flw_sim_/);
+      expect(result.response.simulated).toBe(true);
+    });
+
+    it('POSTs to /v3/transactions/{id}/refund with a JSON body, reporting unknown (async settlement)', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'success', message: 'Refund processed', data: { id: 999, amount_refunded: 1000 } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.processRefund('123456', 1000, 'NGN');
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toBe('https://api.flutterwave.com/v3/transactions/123456/refund');
+      expect(JSON.parse(opts.body)).toEqual({ amount: 1000 });
+
+      // Flutterwave documents refunds settling asynchronously (3-15
+      // working days) — accepted must not be reported as a confirmed
+      // success.
+      expect(result.status).toBe('unknown');
+      expect(result.refundId).toBe('999');
+    });
+
+    it('reports failed on a non-2xx response', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'error', message: 'Transaction not found' }),
+          { status: 404, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.processRefund('nonexistent', 1000, 'NGN');
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('Transaction not found');
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.FLUTTERWAVE_SECRET_KEY;

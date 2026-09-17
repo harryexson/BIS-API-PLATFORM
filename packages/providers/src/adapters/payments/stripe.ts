@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, RefundResult } from '@company/schemas';
 
 /**
  * Real Stripe payment provider adapter.
@@ -94,6 +94,78 @@ export class StripeProvider extends BaseProvider {
     const a = Buffer.from(expected, 'hex');
     const b = Buffer.from(v1, 'hex');
     return a.length === b.length && timingSafeEqual(a, b);
+  }
+
+  /**
+   * Refunds a PaymentIntent via POST /v1/refunds — verified against
+   * Stripe's current API reference via WebSearch, 2026-09-17:
+   * `payment_intent` (this adapter's own TransactionEvent.id from the
+   * original charge) is required, `amount` (smallest currency unit) is
+   * optional for a partial refund, full amount otherwise. The Refund
+   * object's `status` is one of pending/requires_action/succeeded/failed/
+   * canceled — only `succeeded` is a confirmed success; `failed`/
+   * `canceled` are confirmed failures; `pending`/`requires_action` are
+   * genuinely unresolved (async), reported as this platform's 'unknown'
+   * outcome rather than guessed at, the same convention charge creation
+   * already uses for ambiguous outcomes.
+   *
+   * Falls back to a labeled simulated success when no API key is
+   * configured — same rule processRequest already follows: never call
+   * the real API with nothing to authenticate with, but still let the
+   * platform's create→refund flow be exercised end-to-end in dev/test.
+   */
+  public async processRefund(
+    providerTransactionId: string,
+    amount: number,
+    currency: string,
+  ): Promise<RefundResult> {
+    if (!this.apiKey) {
+      return {
+        status: 'success',
+        refundId: 're_sim_' + randomUUID().replace(/-/g, '').slice(0, 16),
+        amount,
+        currency,
+        response: { simulated: true, payment_intent: providerTransactionId },
+      };
+    }
+
+    try {
+      const body = this.toFormBody({
+        payment_intent: providerTransactionId,
+        amount: Math.round(amount * 100),
+      });
+
+      const res = await this.http_request({
+        method: 'POST',
+        url: `${this.baseUrl}/refunds`,
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body,
+        timeoutMs: 30_000,
+        maxAttempts: 2,
+      });
+
+      if (res.status >= 400) {
+        const errBody = res.body?.error;
+        return { status: 'failed', amount, currency, error: errBody?.message || `Stripe API error: HTTP ${res.status}`, response: res.body };
+      }
+
+      const refund = res.body;
+      const status = refund.status === 'succeeded' ? 'success' : refund.status === 'failed' || refund.status === 'canceled' ? 'failed' : 'unknown';
+
+      return {
+        status,
+        refundId: refund.id,
+        amount: refund.amount ? refund.amount / 100 : amount,
+        currency: (refund.currency || currency).toUpperCase(),
+        response: refund,
+        ...(status === 'failed' ? { error: refund.failure_reason || `Stripe refund status: ${refund.status}` } : {}),
+      };
+    } catch (err: any) {
+      return { status: 'failed', amount, currency, error: err.message };
+    }
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

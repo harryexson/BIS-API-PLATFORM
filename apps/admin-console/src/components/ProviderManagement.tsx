@@ -88,6 +88,7 @@ const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]>
     { field: 'username', label: 'Username' },
     { field: 'password', label: 'Password' },
   ],
+  email: [{ field: 'api_key', label: 'Resend API Key (re_...)' }],
 };
 
 function parseList(value: string): string[] {

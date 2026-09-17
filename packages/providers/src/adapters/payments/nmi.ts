@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, RefundResult } from '@company/schemas';
 
 /**
  * Real NMI (Network Merchants Inc.) payment provider adapter.
@@ -100,6 +100,78 @@ export class NMIProvider extends BaseProvider {
     const a = Buffer.from(expected, 'hex');
     const b = Buffer.from(sig, 'hex');
     return a.length === b.length && timingSafeEqual(a, b);
+  }
+
+  /**
+   * Refunds a settled transaction via the same POST /api/transact.php
+   * endpoint used for charges, with `type=refund` — verified against
+   * NMI's current documentation via WebSearch, 2026-09-17:
+   * `transactionid` (this adapter's own TransactionEvent.id from the
+   * original sale) is required, `amount` optional for a partial refund.
+   * NMI's documented refund parameters list `username`/`password` auth,
+   * but its `security_key` (used here, same as every other transaction
+   * type this adapter sends) is NMI's single-credential replacement for
+   * that pair, not endpoint-specific — reusing it here is the same
+   * lower-confidence-but-flagged assumption already documented for
+   * `NMI_GATEWAY_ID` in this file's class comment, not a new one.
+   * Response is the same query-string envelope as a charge: `response`
+   * (1=approved, 2=declined, 3=error).
+   *
+   * Falls back to a labeled simulated success when no API key is
+   * configured — same rule processRequest already follows.
+   */
+  public async processRefund(
+    providerTransactionId: string,
+    amount: number,
+    currency: string,
+  ): Promise<RefundResult> {
+    if (!this.apiKey) {
+      return {
+        status: 'success',
+        refundId: 'nmi_sim_' + randomUUID().replace(/-/g, '').slice(0, 16),
+        amount,
+        currency,
+        response: { simulated: true, transactionid: providerTransactionId },
+      };
+    }
+
+    try {
+      const body = this.toFormBody({
+        security_key: this.apiKey,
+        type: 'refund',
+        transactionid: providerTransactionId,
+        amount: amount.toFixed(2),
+      });
+
+      const res = await this.http_request({
+        method: 'POST',
+        url: `https://${this.hostname}/api/transact.php`,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+        timeoutMs: 30_000,
+      });
+
+      const parsed = new URLSearchParams(typeof res.body === 'string' ? res.body : String(res.body ?? ''));
+      const responseCode = parsed.get('response');
+      const responseText = parsed.get('responsetext') || '';
+      const refundTransactionId = parsed.get('transactionid');
+
+      if (!responseCode) {
+        return { status: 'failed', amount, currency, error: `NMI refund response did not include a 'response' field: ${JSON.stringify(res.body)}` };
+      }
+
+      const approved = responseCode === '1';
+      return {
+        status: approved ? 'success' : 'failed',
+        refundId: refundTransactionId || undefined,
+        amount,
+        currency,
+        response: Object.fromEntries(parsed.entries()),
+        ...(approved ? {} : { error: responseText || `NMI refund response code ${responseCode}` }),
+      };
+    } catch (err: any) {
+      return { status: 'failed', amount, currency, error: err.message };
+    }
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

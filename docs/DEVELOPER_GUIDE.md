@@ -1,24 +1,34 @@
-# Developer Guide — BIS API Platform (`/v1`)
+# Developer Guide — BIS API Platform
 
-This guide explains how to integrate with the BIS API Platform public API.
+This guide explains how to integrate with the BIS API Platform gateway.
 The authoritative machine-readable contract is [`openapi.yaml`](./openapi.yaml)
-(OpenAPI 3.1).
+(OpenAPI 3.1) — this guide and that spec were reconciled with the real
+implementation (`services/api-gateway/src/app.ts`) together on 2026-09-17;
+if they ever drift again, `openapi.yaml` is the one to trust first.
 
 ## 1. Base URLs
 
 | Environment | Base URL |
 |-------------|----------|
-| Production  | `https://api.company.com/v1` |
-| Sandbox     | `https://sandbox.api.company.com/v1` |
+| Production  | `https://api.company.com` |
+| Sandbox     | `https://sandbox.api.company.com` |
 
-Use **sandbox** with `sk_test_...` keys for all development and testing. The
-sandbox simulates provider behavior, including asynchronous mobile-money
-settlement, so you can exercise the full webhook flow without real money.
+Every gateway route lives under `/v1/api/...` on top of the base URL above
+(e.g. `POST https://api.company.com/v1/api/gateway/payment`) — `/health` and
+`/ready` are the only exceptions, at the domain root with no `/v1` prefix.
+
+Use **sandbox** with `sk_test_...` keys for all development and testing.
+Providers without real credentials configured (`GET /v1/api/gateway/
+providers`'s `configured: false`) fall back to labeled simulated
+processing automatically, so you can exercise most flows without real
+money — the sandbox is not a separate simulated backend, just a
+convention for which keys/credentials you use against the same gateway.
 
 ## 2. Authentication (API keys)
 
-Every request (except `/health` and `/webhooks/*`) must carry a valid API key
-as a Bearer token:
+Every `/v1/api/gateway/*` and `/v1/api/webhooks/*` route requires a valid
+API key as a Bearer token — `/health` and `/ready` are the only
+unauthenticated routes:
 
 ```http
 Authorization: Bearer sk_live_xxxxxxxxxxxx
@@ -26,156 +36,142 @@ Authorization: Bearer sk_live_xxxxxxxxxxxx
 
 Keys are:
 
-- **Issued per application** (`app_id`). A key is only valid for the `app_id`
-  it was issued to. Sending a request with `app_id: app_b` while authenticating
-  with a key scoped to `app_a` returns `401 authentication_failed`.
-- **Environment-scoped.** `sk_test_...` works only on the sandbox; `sk_live_...`
-  only on production.
-- **Secret.** Treat them like passwords. They are never returned by any API
-  endpoint; provider secret metadata is always masked (e.g. `sk_live_••••1234`).
+- **Issued per application.** The application is resolved entirely from
+  the key — there is no separate `app_id` request field to set or spoof;
+  if you send one in a request body, it is silently overwritten with the
+  key's own application before the request is processed.
+- **Optionally scoped.** A key may be restricted to specific scopes (e.g.
+  `payments:send`, `messaging:send`, `transactions:read`,
+  `providers:read`) — a key with no scopes configured is unrestricted. A
+  scope mismatch returns `403`, not `401`.
+- **Secret.** Treat them like passwords. They are never returned by any
+  API endpoint; provider secret metadata is always masked (e.g.
+  `sk_live_••••1234`).
+
+Every `/v1/api/gateway/*` route also requires an `x-tenant-id` header,
+validated against the authenticated application's linked tenants — missing
+returns `400`, a tenant not linked to this application returns `403`. This
+is unrelated to API-key scoping; both checks apply independently.
 
 Rotate keys from the admin console. On rotation, the old key stops working
 immediately.
 
-## 3. Request IDs & correlation IDs
+## 3. Request tracing
 
-Every response includes two tracing headers:
-
-| Header             | Meaning |
-|--------------------|---------|
-| `X-Request-Id`     | UUID for this specific HTTP request. **Include it in every support ticket.** |
-| `X-Correlation-Id` | Logical-operation ID that travels across services **and** into the webhook events derived from the request. |
-
-You may supply your own `X-Correlation-Id` on a request; if you omit it, the
-gateway generates one and echoes it back. Use correlation IDs to join a payment
-request with its later `payment.succeeded` webhook.
+Every response includes an `X-Request-Id` header (a UUID generated per
+request) — include it in support tickets. There is no `X-Correlation-Id`
+*response* header: you may send one as a *request* header for this
+gateway's own internal log correlation, but it is not echoed back or
+attached to anything you can query later.
 
 ## 4. Idempotency
 
-Network retries must never cause a double charge or a duplicate message. Send an
-`Idempotency-Key` header (any UUID/opaque string) on any mutating request
-(`POST` to payments, refunds, messages):
+Only `POST /v1/api/gateway/payment` supports idempotency today — refunds
+and messages do not. Send an `x-idempotency-key` header (note the header
+name: `x-idempotency-key`, not `Idempotency-Key`):
 
 ```http
-Idempotency-Key: 8b1f8c2e-3a9d-4c7b-9e21-5f1a2b3c4d5e
+x-idempotency-key: 8b1f8c2e-3a9d-4c7b-9e21-5f1a2b3c4d5e
 ```
 
-Behavior:
-
-- **Replay with the same key and same payload** → the original response is
-  returned (status `201`/`202`), no new provider call is made.
-- **Replay with the same key but a different payload** → `409
-  idempotency_conflict`, and the original resource is returned in
-  `error.resource`.
-- If you omit the header, the gateway still derives a short-window key (5-minute
-  bucket on `app_id + amount + currency`) so a blind network retry of the same
-  payment will not double-charge. For longer-lived safety (e.g. your own
-  retry queue), always set your own key.
+Replaying the same key within a 5-minute window returns the original
+cached response with no new provider call. There is no conflict-detection
+behavior — a reused key always returns the original cached result,
+regardless of whether the new request's payload differs. If you omit the
+header, no idempotency protection applies to that request at all — always
+set your own key for anything that must not double-charge on retry.
 
 ## 5. Errors
 
-All errors use a single envelope:
+Every error is a **flat** envelope — no nested object, no machine-readable
+code, no request-id echo field:
 
 ```json
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "Missing required field: amount",
-    "request_id": "req_1a2b3c4d",
-    "correlation_id": "corr_abc123",
-    "details": [{ "field": "amount", "issue": "required" }]
-  }
-}
+{ "error": "Missing parameter: amount is required" }
 ```
 
-Common `code` values:
-
-| Code | HTTP | Meaning |
-|------|------|---------|
-| `invalid_request` | 400 | Malformed body / missing field |
-| `authentication_failed` | 401 | Missing/invalid/unscope key |
-| `not_found` | 404 | Resource does not exist |
-| `invalid_operation` | 422 | Valid shape, illegal action (e.g. over-refund) |
-| `idempotency_conflict` | 409 | Key reused with a conflicting payload |
-| `rate_limited` | 429 | Too many requests; honor `Retry-After` |
-| `provider_error` | 503 | Upstream provider failed |
-| `internal_error` | 500 | Unexpected platform error |
-
-Always log `error.request_id` — it is the primary key for debugging.
+Log the response body itself for debugging; correlate with `X-Request-Id`
+from the response headers (see §3) if you need to reference a specific
+request.
 
 ## 6. Pagination
 
-List endpoints (`GET /providers`, `GET /conversations/{id}`) use cursor
-pagination:
-
-```http
-GET /v1/providers?limit=20&cursor=eyJvZmZzZXQiOjIwfQ==
-```
-
-Response wrapper:
-
-```json
-{
-  "object": "list",
-  "data": [ ... ],
-  "has_more": true,
-  "next_cursor": "eyJvZmZzZXQiOjQwfQ=="
-}
-```
-
-Pass `next_cursor` as `cursor` on the next call. `limit` defaults to 20 (max
-100).
+There is no pagination on any route today. `GET /v1/api/gateway/providers`
+returns every matching provider in one response; there is no `limit` or
+`cursor` parameter.
 
 ## 7. Payments & refunds
 
 ### Create a payment
 
 ```http
-POST /v1/payments
+POST /v1/api/gateway/payment
 Authorization: Bearer sk_live_xxx
-Idempotency-Key: <uuid>
+x-tenant-id: ten_reach_church
+x-idempotency-key: <uuid>
 Content-Type: application/json
 
 {
-  "app_id": "app_reachchurch",
-  "amount": 4999,
+  "amount": 49.99,
   "currency": "USD",
-  "payment_method": "card"
+  "paymentMethod": "card",
+  "paymentToken": "pm_card_visa"
 }
 ```
 
-For **card** payments the response status is `success`/`failed` synchronously.
-For **mobile money** (`mobile_money`, providers PawaPay/PayChangu) the
-synchronous status is `pending`; final settlement arrives via webhook minutes
-later. Poll `GET /v1/payments/{id}` or listen for `payment.succeeded`.
+`amount` is in the currency's **major** unit (e.g. `49.99` for $49.99), not
+cents. `paymentToken` is a client-side-tokenized payment instrument (e.g.
+via Stripe.js) — the gateway never collects raw card data; without one,
+card-based providers fall back to simulated processing.
+
+For **card** payments the response `status` is typically `success`/`failed`
+synchronously (HTTP `200`). For **mobile money** (`paymentMethod:
+"mobile_money"`, providers PawaPay/PayChangu) the initial `status` is
+often `unknown` (HTTP `202`) — genuinely unresolved, not a fabricated
+guess — with final settlement delivered via webhook. Poll
+`GET /v1/api/gateway/transaction/{id}` to check.
 
 ### Refunds
 
-A refund is a **new, immutable** transaction linked to the original via
-`payment_id` (the original is never mutated). Omit `amount` for a full refund,
-or supply it for a partial refund.
+`POST /v1/api/gateway/refund` refunds a transaction this application owns.
+`transactionId` is the `id` field from the original payment response —
+this platform's internal database id is never exposed to callers. Only a
+transaction currently `success` can be refunded. Omit `amount` for a full
+refund, or supply it for a partial refund:
 
 ```http
-POST /v1/refunds
+POST /v1/api/gateway/refund
 Authorization: Bearer sk_live_xxx
-Idempotency-Key: <uuid>
+x-tenant-id: ten_reach_church
+Content-Type: application/json
 
-{ "payment_id": "pay_8f2c1a9b", "reason": "customer_requested" }
+{ "transactionId": "pi_3MtwBwLkdIwHu7ix28a3tqPa", "reason": "customer_requested" }
 ```
 
-## 8. Messages & conversations
+Real refund support (verified against each provider's own API) exists for
+**Stripe, NMI, and Flutterwave**. Any other provider returns
+`status: "failed"` with an explanatory error — refunds are never
+fabricated for a provider whose real refund API hasn't been integrated.
+
+## 8. Messages
 
 ```http
-POST /v1/messages
+POST /v1/api/gateway/messaging
 Authorization: Bearer sk_live_xxx
+x-tenant-id: ten_reach_church
 
-{ "app_id": "app_reachchurch", "channel": "sms",
-  "recipient": "+265888000111", "content": "Confirmed." }
+{ "recipient": "+265888000111", "content": "Confirmed." }
 ```
 
-Delivery receipts (`message.delivered`, `message.failed`) arrive asynchronously
-via webhook. Retrieve a thread with `GET /v1/conversations/{id}`, which returns
-the conversation's messages (cursor-paginated).
+The channel (SMS, WhatsApp, email) is determined by which provider handles
+the request, not a `channel` field you set — use `providerOverride` (e.g.
+`"email"`) to target a specific provider directly.
+
+There is no read API for an individual message or a conversation thread
+today. The only status-check route is
+`GET /v1/api/gateway/transaction/{id}` (see §7), and it only covers a
+gateway process's own recent in-memory history, not a durable, queryable
+message log.
 
 ## 9. Webhooks
 
@@ -222,57 +218,76 @@ yourself.
 
 ### 9b. Outbound platform webhooks (you receive)
 
-You register a URL in the admin console. The platform POSTs a `WebhookEvent`
-envelope to that URL whenever an async event occurs:
+⚠️ **Not reachable end-to-end today** — verified while reconciling this
+guide and `docs/openapi.yaml` with the real gateway, 2026-09-17. The
+pieces are more built than "not implemented" suggests, just never
+connected:
 
-```json
-{
-  "id": "ev_2f3a4b5c",
-  "object": "event",
-  "type": "payment.succeeded",
-  "created_at": "2026-08-24T12:34:56Z",
-  "livemode": true,
-  "correlation_id": "corr_abc123",
-  "data": { "id": "pay_8f2c1a9b", "object": "payment", "status": "success" }
-}
-```
+- `packages/events/src/webhook-delivery.ts`'s `WebhookDelivery` class is a
+  real, working outbound POST engine — exponential-backoff retry, up to 5
+  attempts — but it is never instantiated or called anywhere in
+  `services/api-gateway` or `packages/workers`. `packages/workers/src/
+  jobs/outboxPoller.ts` and `receiptPipeline.ts` sound related but aren't:
+  the former only re-emits to this platform's own internal EventBus, and
+  the latter sends a receipt *message* to the paying customer, not a
+  webhook to your backend.
+- There is no schema, admin-console UI, or API route for you to register
+  your callback URL in the first place, so nothing ever supplies
+  `WebhookDelivery` a target to send to.
+- It sends **no signature** today — only `X-Webhook-Id`/`X-Webhook-Attempt`
+  headers — despite `packages/api-client`'s `WebhooksResource.verify()`/
+  `constructEvent()` already being built to check one (see that resource's
+  own doc comment).
+- If it were wired up, the POST body would be the **raw `TransactionEvent`
+  itself**, not a separate `{id, object, type, created_at, data}` envelope
+  — an earlier version of this doc invented that envelope.
 
-**Verify the signature.** Every outbound delivery includes an
-`X-Signature` header (HMAC-SHA256 of the raw body with your webhook signing
-secret). Reject any request without a valid signature. Return `2xx` quickly
-(≤5s); the platform retries with backoff on failure. Use the event `id` as your
-own idempotency key to avoid double-processing retries.
-
-Outbound event types: `payment.pending|succeeded|failed`,
-`refund.pending|succeeded|failed`,
-`message.sent|delivered|failed|undeliverable`.
+If you need to know about an event as it happens today, poll
+`GET /v1/api/gateway/transaction/{id}` (§7/§8 above) — there is no push
+mechanism yet. The remaining work to finish this (a `webhook_endpoints`
+table + admin-console CRUD, an `EventBus.subscribe()` listener wired to
+`WebhookDelivery.enqueue()`, and HMAC signing in `processQueue()`) is
+well-scoped, not a design question — see
+`docs/IMPLEMENTATION_BASELINE.md`.
 
 ## 10. Health
 
-```http
-GET /v1/health
-```
+Two separate routes, neither under `/v1` and neither authenticated:
 
-Returns `200` with `status: healthy|degraded` and a `dependencies` block
-(`database`, `event_bus`, `providers`). Returns `503` when a critical
-dependency is down. Safe to call unauthenticated — use it for uptime probes.
+```http
+GET /health
+```
+Trivial liveness check — `200` with `{ status: "healthy", service, timestamp }`
+whenever the process is up. No dependency checks.
+
+```http
+GET /ready
+```
+Real dependency check — `200` (`status: "ready"`) or `503`
+(`status: "degraded"`) with a `dependencies` object reporting `database`,
+`rateLimiter` (`redis`/`in-memory`), `queue` (`healthy`/`unreachable`/
+`unconfigured`), and `providers` (always `ready`). Use `/ready` for
+uptime/orchestration probes that need to know about a real outage, not
+`/health`.
 
 ## 11. Quick start (cURL)
 
 ```bash
 # 1. Create a card payment (sandbox)
-curl -X POST https://sandbox.api.company.com/v1/payments \
+curl -X POST https://sandbox.api.company.com/v1/api/gateway/payment \
   -H "Authorization: Bearer $SANDBOX_KEY" \
-  -H "Idempotency-Key: $(uuidgen)" \
+  -H "x-tenant-id: $TENANT_ID" \
+  -H "x-idempotency-key: $(uuidgen)" \
   -H "Content-Type: application/json" \
-  -d '{ "app_id":"app_reachchurch","amount":4999,"currency":"USD","payment_method":"card" }'
+  -d '{ "amount":49.99,"currency":"USD","paymentMethod":"card","paymentToken":"pm_card_visa" }'
 
 # 2. List providers
-curl https://sandbox.api.company.com/v1/providers \
-  -H "Authorization: Bearer $SANDBOX_KEY"
+curl https://sandbox.api.company.com/v1/api/gateway/providers \
+  -H "Authorization: Bearer $SANDBOX_KEY" \
+  -H "x-tenant-id: $TENANT_ID"
 
-# 3. Health check
-curl https://sandbox.api.company.com/v1/health
+# 3. Health check (no auth, no /v1)
+curl https://sandbox.api.company.com/ready
 ```
 
 ## 12. SDK & tooling notes

@@ -34,6 +34,16 @@ export interface MessageCreate {
   providerOverride?: string;
 }
 
+// POST /v1/api/gateway/refund
+export interface RefundCreate {
+  // The `id` from the original payment's TransactionEvent — this
+  // platform's internal database id is never exposed to callers.
+  transactionId: string;
+  // Omit for a full refund. Major currency unit, same as PaymentCreate.amount.
+  amount?: number;
+  reason?: string;
+}
+
 // Mirrors TransactionEvent from services/api-gateway — the shape every
 // payment/messaging call actually returns, success or failure alike.
 export interface TransactionEvent {

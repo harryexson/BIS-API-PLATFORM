@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { BaseProvider } from '../../base';
-import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, RefundResult } from '@company/schemas';
 
 const CURRENCY_TO_COUNTRY: Record<string, string> = {
   NGN: 'NG',
@@ -97,6 +97,67 @@ export class FlutterwaveProvider extends BaseProvider {
     const a = Buffer.from(header, 'utf8');
     const b = Buffer.from(secret, 'utf8');
     return a.length === b.length && timingSafeEqual(a, b);
+  }
+
+  /**
+   * Refunds a transaction via POST /v3/transactions/{id}/refund —
+   * verified against Flutterwave's current API reference via WebSearch,
+   * 2026-09-17: `{id}` is Flutterwave's own numeric transaction id
+   * (`data.id` from the charge response — exactly what this adapter
+   * already returns as TransactionEvent.id when it's present, see
+   * processRequest below), body is JSON `{ amount, comments? }`.
+   * Refunds settle asynchronously (Flutterwave documents 3-15 working
+   * days) — this synchronous response only confirms the refund *request*
+   * was accepted, so a successful call reports this platform's 'unknown'
+   * outcome, not a confirmed 'success', mirroring how processRequest
+   * already treats Flutterwave's 'pending' charge status.
+   *
+   * Falls back to a labeled simulated success when no API key is
+   * configured — same rule processRequest already follows.
+   */
+  public async processRefund(
+    providerTransactionId: string,
+    amount: number,
+    currency: string,
+  ): Promise<RefundResult> {
+    if (!this.apiKey) {
+      return {
+        status: 'success',
+        refundId: 'flw_sim_' + randomUUID().replace(/-/g, '').slice(0, 16),
+        amount,
+        currency,
+        response: { simulated: true, id: providerTransactionId },
+      };
+    }
+
+    try {
+      const res = await this.http_request({
+        method: 'POST',
+        url: `${this.baseUrl}/transactions/${providerTransactionId}/refund`,
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        body: { amount },
+        timeoutMs: 30_000,
+      });
+
+      if (res.status >= 400 || res.body?.status === 'error') {
+        return { status: 'failed', amount, currency, error: res.body?.message || `Flutterwave API error: HTTP ${res.status}`, response: res.body };
+      }
+
+      const data = res.body?.data;
+      if (!data) {
+        return { status: 'failed', amount, currency, error: 'Flutterwave refund response did not include a data object', response: res.body };
+      }
+
+      return {
+        status: 'unknown',
+        refundId: data.id ? String(data.id) : undefined,
+        amount: data.amount_refunded ?? amount,
+        currency,
+        response: res.body,
+      };
+    } catch (err: any) {
+      return { status: 'failed', amount, currency, error: err.message };
+    }
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {

@@ -105,6 +105,94 @@ describe('StripeProvider', () => {
     });
   });
 
+  describe('processRefund()', () => {
+    it('returns a labeled simulated success with no API key configured, never calling fetch', async () => {
+      delete process.env.STRIPE_SECRET_KEY;
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.processRefund('pi_abc123', 10, 'USD');
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe('success');
+      expect(result.refundId).toMatch(/^re_sim_/);
+      expect(result.response.simulated).toBe(true);
+    });
+
+    it('POSTs to /v1/refunds with the payment_intent and amount in minor units, on success', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ id: 're_abc123', status: 'succeeded', amount: 1000, currency: 'usd', payment_intent: 'pi_abc123' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.processRefund('pi_abc123', 10, 'USD');
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toBe('https://api.stripe.com/v1/refunds');
+      const params = new URLSearchParams(opts.body);
+      expect(params.get('payment_intent')).toBe('pi_abc123');
+      expect(params.get('amount')).toBe('1000');
+
+      expect(result.status).toBe('success');
+      expect(result.refundId).toBe('re_abc123');
+      expect(result.amount).toBe(10);
+    });
+
+    it('reports unknown (not success) for a pending/requires_action refund status', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ id: 're_pending', status: 'pending', amount: 1000, currency: 'usd' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.processRefund('pi_abc123', 10, 'USD');
+      expect(result.status).toBe('unknown');
+    });
+
+    it('reports failed for a declined refund', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ id: 're_failed', status: 'failed', failure_reason: 'expired_or_canceled_card' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.processRefund('pi_abc123', 10, 'USD');
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('expired_or_canceled_card');
+    });
+
+    it('reports failed on a non-2xx response', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { message: 'No such payment_intent' } }),
+          { status: 404, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const result = await provider.processRefund('pi_nonexistent', 10, 'USD');
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('No such payment_intent');
+    });
+  });
+
   describe('without an API key configured (simulated fallback)', () => {
     it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
       delete process.env.STRIPE_SECRET_KEY;

@@ -105,6 +105,31 @@ describe('CompanyApiClient', () => {
     expect(fetchMock.mock.calls[1][0]).toBe('https://api.company.com/v1/api/gateway/transaction/tx_2');
   });
 
+  it('payments.refund posts to /v1/api/gateway/refund without an idempotency header', async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      jsonResponse({
+        id: 're_1', timestamp: 'now', appId: 'a', category: 'payment', providerId: 'stripe',
+        status: 'success', amount: 20, currency: 'USD', latency: 5, cost: 0,
+        decisionReason: 'customer_requested', payload: {}, response: {},
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1', fetchImpl: fetchMock as any });
+
+    const event = await client.payments.refund(
+      { transactionId: 'pi_abc123', amount: 20, reason: 'customer_requested' },
+      { correlationId: 'corr-9' },
+    );
+
+    expect(event.id).toBe('re_1');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://api.company.com/v1/api/gateway/refund');
+    expect(init.method).toBe('POST');
+    expect(init.headers['x-idempotency-key']).toBeUndefined();
+    expect(init.headers['x-correlation-id']).toBe('corr-9');
+    expect(JSON.parse(init.body)).toEqual({ transactionId: 'pi_abc123', amount: 20, reason: 'customer_requested' });
+  });
+
   it('webhooks.verify accepts a valid signature and rejects a bad one', async () => {
     const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1' });
     const secret = 'whsec_test';

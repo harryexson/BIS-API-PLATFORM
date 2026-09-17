@@ -1172,6 +1172,14 @@ export function installDatabaseMock(): Record<string, unknown> {
           .filter((t) => t.appId === appId && t.status === 'success' && t.createdAt >= since)
           .reduce((sum, t) => sum + Math.round(Number(t.amount) * 100), 0);
       },
+      // Real payment reconciliation — mirrors packages/database/src/
+      // repositories/transactions.ts's findStaleUnresolved().
+      async findStaleUnresolved(olderThanMs: number) {
+        const cutoff = new Date(Date.now() - olderThanMs);
+        return dbState.transactions
+          .filter((t) => ['pending', 'processing', 'unknown'].includes(t.status) && t.updatedAt < cutoff)
+          .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
+      },
     },
     // P0: Mock outbox event repository for transactional outbox pattern
     outboxEventRepository: {

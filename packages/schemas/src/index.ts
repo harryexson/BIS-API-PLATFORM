@@ -83,6 +83,21 @@ export interface TransactionEvent {
   error?: string;
 }
 
+// Result of BaseProvider.processRefund() — a real refund attempt against a
+// previously successful payment, distinct from TransactionEvent (which
+// describes the original charge). 'unknown' mirrors TransactionStatus's own
+// meaning here: a refund provider accepted asynchronously (e.g. Stripe's
+// 'pending'/'requires_action') is genuinely unresolved, not a confirmed
+// success or failure.
+export interface RefundResult {
+  status: TransactionStatus;
+  refundId?: string;
+  amount: number;
+  currency: string;
+  response?: any;
+  error?: string;
+}
+
 export interface ProviderManagement extends ProviderConfig {
   environment: ProviderEnvironment;
   countries: string[];

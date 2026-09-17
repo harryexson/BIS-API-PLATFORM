@@ -6,6 +6,106 @@ tests cover it.
 
 ---
 
+## 2026-09-17 — Real Email Adapter, Payment Refunds, Payment Reconciliation, Gateway Docs Reconciled
+
+**Context:** user asked to "continue to build on other remaining items such
+as payment reconciliation etc," and to "complete building the messaging
+providers and API gateway."
+
+### Real email messaging adapter
+
+`packages/providers/src/adapters/messaging/email.ts` was fully simulated
+despite this platform already having a real transactional email
+integration (`@company/shared`'s `sendTransactionalEmail`, built for
+account verification/password-reset — §4 item 15). Wired `EmailProvider`
+to the same Resend integration for the general-purpose messaging gateway
+(`POST /v1/api/gateway/messaging`), falling back to simulated processing
+when `RESEND_API_KEY` is unset or the request has no recipient/content —
+same pattern every real adapter in this package follows. `SignalHouse` and
+`FutureSMS` were reconfirmed via WebSearch as not real, findable vendors
+(no public API to build a real integration against) and will stay
+simulated — this is a deliberate, re-verified decision, not an oversight.
+New tests: `email.test.ts` (isConfigured, simulated fallback, real send
+path with HTML-escaping, Resend failure handling).
+
+### Real payment refund capability
+
+No refund route existed anywhere in the real gateway before this —
+`docs/openapi.yaml` documented a `Refunds` tag with no implementation
+behind it. Added `BaseProvider.processRefund()` (default: honest
+`status: 'failed'`, never a fabricated result) and real,
+WebSearch-verified refund support for **Stripe** (`POST /v1/refunds`),
+**NMI** (`type=refund` on `transact.php`), and **Flutterwave**
+(`POST /v3/transactions/{id}/refund`, whose real settlement is
+asynchronous — reported as `'unknown'`, not `'success'`). New
+`POST /v1/api/gateway/refund` route in `services/api-gateway/src/app.ts`:
+resolves the transaction by the provider-side id the client already has
+(not this platform's internal database id — `transactionRepository.
+findByProviderTransactionId`), enforces it's currently `'success'` and
+that a partial amount doesn't exceed the original, and on confirmed
+success transitions it to `'refunded'` (an `'unknown'` result is left
+alone for the existing `charge.refunded` webhook handling to resolve
+later). `packages/api-client` gained a matching `payments.refund()`.
+Tests: a `processRefund()` suite per adapter (Stripe/NMI/Flutterwave, and
+PawaPay's inherited default-failure case), a new
+`packages/simulation/src/refund.simulation.test.ts` (full/partial refund,
+over-amount rejection, double-refund rejection, cross-application
+ownership rejection), and an `api-client.test.ts` case.
+
+### Real payment reconciliation (detection, not auto-resolution)
+
+`packages/workers/src/jobs/reconciliation.ts` was, despite its name, a
+system/queue health report generator with no payment-specific logic at
+all — confirmed by reading it directly, matching what
+`IMPLEMENTATION_BASELINE.md` §4 item 10 already suspected. Added
+`transactionRepository.findStaleUnresolved(olderThanMs)`: transactions
+stuck in `pending`/`processing`/`unknown` past a configurable threshold
+(`RECONCILIATION_STALE_THRESHOLD_MS`, default 1 hour). Deliberately
+detection-only, never auto-resolving — this platform has no way to know a
+stuck transaction's real outcome without asking the provider, and
+guessing would be exactly the fabrication the master plan prohibits for a
+real charge. The reconciliation job's report/audit-log entry now includes
+a `payments` section listing every stale transaction; a new on-demand
+`GET /api/dashboard/reconciliation` route lets an operator query the same
+thing without waiting for the next scheduled run. Tests: new
+`packages/workers/src/jobs/reconciliation.test.ts` and
+`packages/simulation/src/reconciliation.simulation.test.ts`.
+
+### `docs/openapi.yaml` and `docs/DEVELOPER_GUIDE.md` reconciled with the real gateway
+
+Both documents had explicitly flagged themselves as unfinished — openapi.yaml's
+top-of-file note said Auth/Billing had been corrected in an earlier pass
+but "Payments/Refunds/Messages/Conversations/Providers sections still need
+the same pass." Rewrote every path, request/response shape, and shared
+component (`Error`, headers, idempotency model, pagination, identifiers,
+amount units) to match `services/api-gateway/src/app.ts` exactly — the
+fictional `/payments`, `/refunds`, `/messages/{id}`, `/conversations/{id}`,
+`/providers/{id}` REST-resource design is gone, replaced by the real
+`/v1/api/gateway/{payment,refund,messaging,transaction/{id},providers}`
+routes (`docs/DEVELOPER_GUIDE.md` sections 1-8, 10-11 got the same
+correction). Along the way, found and documented (not built further) that
+**outbound platform webhooks are more built than "not implemented," but
+still not reachable end-to-end**: `packages/events/src/webhook-delivery.ts`'s
+`WebhookDelivery` is a real, working outbound POST engine (exponential
+backoff, 5 attempts) that is never instantiated or called anywhere, there
+is no registration path (schema/admin-console UI/API route) for a
+developer's callback URL, and it sends no signature despite
+`packages/api-client`'s verification helpers already expecting one — see
+`IMPLEMENTATION_BASELINE.md` §4 item 24 for the full finding and the
+well-scoped remaining work. `packages/api-client` (already an accurate,
+separate rewrite from an earlier pass) needed only the new
+`payments.refund()` method to stay in sync. Verified every `$ref` in the
+rewritten YAML resolves via a small script rather than manual inspection.
+
+### Verification
+
+`npm run type-check`, `npm run lint` (0 errors; warnings 297 vs. the
+prior-pass baseline of 292 — consistent with existing `any`-in-catch-block
+style, no new patterns introduced), `npm test` (564 passed, 12 skipped —
+unrelated), `npm run build:all` all clean.
+
+---
+
 ## 2026-09-17 — Provider Secrets Now Survive a Restart (DB Persistence)
 
 **Context:** continuing "complete the remaining production-readiness
