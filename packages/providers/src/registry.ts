@@ -18,6 +18,9 @@ import { FlutterwaveProvider } from './adapters/payments/flutterwave';
 import { PawaPayProvider } from './adapters/payments/pawapay';
 import { PayChanguProvider } from './adapters/payments/paychangu';
 import { AirwallexProvider } from './adapters/payments/airwallex';
+import { AdyenProvider } from './adapters/payments/adyen';
+import { BraintreeProvider } from './adapters/payments/braintree';
+import { CheckoutComProvider } from './adapters/payments/checkout';
 import { ExamplePaymentProvider } from './adapters/payments/example';
 
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
@@ -187,6 +190,42 @@ export class ProviderRegistry {
       transactionFeePercent: 2.0,
       transactionFeeFlat: 0.0
     }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'HKD', 'SGD'], capabilities: ['card', 'bank_transfer'] });
+
+    this.register(new AdyenProvider({
+      id: 'adyen',
+      name: 'Adyen',
+      category: 'payment',
+      status: 'online',
+      weight: 50,
+      latencyMin: 130,
+      latencyMax: 190,
+      transactionFeePercent: 1.9,
+      transactionFeeFlat: 0.12
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP'], capabilities: ['card'] });
+
+    this.register(new BraintreeProvider({
+      id: 'braintree',
+      name: 'Braintree',
+      category: 'payment',
+      status: 'online',
+      weight: 45,
+      latencyMin: 150,
+      latencyMax: 210,
+      transactionFeePercent: 2.59,
+      transactionFeeFlat: 0.49
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP', 'AUD', 'CAD'], capabilities: ['card'] });
+
+    this.register(new CheckoutComProvider({
+      id: 'checkout',
+      name: 'Checkout.com',
+      category: 'payment',
+      status: 'online',
+      weight: 50,
+      latencyMin: 140,
+      latencyMax: 200,
+      transactionFeePercent: 1.8,
+      transactionFeeFlat: 0.10
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP'], capabilities: ['card'] });
 
     this.register(new SignalHouseProvider({
       id: 'signalhouse',

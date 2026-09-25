@@ -119,7 +119,7 @@ describe('cascading waterfall retries', () => {
     // override, broken), flutterwave (real weight 50 + cheaper fee beats
     // nmi's weight 30 + pricier fee, so it deterministically outscores nmi
     // and lands as attempt 2, broken), nmi (the sole survivor, attempt 3).
-    const sidelined = ['paychangu', 'airwallex', 'example-pay'];
+    const sidelined = ['paychangu', 'airwallex', 'example-pay', 'adyen', 'braintree', 'checkout'];
     for (const id of sidelined) await runtime.registry.updateManagement(id, { status: 'offline' });
 
     const broken = ['stripe', 'flutterwave'];

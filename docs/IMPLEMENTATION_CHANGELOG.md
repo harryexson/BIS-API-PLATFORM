@@ -6,6 +6,136 @@ tests cover it.
 
 ---
 
+## 2026-09-25 — Three New Real Payment Gateway Integrations: Adyen, Braintree, Checkout.com
+
+**Context:** user asked for the platform's provider roster to grow toward
+parity with a broad orchestration platform (Spreedly was named as the
+comparison). Given the scale of that ask (a real competitor's integration
+count reflects 18+ years of work), scope was narrowed via
+`AskUserQuestion` to "a few more payment gateways" — 2-3 real,
+WebSearch-verified integrations, built the same rigorous way as the six
+that already existed (Stripe, NMI, Flutterwave, PawaPay, PayChangu,
+Airwallex). Explicitly **declined**, separately, to copy any real
+company's actual leadership names, funding history, or copyright notice
+onto this platform's own about-page content — a fabrication/impersonation
+line, not a scope question; see task #44 for the placeholder-content
+alternative offered and accepted instead.
+
+Each of the three below follows the same non-negotiable pattern already
+established for every real adapter in this package: endpoint, auth
+scheme, and request/response shape verified via WebSearch against the
+provider's real, current public documentation (this environment's
+outbound network access to the providers' own domains is restricted, so
+this is "built from real, current documentation," not "certified against
+a live sandbox" — see `docs/IMPLEMENTATION_BASELINE.md` §6 item 1); falls
+back to clearly-labeled simulated processing whenever credentials or a
+`paymentToken` are missing, never a real call with nothing to charge; an
+ambiguous/async real outcome reports this platform's `'unknown'` status,
+never a guessed success or failure.
+
+### Adyen (`packages/providers/src/adapters/payments/adyen.ts`)
+
+Checkout API. Two structural quirks, both documented in the adapter's own
+class comment: no fixed live host (a per-merchant `live_url_prefix`
+secret is required for the live environment specifically — the test host
+is fixed and used whenever no prefix is configured, so this adapter never
+silently calls a fabricated live URL); and `X-API-Key` auth instead of
+every other adapter's `Bearer` scheme. `paymentToken` maps to
+`storedPaymentMethodId`; `shopperReference` is read from
+`payload.metadata.shopperReference`, falling back to `appId`. Refunds
+always report `'unknown'` — Adyen's refund endpoint only ever
+synchronously returns `status: "received"`; the real result arrives async
+via webhook, not built. Native webhook signature verification is
+deliberately not implemented (Adyen's real scheme is a complex per-item
+HMAC over pipe-delimited fields, not a simple raw-body signature — the
+same reasoning already applied to PawaPay's webhook handling).
+
+### Braintree (`packages/providers/src/adapters/payments/braintree.ts`)
+
+GraphQL API — a single `POST /graphql` endpoint (`chargeCreditCard`/
+`refundTransaction` mutations), not a REST resource per operation, the
+one adapter in this package shaped this way. Auth is HTTP Basic
+(`base64(publicKey:privateKey)`) plus a required `Braintree-Version`
+header. **Real, easy-to-miss quirk**: amounts are decimal strings (e.g.
+`"49.99"`), not minor-unit integers like every other adapter here —
+gotten right rather than silently multiplying by 100. `chargeCreditCard`
+captures funds immediately, so `AUTHORIZED` through `SETTLED` are all
+treated as one successful charge's real lifecycle; refunds are scored
+more conservatively — only `SETTLED` is a confirmed refund success,
+`SUBMITTED_FOR_SETTLEMENT`/`SETTLING`/`AUTHORIZED` report `'unknown'`
+rather than a fabricated success, mirroring Stripe's own
+`succeeded`-vs-`pending` refund asymmetry already in this codebase. A
+`{ data, errors }` GraphQL envelope is handled distinctly from HTTP-level
+4xx/5xx — a 200 response can still carry an `errors` array.
+
+### Checkout.com (`packages/providers/src/adapters/payments/checkout.ts`)
+
+Payments API (their current NAS platform). **Structural quirk unique to
+this adapter**: every request — in both sandbox and live — must go to a
+per-merchant subdomain, `https://{prefix}.api(.sandbox).checkout.com`,
+where `prefix` is mechanically derived (first 8 characters of the
+merchant's `client_id`, `cli_` prefix stripped) rather than admin-typed
+like Adyen's live-only prefix; a request to the bare `api.checkout.com`
+host is rejected outright by Checkout.com itself. `paymentToken` is sent
+as `source: { type: 'token', token }`. Refunds are asynchronous by
+Checkout.com's own documentation — a `202` response only confirms the
+refund was *submitted*, not its outcome — so this adapter always reports
+`'unknown'`, never a fabricated success. **Webhook signature verification
+is implemented** (unlike Adyen's, deliberately left unverified there):
+Checkout.com's real `Cko-Signature` scheme is a plain
+`HMAC-SHA256(raw_body, signing_key)` hex digest, structurally identical
+to this platform's own generic webhook check, so it reuses
+`BaseProvider.verifyWebhookSignature()` the same way PayChangu's adapter
+already does.
+
+### Files changed
+
+- `packages/providers/src/adapters/payments/{adyen,braintree,checkout}.ts`
+  (new) + matching `.test.ts` files (15/24/17 tests respectively, 56 new
+  tests total)
+- `packages/providers/src/registry.ts` — three new registrations (payment
+  category), each with real per-adapter secret-field requirements
+- `packages/providers/src/index.ts` — three new exports
+- `apps/admin-console/src/components/ProviderManagement.tsx` —
+  `PROVIDER_SECRET_FIELDS` entries for all three (Adyen: `api_key`,
+  `merchant_account`, `live_url_prefix`; Braintree: `public_key`,
+  `private_key`, `merchant_id`; Checkout.com: `secret_key`, `client_id`,
+  `webhook_signing_key`)
+- `.env.example` — `ADYEN_*`, `BRAINTREE_*`, `CHECKOUT_*` variables
+
+### Test fallout from a real, growing provider pool (not weakened tests)
+
+Adding three legitimate, higher-scoring USD/card candidates to the
+registry shifted several tests that hardcoded exact provider counts or a
+specific cascade winner — the same category of fallout the dynamic-
+routing pass above documented as expected whenever the pool grows:
+- `providerRegistry.test.ts`/`management.test.ts` — provider-count
+  assertions bumped 18 → 21 (payment category 7 → 10) across three
+  passes, one per new adapter
+- `routing.test.ts`'s "all payment providers offline" test — each new
+  provider added to its explicit offline list
+- `dynamic-routing.simulation.test.ts`'s cascading-waterfall test — each
+  new provider added to its `sidelined` array (all three otherwise
+  outrank NMI on weight/cost, breaking that test's fixed 3-candidate
+  determinism assumption)
+
+**Tests:** `npm test` — 667 passed, 12 skipped, stable across repeated
+runs (up from 611 before this pass, +56 net from three adapters' own test
+files plus fallout fixes). `npx tsc --noEmit` / `npm run type-check`: 0
+errors. `npm run lint`: 0 errors, 315 warnings (up slightly from 309,
+same pre-existing categories — `no-explicit-any`/unused-arg patterns
+already present elsewhere in the codebase, not new categories). `npm run
+build:all`: clean.
+
+**Known limitation carried forward, same as every other real adapter in
+this package:** "real HTTP integration, verified via documentation" is
+not the same claim as "tested against a live account" — none of these
+three has been exercised against an actual Adyen/Braintree/Checkout.com
+sandbox, because this environment cannot reach those domains. See
+`docs/IMPLEMENTATION_BASELINE.md` §6 item 1.
+
+---
+
 ## 2026-09-25 — Dynamic Routing: Admin Rules Actually Consulted, Success-Rate/Cost Scoring, Cascading Waterfall
 
 **Context:** user asked the routing engine to provide "truly dynamic

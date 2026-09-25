@@ -72,6 +72,21 @@ const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]>
     { field: 'api_key', label: 'API Key' },
     { field: 'webhook_secret', label: 'Webhook Secret (per notification URL)' },
   ],
+  adyen: [
+    { field: 'api_key', label: 'API Key (from the Customer Area)' },
+    { field: 'merchant_account', label: 'Merchant Account code' },
+    { field: 'live_url_prefix', label: 'Live URL Prefix (optional — leave unset to call the test API)' },
+  ],
+  braintree: [
+    { field: 'public_key', label: 'Public Key' },
+    { field: 'private_key', label: 'Private Key' },
+    { field: 'merchant_id', label: 'Merchant ID' },
+  ],
+  checkout: [
+    { field: 'secret_key', label: 'Secret Key' },
+    { field: 'client_id', label: 'Client ID (used to derive the per-merchant API subdomain)' },
+    { field: 'webhook_signing_key', label: 'Webhook Signing Key (optional — from the Workflows webhook action)' },
+  ],
   infobip: [
     { field: 'api_key', label: 'API Key' },
     { field: 'base_url', label: 'Base URL (e.g. xxxx.api.infobip.com)' },

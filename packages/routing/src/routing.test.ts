@@ -134,6 +134,9 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('paychangu', { status: 'offline' });
       registry.updateProviderConfig('airwallex', { status: 'offline' });
       registry.updateProviderConfig('example-pay', { status: 'offline' });
+      registry.updateProviderConfig('adyen', { status: 'offline' });
+      registry.updateProviderConfig('braintree', { status: 'offline' });
+      registry.updateProviderConfig('checkout', { status: 'offline' });
 
       await expect(
         engine.routePayment('testapp', { amount: 100, currency: 'USD', paymentMethod: 'card' })
