@@ -13,6 +13,8 @@ import {
   KeyRound,
   LifeBuoy,
 } from 'lucide-react';
+import VerifyEmailPage from './pages/VerifyEmailPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
 
 const FEATURES = [
   {
@@ -82,6 +84,16 @@ const PLANS = [
 const APPLICATIONS = ['Reach Church', 'Afribook', 'HaulPro'];
 
 export default function App() {
+  // Plain pathname-based routing — the site is 3 standalone pages (the
+  // marketing landing page plus these 2 emailed-link destinations) with no
+  // navigation between them, so a router library would be more machinery
+  // than the scope needs. apps/web/vercel.json's SPA rewrite makes a direct
+  // load of either path work in production; Vite's dev server already
+  // does this by default.
+  const path = window.location.pathname;
+  if (path === '/verify-email') return <VerifyEmailPage />;
+  if (path === '/reset-password') return <ResetPasswordPage />;
+
   return (
     <div>
       <Nav />

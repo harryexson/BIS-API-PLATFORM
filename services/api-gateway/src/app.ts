@@ -219,14 +219,13 @@ function observe(event: TransactionEvent) {
   });
 }
 
-// This repo does not yet include the customer-facing frontend page that
-// would handle a verify-email/reset-password link click (no such page
-// exists under apps/ today) — PLATFORM_APP_URL lets a deployment point at
-// wherever that page actually lives once built. Without it, the link
-// falls back to a relative path so the email is still well-formed, and
-// the raw token is always included as plain text too so the email stays
-// actionable (e.g. via a support-assisted API call) even before that
-// frontend page exists.
+// apps/web's /verify-email and /reset-password pages (VerifyEmailPage.tsx,
+// ResetPasswordPage.tsx) land this link and call the two routes below
+// directly — PLATFORM_APP_URL points at wherever that deployment lives.
+// Left unset, the link falls back to a relative path so the email is
+// still well-formed; the raw token is always included as plain text too,
+// so the email stays actionable (e.g. via a support-assisted API call)
+// even if PLATFORM_APP_URL is misconfigured or that deployment is down.
 function buildAccountLink(path: string, token: string): string {
   const base = (process.env.PLATFORM_APP_URL || '').replace(/\/+$/, '');
   return `${base}${path}?token=${encodeURIComponent(token)}`;

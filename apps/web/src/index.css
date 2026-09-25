@@ -205,3 +205,8 @@ h1, h2, h3 {
   -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 0%, black 30%, transparent 75%);
   mask-image: radial-gradient(ellipse 70% 60% at 50% 0%, black 30%, transparent 75%);
 }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

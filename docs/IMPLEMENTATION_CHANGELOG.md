@@ -6,6 +6,71 @@ tests cover it.
 
 ---
 
+## 2026-09-25 — Verify-Email / Reset-Password Pages, npm-audit Re-investigation
+
+**Context:** same "audit, identify any gaps, and continue to build any
+remaining things" pass as the outbound-webhooks work below. After applying
+that migration to the live database, continued auditing and found one more
+concrete, closable gap plus one previously-deferred item worth a fresh,
+real attempt rather than just re-asserting the old conclusion.
+
+### Customer-facing verify-email / reset-password pages
+
+`docs/IMPLEMENTATION_BASELINE.md` item 15 had flagged, since the real
+transactional-email integration landed (2026-09-14), that
+`PLATFORM_APP_URL` pointed at a page that didn't exist anywhere in the
+repo — the two server-side routes (`POST /v1/api/auth/verify-email`,
+`POST /v1/api/auth/reset-password`) were real and always had been, but
+nothing a user could click through to reach them. Closed by adding
+`/verify-email` and `/reset-password` to `apps/web` (`VerifyEmailPage.tsx`,
+`ResetPasswordPage.tsx`, `AccountLayout.tsx`), routed by
+`window.location.pathname` rather than adding `react-router-dom` — the
+site is 3 independent pages with no navigation between them, so a router
+library would be more machinery than the scope needs (unlike
+`apps/admin-console`, which genuinely has 4 interlinked tabs). Both pages
+call the existing real auth routes directly; no server-side change was
+needed beyond correcting `app.ts`'s doc comment and `.env.example`'s
+description of `PLATFORM_APP_URL`, both of which had described the page as
+not existing. `apps/web/vercel.json` (new) adds the SPA rewrite a direct
+load of either path needs in production — the same rewrite
+`apps/admin-console/vercel.json` already has for its own router. Verified
+in a real headless browser (Playwright, the pre-installed
+`/opt/pw-browsers/chromium`) against the real Vite dev server: missing-
+token, success, and error states for both pages, client-side password
+validation (length, match), and confirmed the existing landing page still
+renders unaffected.
+
+### npm audit `qs`/`express` — re-investigated, conclusion unchanged but now proven
+
+§4 item 11 previously stated no non-breaking fix was available. Rather
+than re-assert that, tried to actually fix it this pass: `express@4.22.2`
+pins `"qs": "~6.15.1"` and the two advisories' fix landed only in
+`qs@6.16.0` (confirmed no patched 6.15.x exists), so express's own
+declared range structurally excludes the fix. Tried a root
+`"overrides": { "qs": "6.16.0" }` — a legitimate, commonly-used pattern for
+exactly this situation — but `npm install` in this environment accepted
+the override in `package.json` without ever regenerating
+`package-lock.json` to match, leaving `node_modules` in a broken
+`invalid`/`ELSPROBLEMS` state regardless of a fresh install or deleting
+the package's own `node_modules/qs`. Making it actually take would require
+a full lockfile regeneration across 585 packages with no CI in this
+environment to catch a regression in an unrelated transitive version — a
+materially larger, less verifiable change than a moderate DoS advisory in
+a deeply nested dependency justifies. Reverted the override attempt
+cleanly (`git status` showed zero diff afterward) rather than leave a
+half-applied fix in the tree. Still open, still requires an express
+major-version bump (or a lockfile regeneration this environment can't
+safely verify) — but that conclusion is now backed by an actual attempt.
+
+**Database migrations:** none (see the outbound-webhooks entry below for
+the one that did land this session).
+
+**Tests:** `npm run type-check` (root + `apps/admin-console` +
+`apps/web`) clean; `npm test`: 584 passed, 12 skipped (unchanged — no test
+package touched by this entry); `npm run build:all` clean.
+
+---
+
 ## 2026-09-25 — Outbound Platform Webhooks (register, wire, sign)
 
 **Context:** user asked to "audit, identify any gaps, and continue to build

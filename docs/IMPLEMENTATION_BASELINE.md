@@ -418,6 +418,33 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     requires an express major-version bump, out of scope for this pass.
     Everything else flagged by `npm audit` (vite, vitest, esbuild,
     drizzle-kit) is dev/build tooling, not shipped to production.
+    **Re-investigated 2026-09-25** (part of the "audit, identify any gaps"
+    pass that also closed item 24): confirmed this is still accurate, not
+    just re-asserted. `express@4.22.2` declares `"qs": "~6.15.1"` — the
+    npm tilde range `>=6.15.1 <6.16.0` — and the fix for both advisories
+    landed only in `qs@6.16.0` (no patched 6.15.x release exists;
+    confirmed via `npm view qs versions`), so express's own dependency
+    declaration structurally excludes the only fixed version — this is
+    exactly why `npm audit fix` (non-force) reports "fix available" but
+    doesn't actually change `express`'s resolved `qs`. Tried forcing it
+    via a root-level `"overrides": { "qs": "6.16.0" }` (a legitimate,
+    commonly-used pattern for exactly this situation) — `npm install`
+    accepted the override in `package.json` but never regenerated
+    `package-lock.json` to reflect it (`npm ls qs` kept reporting the
+    hoisted `node_modules/qs` as `6.15.3 invalid`, `ELSPROBLEMS`,
+    regardless of a fresh install or deleting the package's own
+    `node_modules` folder), leaving the tree in a broken, inconsistent
+    state rather than a clean fix. Getting it to actually take would need
+    a full `package-lock.json` regeneration (delete + reinstall) across a
+    585-package lockfile with no CI in this environment to catch a
+    regression across unrelated transitive versions — a materially larger
+    and less verifiable change than the advisory itself justifies. Reverted
+    the override attempt cleanly (confirmed via `git status` — zero diff
+    remained) rather than leave a half-applied fix. Conclusion unchanged:
+    still requires either an express major-version bump or a full lockfile
+    regeneration this environment can't safely verify — both out of scope
+    here, but now backed by an actual attempt, not just the original
+    finding restated.
 12. ~~Drizzle migration *files* have diverged from reality~~ — **the
     file-side problem closed 2026-09-15**, the live-database side has
     one deliberately-deferred follow-up. Original finding (2026-09-08,
@@ -526,12 +553,28 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     emails via Resend's HTTP API, wired into signup,
     `/resend-verification`, and `/request-password-reset`. Fire-and-forget
     (never blocks the request it's attached to); the dev-only token echo
-    in the API response is kept as a fallback. Real, remaining gap within
-    it: no frontend page exists yet in this repo to land a verify-email/
-    reset-password link on (`PLATFORM_APP_URL` is a placeholder for
-    wherever that page eventually lives) — the email always also includes
-    the raw token as plain text so it stays actionable via a
-    support-assisted API call in the meantime. The `EmailProvider`
+    in the API response is kept as a fallback. ~~Real, remaining gap
+    within it: no frontend page exists yet in this repo to land a
+    verify-email/reset-password link on~~ — **closed 2026-09-25.**
+    `apps/web` gained `/verify-email` and `/reset-password` pages
+    (`VerifyEmailPage.tsx`, `ResetPasswordPage.tsx`), pathname-routed with
+    no new router dependency (the site is 3 standalone pages with no
+    navigation between them, so `react-router-dom` — used by
+    `apps/admin-console` for its 4 real tabs — would be more machinery
+    than this scope needs). Both call the real, already-existing
+    `POST /v1/api/auth/verify-email`/`reset-password` routes directly (no
+    server-side change needed — they'd always accepted real requests, just
+    had nothing pointing at them). `apps/web/vercel.json` (new) adds the
+    SPA rewrite a direct load of either path needs in production, mirroring
+    the one `apps/admin-console/vercel.json` already has; `vite.config.ts`
+    gained a `/v1` dev proxy to the gateway, mirroring the admin console's
+    own `/api` proxy. Verified in a real headless browser (Playwright,
+    `/opt/pw-browsers/chromium`) against the real dev server, mocking only
+    the two API responses: missing-token, success, and error states render
+    correctly for both pages, client-side password-match/length validation
+    works, and the existing landing page is unaffected. `PLATFORM_APP_URL`
+    now points at a page that actually exists; the raw-token fallback in
+    the email stays as defense-in-depth, unchanged. The `EmailProvider`
     messaging adapter (client apps' own outbound email, a different
     concern from this platform's own transactional email) remains
     simulated — unchanged, not in scope here.
