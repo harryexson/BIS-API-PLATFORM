@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import VerifyEmailPage from './pages/VerifyEmailPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
+import AboutPage from './pages/AboutPage';
 
 const FEATURES = [
   {
@@ -93,6 +94,7 @@ export default function App() {
   const path = window.location.pathname;
   if (path === '/verify-email') return <VerifyEmailPage />;
   if (path === '/reset-password') return <ResetPasswordPage />;
+  if (path === '/about') return <AboutPage />;
 
   return (
     <div>
@@ -108,7 +110,7 @@ export default function App() {
   );
 }
 
-function Nav() {
+export function Nav() {
   return (
     <header style={{ borderBottom: '1px solid var(--border)', position: 'sticky', top: 0, background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(10px)', zIndex: 10 }}>
       <div className="container" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', minHeight: '76px', paddingBlock: '14px', gap: '16px' }}>
@@ -120,9 +122,10 @@ function Nav() {
           <span className="nav-wordmark nav-wordmark-short">BIS API</span>
         </div>
         <nav className="nav-actions" style={{ display: 'flex', alignItems: 'center', gap: '36px', fontSize: '15.5px', fontWeight: 600, color: 'var(--text-secondary)', flexShrink: 0 }}>
-          <a href="#features" className="nav-link">Platform</a>
-          <a href="#how-it-works" className="nav-link">How it works</a>
-          <a href="#pricing" className="nav-link">Pricing</a>
+          <a href="/#features" className="nav-link">Platform</a>
+          <a href="/#how-it-works" className="nav-link">How it works</a>
+          <a href="/#pricing" className="nav-link">Pricing</a>
+          <a href="/about" className="nav-link">About</a>
           <a href="/admin" className="btn btn-secondary" style={{ padding: '11px 22px', fontSize: '15px', whiteSpace: 'nowrap' }}>Admin console</a>
         </nav>
       </div>
@@ -334,14 +337,15 @@ function CTA() {
   );
 }
 
-function Footer() {
+export function Footer() {
   return (
     <footer style={{ borderTop: '1px solid var(--border)', padding: '48px 0' }}>
       <div className="container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '18px' }}>
         <span style={{ fontSize: '15px', color: 'var(--text-muted)' }}>© {new Date().getFullYear()} BIS API Platform</span>
         <div style={{ display: 'flex', gap: '24px', fontSize: '15px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+          <a href="/about" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><Building2 className="w-4 h-4" /> About</a>
           <a href="/admin" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><ShieldCheck className="w-4 h-4" /> Admin console</a>
-          <a href="#pricing" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><LifeBuoy className="w-4 h-4" /> Support</a>
+          <a href="/#pricing" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><LifeBuoy className="w-4 h-4" /> Support</a>
         </div>
       </div>
     </footer>
