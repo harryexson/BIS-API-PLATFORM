@@ -807,30 +807,81 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     `packages/simulation/src/reconciliation.simulation.test.ts` (stale
     pending/unknown transactions reported; recent, resolved, or
     already-refunded ones are not).
-24. **New finding: outbound platform webhooks are more built than "not
-    implemented" but still not reachable end-to-end** — found and
-    documented (not built further) 2026-09-17, while reconciling
-    `docs/openapi.yaml` and `docs/DEVELOPER_GUIDE.md` §9b against the real
-    gateway. Both docs previously presented a working "register a URL,
-    receive a signed `WebhookEvent` envelope" feature as current — false.
-    What's actually real: `packages/events/src/webhook-delivery.ts`'s
-    `WebhookDelivery` class is a genuine, working outbound POST engine
-    (exponential-backoff retry, 5 attempts) — but it is never instantiated
-    or called anywhere in `services/api-gateway` or `packages/workers`,
-    and there is no schema, admin-console UI, or API route for a developer
-    to register a callback URL in the first place, so nothing ever
-    supplies it a target. It also sends no signature today (`X-Webhook-Id`/
-    `X-Webhook-Attempt` headers only) despite `packages/api-client`'s
-    `WebhooksResource.verify()`/`constructEvent()` already being built,
-    unused, to check one. The remaining work to finish it is well-scoped:
-    a `webhook_endpoints` table + admin-console CRUD, an
-    `EventBus.subscribe()` listener wired to `WebhookDelivery.enqueue()`
-    for the right event types, and HMAC signing added to
-    `processQueue()`. Deliberately not attempted this pass (a live-database
-    migration plus a new customer-facing feature, on top of everything
-    else already shipped this pass) — corrected in both docs rather than
-    left presented as current, and tracked here as the next well-defined
-    pickup.
+24. ~~**Outbound platform webhooks are more built than "not implemented" but
+    still not reachable end-to-end**~~ — **closed 2026-09-25.** Found
+    2026-09-17 while reconciling `docs/openapi.yaml` and
+    `docs/DEVELOPER_GUIDE.md` §9b against the real gateway: both docs
+    previously presented a working "register a URL, receive a signed
+    `WebhookEvent`" feature as current — false at the time.
+    `packages/events/src/webhook-delivery.ts`'s `WebhookDelivery` class
+    was a genuine, working outbound POST engine (exponential-backoff
+    retry, 5 attempts) that nothing ever instantiated, called, or supplied
+    a target to.
+
+    Closed by building exactly the well-scoped remaining work this entry
+    originally identified:
+    - A new `webhook_endpoints` table (`packages/database/src/schema/
+      webhook-endpoints.ts`, migration `drizzle/0002_webhook_endpoints.sql`
+      — purely additive, no existing table touched) scoped by `appId` (the
+      only identifier `TransactionEvent` actually carries — it has no
+      `tenantId`, so dispatch can't key on tenant even though the table
+      also records one for the registration API's own ownership checks).
+      The signing secret is encrypted at rest the same way as
+      `provider_configs` (`packages/database/src/crypto.ts`'s existing
+      AES-256-GCM helpers, same column shape) — generated once, returned
+      to the caller exactly once, never re-displayed.
+    - `WebhookTarget` (`packages/events/src/webhook-delivery.ts`) gained an
+      optional `secret`; `processQueue()` now signs every delivery with
+      `X-Webhook-Signature: sha256=<hmac-sha256(secret, body)>` when one is
+      set — the exact construction `packages/api-client`'s
+      `WebhooksResource.verify()`/`constructEvent()` already expected,
+      unused, since an earlier pass.
+    - `services/api-gateway/src/app.ts` now instantiates one
+      `WebhookDelivery`, starts its retry loop, and subscribes to
+      `EventBus`: every emitted event fans out to every active,
+      category-matching `webhook_endpoints` row for that event's `appId`,
+      decrypting each endpoint's own secret to sign its delivery. Fully
+      fire-and-forget from the emitting request's perspective — a DB
+      failure or a slow/dead callback URL never blocks or fails the
+      request that triggered the event.
+    - New developer-facing routes: `POST /v1/api/gateway/webhooks`
+      (register — `https://` only outside a non-production override,
+      returns the secret once), `GET /v1/api/gateway/webhooks` (list, never
+      re-exposing the secret), `DELETE /v1/api/gateway/webhooks/:id`
+      (ownership-scoped — 404s rather than leaking another application's
+      endpoint exists). Scoped by `webhooks:read`/`webhooks:write` API-key
+      scopes, matching the existing opt-in scope-enforcement pattern (§4
+      item 5) — an unscoped key remains unrestricted.
+    - `packages/api-client`'s `WebhooksResource` gained
+      `register()`/`list()`/`delete()` calling these real routes; its
+      verify()/constructEvent() doc comment, previously explaining they
+      couldn't yet see a real delivery, now explains they do.
+    - `docs/openapi.yaml` (new `WebhookEndpointCreate`/`WebhookEndpointSummary`/
+      `WebhookEndpointCreated` schemas and the three new paths; the
+      `WebhookEvent` schema's "NOT REACHABLE" warning replaced with what it
+      now actually documents) and `docs/DEVELOPER_GUIDE.md` §9b (registration,
+      the real delivery/retry/signature shape, and a verification example)
+      were both corrected to match, the same way item 25 corrected the rest
+      of the gateway surface.
+    - Tests: `packages/events/src/webhook-delivery.test.ts` (new — signing,
+      no-signature-when-unconfigured, retry/dead-letter), a unit suite for
+      `webhookEndpointRepository` (validation before any DB/encryption call,
+      and a real encrypt/decrypt round trip), `packages/api-client`'s
+      existing suite gained the three new resource methods, and a new
+      `packages/simulation/src/outbound-webhooks.simulation.test.ts` (10
+      cases) drives the real HTTP routes end-to-end: registration returns a
+      one-time secret, listing/deletion are ownership-scoped, and — the
+      real proof — a donation triggers an actual signed HTTP POST to a
+      mocked callback URL, verified byte-for-byte against an independently
+      computed HMAC, plus category-filtering and cross-application isolation
+      negative cases. `packages/simulation/src/db.ts`'s mock gained
+      `webhookEndpointRepository` (same real encrypt/decrypt round trip as
+      `provider_configs`' mock) and `packages/simulation/src/harness.ts`
+      exposes the gateway's real `WebhookDelivery` instance
+      (`gatewayWebhookDelivery`, via a new `getWebhookDeliveryForTests()`
+      export from `app.ts`, mirroring the existing
+      `getGatewayQueueForTests()` pattern) so tests can force an immediate
+      delivery attempt instead of waiting on the real 5s interval timer.
 25. **`docs/openapi.yaml` and `docs/DEVELOPER_GUIDE.md` reconciled with the
     real gateway** — closed 2026-09-17. Both documents' own text had
     already flagged this as a known, unfinished correction (openapi.yaml's

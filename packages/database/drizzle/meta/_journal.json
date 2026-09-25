@@ -15,6 +15,13 @@
       "when": 1789505410008,
       "tag": "0001_events_app_id_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790315995550,
+      "tag": "0002_webhook_endpoints",
+      "breakpoints": true
     }
   ]
 }

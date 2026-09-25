@@ -1,9 +1,18 @@
+import { createHmac } from 'node:crypto';
 import { TransactionEvent } from '@company/schemas';
 import { logger, metrics } from '@company/observability';
 
 export interface WebhookTarget {
   url: string;
   headers?: Record<string, string>;
+  // When set, every delivery attempt is signed: an `X-Webhook-Signature:
+  // sha256=<hex>` header is added, computed as
+  // HMAC-SHA256(secret, JSON body) — the exact construction
+  // packages/api-client's WebhooksResource.verify()/constructEvent()
+  // already expect (`sha256=` prefix, hex digest, utf8 body). Omitted for
+  // a target with no registered secret, in which case no signature header
+  // is sent — never a fabricated or empty one.
+  secret?: string;
 }
 
 export interface DeliveryAttempt {
@@ -77,6 +86,16 @@ export class WebhookDelivery {
     return Array.from(this.pending.values()).filter((d) => d.status === 'pending');
   }
 
+  /**
+   * Force an immediate delivery attempt on every due item, without waiting
+   * for the interval timer. Used by tests (real production callers rely on
+   * start()'s 5s tick); safe to call in production too since it's just an
+   * out-of-band processQueue() run.
+   */
+  async flush(): Promise<void> {
+    await this.processQueue();
+  }
+
   private scheduleNext(): void {
     // Timer will pick up pending items on next tick
   }
@@ -92,15 +111,22 @@ export class WebhookDelivery {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10_000);
 
+        const body = JSON.stringify(attempt.event);
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'X-Webhook-Id': id,
+          'X-Webhook-Attempt': String(attempt.attempt),
+          ...attempt.target.headers,
+        };
+        if (attempt.target.secret) {
+          const digest = createHmac('sha256', attempt.target.secret).update(body, 'utf8').digest('hex');
+          headers['X-Webhook-Signature'] = `sha256=${digest}`;
+        }
+
         const res = await fetch(attempt.target.url, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Webhook-Id': id,
-            'X-Webhook-Attempt': String(attempt.attempt),
-            ...attempt.target.headers,
-          },
-          body: JSON.stringify(attempt.event),
+          headers,
+          body,
           signal: controller.signal,
         });
 

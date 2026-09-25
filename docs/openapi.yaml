@@ -19,11 +19,14 @@ info:
     was a tag with no route behind it at all — see the changelog entry
     "Real payment refund capability"). There is still no real
     `GET /conversations/{id}`-equivalent read API — see the Messaging
-    section's note. This same pass also found the outbound-webhook design
-    (developer-registered callback URLs, `WebhookEvent`/
-    `WebhookEventTypes`) was never built either — see the `WebhookEvent`
-    schema's own note; `docs/DEVELOPER_GUIDE.md` §9b makes the same claim
-    and needs the same correction. If a future change to
+    section's note. This same pass found the outbound-webhook design
+    (developer-registered callback URLs, `WebhookEvent`) was documented but
+    never built — that gap closed 2026-09-17 (see
+    `docs/IMPLEMENTATION_BASELINE.md` item 24 and
+    `docs/IMPLEMENTATION_CHANGELOG.md`): `POST/GET/DELETE
+    /v1/api/gateway/webhooks` now register/list/remove a real callback URL,
+    and every event fans out to it, signed, through
+    `packages/events/src/webhook-delivery.ts`. If a future change to
     services/api-gateway drifts from this document again, correct this
     file in the same pass, the way this rewrite did — don't let it go
     stale a second time.
@@ -104,9 +107,9 @@ tags:
     description: Read-only discovery of available upstream providers.
   - name: Webhooks
     description: >-
-      Inbound provider webhook ingestion (real). Outbound event delivery to
-      developer-registered URLs is not implemented — see the WebhookEvent
-      schema's own note.
+      Inbound provider webhook ingestion, and outbound delivery of your own
+      application's events to a callback URL you register — see the
+      WebhookEvent schema and the /v1/api/gateway/webhooks paths below.
   - name: Health
     description: Service and dependency health.
 
@@ -785,6 +788,74 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v1/api/gateway/webhooks:
+    post:
+      tags: [Webhooks]
+      operationId: registerWebhookEndpoint
+      summary: Register an outbound webhook endpoint
+      description: >-
+        Register a callback URL to receive every TransactionEvent this
+        application generates (payments, refunds, messages), signed with a
+        per-endpoint secret. The response's `secret` field is shown exactly
+        once — store it now; `GET` never re-displays it. `url` must be
+        `https://` (plain `http://` is only accepted outside production).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEndpointCreate' }
+      responses:
+        '201':
+          description: Endpoint registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookEndpoints
+      summary: List this application's webhook endpoints
+      description: Never includes the signing secret — only present on the create response.
+      responses:
+        '200':
+          description: The authenticated application's own registered endpoints.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoints:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEndpointSummary' }
+                  count: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/api/gateway/webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The endpoint id returned by `POST /v1/api/gateway/webhooks`.
+        schema: { type: string }
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhookEndpoint
+      summary: Remove a webhook endpoint
+      description: >-
+        Scoped to the authenticated application — deleting an id owned by a
+        different application 404s rather than revealing it exists.
+      responses:
+        '204': { description: Removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
   /health:
     get:
       tags: [Health]
@@ -1336,25 +1407,49 @@ components:
       allOf:
         - $ref: '#/components/schemas/TransactionEvent'
       description: >-
-        ⚠️ NOT REACHABLE END-TO-END TODAY — verified while reconciling this
-        file with the real gateway, 2026-09-17. `packages/events/src/
-        webhook-delivery.ts`'s `WebhookDelivery` class is a real, working
-        outbound POST engine (exponential-backoff retry, up to 5 attempts)
-        — it is simply never instantiated or called anywhere in
-        `services/api-gateway` or `packages/workers`, and there is no
-        schema, admin-console UI, or API route for a developer to register
-        their callback URL in the first place, so nothing ever supplies it
-        an event to send. It also sends no signature today (`X-Webhook-Id`/
-        `X-Webhook-Attempt` headers only) despite `packages/api-client`'s
-        `WebhooksResource.verify()`/`constructEvent()` already being built
-        to check one — see that resource's own doc comment. Whoever
-        registered a URL would receive the **raw `TransactionEvent`
-        itself** as the POST body, not a separate wrapping envelope with
-        its own `id`/`type`/`created_at`/`data` fields — an earlier version
-        of this schema invented that envelope; it doesn't exist.
-        `docs/DEVELOPER_GUIDE.md` §9b has the same correction. The
-        remaining work is well-scoped, not a design question: a
-        `webhook_endpoints` table + admin-console CRUD, wiring an
-        `EventBus.subscribe()` listener to call `WebhookDelivery.enqueue()`
-        for the right event types, and adding HMAC signing to
-        `processQueue()`.
+        The exact POST body delivered to a registered webhook endpoint —
+        the **raw `TransactionEvent` itself**, not a separate wrapping
+        envelope with its own `id`/`type`/`created_at`/`data` fields (an
+        earlier version of this schema invented that envelope; it doesn't
+        exist). Delivered by `packages/events/src/webhook-delivery.ts`'s
+        `WebhookDelivery`, signed with `X-Webhook-Signature:
+        sha256=<hmac-sha256(secret, body)>` — see `WebhookEndpointCreated`
+        and `docs/DEVELOPER_GUIDE.md` §9b for registration and
+        verification. Closed 2026-09-17 (`docs/IMPLEMENTATION_BASELINE.md`
+        item 24) — this schema previously described a feature that was
+        documented but not reachable end-to-end.
+    WebhookEndpointCreate:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: >-
+            Must be `https://` (plain `http://` accepted only outside
+            production, for local testing).
+          example: https://your-app.example.com/webhooks/company
+        events:
+          type: array
+          items: { type: string, enum: [payment, messaging, other, '*'] }
+          description: Event categories to receive. Omit (or pass `["*"]`) for every category.
+          example: [payment]
+    WebhookEndpointSummary:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string, format: uri }
+        events: { type: array, items: { type: string } }
+        active: { type: boolean }
+        createdAt: { type: string, format: date-time }
+    WebhookEndpointCreated:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEndpointSummary'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: >-
+                The signing secret (`whsec_...`), generated once and shown
+                exactly here — never re-displayed. Store it immediately.
+              example: whsec_9f2492b5de8b4a1c9f2492b5de8b4a1c

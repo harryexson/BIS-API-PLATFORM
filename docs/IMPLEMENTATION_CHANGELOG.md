@@ -6,6 +6,107 @@ tests cover it.
 
 ---
 
+## 2026-09-25 — Outbound Platform Webhooks (register, wire, sign)
+
+**Context:** user asked to "audit, identify any gaps, and continue to build
+any remaining things." The audit's most substantial, already-well-scoped
+open item was `docs/IMPLEMENTATION_BASELINE.md` item 24: outbound webhooks
+were "more built than 'not implemented'" — a real retry-with-backoff
+delivery engine (`packages/events/src/webhook-delivery.ts`'s
+`WebhookDelivery`) existed but was never instantiated, never called, sent
+no signature, and had no table, route, or UI for a developer to register a
+callback URL in the first place. Closed it in full this pass.
+
+### Schema, encryption, dispatch
+
+New `webhook_endpoints` table (`packages/database/src/schema/
+webhook-endpoints.ts`, migration `drizzle/0002_webhook_endpoints.sql` —
+purely additive) scoped by `appId` (the only identifier `TransactionEvent`
+carries — it has no `tenantId`, so fan-out can't key on tenant even though
+the table records one for the registration API's own ownership checks).
+The signing secret is encrypted at rest with the same AES-256-GCM helpers
+`provider_configs` already uses (`packages/database/src/crypto.ts`),
+generated fresh per registration and returned to the caller exactly once —
+`GET` never re-displays it, matching how this platform already treats API
+keys and session tokens.
+
+`WebhookTarget` (`packages/events/src/webhook-delivery.ts`) gained an
+optional `secret`; `processQueue()` now adds `X-Webhook-Signature:
+sha256=<hmac-sha256(secret, body)>` to every delivery attempt when one is
+configured — the exact construction `packages/api-client`'s
+`WebhooksResource.verify()`/`constructEvent()` were already built, unused,
+to check.
+
+`services/api-gateway/src/app.ts` instantiates one `WebhookDelivery`,
+starts its retry loop at module load, and subscribes to the existing
+`EventBus`: every event this gateway emits (payment, refund, messaging,
+and the various admin/system events that reuse the same `TransactionEvent`
+shape) triggers a fire-and-forget `dispatchOutboundWebhooks()` that looks
+up every active, category-matching `webhook_endpoints` row for that
+event's `appId`, decrypts each one's own secret, and enqueues a signed
+delivery. A DB failure or a dead/slow callback URL never blocks or fails
+the request whose event triggered it — mirrors the existing fire-and-forget
+pattern `persistProviderSecrets`/inbound-message enqueueing already use
+elsewhere in this same file.
+
+### API surface
+
+`POST /v1/api/gateway/webhooks` (register — `https://` required outside a
+non-production override; returns the endpoint plus its one-time secret),
+`GET /v1/api/gateway/webhooks` (list the authenticated application's own
+endpoints, secret omitted), `DELETE /v1/api/gateway/webhooks/:id`
+(ownership-scoped — 404s rather than confirming another application's
+endpoint exists). Gated by `webhooks:read`/`webhooks:write` API-key
+scopes, the same opt-in enforcement pattern every other gateway route uses
+(an unscoped key stays unrestricted). `packages/api-client`'s
+`WebhooksResource` gained `register()`/`list()`/`delete()` against these
+real routes.
+
+### Docs
+
+`docs/openapi.yaml`: three new paths, three new schemas
+(`WebhookEndpointCreate`/`WebhookEndpointSummary`/`WebhookEndpointCreated`),
+and the `WebhookEvent` schema's "NOT REACHABLE END-TO-END" warning replaced
+with what it now actually documents. `docs/DEVELOPER_GUIDE.md` §9b rewritten
+from a description of what was missing into registration instructions, the
+real delivery/retry/signature shape, and a verification example. Verified
+every `$ref` in the rewritten YAML resolves (the same small script used to
+verify the 2026-09-17 openapi.yaml pass).
+
+### Tests
+
+`packages/events/src/webhook-delivery.test.ts` (new): signing present only
+when a secret is configured, retry-then-dead-letter behavior. A new
+`webhookEndpointRepository` unit suite (validation runs before any
+DB/encryption call; a real encrypt/decrypt round trip). `packages/api-client`'s
+existing suite gained cases for the three new resource methods. A new
+`packages/simulation/src/outbound-webhooks.simulation.test.ts` (10 cases)
+drives the real HTTP routes end-to-end against the real gateway: a donation
+triggers an actual signed HTTP POST to a mocked callback URL, the signature
+verified byte-for-byte against an independently computed HMAC, plus
+category-filtering, cross-application isolation, and ownership-scoped
+delete/list as negative cases. `packages/simulation/src/db.ts`'s mock
+gained `webhookEndpointRepository`; `packages/simulation/src/harness.ts`
+exposes the gateway's real `WebhookDelivery` instance
+(`gatewayWebhookDelivery`, via a new `getWebhookDeliveryForTests()` export
+from `app.ts`, mirroring the existing `getGatewayQueueForTests()` pattern)
+so tests can force an immediate delivery attempt instead of waiting on the
+real 5-second interval timer.
+
+**Database migrations:** `packages/database/drizzle/0002_webhook_endpoints.sql`
+(new `webhook_endpoints` table + 3 indexes — additive only, no existing
+table altered). Not yet applied to the live database — see the PR/session
+notes for confirmation before `drizzle-kit migrate` runs against Neon.
+
+**Deliberately not done in this pass:** a delivery log or manual-replay
+endpoint (if all 5 attempts fail, the only recovery path today is polling
+`GET /v1/api/gateway/transaction/:id`); an admin-console UI for viewing a
+tenant's registered endpoints (the API is fully developer-self-service via
+the gateway routes, same as every other `/v1/api/gateway/*` resource); a
+secret-rotation endpoint (today rotation is delete + re-register).
+
+---
+
 ## 2026-09-17 — Real Email Adapter, Payment Refunds, Payment Reconciliation, Gateway Docs Reconciled
 
 **Context:** user asked to "continue to build on other remaining items such

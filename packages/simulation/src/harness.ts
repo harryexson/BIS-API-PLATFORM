@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { EventBus } from '@company/events';
+import { EventBus, WebhookDelivery } from '@company/events';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine } from '@company/routing';
 import {
@@ -115,6 +115,11 @@ export interface SimRuntime {
   // that enqueue directly onto an arbitrary queue.
   gatewayStore: KVStore;
   gatewayKeys: Keys;
+  // The real WebhookDelivery instance services/api-gateway/src/app.ts's
+  // EventBus listener enqueues outbound webhook deliveries into — call
+  // .flush() on it to force an immediate delivery attempt instead of
+  // waiting on its real 5s interval timer.
+  gatewayWebhookDelivery: WebhookDelivery;
   // stop the booted HTTP server
   close(): Promise<void>;
   // spawn an isolated worker (own store/keys unless supplied) against the
@@ -146,6 +151,9 @@ export async function createSimulation(
   const { store: gatewayStore, keys: gatewayKeys } = await (
     gatewayModule as unknown as { getGatewayQueueForTests(): Promise<{ store: KVStore; keys: Keys }> }
   ).getGatewayQueueForTests();
+  const gatewayWebhookDelivery = (
+    gatewayModule as unknown as { getWebhookDeliveryForTests(): WebhookDelivery }
+  ).getWebhookDeliveryForTests();
 
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
@@ -207,7 +215,7 @@ export async function createSimulation(
     return fetch(`${baseUrl}${path}`, { method: 'GET', headers });
   }
 
-  return { baseUrl, server, bus, registry, gatewayStore, gatewayKeys, close, makeWorker, request, post, postText, get };
+  return { baseUrl, server, bus, registry, gatewayStore, gatewayKeys, gatewayWebhookDelivery, close, makeWorker, request, post, postText, get };
 }
 
 // ---------------------------------------------------------------------------

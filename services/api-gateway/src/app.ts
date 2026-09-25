@@ -3,7 +3,7 @@ import cors from 'cors';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine, ConsentBlockedError } from '@company/routing';
-import { EventBus } from '@company/events';
+import { EventBus, WebhookDelivery } from '@company/events';
 import { TransactionEvent, TransactionStatusResponse, TransactionStatus, ProviderCapabilityMatch } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
 import {
@@ -39,6 +39,7 @@ import {
   ensureProviderRow,
   persistProviderSecrets,
   loadAllProviderSecrets,
+  webhookEndpointRepository,
 } from '@company/database';
 import {
   logger,
@@ -311,6 +312,63 @@ app.use('/v1/api/gateway/*', (req, res, next) => {
 const registry = ProviderRegistry.getInstance();
 const routingEngine = new RoutingEngine();
 const eventBus = EventBus.getInstance();
+
+// P0: Outbound platform webhooks. Previously docs/openapi.yaml and
+// docs/DEVELOPER_GUIDE.md §9b documented a working "register a URL,
+// receive a signed event" feature that wasn't reachable end-to-end —
+// packages/events/src/webhook-delivery.ts's WebhookDelivery was a real,
+// working POST-with-retry engine that nothing ever instantiated, and there
+// was no table/route for a developer to register a callback URL at all
+// (see docs/IMPLEMENTATION_BASELINE.md item 24). This wires it up: every
+// event this gateway emits is fanned out to every active, subscribed
+// webhook_endpoints row for that event's appId (TransactionEvent carries
+// no tenantId, so dispatch can only key on appId — see the schema's class
+// comment), signed with that endpoint's own secret.
+const webhookDelivery = new WebhookDelivery();
+webhookDelivery.start();
+
+async function dispatchOutboundWebhooks(event: TransactionEvent): Promise<void> {
+  if (!event.appId) return;
+  let endpoints;
+  try {
+    endpoints = await webhookEndpointRepository.findActiveByAppId(event.appId);
+  } catch {
+    // No DB configured (e.g. some simulation/test contexts) — nothing to
+    // dispatch to; never let this block the event that triggered it.
+    return;
+  }
+  if (endpoints.length === 0) return;
+
+  for (const endpoint of endpoints) {
+    const eventTypes = Array.isArray(endpoint.eventTypes) ? (endpoint.eventTypes as string[]) : ['*'];
+    if (!eventTypes.includes('*') && !eventTypes.includes(event.category)) continue;
+
+    let secret: string | undefined;
+    try {
+      secret = webhookEndpointRepository.resolveSecret(endpoint);
+    } catch {
+      logger.error('failed to decrypt webhook endpoint secret — skipping delivery', {
+        operation: 'webhook-dispatch',
+        errorCode: 'SECRET_DECRYPT_FAILED',
+        status: 'failed',
+      });
+      continue;
+    }
+    // Namespaced by endpoint + event id: the same event can fan out to
+    // several endpoints, each tracked as its own independent delivery.
+    webhookDelivery.enqueue(`${endpoint.id}:${event.id}`, { url: endpoint.url, secret }, event);
+  }
+}
+
+eventBus.subscribe((event) => {
+  dispatchOutboundWebhooks(event).catch(() => {
+    logger.error('outbound webhook dispatch failed', {
+      operation: 'webhook-dispatch',
+      errorCode: 'DISPATCH_FAILED',
+      status: 'failed',
+    });
+  });
+});
 
 // P0: Provider secrets added through the admin console previously lived
 // only in ProviderRegistry's in-memory Map — a real gap this platform
@@ -1408,6 +1466,86 @@ app.post('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:wri
   }
 });
 
+// P0: Outbound webhook registration. Register a callback URL to receive a
+// signed TransactionEvent (see dispatchOutboundWebhooks, above) as this
+// application's payments/messages/other events happen. The signing secret
+// is returned exactly once, here — it's never re-displayed, only used
+// server-side to compute each delivery's X-Webhook-Signature header.
+app.post('/v1/api/gateway/webhooks', mw.apiKey('webhooks:write'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { url, events } = req.body || {};
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'url must be a valid URL' });
+  }
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && process.env.NODE_ENV !== 'production')) {
+    return res.status(400).json({ error: 'url must use https (http is only allowed outside production)' });
+  }
+  if (events !== undefined && (!Array.isArray(events) || events.some((e: unknown) => typeof e !== 'string'))) {
+    return res.status(400).json({ error: 'events must be an array of strings when provided' });
+  }
+
+  try {
+    const { endpoint, secret } = await webhookEndpointRepository.create({
+      appId,
+      tenantId,
+      url,
+      eventTypes: events,
+    });
+    return res.status(201).json({
+      id: endpoint.id,
+      url: endpoint.url,
+      events: endpoint.eventTypes,
+      active: endpoint.active,
+      createdAt: endpoint.createdAt,
+      // Shown once — store it now. Every subsequent GET omits it.
+      secret,
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to register webhook endpoint' });
+  }
+}));
+
+app.get('/v1/api/gateway/webhooks', mw.apiKey('webhooks:read'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  const endpoints = await webhookEndpointRepository.findByAppId(appId);
+  return res.json({
+    endpoints: endpoints.map((e) => ({
+      id: e.id,
+      url: e.url,
+      events: e.eventTypes,
+      active: e.active,
+      createdAt: e.createdAt,
+    })),
+    count: endpoints.length,
+  });
+}));
+
+app.delete('/v1/api/gateway/webhooks/:id', mw.apiKey('webhooks:write'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  const deleted = await webhookEndpointRepository.deleteScoped(req.params.id, appId);
+  if (!deleted) {
+    return res.status(404).json({ error: 'Webhook endpoint not found' });
+  }
+  return res.status(204).send();
+}));
+
 app.patch('/api/dashboard/messaging-profiles/:id', requireAdmin, async (req: Request, res: Response) => {
   const { complianceStatus } = req.body;
   if (!complianceStatus) {
@@ -1671,6 +1809,13 @@ function getGatewayQueue() {
 // packages/simulation/src/harness.ts. Not used by any production code path.
 export async function getGatewayQueueForTests() {
   return getGatewayQueue();
+}
+
+// Exposed only so packages/simulation's tests can force an immediate
+// outbound-webhook delivery attempt instead of waiting on the real 5s
+// interval timer. Not used by any production code path.
+export function getWebhookDeliveryForTests() {
+  return webhookDelivery;
 }
 
 async function enqueueInboundMessage(providerId: string, payload: any): Promise<void> {

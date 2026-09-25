@@ -218,37 +218,72 @@ yourself.
 
 ### 9b. Outbound platform webhooks (you receive)
 
-⚠️ **Not reachable end-to-end today** — verified while reconciling this
-guide and `docs/openapi.yaml` with the real gateway, 2026-09-17. The
-pieces are more built than "not implemented" suggests, just never
-connected:
+Register a callback URL and this platform will POST every event your
+application generates — payments, refunds, messages — to it as it happens,
+signed so you can verify it really came from here. This closed 2026-09-17;
+see `docs/IMPLEMENTATION_BASELINE.md` item 24 for the history (the retry
+engine existed for a while before anything could reach it).
 
-- `packages/events/src/webhook-delivery.ts`'s `WebhookDelivery` class is a
-  real, working outbound POST engine — exponential-backoff retry, up to 5
-  attempts — but it is never instantiated or called anywhere in
-  `services/api-gateway` or `packages/workers`. `packages/workers/src/
-  jobs/outboxPoller.ts` and `receiptPipeline.ts` sound related but aren't:
-  the former only re-emits to this platform's own internal EventBus, and
-  the latter sends a receipt *message* to the paying customer, not a
-  webhook to your backend.
-- There is no schema, admin-console UI, or API route for you to register
-  your callback URL in the first place, so nothing ever supplies
-  `WebhookDelivery` a target to send to.
-- It sends **no signature** today — only `X-Webhook-Id`/`X-Webhook-Attempt`
-  headers — despite `packages/api-client`'s `WebhooksResource.verify()`/
-  `constructEvent()` already being built to check one (see that resource's
-  own doc comment).
-- If it were wired up, the POST body would be the **raw `TransactionEvent`
-  itself**, not a separate `{id, object, type, created_at, data}` envelope
-  — an earlier version of this doc invented that envelope.
+#### Register an endpoint
 
-If you need to know about an event as it happens today, poll
-`GET /v1/api/gateway/transaction/{id}` (§7/§8 above) — there is no push
-mechanism yet. The remaining work to finish this (a `webhook_endpoints`
-table + admin-console CRUD, an `EventBus.subscribe()` listener wired to
-`WebhookDelivery.enqueue()`, and HMAC signing in `processQueue()`) is
-well-scoped, not a design question — see
-`docs/IMPLEMENTATION_BASELINE.md`.
+```http
+POST /v1/api/gateway/webhooks
+Authorization: Bearer sk_live_xxx
+x-tenant-id: ten_reach_church
+Content-Type: application/json
+
+{ "url": "https://your-app.example.com/webhooks/company", "events": ["payment"] }
+```
+
+`events` is optional — omit it (or pass `["*"]`) to receive every category
+(`payment`, `messaging`, `other`). The response includes a `secret`
+(`whsec_...`) — **shown exactly once, here.** Store it now; it's never
+re-displayed by `GET`, only used server-side to sign each delivery.
+
+```json
+{ "id": "...", "url": "...", "events": ["payment"], "active": true, "createdAt": "...", "secret": "whsec_..." }
+```
+
+`url` must be `https://` (plain `http://` is only accepted outside
+production, for local testing). `GET /v1/api/gateway/webhooks` lists your
+own endpoints (no secret); `DELETE /v1/api/gateway/webhooks/{id}` removes
+one — both scoped to the authenticated application, so you can never see
+or delete another application's registration.
+
+#### What you receive
+
+Each delivery is a `POST` of the **raw `TransactionEvent` itself** — the
+same shape `POST /v1/api/gateway/payment`/`/refund`/`/messaging` return
+synchronously — not a separate `{id, object, type, created_at, data}`
+envelope:
+
+```http
+POST https://your-app.example.com/webhooks/company
+Content-Type: application/json
+X-Webhook-Id: wh_9f2492b5-de8:pi_3MtwBwLkdIwHu7ix28a3tqPa
+X-Webhook-Attempt: 1
+X-Webhook-Signature: sha256=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+
+{ "id": "pi_3MtwBwLkdIwHu7ix28a3tqPa", "category": "payment", "status": "success", ... }
+```
+
+Verify the signature with your registered secret before trusting the body
+— `packages/api-client`'s `WebhooksResource` does this for you:
+
+```ts
+const event = client.webhooks.constructEvent(rawBody, req.headers['x-webhook-signature'], secret);
+```
+
+or by hand: `X-Webhook-Signature` is `sha256=` followed by the hex
+`HMAC-SHA256(secret, rawBody)` digest — compute it the same way and
+compare with a constant-time check, never `===`.
+
+Delivery retries with exponential backoff (1s, 2s, 4s, 8s, up to 16s) for
+up to 5 attempts total before giving up; a non-2xx response or a timeout
+counts as a failure. There is no delivery log or manual-replay endpoint
+today — if your endpoint was down for all 5 attempts, poll
+`GET /v1/api/gateway/transaction/{id}` (§7/§8) to catch up on what you
+missed.
 
 ## 10. Health
 

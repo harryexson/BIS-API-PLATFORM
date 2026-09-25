@@ -139,6 +139,7 @@ export interface DbState {
   transactions: TransactionRow[];
   providers: ProviderRow[];
   providerConfigs: ProviderConfigRow[];
+  webhookEndpoints: WebhookEndpointRow[];
 }
 
 export interface ProviderRow {
@@ -157,6 +158,20 @@ export interface ProviderConfigRow {
   encryptedSecret: string | null;
   secretIv: string | null;
   secretTag: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface WebhookEndpointRow {
+  id: string;
+  appId: string;
+  tenantId: string;
+  url: string;
+  encryptedSecret: string;
+  secretIv: string;
+  secretTag: string;
+  eventTypes: string[];
+  active: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -309,6 +324,7 @@ export const dbState: DbState = {
   transactions: [],
   providers: [],
   providerConfigs: [],
+  webhookEndpoints: [],
 };
 
 export const APP_SLUG = 'reach-church';
@@ -411,6 +427,7 @@ export function clearDb(): void {
   dbState.transactions = [];
   dbState.providers = [];
   dbState.providerConfigs = [];
+  dbState.webhookEndpoints = [];
 }
 
 // Mirrors the seed plans inserted by migration 0011_add_subscriptions.sql
@@ -1971,6 +1988,63 @@ export function installDatabaseMock(): Record<string, unknown> {
         if (!row) return undefined;
         Object.assign(row, data, { updatedAt: new Date() });
         return row;
+      },
+    },
+    // Mirrors packages/database/src/repositories/webhook-endpoints.ts —
+    // real encryptSecret/decryptSecret round trip, same generated
+    // 'whsec_...' secret shape, against dbState instead of Postgres.
+    webhookEndpointRepository: {
+      async findById(id: string) {
+        return dbState.webhookEndpoints.find((w) => w.id === id);
+      },
+      async findByAppId(appId: string) {
+        return dbState.webhookEndpoints
+          .filter((w) => w.appId === appId)
+          .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      },
+      async findActiveByAppId(appId: string) {
+        return dbState.webhookEndpoints.filter((w) => w.appId === appId && w.active);
+      },
+      async create(data: { appId: string; tenantId: string; url: string; eventTypes?: string[] }) {
+        const validCategories = new Set(['payment', 'messaging', 'other', '*']);
+        const eventTypes = data.eventTypes && data.eventTypes.length > 0 ? data.eventTypes : ['*'];
+        const invalid = eventTypes.filter((e) => !validCategories.has(e));
+        if (invalid.length > 0) {
+          throw new Error(`Invalid event type(s): ${invalid.join(', ')} — expected one of payment, messaging, other, *`);
+        }
+        const secret = 'whsec_' + randomUUID().replace(/-/g, '');
+        const payload = encryptSecret(secret);
+        const row: WebhookEndpointRow = {
+          id: `wh_${randomUUID().slice(0, 12)}`,
+          appId: data.appId,
+          tenantId: data.tenantId,
+          url: data.url,
+          encryptedSecret: payload.encrypted,
+          secretIv: payload.iv,
+          secretTag: payload.tag,
+          eventTypes,
+          active: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        dbState.webhookEndpoints.push(row);
+        return { endpoint: row, secret };
+      },
+      async setActive(id: string, active: boolean) {
+        const row = dbState.webhookEndpoints.find((w) => w.id === id);
+        if (!row) return undefined;
+        row.active = active;
+        row.updatedAt = new Date();
+        return row;
+      },
+      async deleteScoped(id: string, appId: string) {
+        const idx = dbState.webhookEndpoints.findIndex((w) => w.id === id && w.appId === appId);
+        if (idx === -1) return false;
+        dbState.webhookEndpoints.splice(idx, 1);
+        return true;
+      },
+      resolveSecret(endpoint: WebhookEndpointRow) {
+        return decryptSecret({ encrypted: endpoint.encryptedSecret, iv: endpoint.secretIv, tag: endpoint.secretTag });
       },
     },
     encryptSecret,

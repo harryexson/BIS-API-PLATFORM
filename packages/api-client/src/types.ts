@@ -157,3 +157,26 @@ export interface RequestOptions {
 // with a `type`/`created_at`/`data` shape, so this is just TransactionEvent
 // again rather than a distinct WebhookEvent type.
 export type WebhookEvent = TransactionEvent;
+
+// POST /v1/api/gateway/webhooks
+export interface WebhookEndpointCreate {
+  url: string;
+  // TransactionEvent.category values to receive, or omit/['*'] for every
+  // category. Matches the gateway's own validation
+  // (packages/database/src/repositories/webhook-endpoints.ts).
+  events?: Array<'payment' | 'messaging' | 'other' | '*'>;
+}
+
+export interface WebhookEndpointSummary {
+  id: string;
+  url: string;
+  events: string[];
+  active: boolean;
+  createdAt: string;
+}
+
+// The signing secret is present only on the create response — it's
+// generated once, encrypted at rest server-side, and never re-displayed.
+export interface WebhookEndpointCreated extends WebhookEndpointSummary {
+  secret: string;
+}
