@@ -822,7 +822,11 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     originally identified:
     - A new `webhook_endpoints` table (`packages/database/src/schema/
       webhook-endpoints.ts`, migration `drizzle/0002_webhook_endpoints.sql`
-      — purely additive, no existing table touched) scoped by `appId` (the
+      — purely additive, no existing table touched; applied to the live
+      database 2026-09-25 with explicit human confirmation, verified
+      column-for-column against the live schema afterward, same standing
+      rule as every other live-DB write this session — see the changelog)
+      scoped by `appId` (the
       only identifier `TransactionEvent` actually carries — it has no
       `tenantId`, so dispatch can't key on tenant even though the table
       also records one for the registration API's own ownership checks).

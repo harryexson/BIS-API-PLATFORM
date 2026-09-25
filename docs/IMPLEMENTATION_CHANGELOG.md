@@ -95,8 +95,19 @@ real 5-second interval timer.
 
 **Database migrations:** `packages/database/drizzle/0002_webhook_endpoints.sql`
 (new `webhook_endpoints` table + 3 indexes — additive only, no existing
-table altered). Not yet applied to the live database — see the PR/session
-notes for confirmation before `drizzle-kit migrate` runs against Neon.
+table altered). Applied to the live database (Neon project
+`orange-water-80452818`) with explicit human confirmation, same standing
+rule as every other live-DB write this session: statements run directly
+(the Neon HTTP driver rejects multi-statement batches, so each `CREATE
+TABLE`/`CREATE INDEX` ran individually, matching how the app's own
+migrator already splits on `--> statement-breakpoint`), then verified
+column-for-column and index-for-index against the migration file, and the
+`drizzle.__drizzle_migrations` bookkeeping row inserted with the migration
+file's real sha256 hash — computed locally and cross-checked against the
+already-applied 0001 migration's hash already in that table (both
+matched), rather than guessed. `drizzle-kit migrate` now correctly sees
+this migration as already applied. Table confirmed empty (0 rows) both
+before and immediately after — no data at risk.
 
 **Deliberately not done in this pass:** a delivery log or manual-replay
 endpoint (if all 5 attempts fail, the only recovery path today is polling
