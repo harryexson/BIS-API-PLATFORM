@@ -202,16 +202,27 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
   };
 
   // ---- Routing rule handlers ----
+  const [newRuleMatch, setNewRuleMatch] = useState('');
+  const [newRuleTarget, setNewRuleTarget] = useState('');
+  const [newRuleDescription, setNewRuleDescription] = useState('');
+
   const addRule = async (providerId: string) => {
+    if (!newRuleMatch || !newRuleTarget) {
+      setError('A match expression and a target provider are both required');
+      return;
+    }
     setBusyId(providerId);
     setError(null);
     try {
       await mutate(`/api/dashboard/providers/${providerId}/routing`, 'POST', {
-        match: 'currency == USD',
-        target: providerId,
-        description: 'Custom routing rule',
+        match: newRuleMatch,
+        target: newRuleTarget,
+        description: newRuleDescription || undefined,
         enabled: true,
       });
+      setNewRuleMatch('');
+      setNewRuleTarget('');
+      setNewRuleDescription('');
       await onRefresh();
     } catch (err: any) {
       setError(err.message);
@@ -318,6 +329,13 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
         setNewSecretLabel={setNewSecretLabel}
         newSecretValue={newSecretValue}
         setNewSecretValue={setNewSecretValue}
+        allProviders={providers.map((p) => ({ id: p.id, name: p.name }))}
+        newRuleMatch={newRuleMatch}
+        setNewRuleMatch={setNewRuleMatch}
+        newRuleTarget={newRuleTarget}
+        setNewRuleTarget={setNewRuleTarget}
+        newRuleDescription={newRuleDescription}
+        setNewRuleDescription={setNewRuleDescription}
       />
     );
   }
@@ -446,6 +464,13 @@ interface DetailProps {
   setNewSecretLabel: (v: string) => void;
   newSecretValue: string;
   setNewSecretValue: (v: string) => void;
+  allProviders: { id: string; name: string }[];
+  newRuleMatch: string;
+  setNewRuleMatch: (v: string) => void;
+  newRuleTarget: string;
+  setNewRuleTarget: (v: string) => void;
+  newRuleDescription: string;
+  setNewRuleDescription: (v: string) => void;
 }
 
 const ProviderDetail: React.FC<DetailProps> = (props) => {
@@ -472,6 +497,13 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
     setNewSecretLabel,
     newSecretValue,
     setNewSecretValue,
+    allProviders,
+    newRuleMatch,
+    setNewRuleMatch,
+    newRuleTarget,
+    setNewRuleTarget,
+    newRuleDescription,
+    setNewRuleDescription,
   } = props;
 
   const knownFields = PROVIDER_SECRET_FIELDS[provider.id];
@@ -619,38 +651,68 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
         </Field>
       </div>
 
-      {/* Routing rules */}
-      <Section title="Routing Rules" icon={<Route className="w-4 h-4" />} onAdd={isAdmin ? onAddRule : undefined} addDisabled={disabled} addLabel="Add Rule">
+      {/* Routing rules — actually consulted by RoutingEngine (packages/
+          routing/src/rules.ts): the first enabled rule whose match
+          expression holds overrides success-rate/cost-based selection for
+          that request. Stored under whichever provider's page created it,
+          but target can be any provider id — "IF <match> route to
+          <target>" is a general rule, not scoped to this provider. */}
+      <Section title="Routing Rules" icon={<Route className="w-4 h-4" />}>
         {provider.routingRules.length === 0 ? (
           <Empty text="No custom routing rules configured." />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {provider.routingRules.map((rule) => (
-              <div key={rule.id} style={ruleRowStyle}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: '12px' }}>
-                    IF {rule.match} → {rule.target}
-                  </div>
-                  {rule.description && <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{rule.description}</div>}
-                </div>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--text-secondary)' }}>
-                  <input
-                    type="checkbox"
-                    checked={rule.enabled}
-                    disabled={disabled}
-                    onChange={(e) => onUpdateRule(rule, { enabled: e.target.checked })}
-                  />
-                  enabled
-                </label>
-                {isAdmin && (
-                  <button onClick={() => onDeleteRule(rule)} disabled={disabled} style={iconButtonStyle('var(--accent-red)')} title="Delete rule">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
+              <RuleRow
+                key={rule.id}
+                rule={rule}
+                allProviders={allProviders}
+                disabled={disabled}
+                isAdmin={isAdmin}
+                onSave={(updates) => onUpdateRule(rule, updates)}
+                onToggleEnabled={(enabled) => onUpdateRule(rule, { enabled })}
+                onDelete={() => onDeleteRule(rule)}
+              />
             ))}
           </div>
         )}
+
+        {isAdmin && (
+          <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+            <input
+              placeholder="Match expression (e.g. currency == MWK)"
+              value={newRuleMatch}
+              disabled={disabled}
+              onChange={(e) => setNewRuleMatch(e.target.value)}
+              style={{ ...inputStyle, minWidth: '220px' }}
+            />
+            <select aria-label="New rule target provider" value={newRuleTarget} disabled={disabled} onChange={(e) => setNewRuleTarget(e.target.value)} style={selectStyle}>
+              <option value="">Target provider…</option>
+              {allProviders.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+            <input
+              aria-label="New rule description"
+              placeholder="Description (optional)"
+              value={newRuleDescription}
+              disabled={disabled}
+              onChange={(e) => setNewRuleDescription(e.target.value)}
+              style={inputStyle}
+            />
+            <button onClick={onAddRule} disabled={disabled} style={actionButtonStyle('var(--accent-green)')}>
+              <Plus className="w-4 h-4" /> Add Rule
+            </button>
+          </div>
+        )}
+        <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '8px' }}>
+          Match syntax: <code>field OP value</code>, optionally joined with{' '}
+          <code>AND</code> — e.g. <code>currency == MWK AND amount &gt; 50</code>.
+          Fields: <code>currency</code>, <code>amount</code>, <code>paymentMethod</code>{' '}
+          (payments), <code>channel</code> (messaging: sms/whatsapp/email). Operators:{' '}
+          <code>== != &gt; &gt;= &lt; &lt;=</code>. The first enabled rule that matches wins;
+          a rule whose target is offline falls through to normal routing rather than failing the request.
+        </div>
       </Section>
 
       {/* Secrets */}
@@ -736,6 +798,79 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
     </div>
   );
 };
+
+function RuleRow({
+  rule,
+  allProviders,
+  disabled,
+  isAdmin,
+  onSave,
+  onToggleEnabled,
+  onDelete,
+}: {
+  rule: RoutingRule;
+  allProviders: { id: string; name: string }[];
+  disabled: boolean;
+  isAdmin: boolean;
+  onSave: (updates: Partial<RoutingRule>) => void;
+  onToggleEnabled: (enabled: boolean) => void;
+  onDelete: () => void;
+}) {
+  const [match, setMatch] = useState(rule.match);
+  const [target, setTarget] = useState(rule.target);
+  const [description, setDescription] = useState(rule.description ?? '');
+  const dirty = match !== rule.match || target !== rule.target || description !== (rule.description ?? '');
+
+  return (
+    <div style={{ ...ruleRowStyle, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', flex: 1, alignItems: 'center' }}>
+        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>IF</span>
+        <input
+          aria-label="Rule match expression"
+          value={match}
+          disabled={disabled}
+          onChange={(e) => setMatch(e.target.value)}
+          style={{ ...inputStyle, minWidth: '180px' }}
+        />
+        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>→</span>
+        <select aria-label="Rule target provider" value={target} disabled={disabled} onChange={(e) => setTarget(e.target.value)} style={selectStyle}>
+          {allProviders.map((p) => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+        <input
+          aria-label="Rule description"
+          placeholder="Description (optional)"
+          value={description}
+          disabled={disabled}
+          onChange={(e) => setDescription(e.target.value)}
+          style={inputStyle}
+        />
+        {isAdmin && dirty && (
+          <SaveButton
+            onClick={() => onSave({ match, target, description: description || undefined })}
+            disabled={disabled}
+            label="Save"
+          />
+        )}
+      </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--text-secondary)' }}>
+        <input
+          type="checkbox"
+          checked={rule.enabled}
+          disabled={disabled}
+          onChange={(e) => onToggleEnabled(e.target.checked)}
+        />
+        enabled
+      </label>
+      {isAdmin && (
+        <button onClick={onDelete} disabled={disabled} style={iconButtonStyle('var(--accent-red)')} title="Delete rule">
+          <Trash2 className="w-4 h-4" />
+        </button>
+      )}
+    </div>
+  );
+}
 
 // ----------------------------------------------------
 // Small UI helpers

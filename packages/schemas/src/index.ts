@@ -198,6 +198,14 @@ export interface ProviderCapabilityMatch {
   countries: string[];
   weight: number;
   status: ProviderStatus;
+  // Live rolling error rate (0-100, see ProviderRegistry.recordTraffic) and
+  // configured cost fields — carried through so RoutingEngine's scoring
+  // (packages/routing/src/scoring.ts) can weigh a candidate by real success
+  // rate and cost, not just its static admin-set weight.
+  errorRate: number;
+  transactionFeePercent?: number;
+  transactionFeeFlat?: number;
+  messageCost?: number;
 }
 
 // Transaction status tracking

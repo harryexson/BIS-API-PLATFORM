@@ -225,18 +225,12 @@ describe('R4 — all SMS providers offline: silent channel change (GAP)', () => 
 
 describe('R5 — single provider failover then hard 503 (OK)', () => {
   it('fails over on one provider error and returns 503 when all fail', async () => {
-    const infobip = runtime.registry.getProvider('infobip') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const origInfo = infobip.processRequest.bind(infobip);
-    infobip.processRequest = async () => {
+    patchProvider('infobip', async () => {
       throw new Error('429');
-    };
-    patches.push(() => {
-      infobip.processRequest = origInfo;
     });
 
-    // signalhouse is online by default -> single failover target.
+    // Every other SMS-capable provider is still healthy -> the cascading
+    // waterfall (packages/routing/src/index.ts) finds one of them.
     const first = await sendMessage(
       runtime,
       { recipient: DONOR_PHONE, content: 'x', providerOverride: 'infobip' },
@@ -245,17 +239,16 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
     expect(first.status).toBe(200);
     expect(first.body.providerId).not.toBe('infobip');
 
-    // Now also break signalhouse -> nothing left -> 503.
-    const signalhouse = runtime.registry.getProvider('signalhouse') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const origSig = signalhouse.processRequest.bind(signalhouse);
-    signalhouse.processRequest = async () => {
-      throw new Error('down');
-    };
-    patches.push(() => {
-      signalhouse.processRequest = origSig;
-    });
+    // Now break every other SMS-capable provider too -> the cascade
+    // genuinely exhausts every ranked candidate -> 503. Breaking only a
+    // second provider is no longer enough to prove exhaustion now that
+    // routing cascades through more than one fallback.
+    const sms = ['signalhouse', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
+    for (const p of sms) {
+      patchProvider(p, async () => {
+        throw new Error('down');
+      });
+    }
 
     const second = await sendMessage(
       runtime,
@@ -263,7 +256,7 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
       AUTH,
     );
     expect(second.status).toBe(503);
-    console.warn('[OK] single-provider failover and hard-failure 503 both work');
+    console.warn('[OK] cascading failover and hard-failure 503 both work');
   });
 });
 

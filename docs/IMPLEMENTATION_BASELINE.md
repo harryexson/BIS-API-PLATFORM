@@ -956,6 +956,75 @@ These are carried forward from `SECURITY_AUDIT_REPORT.md` /
     to stay in sync — everything else it already documented matched.
     Verified every schema/parameter/response `$ref` in the rewritten YAML
     resolves (a small script, not manual inspection) after the rewrite.
+26. **New finding, closed same-pass: admin-configured routing rules and
+    per-provider cost fields were real, admin-editable, and displayed in
+    the admin console — but `RoutingEngine` never consulted either.**
+    `RoutingRule` (`packages/schemas`) already had full CRUD
+    (`ProviderRegistry.addRoutingRule`/`updateRoutingRule`/
+    `deleteRoutingRule`, real gateway routes at
+    `/api/dashboard/providers/:id/routing*`, an admin console "Routing
+    Rules" section rendering `IF {match} → {target}`) and passing tests —
+    but `packages/routing/src/index.ts` never called
+    `getRoutingRules()`/consulted this data at all, so every rule an admin
+    created was purely decorative. The exact same shape of bug as the
+    provider-secrets (§4 item 19) and inbound-webhook-signature (§4 item
+    20) findings from earlier passes. Similarly,
+    `ProviderConfig.transactionFeePercent`/`transactionFeeFlat`/
+    `messageCost` were real, admin-configured fields `RoutingEngine` never
+    read — selection was static-`weight`-only, no live success-rate or
+    cost signal despite both already being tracked
+    (`ProviderRegistry.recordTraffic`'s rolling error rate had existed
+    since the circuit-breaker work, §4 item 7).
+
+    Closed by building a real rule evaluator
+    (`packages/routing/src/rules.ts` — a safe, no-`eval()`, fail-closed
+    parser for `field OP value [AND ...]` expressions; fields `currency`/
+    `amount`/`paymentMethod`/`channel` — deliberately no `bin`/card-range
+    field, since this gateway never collects raw card data to match one
+    against) and a scorer (`packages/routing/src/scoring.ts` —
+    `computeProviderScore()` blends static weight with live error rate,
+    squared so health dominates ahead of the circuit breaker's hard
+    cutoff, and configured cost). `routePayment`/`routeMessage` gained a
+    new selection precedence: explicit override → (messaging only)
+    conversation continuity → first matching enabled admin rule (falls
+    through to normal selection, not a hard failure, if the rule's target
+    is offline) → success-rate/cost-scored selection. On failure, both now
+    cascade through every remaining ranked candidate (not the single fixed
+    fallback hop the previous version made) up to `MAX_ROUTING_ATTEMPTS`
+    (default 3) — except a payment timeout, which still stops the cascade
+    immediately at any point and returns `'unknown'`, unchanged from
+    before: the provider may have already processed the charge, so
+    retrying through another provider risks a real double charge on an
+    outcome that isn't actually known to have failed.
+
+    The admin console's other half of the same bug — "Add Rule" always
+    POSTed an identical hardcoded template with no way to edit
+    `match`/`target` after creation — closed alongside it:
+    `ProviderManagement.tsx` gained a real inline authoring form (match
+    expression input with a grammar hint, target-provider select,
+    description) for both creating and editing a rule.
+
+    Several existing simulation tests had hardcoded a *specific* provider
+    as the outcome of channel-based message routing — safe when
+    email/whatsapp selection was a fixed highest-weight pick (SMS already
+    used weighted-random before this pass; this pass made email/whatsapp
+    consistent with it, a real behavior change, not a test weakening).
+    Updated to tolerate every provider that actually declares the
+    capability, and two resilience tests whose premise ("break 2 of 7 SMS
+    providers, expect total failure") the now-working cascade genuinely
+    invalidated were updated to break the full candidate set — what those
+    tests were actually trying to prove.
+
+    Tests: `packages/routing/src/rules.test.ts` (12 cases) and
+    `scoring.test.ts` (10 cases) unit-test the evaluator/scorer directly;
+    a new `packages/simulation/src/dynamic-routing.simulation.test.ts` (5
+    cases) drives the real HTTP admin routes and gateway end-to-end (rule
+    override beats scoring, disabled/non-matching/offline-target rules
+    fall through correctly, a deterministic multi-hop cascade); a new
+    `apps/admin-console/tests/routing-rules.spec.ts` (2 cases) proves the
+    authoring form posts real data and edits round-trip. 611 tests passing
+    (was 584), verified stable across 3 repeated full-suite runs given the
+    new randomness in selection.
 
 ## 5. What Is Documented Elsewhere (Not Re-Litigated Here)
 

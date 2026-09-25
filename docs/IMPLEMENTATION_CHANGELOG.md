@@ -6,6 +6,115 @@ tests cover it.
 
 ---
 
+## 2026-09-25 — Dynamic Routing: Admin Rules Actually Consulted, Success-Rate/Cost Scoring, Cascading Waterfall
+
+**Context:** user asked the routing engine to provide "truly dynamic
+routing" comparable to a real orchestration platform, selecting all three
+of: success-rate/cost-based smart routing, cascading waterfall retries,
+and admin-configurable routing rules.
+
+**A real, previously-undiscovered finding**, surfaced while scoping this:
+`RoutingRule` (`packages/schemas`) already had full CRUD
+(`ProviderRegistry.addRoutingRule`/`updateRoutingRule`/`deleteRoutingRule`),
+a real admin console UI (`ProviderManagement.tsx`'s "Routing Rules"
+section, `IF {match} → {target}`), and passing tests — but
+`RoutingEngine` never called `getRoutingRules()` or consulted this data at
+all. Every rule an admin created was purely decorative, exactly the same
+class of bug as the provider-secrets and inbound-webhook-signature
+findings from earlier passes (see `docs/IMPLEMENTATION_BASELINE.md`).
+Similarly, `ProviderConfig.transactionFeePercent`/`transactionFeeFlat`/
+`messageCost` were real, admin-configured, admin-console-displayed fields
+that `RoutingEngine` never read either — selection was static-weight-only.
+
+### Rule evaluator (`packages/routing/src/rules.ts`, new)
+
+A safe (no `eval()`), fail-closed parser/evaluator for `RoutingRule.match`
+expressions — `field OP value [AND field OP value ...]`, fields
+`currency`/`amount`/`paymentMethod`/`channel`, operators `== != > >= < <=`.
+No `bin`/card-range field exists, deliberately: this gateway never
+collects raw card data (tokenized only), so there is nothing real to match
+a BIN range against — building one would mean fabricating data the
+platform doesn't have. An unparseable expression, an unknown field, or a
+numeric comparator on a string field all fail to match rather than
+throwing or matching everything.
+
+### Scoring (`packages/routing/src/scoring.ts`, new)
+
+`computeProviderScore()` blends the static admin-set `weight` with two
+live signals that already existed but were unused: the provider's rolling
+error rate (`ProviderRegistry.recordTraffic`, fed by every real
+request/response) and its configured cost
+(`transactionFeePercent`/`Flat` for payments, `messageCost` for
+messaging). Success rate is squared in the formula so live health
+dominates the pick well before the circuit breaker would remove a
+provider entirely, not just as a tiebreaker. `weightedRandomSelect()`
+centralizes the weighted-random algorithm `routePayment`/`routeMessage`
+each previously hand-rolled inline (three separate copies).
+
+### RoutingEngine (`packages/routing/src/index.ts`, rewritten)
+
+New selection precedence for both `routePayment` and `routeMessage`: (1)
+an explicit `providerOverride`, (2) — messaging only — active conversation
+continuity, (3) the first enabled admin routing rule whose match holds
+(falls through to normal selection, not a hard failure, if the rule's
+target is offline/invalid), (4) success-rate/cost-scored selection among
+capability-matched candidates. On failure, cascades through every
+remaining score-ranked candidate (not the single fixed fallback hop the
+previous version made) up to `MAX_ROUTING_ATTEMPTS` (default 3) total
+attempts — except a payment timeout, which still stops the cascade
+immediately at any point in the chain and returns `'unknown'`: the
+provider may have already processed the charge, so retrying it through
+another provider risks a real double charge on an outcome that isn't
+actually known to have failed. This safety rule is unchanged from the
+previous version and its existing test coverage
+(`packages/routing/src/routing.test.ts`'s "deliberate: provider timeout"
+suite) still passes without modification. Messaging's cascade has no such
+special case — a message timeout carries none of a duplicate-charge's
+real-money risk, matching the previous version's behavior.
+
+### Test fallout from a real behavior change (not weakened tests)
+
+Several existing simulation tests hardcoded a *specific* provider as the
+outcome of channel-based routing (e.g. "email always goes to the `email`
+provider") — safe when email/whatsapp channel selection was a fixed
+highest-weight pick, no longer safe now that it's genuinely
+weighted-random across every real candidate that declares the capability
+(SMS routing already worked this way before this pass; this pass made
+email/whatsapp consistent with it). Updated each to tolerate every
+provider that actually declares the relevant capability — the same
+pattern already established elsewhere in this codebase — rather than
+asserting one incidental winner. Two resilience tests ("breaks 2 of 7 SMS
+providers, expects total failure") had their premise invalidated by the
+cascade genuinely working now (breaking 2 of 7 real candidates is no
+longer enough to exhaust the pool) — updated to break the full candidate
+set, which is what those tests were actually trying to prove.
+
+### Admin console: real rule-authoring UI
+
+Closed the other half of the original "purely decorative" finding: the
+admin console's "Add Rule" button always POSTed the identical hardcoded
+template (`currency == USD` → self) with no way to edit `match`/`target`
+after creation beyond the enabled toggle. `ProviderManagement.tsx` gained
+a real inline form (match expression input with a grammar hint, target
+provider select, description) for both creating and editing a rule.
+
+### Tests
+
+`packages/routing/src/rules.test.ts` (new, 12 cases) and `scoring.test.ts`
+(new, 10 cases) unit-test the evaluator and scorer directly.
+`packages/simulation/src/dynamic-routing.simulation.test.ts` (new, 5
+cases) drives the real HTTP admin routes and gateway end-to-end: a rule
+override beats scored selection, a disabled/non-matching/target-offline
+rule correctly falls through, and a cascade deterministically walks
+through 2 broken providers (pool shrunk to exactly 3 candidates so the
+result doesn't depend on `MAX_ROUTING_ATTEMPTS`, a module-load-time
+constant a running test can't retroactively change) to the one healthy
+survivor. 611 tests passing (was 584), verified stable across 3 repeated
+full-suite runs given the new randomness. 0 lint errors, clean
+type-check and build.
+
+---
+
 ## 2026-09-25 — Verify-Email / Reset-Password Pages, npm-audit Re-investigation
 
 **Context:** same "audit, identify any gaps, and continue to build any

@@ -149,8 +149,11 @@ describe('RoutingEngine', () => {
       });
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
-      // Email provider has email capability
-      expect(['email', 'signalhouse']).toContain(result.providerId);
+      // Every provider that actually declares the 'email' capability —
+      // selection among them is now score-weighted-random (packages/
+      // routing/src/scoring.ts), not always the single highest-weight
+      // pick, so both are legitimate outcomes.
+      expect(['email', 'example-msg']).toContain(result.providerId);
     });
 
     it('routes SMS to an SMS-capable provider', async () => {

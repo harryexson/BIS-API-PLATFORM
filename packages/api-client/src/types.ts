@@ -89,6 +89,10 @@ export interface ProviderCapabilityMatch {
   countries: string[];
   weight: number;
   status: ProviderStatus;
+  errorRate: number;
+  transactionFeePercent?: number;
+  transactionFeeFlat?: number;
+  messageCost?: number;
 }
 
 export interface ProviderManagement {

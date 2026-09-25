@@ -470,12 +470,37 @@ export class ProviderRegistry {
         countries: state.countries,
         weight: config.weight,
         status: config.status,
+        errorRate: state.errorRate,
+        transactionFeePercent: config.transactionFeePercent,
+        transactionFeeFlat: config.transactionFeeFlat,
+        messageCost: config.messageCost,
       });
     }
 
-    // Sort by weight descending
+    // Sort by weight descending — callers that want success-rate/cost-aware
+    // ordering re-sort by packages/routing's computeProviderScore() instead;
+    // this default keeps every existing caller of this method unaffected.
     matches.sort((a, b) => b.weight - a.weight);
     return matches;
+  }
+
+  // Every enabled routing rule across every provider's management state —
+  // RoutingRule.target is an explicit provider id, not necessarily the
+  // provider the rule happens to be stored under (the admin console's "Add
+  // Rule" lives on a provider's own page for convenience, but a rule means
+  // "IF <match> route to <target>" regardless of storage location). Added
+  // 2026-09-25: this data had full CRUD (add/update/delete) and an admin
+  // console UI since an earlier pass, but nothing ever read it back —
+  // RoutingEngine never called this method, so every rule an admin created
+  // was purely decorative. See docs/IMPLEMENTATION_BASELINE.md.
+  public getEnabledRoutingRules(): RoutingRule[] {
+    const rules: RoutingRule[] = [];
+    for (const state of this.management.values()) {
+      for (const rule of state.routingRules) {
+        if (rule.enabled) rules.push(rule);
+      }
+    }
+    return rules;
   }
 
   public updateProviderConfig(id: string, updates: Partial<ProviderConfig>): ProviderConfig | null {

@@ -149,17 +149,20 @@ describe('outbound messaging (POST /messages -> gateway -> router -> provider ->
     expect(conv!.providerId).toBe(res.body.providerId);
   });
 
-  it('routes an email recipient to the email provider by capability', async () => {
+  it('routes an email recipient to an email-capable provider by capability', async () => {
     const res = await sendMessage(runtime, {
       recipient: DONOR_EMAIL,
       content: 'Your e-statement is ready.',
     });
     expect(res.status).toBe(200);
-    expect(res.body.providerId).toBe('email');
+    // Either provider that actually declares 'email' capability is a
+    // legitimate outcome — selection is score-weighted-random (packages/
+    // routing/src/scoring.ts), not always the single highest-weight pick.
+    expect(['email', 'example-msg']).toContain(res.body.providerId);
     expect(res.body.messageType).toBe('email');
     const conv = findConversation(APP_SLUG, DONOR_EMAIL);
     expect(conv?.channel).toBe('email');
-    expect(conv?.providerId).toBe('email');
+    expect(conv?.providerId).toBe(res.body.providerId);
   });
 
   it('enforces auth, tenant isolation, and required fields (401/403/400)', async () => {
@@ -197,8 +200,14 @@ describe('Provider Selection edge cases', () => {
       providerOverride: 'signalhouse',
     });
     expect(res.status).toBe(200);
-    // Deterministic: fallback is the first other online messaging provider (Infobip).
-    expect(res.body.providerId).toBe('infobip');
+    // The specific fallback target is no longer a fixed "first in list" —
+    // packages/routing/src/scoring.ts ranks candidates by live success
+    // rate and cost, so the winner among several equally-weighted,
+    // healthy SMS providers can legitimately shift. What must still hold:
+    // it failed over away from signalhouse to some other real SMS-capable
+    // provider, via the dynamic failover path.
+    expect(res.body.providerId).not.toBe('signalhouse');
+    expect(['infobip', 'africastalking', 'sinch', 'vibes', 'futuresms', 'example-msg']).toContain(res.body.providerId);
     expect(String(res.body.decisionReason)).toContain('Dynamic Failover');
   });
 
@@ -222,14 +231,17 @@ describe('Provider Selection edge cases', () => {
   });
 
   it('a hard routing failure returns 503 and emits a failed routing event', async () => {
-    patchProviderProcessRequest('signalhouse', async () => {
-      await sleep(5);
-      throw new Error('down');
-    });
-    patchProviderProcessRequest('infobip', async () => {
-      await sleep(5);
-      throw new Error('down');
-    });
+    // Break every SMS-capable provider, not just the override target — the
+    // routing engine now cascades through every remaining ranked candidate
+    // (packages/routing/src/index.ts), not a single fixed fallback hop, so
+    // proving genuine exhaustion means genuinely exhausting the pool.
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
+    for (const p of smsProviders) {
+      patchProviderProcessRequest(p, async () => {
+        await sleep(5);
+        throw new Error('down');
+      });
+    }
 
     const token = mark();
     const res = await sendMessage(runtime, { recipient: DONOR_PHONE, content: 'x', providerOverride: 'signalhouse' });
@@ -258,8 +270,13 @@ describe('Delivery Event -> Platform Webhook (worker durable path)', () => {
 
     const created = dbState.events.filter((r) => !rowsBefore.includes(r));
     expect(created.some((r) => r.category === 'messaging')).toBe(true);
-    expect(created.some((r) => r.providerId === 'email')).toBe(true);
-    expect(busEventsAfter(token, 'messaging', 'email').length).toBe(1);
+    // Either provider that actually declares the 'email' capability is a
+    // legitimate outcome — selection is score-weighted-random (packages/
+    // routing/src/scoring.ts), not always the single highest-weight pick;
+    // same tolerance routing.test.ts already uses for this exact case.
+    const emailCapable = created.filter((r) => r.category === 'messaging' && ['email', 'example-msg'].includes(r.providerId as string));
+    expect(emailCapable.length).toBe(1);
+    expect(busEventsAfter(token, 'messaging', emailCapable[0].providerId as string).length).toBe(1);
   });
 
   it('the provider_webhook job verifies, records, flips provider status, and de-dupes replays', async () => {

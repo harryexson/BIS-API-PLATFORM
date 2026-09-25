@@ -3,10 +3,25 @@ import { ProviderConfig, TransactionEvent } from '@company/schemas';
 import { ProviderRegistry, BaseProvider } from '@company/providers';
 import { consentRecordRepository } from '@company/database';
 import { ConversationManager, ConversationContext } from './conversation';
+import { findMatchingRule, type RoutingContext } from './rules';
+import { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
 
 export { ConversationManager, type ConversationContext } from './conversation';
 export { ConversationResolver, type ConversationResolution } from './conversation-resolver';
 export { handleKeyword, type KeywordContext, type KeywordResult } from './keywords';
+export { evaluateRule, findMatchingRule, type RoutingContext } from './rules';
+export { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
+
+// P0: How many providers a single payment/message will cascade through
+// before giving up — the initial pick plus this many additional
+// score-ranked fallbacks, not unbounded (each hop can cost up to
+// PROVIDER_TIMEOUT_MS, and a payment cascade stops immediately on any
+// timeout regardless of this cap — see routePayment).
+const MAX_ROUTING_ATTEMPTS = Number(process.env.MAX_ROUTING_ATTEMPTS) || 3;
+
+interface RankedCandidate extends ScorableCandidate {
+  name: string;
+}
 
 /**
  * Thrown when an outbound send is blocked because the recipient has
@@ -96,8 +111,28 @@ export class RoutingEngine {
   // Capability-based payment routing — selects providers by capabilities/currency
   // rather than hardcoded provider IDs. Adding a new provider with the right
   // capabilities automatically makes it eligible for routing.
+  //
+  // Selection precedence: (1) an explicit providerOverride from the caller,
+  // (2) an admin-configured routing rule whose match expression holds (see
+  // packages/routing/src/rules.ts — this data has existed with full CRUD
+  // and an admin console UI since an earlier pass, but was never actually
+  // consulted here; every rule an admin created was purely decorative
+  // until this pass), (3) success-rate/cost-scored selection among
+  // capability-matched candidates (packages/routing/src/scoring.ts — real
+  // signals: ProviderRegistry.recordTraffic's live rolling error rate and
+  // the admin-configured transactionFeePercent/Flat, not just the static
+  // weight the previous version used alone).
+  //
+  // On failure, cascades through the remaining score-ranked candidates
+  // (up to MAX_ROUTING_ATTEMPTS total attempts) rather than the single
+  // fixed fallback hop the previous version made — except a timeout,
+  // which stops the cascade immediately at any point in the chain: the
+  // provider may have already processed the charge, so retrying it
+  // through another provider risks a real double charge on an outcome
+  // that isn't actually known to have failed.
   public async routePayment(appId: string, payload: any): Promise<TransactionEvent> {
     const { currency = 'USD', paymentMethod = 'card', providerOverride } = payload;
+    const amount = Number(payload.amount);
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
 
@@ -110,7 +145,7 @@ export class RoutingEngine {
       throw new Error('All payment providers are currently OFFLINE / UNDER MAINTENANCE');
     }
 
-    // 1. Check for manual override
+    // 1. Manual override
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
       if (provider && this.registry.isProviderAvailable(providerOverride) && this.registry.isLiveEligible(providerOverride)) {
@@ -121,61 +156,42 @@ export class RoutingEngine {
       }
     }
 
-    // 2. Capability-based routing: find providers that support the currency + payment method
+    // 2. Admin-configured routing rule
     if (!selectedProvider) {
-      const cur = currency.toUpperCase();
-      const capabilities = [paymentMethod];
-
-      // For mobile money in East/West Africa, also check mobile_money capability
-      if (paymentMethod === 'mobile_money') {
-        capabilities.push('mobile_money');
-      }
-
-      const candidates = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur);
-
-      if (candidates.length > 0) {
-        // Weight-based selection among capability-matched providers
-        const totalWeight = candidates.reduce((sum, c) => sum + c.weight, 0);
-        let random = Math.random() * totalWeight;
-        let chosen = candidates[0];
-
-        for (const c of candidates) {
-          random -= c.weight;
-          if (random <= 0) {
-            chosen = c;
-            break;
-          }
-        }
-
-        const provider = this.registry.getProvider(chosen.id);
-        if (provider) {
+      const ctx: RoutingContext = { currency: currency?.toUpperCase(), amount, paymentMethod };
+      const rule = findMatchingRule(this.registry.getEnabledRoutingRules(), ctx);
+      if (rule) {
+        const provider = this.registry.getProvider(rule.target);
+        if (provider && this.registry.isProviderAvailable(rule.target) && this.registry.isLiveEligible(rule.target)) {
           selectedProvider = provider;
-          reason = `Capability-based routing: Matched providers [${candidates.map(c => c.name).join(', ')}] for ${cur}/${paymentMethod}. Selected '${chosen.name}' (weight ${chosen.weight}/${totalWeight}).`;
+          reason += `Routing rule matched ('${rule.match}'${rule.description ? ` — ${rule.description}` : ''}): routed to '${provider.config.name}'.`;
+        } else {
+          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' is offline/invalid. Falling back. | `;
         }
       }
+    }
 
-      // Fallback: if no capability match, use global weight-based routing
-      if (!selectedProvider) {
-        const candidates = activePayments.filter(p => ['stripe', 'nmi', 'airwallex'].includes(p.id));
+    // 3. Capability + success-rate/cost-scored candidate pool — also the
+    // basis for the cascading fallback order below, whether or not step 1
+    // or 2 already picked a provider.
+    const cur = currency.toUpperCase();
+    const capabilities = [paymentMethod];
+    if (paymentMethod === 'mobile_money') capabilities.push('mobile_money');
 
-        if (candidates.length > 0) {
-          const totalWeight = candidates.reduce((sum, p) => sum + p.weight, 0);
-          let random = Math.random() * totalWeight;
-          let chosenConfig: ProviderConfig | null = null;
+    let candidatePool: RankedCandidate[] = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur);
+    let poolDescription = `capability match for ${cur}/${paymentMethod}`;
+    if (candidatePool.length === 0) {
+      candidatePool = activePayments.filter(p => ['stripe', 'nmi', 'airwallex'].includes(p.id));
+      poolDescription = 'global weight-allocation fallback pool';
+    }
+    const ranked = rankByScore(candidatePool, { amount });
 
-          for (const c of candidates) {
-            random -= c.weight;
-            if (random <= 0) {
-              chosenConfig = c;
-              break;
-            }
-          }
-
-          if (chosenConfig) {
-            selectedProvider = this.registry.getProvider(chosenConfig.id) || null;
-            reason += `Global weight allocation fallback. Chosen: '${selectedProvider?.config.name}' (weight ${chosenConfig.weight}/${totalWeight}).`;
-          }
-        }
+    if (!selectedProvider && ranked.length > 0) {
+      const chosen = weightedRandomSelect(ranked, c => computeProviderScore(c, { amount }));
+      const provider = this.registry.getProvider(chosen.id);
+      if (provider) {
+        selectedProvider = provider;
+        reason += `Success-rate/cost-scored routing (${poolDescription}): candidates [${ranked.map(c => c.name).join(', ')}]. Selected '${chosen.name}' (error rate ${(chosen.errorRate ?? 0).toFixed(1)}%).`;
       }
     }
 
@@ -183,56 +199,54 @@ export class RoutingEngine {
       throw new Error('Routing failure: Unable to find a suitable online payment provider.');
     }
 
-    try {
-      // P1: Wrap provider call with timeout to prevent hung requests
-      return await withProviderTimeout(
-        () => selectedProvider!.processRequest(appId, payload, reason),
-      );
-    } catch (err: any) {
-      // P0: A payment timeout is ambiguous — the provider may have received
-      // and even completed the charge before the response was lost. Never
-      // treat that the same as a confirmed failure: retrying the same
-      // payment through a second provider here would risk a real double
-      // charge on money we don't know the status of. Surface it as its own
-      // 'unknown' outcome instead — the caller must persist it as pending
-      // reconciliation (via webhook or a status check against the
-      // provider), not silently resolve it either way.
-      if (err instanceof ProviderTimeoutError) {
-        return {
-          id: randomUUID(),
-          timestamp: new Date().toISOString(),
-          appId,
-          category: 'payment',
-          providerId: selectedProvider.config.id,
-          status: 'unknown',
-          amount: Number(payload.amount),
-          currency,
-          latency: PROVIDER_TIMEOUT_MS,
-          cost: 0,
-          decisionReason: `${reason} | Ambiguous outcome: ${err.message}. Not retried via another provider — outcome must be reconciled via webhook/status check before any further action.`,
-          payload,
-          response: null,
-          error: err.message,
-        };
-      }
+    const fallbackOrder = ranked.filter(c => c.id !== selectedProvider!.config.id);
+    const attemptedIds = new Set<string>();
+    let currentProvider = selectedProvider;
+    let currentReason = reason;
 
-      // Any other error (e.g. the provider rejected the request outright,
-      // or went offline in the race between selection and dispatch) is
-      // safe to treat as "never processed" and failover.
-      const nextProviderConfig = activePayments.find(p => p.id !== selectedProvider!.config.id);
-      if (nextProviderConfig) {
-        const nextProvider = this.registry.getProvider(nextProviderConfig.id)!;
-        const fallbackReason = `Dynamic Failover: Primary '${selectedProvider.config.name}' failed (${err.message}). Re-routing to secondary '${nextProvider.config.name}'. Original Reason: ${reason}`;
-        return await withProviderTimeout(
-          () => nextProvider.processRequest(appId, payload, fallbackReason),
-        );
-      } else {
-        throw new Error(`Primary route '${selectedProvider.config.name}' failed (${err.message}) and no fallback options are available.`);
+    for (let attempt = 1; ; attempt++) {
+      attemptedIds.add(currentProvider.config.id);
+      try {
+        // P1: Wrap provider call with timeout to prevent hung requests
+        return await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
+      } catch (err: any) {
+        if (err instanceof ProviderTimeoutError) {
+          return {
+            id: randomUUID(),
+            timestamp: new Date().toISOString(),
+            appId,
+            category: 'payment',
+            providerId: currentProvider.config.id,
+            status: 'unknown',
+            amount,
+            currency,
+            latency: PROVIDER_TIMEOUT_MS,
+            cost: 0,
+            decisionReason: `${currentReason} | Ambiguous outcome: ${err.message}. Not retried via another provider — outcome must be reconciled via webhook/status check before any further action.`,
+            payload,
+            response: null,
+            error: err.message,
+          };
+        }
+
+        const next = fallbackOrder.find(c => !attemptedIds.has(c.id));
+        if (!next || attempt >= MAX_ROUTING_ATTEMPTS) {
+          throw new Error(
+            `Payment routing exhausted after ${attempt} attempt(s) [${Array.from(attemptedIds).join(' -> ')}]: last failure on '${currentProvider.config.name}' (${err.message}).`,
+          );
+        }
+        const nextProvider = this.registry.getProvider(next.id)!;
+        currentReason = `Dynamic Failover (cascading, attempt ${attempt + 1}/${Math.min(MAX_ROUTING_ATTEMPTS, fallbackOrder.length + 1)}): '${currentProvider.config.name}' failed (${err.message}). Trying next-best-ranked '${nextProvider.config.name}'. | ${currentReason}`;
+        currentProvider = nextProvider;
       }
     }
   }
 
-  // Capability-based messaging routing
+  // Capability-based messaging routing. Same precedence model as
+  // routePayment above, with one addition ahead of everything except an
+  // explicit providerOverride: conversation continuity (reusing the
+  // provider an ongoing thread already used) — a routing rule or a
+  // score-based pick must never silently switch providers mid-conversation.
   public async routeMessage(appId: string, payload: any): Promise<TransactionEvent> {
     const { recipient = '', content = '', providerOverride, tenantId = 'default' } = payload;
     let selectedProvider: BaseProvider | null = null;
@@ -297,43 +311,37 @@ export class RoutingEngine {
       }
     }
 
-    // 2. Channel detection + capability-based routing
+    // 2. Admin-configured routing rule (never overrides conversation
+    // continuity above — see this method's class comment)
     if (!selectedProvider) {
-      const isEmail = channel === 'email';
-      const isWhatsapp = channel === 'whatsapp';
-
-      if (isEmail) {
-        const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['email']);
-        if (candidates.length > 0) {
-          selectedProvider = this.registry.getProvider(candidates[0].id) || null;
-          reason += `Email address format detected. Capability-based routing to '${selectedProvider?.config.name}'.`;
+      const ctx: RoutingContext = { channel };
+      const rule = findMatchingRule(this.registry.getEnabledRoutingRules(), ctx);
+      if (rule) {
+        const provider = this.registry.getProvider(rule.target);
+        if (provider && this.registry.isProviderAvailable(rule.target) && this.registry.isLiveEligible(rule.target)) {
+          selectedProvider = provider;
+          reason += `Routing rule matched ('${rule.match}'${rule.description ? ` — ${rule.description}` : ''}): routed to '${provider.config.name}'.`;
+        } else {
+          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' is offline/invalid. Falling back. | `;
         }
-      } else if (isWhatsapp) {
-        const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['whatsapp']);
-        if (candidates.length > 0) {
-          selectedProvider = this.registry.getProvider(candidates[0].id) || null;
-          reason += `WhatsApp format detected. Capability-based routing to '${selectedProvider?.config.name}'.`;
-        }
-      } else {
-        // SMS routing: try capability-based, then fallback to first available
-        const candidates = this.registry.findByCategoryAndCapabilities('messaging', ['sms']);
-        if (candidates.length > 0) {
-          // Weight-based selection among SMS-capable providers
-          const totalWeight = candidates.reduce((sum, c) => sum + c.weight, 0);
-          let random = Math.random() * totalWeight;
-          let chosen = candidates[0];
+      }
+    }
 
-          for (const c of candidates) {
-            random -= c.weight;
-            if (random <= 0) {
-              chosen = c;
-              break;
-            }
-          }
+    // 3. Channel detection + success-rate/cost-scored capability routing.
+    // Do NOT silently change a communication channel — every candidate
+    // pool below is scoped to providers that declare the detected
+    // channel's capability, matching the P1-4 fallback policy above.
+    const channelCapability = channel === 'email' ? 'email' : channel === 'whatsapp' ? 'whatsapp' : 'sms';
+    let ranked: RankedCandidate[] = rankByScore(
+      this.registry.findByCategoryAndCapabilities('messaging', [channelCapability]),
+    );
 
-          selectedProvider = this.registry.getProvider(chosen.id) || null;
-          reason += `SMS routing: Matched providers [${candidates.map(c => c.name).join(', ')}]. Selected '${chosen.name}'.`;
-        }
+    if (!selectedProvider && ranked.length > 0) {
+      const chosen = weightedRandomSelect(ranked, (c) => computeProviderScore(c));
+      const provider = this.registry.getProvider(chosen.id);
+      if (provider) {
+        selectedProvider = provider;
+        reason += `${channel} routing: candidates [${ranked.map(c => c.name).join(', ')}]. Selected '${chosen.name}' (error rate ${(chosen.errorRate ?? 0).toFixed(1)}%).`;
       }
     }
 
@@ -346,30 +354,33 @@ export class RoutingEngine {
       throw new Error('Routing failure: Unable to find a suitable online messaging provider.');
     }
 
-    try {
-      // P1: Wrap provider call with timeout to prevent hung requests
-      const event = await withProviderTimeout(
-        () => selectedProvider!.processRequest(appId, payload, reason),
-      );
-      // P2-8: Record conversation after successful delivery
-      await this.conversationManager.record(conversationCtx, selectedProvider.config.id, channel);
-      return event;
-    } catch (err: any) {
-      // P1-4: Respect channel fallback policy.
-      // Do NOT silently change a communication channel — only failover
-      // to alternate providers of the same channel type.
-      const fallbackConfig = activeMsg.find(p => p.id !== selectedProvider!.config.id);
-      if (fallbackConfig && DEFAULT_FALLBACK_POLICY.allowAlternateProvider) {
-        const nextProvider = this.registry.getProvider(fallbackConfig.id)!;
-        return await withProviderTimeout(
-          () => nextProvider.processRequest(
-            appId,
-            payload,
-            `Dynamic Failover: Primary '${selectedProvider.config.name}' failed (${err.message}). Switched to '${nextProvider.config.name}'.`,
-          ),
-        );
-      } else {
-        throw new Error(`Messaging dispatch failed on '${selectedProvider.config.name}' (${err.message}) with no available failover routes.`);
+    // Cascading waterfall across same-channel candidates, best-first by
+    // score, up to MAX_ROUTING_ATTEMPTS total attempts. Unlike payments, a
+    // messaging timeout is not treated as an ambiguous outcome worth
+    // stopping the cascade for — resending a message carries none of a
+    // duplicate-charge's real-money risk.
+    const fallbackOrder = ranked.filter(c => c.id !== selectedProvider!.config.id);
+    const attemptedIds = new Set<string>();
+    let currentProvider = selectedProvider;
+    let currentReason = reason;
+
+    for (let attempt = 1; ; attempt++) {
+      attemptedIds.add(currentProvider.config.id);
+      try {
+        // P1: Wrap provider call with timeout to prevent hung requests
+        const event = await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
+        // P2-8: Record conversation after successful delivery
+        await this.conversationManager.record(conversationCtx, currentProvider.config.id, channel);
+        return event;
+      } catch (err: any) {
+        const next = fallbackOrder.find(c => !attemptedIds.has(c.id))
+          ?? (DEFAULT_FALLBACK_POLICY.allowAlternateProvider ? activeMsg.find(p => !attemptedIds.has(p.id)) : undefined);
+        if (!next || attempt >= MAX_ROUTING_ATTEMPTS) {
+          throw new Error(`Messaging dispatch failed on '${currentProvider.config.name}' (${err.message}) with no available failover routes.`);
+        }
+        const nextProvider = this.registry.getProvider(next.id)!;
+        currentReason = `Dynamic Failover (cascading, attempt ${attempt + 1}): '${currentProvider.config.name}' failed (${err.message}). Switched to '${nextProvider.config.name}'. | ${currentReason}`;
+        currentProvider = nextProvider;
       }
     }
   }
