@@ -1042,6 +1042,9 @@ app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantCon
         currency: event.currency || 'USD',
         paymentMethod: paymentMethod || null,
         idempotencyKey: idempotencyKey || null,
+        ...(event.fraudRiskLevel !== undefined || event.fraudRiskScore !== undefined
+          ? { metadata: { fraudRiskLevel: event.fraudRiskLevel, fraudRiskScore: event.fraudRiskScore } }
+          : {}),
       });
     } catch (txErr) {
       // Transaction creation is best-effort — don't fail the payment if it fails

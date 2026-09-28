@@ -33,6 +33,48 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, RefundResult } from '
  * it does when no API key is configured — it does not fabricate a real
  * charge against nothing.
  *
+ * **SCA/3D Secure (PSD2)**: this platform never collects a live card entry
+ * or has a page to redirect a shopper to, so `automatic_payment_methods[
+ * allow_redirects] = 'never'` was already set here (since this adapter's
+ * original build) — Stripe fails a PaymentIntent outright rather than
+ * returning a redirect-based challenge it has nowhere to send the shopper
+ * to. When authentication is still required and can't complete without
+ * one, Stripe's real PaymentIntent status is `requires_action` — a
+ * genuinely unresolved outcome (the shopper would need to authenticate
+ * some other way this platform doesn't relay), not a definite decline, so
+ * it's mapped to `'unknown'` here rather than `'failed'` (a real
+ * correction — earlier versions of this adapter lumped it in with actual
+ * declines). `requires_payment_method`/`canceled` remain definite
+ * failures. This mirrors the same "frictionless-or-honestly-unresolved,
+ * never fabricated" handling Adyen's/Airwallex's own catch-all 'unknown'
+ * branches already use for their equivalent challenge-required states.
+ *
+ * **Fraud scoring (Stripe Radar)**: every Stripe account has Radar running
+ * by default, and its risk assessment (`outcome.risk_level`, and
+ * `outcome.risk_score` on accounts with Radar for Fraud Teams) lives on
+ * the Charge created alongside a confirmed PaymentIntent — not on the
+ * PaymentIntent itself unless expanded. This adapter requests
+ * `expand[]=latest_charge` so that data comes back inline with the same
+ * call, rather than a second round-trip. A charge Radar scores as
+ * `risk_level: 'highest'` is downgraded to this platform's `'failed'`
+ * status even if Stripe itself authorized it — Radar's own strongest
+ * signal, surfaced into the actual payment flow rather than just logged
+ * after the fact (the ask this exists to satisfy), not a fabricated
+ * fraud rule invented independently of what Stripe already computed.
+ * `risk_level`/`risk_score` are always surfaced on
+ * `TransactionEvent.fraudRiskLevel`/`fraudRiskScore` when present, success
+ * or not, for reporting.
+ * NOTE ON VERIFICATION: the `requires_action` status mapping above is
+ * high-confidence, stable Stripe API knowledge (unchanged since
+ * PaymentIntents launched) and was reasoned through, not freshly
+ * WebSearched. The `expand[]=latest_charge` mechanism and the exact
+ * `outcome.risk_level`/`risk_score` field names were **not** verified via
+ * WebSearch this pass either (WebSearch was unavailable — monthly limit
+ * hit — unlike every other fact in this file, which was WebSearched on
+ * 2026-09-14/17 as noted above). Treat the Radar-specific pieces as
+ * lower-confidence than the rest of this adapter until spot-checked
+ * against Stripe's current docs.
+ *
  * Environment variables:
  *   STRIPE_SECRET_KEY — sk_test_... or sk_live_...
  *   STRIPE_WEBHOOK_SECRET — whsec_... (from the Stripe dashboard's webhook
@@ -199,6 +241,9 @@ export class StripeProvider extends BaseProvider {
         'automatic_payment_methods[allow_redirects]': 'never',
         'metadata[appId]': appId,
         'metadata[decisionReason]': decisionReason,
+        // Brings Radar's risk assessment back inline on the Charge this
+        // confirm call creates, instead of a second round-trip to fetch it.
+        'expand[0]': 'latest_charge',
       });
 
       const res = await this.http_request({
@@ -226,13 +271,37 @@ export class StripeProvider extends BaseProvider {
       const feeFlat = this.config.transactionFeeFlat || 0.30;
       const cost = (amount * feePercent) / 100 + feeFlat;
 
-      // succeeded: money moved. requires_payment_method/requires_action/
-      // canceled: the attempt did not complete — a definite, non-ambiguous
-      // failure (unlike a network timeout, Stripe told us exactly what
-      // happened). processing: Stripe is still resolving it asynchronously
-      // (common for some bank-debit methods) — genuinely unresolved, not a
-      // failure, so it must not be reported as either success or failure.
-      const status = intent.status === 'succeeded' ? 'success' : intent.status === 'processing' ? 'unknown' : 'failed';
+      // succeeded: money moved. requires_payment_method/canceled: the
+      // attempt did not complete — a definite, non-ambiguous failure
+      // (unlike a network timeout, Stripe told us exactly what happened).
+      // processing: Stripe is still resolving it asynchronously (common
+      // for some bank-debit methods) — genuinely unresolved. requires_action
+      // means SCA/3D Secure authentication is still needed and — since
+      // `allow_redirects: 'never'` above rules out the only way this
+      // adapter could relay one — genuinely unresolved too, the same as
+      // Adyen's/Airwallex's equivalent challenge-required states, not a
+      // definite decline.
+      let status: 'success' | 'failed' | 'unknown' =
+        intent.status === 'succeeded' ? 'success'
+          : intent.status === 'processing' || intent.status === 'requires_action' ? 'unknown'
+            : 'failed';
+
+      // Radar's own risk assessment lives on the Charge (see class comment
+      // for why this needs `expand[]=latest_charge` to be present here).
+      const charge = typeof intent.latest_charge === 'object' ? intent.latest_charge : null;
+      const outcome = charge?.outcome;
+      const fraudRiskLevel: string | undefined = outcome?.risk_level;
+      const fraudRiskScore: number | undefined = outcome?.risk_score;
+
+      // Radar's strongest signal, acted on rather than only logged: a
+      // charge it scores 'highest' risk is blocked here even if Stripe
+      // itself authorized it — surfaced into the actual payment decision,
+      // not a fraud rule this platform invented independently of Radar.
+      let fraudBlockedMessage: string | undefined;
+      if (status === 'success' && fraudRiskLevel === 'highest') {
+        status = 'failed';
+        fraudBlockedMessage = `Blocked by Stripe Radar: risk_level 'highest'${outcome?.seller_message ? ` — ${outcome.seller_message}` : ''}`;
+      }
 
       return {
         id: intent.id,
@@ -248,7 +317,11 @@ export class StripeProvider extends BaseProvider {
         decisionReason,
         payload,
         response: intent,
-        ...(status === 'failed' ? { error: intent.last_payment_error?.message || `PaymentIntent status: ${intent.status}` } : {}),
+        ...(fraudRiskLevel !== undefined ? { fraudRiskLevel } : {}),
+        ...(fraudRiskScore !== undefined ? { fraudRiskScore } : {}),
+        ...(status === 'failed'
+          ? { error: fraudBlockedMessage || intent.last_payment_error?.message || `PaymentIntent status: ${intent.status}` }
+          : {}),
       };
     } catch (err: any) {
       const latency = Date.now() - startTime;
@@ -298,6 +371,10 @@ export class StripeProvider extends BaseProvider {
       currency: currency.toLowerCase(),
       payment_method_types: [paymentMethod === 'card' ? 'card' : paymentMethod],
       status: 'succeeded',
+      latest_charge: {
+        id: 'ch_sim_' + randomUUID().replace(/-/g, '').slice(0, 20),
+        outcome: { risk_level: 'normal', type: 'authorized', seller_message: 'Payment complete.' },
+      },
     };
 
     return {
@@ -314,6 +391,7 @@ export class StripeProvider extends BaseProvider {
       decisionReason,
       payload,
       response: responsePayload,
+      fraudRiskLevel: 'normal',
     };
   }
 }

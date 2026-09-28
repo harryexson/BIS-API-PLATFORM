@@ -55,6 +55,28 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, RefundResult } from '
  * Reported as this platform's `'unknown'` outcome, never a fabricated
  * `'success'`, the same convention PawaPay's deposit flow already uses.
  *
+ * **SCA/3D Secure (PSD2)**: `shopperInteraction: 'ContAuth'` +
+ * `recurringProcessingModel: 'CardOnFile'` above (needed anyway, since
+ * this adapter only ever charges a previously-tokenized instrument, never
+ * a live shopper-present card entry) is also the real, standard shape of
+ * a PSD2-exempt "merchant-initiated transaction" — real acquirers
+ * generally don't challenge this request shape at all, which is why this
+ * adapter hasn't needed a redirect/challenge-completion flow. See
+ * `THREE_DS_CHALLENGE_RESULT_CODES` and `processRequest`'s status mapping
+ * below for how a challenge resultCode is still handled honestly
+ * (`'unknown'`, never fabricated) on the rare chance Adyen returns one
+ * anyway.
+ *
+ * NOTE ON VERIFICATION: unlike the rest of this file (WebSearched against
+ * Adyen's real docs on 2026-09-25, per the top of this comment), the 3DS/
+ * PSD2 reasoning above was reasoned through from established, stable PSD2/
+ * Adyen knowledge, not freshly WebSearched — WebSearch was unavailable
+ * this pass (monthly limit hit). The resultCode *values* themselves were
+ * already part of the original 2026-09-25 WebSearch pass (see the
+ * "Anything else... is genuinely unresolved" comment predating this
+ * change); only their explicit naming/grouping here is new and
+ * unverified-this-pass.
+ *
  * Native inbound-webhook signature verification is deliberately not
  * implemented here (falls back to the platform's generic HMAC check) —
  * Adyen's real scheme signs each notification *item* individually via an
@@ -74,6 +96,15 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, RefundResult } from '
  *     without it, even a 'live'-environment provider record calls Adyen's
  *     real test host, since there's no live host to call otherwise)
  */
+// The real Adyen resultCodes that mean "an SCA/3D Secure challenge is
+// required" — named explicitly (rather than left as an implicit catch-all)
+// so this platform's "frictionless-only, challenge reports honestly as
+// unknown" 3DS/PSD2 handling is inspectable and testable, not an
+// accidental side effect of a generic default branch. Behaviorally these
+// already fall into the same 'unknown' bucket as any other unrecognized
+// resultCode — listing them doesn't change that, it documents it.
+const THREE_DS_CHALLENGE_RESULT_CODES = ['IdentifyShopper', 'ChallengeShopper', 'RedirectShopper', 'PresentToShopper'];
+
 export class AdyenProvider extends BaseProvider {
   private apiVersion = 'v71';
 
@@ -209,8 +240,21 @@ export class AdyenProvider extends BaseProvider {
 
       // Authorised: money moved. Refused/Error/Cancelled: a definite,
       // non-ambiguous failure — Adyen told us exactly what happened.
-      // Anything else (Pending, Received, RedirectShopper, ...) is
-      // genuinely unresolved, never guessed at either way.
+      // Anything else — including SCA/3D-Secure-challenge resultCodes
+      // (IdentifyShopper, ChallengeShopper, RedirectShopper,
+      // PresentToShopper — see THREE_DS_CHALLENGE_RESULT_CODES above) and
+      // async ones (Pending, Received) — is genuinely unresolved, never
+      // guessed at either way. In practice a challenge resultCode should
+      // be rare here: shopperInteraction:'ContAuth' +
+      // recurringProcessingModel:'CardOnFile' above already requests
+      // merchant-initiated/off-session processing against a previously
+      // consented stored instrument — the PSD2 RTS Article 13/14
+      // "merchant-initiated transaction" exemption real acquirers apply
+      // to exactly this shape of request, which is why this adapter
+      // (only ever charging pre-tokenized instruments, never a live
+      // shopper-present card entry) hasn't needed a challenge-handling
+      // flow. If Adyen ever does return one anyway, it's honestly
+      // reported as unresolved rather than fabricated as a success.
       const status =
         result.resultCode === 'Authorised' ? 'success'
           : ['Refused', 'Error', 'Cancelled'].includes(result.resultCode) ? 'failed'

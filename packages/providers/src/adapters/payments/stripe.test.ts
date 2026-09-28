@@ -205,6 +205,7 @@ describe('StripeProvider', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
       expect(event.response.id).toMatch(/^pi_/);
+      expect(event.fraudRiskLevel).toBe('normal');
     });
   });
 
@@ -255,6 +256,8 @@ describe('StripeProvider', () => {
       expect(params.get('payment_method')).toBe('pm_card_visa');
       expect(params.get('confirm')).toBe('true');
       expect(params.get('metadata[appId]')).toBe('app1');
+      // Requests Radar's risk data inline on the created Charge.
+      expect(params.get('expand[0]')).toBe('latest_charge');
 
       expect(event.status).toBe('success');
       expect(event.id).toBe('pi_abc123');
@@ -284,6 +287,29 @@ describe('StripeProvider', () => {
 
       expect(event.status).toBe('failed');
       expect(event.error).toBe('Your card was declined.');
+    });
+
+    it('reports an unresolved outcome (unknown, not failed) when SCA/3D Secure authentication is still required', async () => {
+      // allow_redirects: 'never' means Stripe can't hand back a redirect
+      // this platform has nowhere to send the shopper to — requires_action
+      // is the resulting genuinely-unresolved status, not a definite decline.
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ id: 'pi_needs_auth', object: 'payment_intent', status: 'requires_action' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const event = await provider.processRequest(
+        'app1',
+        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_authenticationRequired' },
+        'test',
+      );
+
+      expect(event.status).toBe('unknown');
     });
 
     it('reports an unresolved outcome (unknown, not failed) when the PaymentIntent is still processing', async () => {
@@ -350,6 +376,87 @@ describe('StripeProvider', () => {
       expect(fetchSpy.mock.calls.length).toBeGreaterThan(1);
       expect(event.status).toBe('failed');
     }, 15_000);
+
+    it('surfaces Radar\'s risk_level/risk_score from the expanded latest_charge on a normal-risk success', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: 'pi_abc123',
+            object: 'payment_intent',
+            status: 'succeeded',
+            latest_charge: { id: 'ch_abc123', outcome: { risk_level: 'normal', risk_score: 12, type: 'authorized' } },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const event = await provider.processRequest(
+        'app1',
+        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        'test',
+      );
+
+      expect(event.status).toBe('success');
+      expect(event.fraudRiskLevel).toBe('normal');
+      expect(event.fraudRiskScore).toBe(12);
+    });
+
+    it('blocks a charge Radar scores as risk_level "highest", even though Stripe itself authorized it', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: 'pi_risky',
+            object: 'payment_intent',
+            status: 'succeeded',
+            latest_charge: {
+              id: 'ch_risky',
+              outcome: { risk_level: 'highest', risk_score: 91, type: 'authorized', seller_message: 'This payment is highly likely to be fraudulent.' },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const event = await provider.processRequest(
+        'app1',
+        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        'test',
+      );
+
+      expect(event.status).toBe('failed');
+      expect(event.fraudRiskLevel).toBe('highest');
+      expect(event.fraudRiskScore).toBe(91);
+      expect(event.error).toContain('Radar');
+      expect(event.error).toContain('highly likely to be fraudulent');
+    });
+
+    it('does not surface fraud fields when the response carries no Radar outcome at all', async () => {
+      process.env.STRIPE_SECRET_KEY = 'sk_test_123';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ id: 'pi_no_charge', object: 'payment_intent', status: 'succeeded' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new StripeProvider(makeConfig());
+      const event = await provider.processRequest(
+        'app1',
+        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        'test',
+      );
+
+      expect(event.status).toBe('success');
+      expect(event.fraudRiskLevel).toBeUndefined();
+      expect(event.fraudRiskScore).toBeUndefined();
+    });
 
     it('reports offline/maintenance status without making an HTTP call', async () => {
       process.env.STRIPE_SECRET_KEY = 'sk_test_123';

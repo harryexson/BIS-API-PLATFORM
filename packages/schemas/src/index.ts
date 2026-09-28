@@ -81,6 +81,12 @@ export interface TransactionEvent {
   payload: any;
   response: any;
   error?: string;
+  // Third-party fraud-scoring signal, when the selected provider returns
+  // one (currently only Stripe Radar — see stripe.ts's class comment).
+  // Absent for a provider/response that carries no fraud signal at all —
+  // never a fabricated neutral score standing in for "unknown".
+  fraudRiskLevel?: string;
+  fraudRiskScore?: number;
 }
 
 // Result of BaseProvider.processRefund() — a real refund attempt against a

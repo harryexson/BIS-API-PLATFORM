@@ -34,7 +34,12 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * back to a customer for confirmation — a REQUIRES_CUSTOMER_ACTION
  * result is reported as this platform's 'unknown' outcome rather than
  * either fabricated extreme, but there is no flow here to actually
- * resolve it.
+ * resolve it. This should be rare in practice: confirming against a
+ * saved `payment_consent_id` for a known `customer_id` (never a live
+ * card entry) is the same real PSD2 "merchant-initiated transaction"
+ * shape Adyen's adapter documents as generally SCA-exempt — see
+ * adyen.ts's class comment for the fuller reasoning, reasoned through
+ * (not freshly WebSearched) rather than re-derived here.
  *
  * Environment variables:
  *   AIRWALLEX_CLIENT_ID     — x-client-id

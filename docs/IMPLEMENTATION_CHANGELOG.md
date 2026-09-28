@@ -6,6 +6,102 @@ tests cover it.
 
 ---
 
+## 2026-09-28 — Fraud Scoring (Stripe Radar) + SCA/3D Secure Handling
+
+**Context:** user picked, from the routing-capability audit above,
+"3D Secure/SCA" and "third-party fraud scoring" to build next, scoped via
+`AskUserQuestion`: fraud vendor → **Stripe Radar** (already-integrated,
+zero new vendor onboarding, vs. a standalone vendor needing net-new
+integration); 3DS UX → **frictionless-only** (this gateway is API-only —
+no customer-facing page exists for a shopper to complete an OTP/bank-app
+challenge, so a "challenge required" outcome reports honestly as this
+platform's `'unknown'`, same as every other unresolved async outcome here,
+rather than fabricating a redirect flow with nowhere to send the shopper).
+
+**Verification note:** WebSearch hit its monthly spend limit mid-session
+and was unavailable for this entire pass — unlike every other adapter fact
+in this codebase (each WebSearched against the provider's real docs on a
+named date), the facts below were reasoned from stable, well-established,
+long-unchanged API knowledge instead (Stripe's `requires_action`
+PaymentIntent status and Radar's `outcome.risk_level`/`risk_score` fields
+have been part of Stripe's core API since PaymentIntents/Radar launched).
+Each touched file's class comment flags exactly which claims are
+lower-confidence this pass and worth a spot-check once WebSearch is back,
+rather than silently presenting them at the same confidence as everything
+else.
+
+### Stripe Radar (`packages/providers/src/adapters/payments/stripe.ts`)
+
+- Requests now expand `latest_charge` (`expand[]=latest_charge`) so
+  Radar's risk assessment comes back inline instead of needing a second
+  round-trip.
+- `TransactionEvent` gained `fraudRiskLevel?`/`fraudRiskScore?` (new,
+  optional fields in `packages/schemas`), populated from
+  `latest_charge.outcome.risk_level`/`risk_score` whenever Stripe returns
+  an outcome at all — never a fabricated neutral score when it doesn't.
+- **Acted on, not just logged**: a charge Radar scores `risk_level:
+  'highest'` is downgraded to this platform's `'failed'` status even
+  though Stripe itself authorized it, with Radar's own `seller_message`
+  surfaced as the error — Radar's strongest signal actually blocking the
+  transaction, which is what "integrates fraud scoring into the payment
+  flow" means, not passive reporting after the fact.
+- Fixed a real, separate correctness bug while touching this status logic:
+  Stripe's `requires_action` PaymentIntent status (SCA/3DS authentication
+  still needed) was previously bucketed into `'failed'` — a definite
+  decline — alongside `requires_payment_method`/`canceled`. It's now
+  `'unknown'` (genuinely unresolved, the shopper would need to
+  authenticate some other way this platform can't relay), consistent with
+  how Adyen's and Airwallex's own challenge-required states were already
+  handled. `automatic_payment_methods[allow_redirects]='never'` (already
+  present since this adapter's original build) is what makes
+  `requires_action` — rather than a redirect this platform has nowhere to
+  send the shopper to — the actual outcome Stripe returns when SCA is
+  required.
+
+### SCA/3D Secure documentation (Adyen, Airwallex)
+
+No behavior change to Adyen's or Airwallex's status mapping — both already
+correctly bucketed a challenge-required state into `'unknown'` via their
+existing catch-all branches. What changed is making that fact
+inspectable rather than an accidental side effect of a generic default:
+- `adyen.ts` — added a named `THREE_DS_CHALLENGE_RESULT_CODES` constant
+  (`IdentifyShopper`, `ChallengeShopper`, `RedirectShopper`,
+  `PresentToShopper`) and four new tests asserting each one explicitly
+  maps to `'unknown'`, rather than relying on an implicit catch-all with
+  no named test coverage. Also documents *why* a challenge is rare here in
+  the first place: `shopperInteraction: 'ContAuth'` +
+  `recurringProcessingModel: 'CardOnFile'` (needed anyway, since this
+  adapter only ever charges a previously-tokenized instrument, never a
+  live shopper-present card entry) is the real, standard PSD2 RTS Article
+  13/14 "merchant-initiated transaction" shape acquirers generally exempt
+  from SCA outright.
+- `airwallex.ts` — class comment cross-references the same MIT-exemption
+  reasoning for its own saved-`payment_consent_id`/`customer_id` confirm
+  flow.
+- `checkout.ts` — already documented this correctly from its original
+  build; no change needed.
+
+### Files changed
+
+`packages/schemas/src/index.ts` (new `TransactionEvent` fields),
+`packages/providers/src/adapters/payments/stripe.ts` (+ `.test.ts`, 4 new
+tests + 1 updated), `adyen.ts` (+ `.test.ts`, 4 new tests), `airwallex.ts`
+(docs only), `services/api-gateway/src/app.ts` (stores
+`fraudRiskLevel`/`fraudRiskScore` in the transaction record's existing
+`metadata` jsonb column — no migration needed).
+
+**Not built, still an honest gap:** a real 3DS challenge-completion flow
+(a hosted page + redirect/return route for a shopper to actually enter an
+OTP or approve in their banking app) and any fraud vendor other than
+Stripe Radar. Both were explicitly scoped out by the user's own choices
+above, not silently skipped.
+
+**Tests:** `npm test` — 681 passed (up from 673, +8 new), 12 skipped,
+stable across repeated runs. `npm run type-check`: 0 errors. `npm run
+lint`: 0 errors, 315 warnings (unchanged). `npm run build:all`: clean.
+
+---
+
 ## 2026-09-28 — Geographic Smart Routing + Retry Logic on Soft Declines
 
 **Context:** user asked the platform to provide, specifically: smart routing

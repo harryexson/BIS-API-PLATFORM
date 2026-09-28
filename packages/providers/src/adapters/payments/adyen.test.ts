@@ -188,6 +188,22 @@ describe('AdyenProvider', () => {
       expect(event.status).toBe('unknown');
     });
 
+    it.each(['IdentifyShopper', 'ChallengeShopper', 'RedirectShopper', 'PresentToShopper'])(
+      'reports unknown (never fabricated) for the SCA/3DS challenge resultCode %s — this platform has no flow to complete it',
+      async (resultCode) => {
+        process.env.ADYEN_API_KEY = 'AQE...';
+        process.env.ADYEN_MERCHANT_ACCOUNT = 'BisApiPlatformECOM';
+        const fetchSpy = vi.fn().mockResolvedValue(
+          new Response(JSON.stringify({ pspReference: 'psp1', resultCode }), { status: 200, headers: { 'content-type': 'application/json' } }),
+        );
+        vi.stubGlobal('fetch', fetchSpy);
+
+        const provider = new AdyenProvider(makeConfig());
+        const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+        expect(event.status).toBe('unknown');
+      },
+    );
+
     it('reports failed on a non-2xx error envelope', async () => {
       process.env.ADYEN_API_KEY = 'AQE...';
       process.env.ADYEN_MERCHANT_ACCOUNT = 'BisApiPlatformECOM';
