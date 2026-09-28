@@ -377,6 +377,148 @@ describe('RoutingEngine', () => {
     });
   });
 
+  describe('retry logic: soft declines (resolved status "failed", not a thrown error)', () => {
+    // A real gateway call that completes and reports the card as declined
+    // never throws — it resolves normally with status:'failed'. Before this
+    // pass, routePayment's cascade only triggered on a *thrown* exception,
+    // so an ordinary decline silently returned as failed with no failover
+    // at all, despite the cascade machinery existing right here.
+    function declinedEvent(providerId: string, reason: string) {
+      return {
+        id: `${providerId}_declined`,
+        timestamp: new Date().toISOString(),
+        appId: 'testapp',
+        category: 'payment' as const,
+        providerId,
+        status: 'failed' as const,
+        amount: 100,
+        currency: 'USD',
+        latency: 50,
+        cost: 0,
+        decisionReason: reason,
+        payload: {},
+        response: { declined: true },
+        error: 'card_declined',
+      };
+    }
+
+    it('cascades to the next-best provider when the first one resolves with a soft decline', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const stripe = registry.getProvider('stripe')!;
+
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce(
+        declinedEvent('stripe', 'stub'),
+      );
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      expect(result.status).toBe('success');
+      expect(result.providerId).not.toBe('stripe');
+      expect(String(result.decisionReason)).toContain('declined');
+      expect(stripeSpy).toHaveBeenCalledTimes(1);
+
+      stripeSpy.mockRestore();
+    });
+
+    it('never cascades on a resolved "unknown" status — same double-charge risk as a timeout', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const stripe = registry.getProvider('stripe')!;
+      const nmi = registry.getProvider('nmi')!;
+
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce({
+        ...declinedEvent('stripe', 'stub'),
+        status: 'unknown' as const,
+        error: 'ambiguous processor response',
+      });
+      const nmiSpy = vi.spyOn(nmi, 'processRequest');
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      expect(result.status).toBe('unknown');
+      expect(result.providerId).toBe('stripe');
+      expect(nmiSpy).not.toHaveBeenCalled();
+
+      stripeSpy.mockRestore();
+      nmiSpy.mockRestore();
+    });
+
+    it('returns the final declined TransactionEvent (not a thrown error) when every candidate in the cascade declines', async () => {
+      const registry = ProviderRegistry.getInstance();
+      // Narrow the candidate pool to exactly 2 (stripe + nmi) so both can be
+      // deterministically stubbed to decline and the cascade exhausts.
+      const sidelined = ['flutterwave', 'pawapay', 'paychangu', 'airwallex', 'example-pay', 'adyen', 'braintree', 'checkout'];
+      for (const id of sidelined) registry.updateProviderConfig(id, { status: 'offline' });
+
+      const stripe = registry.getProvider('stripe')!;
+      const nmi = registry.getProvider('nmi')!;
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce(declinedEvent('stripe', 'stub'));
+      const nmiSpy = vi.spyOn(nmi, 'processRequest').mockResolvedValueOnce(declinedEvent('nmi', 'stub'));
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      expect(result.status).toBe('failed');
+      expect(result.providerId).toBe('nmi');
+      expect(stripeSpy).toHaveBeenCalledTimes(1);
+      expect(nmiSpy).toHaveBeenCalledTimes(1);
+
+      stripeSpy.mockRestore();
+      nmiSpy.mockRestore();
+      for (const id of sidelined) registry.updateProviderConfig(id, { status: 'online' });
+    });
+  });
+
+  describe('geographic-region-aware smart routing', () => {
+    it('threads PaymentRequest.country into the capability match, narrowing the candidate pool', async () => {
+      const registry = ProviderRegistry.getInstance();
+      // PawaPay is configured for MW/ZM/TZ/UG specifically (not '*') and
+      // supports TZS/mobile_money — without a country filter it's a real
+      // candidate for TZS mobile_money; asking for a country it doesn't
+      // serve (US) must exclude it even though currency/capability match.
+      const pawapay = registry.getManagementView('pawapay')!;
+      expect(pawapay.countries).not.toContain('*');
+      expect(pawapay.countries).toContain('TZ');
+      expect(pawapay.countries).not.toContain('US');
+
+      const withoutCountry = registry.findByCategoryAndCapabilities('payment', ['mobile_money'], 'TZS');
+      expect(withoutCountry.map(m => m.id)).toContain('pawapay');
+
+      const withCountry = registry.findByCategoryAndCapabilities('payment', ['mobile_money'], 'TZS', 'US');
+      expect(withCountry.map(m => m.id)).not.toContain('pawapay');
+    });
+
+    it('an admin routing rule can match on country', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const rule = registry.addRoutingRule('nmi', { match: 'country == US', target: 'nmi', enabled: true })!;
+      try {
+        const result = await engine.routePayment('testapp', {
+          amount: 100,
+          currency: 'USD',
+          paymentMethod: 'card',
+          country: 'US',
+        });
+        expect(result.providerId).toBe('nmi');
+        expect(String(result.decisionReason)).toContain('Routing rule matched');
+      } finally {
+        registry.deleteRoutingRule('nmi', rule.id);
+      }
+    });
+  });
+
   describe('production environment isolation', () => {
     // NODE_ENV is process-global and this suite runs alongside other test
     // files, so every mutation below is synchronous (no `await` in between)

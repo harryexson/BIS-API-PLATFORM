@@ -473,6 +473,7 @@ export class ProviderRegistry {
     category: 'payment' | 'messaging' | 'other',
     requiredCapabilities: string[],
     currency?: string,
+    country?: string,
   ): ProviderCapabilityMatch[] {
     const matches: ProviderCapabilityMatch[] = [];
 
@@ -498,6 +499,16 @@ export class ProviderRegistry {
       if (currency) {
         const cur = currency.toUpperCase();
         if (!state.currencies.includes(cur) && !state.currencies.includes('*')) continue;
+      }
+
+      // Check country support if specified — real routing input as of
+      // this pass: previously `countries` was collected and admin-
+      // configurable but never actually consulted here, the same
+      // "decorative field" gap routing rules and transaction fees had
+      // before earlier passes wired those in too.
+      if (country) {
+        const c = country.toUpperCase();
+        if (!state.countries.includes(c) && !state.countries.includes('*')) continue;
       }
 
       matches.push({

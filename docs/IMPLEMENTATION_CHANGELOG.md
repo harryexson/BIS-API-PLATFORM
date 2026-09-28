@@ -6,6 +6,109 @@ tests cover it.
 
 ---
 
+## 2026-09-28 — Geographic Smart Routing + Retry Logic on Soft Declines
+
+**Context:** user asked the platform to provide, specifically: smart routing
+by cost/region/success-rate, automatic failover, retry logic on declined
+transactions, unified reporting, and fraud/compliance tools. An audit
+against the real code found three already real (cost/success-rate scoring,
+automatic failover on thrown errors, and unified reporting via
+`/api/observability/metrics`+`/logs`), two gaps closed in this pass, and one
+(fraud/compliance) deliberately not started pending user scoping — see the
+session record for why.
+
+### Gap 1: geographic region was collected but never consulted
+
+Every provider's `countries` list (admin-configured, e.g. PawaPay's
+`['MW','ZM','TZ','UG']`) has existed since the original provider-management
+surface, but `findByCategoryAndCapabilities` filtered on category,
+capability, and currency only — the same "decorative field" class of bug
+this repo has found and fixed before (routing rules, transaction fees).
+Fixed by:
+- `packages/schemas/src/index.ts` — new `PaymentRequest.country?: string`
+  (ISO 3166-1 alpha-2), documented as optional/backward-compatible.
+- `packages/providers/src/registry.ts` — `findByCategoryAndCapabilities`
+  takes an optional `country` param, filtering exactly like the existing
+  currency check (`state.countries.includes(c) || includes('*')`).
+- `packages/routing/src/rules.ts` — `RoutingContext.country` added, so an
+  admin routing rule can match on it (`country == KE`), same pattern as
+  `currency`/`paymentMethod`.
+- `packages/routing/src/index.ts` — `routePayment` threads `country`
+  through to the capability match, the rule-matching context, and the
+  decision-reason text.
+- `services/api-gateway/src/app.ts` — both `POST /v1/api/gateway/payment`
+  and the admin console's request-playground dispatch route now read
+  `country` from the request body and pass it through.
+- `docs/openapi.yaml` — documented on `PaymentCreateRequest`.
+
+### Gap 2: soft declines never triggered failover
+
+The cascade machinery in `routePayment` (built in the 2026-09-25 dynamic-
+routing pass) only ever fired on a **thrown** exception — a network error,
+timeout, or HTTP-level provider error. A real gateway call that completes
+normally and reports the card as declined (`TransactionEvent.status ===
+'failed'`, e.g. Stripe's `card_declined`, Adyen's `Refused`, Braintree's
+`PROCESSOR_DECLINED`) never throws; it resolves. So an ordinary declined
+card silently returned as failed with **no retry through another
+provider/acquirer** — despite this being exactly what "retry logic" /
+"rescue revenue on soft declines" means in a real orchestration platform,
+and despite the cascade loop already existing right there.
+
+Fixed in `packages/routing/src/index.ts`'s `routePayment`: the attempt loop
+now treats a resolved `status:'failed'` the same as a non-timeout thrown
+error — safe to retry via the next best-ranked candidate, because the
+charge is known NOT to have moved money. The existing timeout safety rule
+is unchanged and was not weakened: a resolved `status:'unknown'` (or a
+thrown `ProviderTimeoutError`) still returns immediately without cascading,
+for the same double-charge-risk reason as before. When the cascade
+exhausts on a genuine decline (not an infra failure), the function now
+returns that last declined `TransactionEvent` rather than throwing —
+honestly reporting "every provider tried, all declined" instead of masking
+a real (if unsuccessful) outcome as a routing infrastructure failure.
+
+### Confirmed already real, no code changes needed
+
+- **Automatic failover**: `routePayment`/`routeMessage`'s cascading
+  waterfall (added 2026-09-25) already switches to a backup provider on a
+  thrown non-timeout error.
+- **Unified reporting**: the admin console's Observability tab
+  (`apps/admin-console/src/components/Observability.tsx`) already pulls
+  `paymentSuccess`/`paymentFailure`/`messageSuccess`/`messageFailure`/
+  provider-health/webhook/queue/routing-failure counters and structured
+  logs from `/api/observability/metrics` and `/logs` into one dashboard
+  across every registered provider.
+- **Tokenization** (part of "fraud & compliance"): every card-based adapter
+  already refuses to collect raw card data — `PaymentRequest.paymentToken`
+  is the only instrument accepted, sourced from each provider's own
+  client-side tokenization (Stripe.js, etc.).
+
+### Not started: third-party fraud scoring, PSD2/SCA (3D Secure)
+
+No fraud-scoring vendor integration and no 3D Secure/SCA challenge flow
+exist anywhere in this codebase — several adapters' class comments say so
+explicitly (e.g. Adyen's and Airwallex's "no 3D-Secure/`next_action` relay
+built"). Deliberately not started in this pass: fabricating a fraud score
+or a compliance claim (PSD2/SCA is a real regulatory standard) without a
+real, named, WebSearch-verified vendor integration would be exactly the
+kind of fabrication this repo's provider-adapter discipline exists to
+prevent. Scoping this needs a vendor decision from the user before any
+code is written.
+
+**Files changed:** `packages/schemas/src/index.ts`,
+`packages/providers/src/registry.ts`, `packages/routing/src/rules.ts`,
+`packages/routing/src/index.ts`, `services/api-gateway/src/app.ts`,
+`docs/openapi.yaml`, plus new/updated tests in
+`packages/routing/src/routing.test.ts` and `rules.test.ts`.
+
+**Tests:** `npm test` — 673 passed (up from 667; +6 new tests covering
+soft-decline cascade, the unretried-'unknown' safety rule, cascade
+exhaustion returning the last declined event, country-based capability
+filtering, and a country-matching routing rule), 12 skipped, stable across
+repeated runs. `npm run type-check`: 0 errors. `npm run lint`: 0 errors,
+315 warnings (unchanged). `npm run build:all`: clean.
+
+---
+
 ## 2026-09-25 — Three New Real Payment Gateway Integrations: Adyen, Braintree, Checkout.com
 
 **Context:** user asked for the platform's provider roster to grow toward

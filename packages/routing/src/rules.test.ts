@@ -43,6 +43,12 @@ describe('evaluateRule', () => {
     expect(evaluateRule(makeRule({ match: 'channel == whatsapp' }), { channel: 'whatsapp' })).toBe(true);
   });
 
+  it('matches the country field, case-insensitively', () => {
+    expect(evaluateRule(makeRule({ match: 'country == US' }), { country: 'US' })).toBe(true);
+    expect(evaluateRule(makeRule({ match: 'country == us' }), { country: 'US' })).toBe(true);
+    expect(evaluateRule(makeRule({ match: 'country == US' }), { country: 'KE' })).toBe(false);
+  });
+
   it('never matches when the referenced field is absent from context (fails closed)', () => {
     expect(evaluateRule(makeRule({ match: 'currency == USD' }), {})).toBe(false);
     expect(evaluateRule(makeRule({ match: 'channel == sms' }), { currency: 'USD' })).toBe(false);

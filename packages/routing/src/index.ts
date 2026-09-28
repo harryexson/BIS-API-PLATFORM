@@ -131,7 +131,7 @@ export class RoutingEngine {
   // through another provider risks a real double charge on an outcome
   // that isn't actually known to have failed.
   public async routePayment(appId: string, payload: any): Promise<TransactionEvent> {
-    const { currency = 'USD', paymentMethod = 'card', providerOverride } = payload;
+    const { currency = 'USD', paymentMethod = 'card', providerOverride, country } = payload;
     const amount = Number(payload.amount);
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
@@ -158,7 +158,7 @@ export class RoutingEngine {
 
     // 2. Admin-configured routing rule
     if (!selectedProvider) {
-      const ctx: RoutingContext = { currency: currency?.toUpperCase(), amount, paymentMethod };
+      const ctx: RoutingContext = { currency: currency?.toUpperCase(), amount, paymentMethod, country: country?.toUpperCase() };
       const rule = findMatchingRule(this.registry.getEnabledRoutingRules(), ctx);
       if (rule) {
         const provider = this.registry.getProvider(rule.target);
@@ -178,8 +178,8 @@ export class RoutingEngine {
     const capabilities = [paymentMethod];
     if (paymentMethod === 'mobile_money') capabilities.push('mobile_money');
 
-    let candidatePool: RankedCandidate[] = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur);
-    let poolDescription = `capability match for ${cur}/${paymentMethod}`;
+    let candidatePool: RankedCandidate[] = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur, country);
+    let poolDescription = `capability match for ${cur}/${paymentMethod}${country ? `/${String(country).toUpperCase()}` : ''}`;
     if (candidatePool.length === 0) {
       candidatePool = activePayments.filter(p => ['stripe', 'nmi', 'airwallex'].includes(p.id));
       poolDescription = 'global weight-allocation fallback pool';
@@ -206,9 +206,21 @@ export class RoutingEngine {
 
     for (let attempt = 1; ; attempt++) {
       attemptedIds.add(currentProvider.config.id);
+
+      // A soft decline (the provider call succeeded and returned a
+      // definite 'failed' TransactionEvent — a real decline, not an
+      // infrastructure failure) is just as safe to retry via another
+      // provider/acquirer as a thrown error: the charge is known NOT to
+      // have moved money. This is what real orchestration platforms mean
+      // by "retry logic" — without this branch, only network/HTTP-level
+      // failures ever cascaded, and an ordinary declined card silently
+      // returned as failed with no failover, despite the cascade
+      // machinery existing right here.
+      let event: TransactionEvent | undefined;
+      let declineMessage: string | undefined;
       try {
         // P1: Wrap provider call with timeout to prevent hung requests
-        return await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
+        event = await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
       } catch (err: any) {
         if (err instanceof ProviderTimeoutError) {
           return {
@@ -228,17 +240,32 @@ export class RoutingEngine {
             error: err.message,
           };
         }
-
-        const next = fallbackOrder.find(c => !attemptedIds.has(c.id));
-        if (!next || attempt >= MAX_ROUTING_ATTEMPTS) {
-          throw new Error(
-            `Payment routing exhausted after ${attempt} attempt(s) [${Array.from(attemptedIds).join(' -> ')}]: last failure on '${currentProvider.config.name}' (${err.message}).`,
-          );
-        }
-        const nextProvider = this.registry.getProvider(next.id)!;
-        currentReason = `Dynamic Failover (cascading, attempt ${attempt + 1}/${Math.min(MAX_ROUTING_ATTEMPTS, fallbackOrder.length + 1)}): '${currentProvider.config.name}' failed (${err.message}). Trying next-best-ranked '${nextProvider.config.name}'. | ${currentReason}`;
-        currentProvider = nextProvider;
+        declineMessage = err.message;
       }
+
+      // 'success' or the genuinely ambiguous 'unknown' both return
+      // immediately — 'unknown' must never be retried via another
+      // provider for the same double-charge-risk reason a timeout isn't.
+      if (event && event.status !== 'failed') {
+        return event;
+      }
+      if (event) declineMessage = event.error || `provider reported status '${event.status}'`;
+
+      const next = fallbackOrder.find(c => !attemptedIds.has(c.id));
+      if (!next || attempt >= MAX_ROUTING_ATTEMPTS) {
+        // The cascade is exhausted. If the last attempt resolved with a
+        // real (if declined) result, that IS the honest outcome to
+        // return — not a thrown error masking a transaction that
+        // actually completed (as declined) on every provider tried.
+        if (event) return event;
+        throw new Error(
+          `Payment routing exhausted after ${attempt} attempt(s) [${Array.from(attemptedIds).join(' -> ')}]: last failure on '${currentProvider.config.name}' (${declineMessage}).`,
+        );
+      }
+      const nextProvider = this.registry.getProvider(next.id)!;
+      const verb = event ? 'declined' : 'failed';
+      currentReason = `Dynamic Failover (cascading, attempt ${attempt + 1}/${Math.min(MAX_ROUTING_ATTEMPTS, fallbackOrder.length + 1)}): '${currentProvider.config.name}' ${verb} (${declineMessage}). Trying next-best-ranked '${nextProvider.config.name}'. | ${currentReason}`;
+      currentProvider = nextProvider;
     }
   }
 

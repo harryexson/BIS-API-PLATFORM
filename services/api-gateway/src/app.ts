@@ -996,7 +996,7 @@ app.get('/ready', async (req: Request, res: Response) => {
 
 app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
-  const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken } = req.body;
+  const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken, country } = req.body;
   // P1: Accept idempotency key from header — prevents duplicate charges on retries
   const idempotencyKey = req.header('x-idempotency-key');
   
@@ -1025,7 +1025,8 @@ app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantCon
       paymentMethod,
       providerOverride,
       phoneNumber,
-      paymentToken
+      paymentToken,
+      country
     });
 
     // P0: Create a transaction record for state tracking.
@@ -1907,7 +1908,7 @@ app.post('/api/dashboard/playground/dispatch', async (req: Request, res: Respons
   try {
     let event: TransactionEvent;
     if (category === 'payment') {
-      const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken } = fields;
+      const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken, country } = fields;
       event = await routingEngine.routePayment(appId, {
         amount: Number(amount),
         currency,
@@ -1915,6 +1916,7 @@ app.post('/api/dashboard/playground/dispatch', async (req: Request, res: Respons
         providerOverride,
         phoneNumber,
         paymentToken,
+        country,
       });
     } else if (category === 'messaging') {
       const { recipient, content, providerOverride } = fields;

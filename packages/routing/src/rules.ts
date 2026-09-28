@@ -12,6 +12,9 @@ export interface RoutingContext {
   currency?: string;
   amount?: number;
   paymentMethod?: string;
+  // Payments only: ISO 3166-1 alpha-2 country code, as passed on
+  // PaymentRequest.country — see that field's own comment.
+  country?: string;
   // Messaging only: 'sms' | 'whatsapp' | 'email', as resolved in routeMessage.
   channel?: string;
 }
@@ -25,7 +28,7 @@ interface Clause {
   value: string;
 }
 
-const KNOWN_FIELDS = new Set<keyof RoutingContext>(['currency', 'amount', 'paymentMethod', 'channel']);
+const KNOWN_FIELDS = new Set<keyof RoutingContext>(['currency', 'amount', 'paymentMethod', 'country', 'channel']);
 
 /**
  * Parses a rule's `match` string, e.g. "currency == USD" or

@@ -145,6 +145,12 @@ export interface PaymentRequest {
   currency: string;
   paymentMethod: string;
   phoneNumber?: string;
+  // ISO 3166-1 alpha-2 country code (e.g. 'US', 'KE') the transaction is
+  // associated with — the caller's or cardholder's country, not the
+  // merchant's. Optional: when present, routing filters candidates to
+  // providers whose configured `countries` list includes it (or '*');
+  // when absent, routing is unchanged from before this field existed.
+  country?: string;
   metadata?: Record<string, unknown>;
   // A pre-tokenized payment instrument reference the selected provider's
   // own API understands (e.g. a Stripe PaymentMethod id created client-side
