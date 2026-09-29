@@ -104,6 +104,11 @@ const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]>
     { field: 'api_key', label: 'API Key' },
     { field: 'base_url', label: 'Base URL (e.g. xxxx.api.infobip.com)' },
   ],
+  twilio: [
+    { field: 'account_sid', label: 'Account SID' },
+    { field: 'auth_token', label: 'Auth Token' },
+    { field: 'from_number', label: 'From Number (E.164) or Messaging Service SID' },
+  ],
   africastalking: [
     { field: 'api_key', label: 'API Key' },
     { field: 'username', label: 'Username' },

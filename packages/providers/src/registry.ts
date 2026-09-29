@@ -28,6 +28,7 @@ import { ExamplePaymentProvider } from './adapters/payments/example';
 
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
+import { TwilioProvider } from './adapters/messaging/twilio';
 import { AfricasTalkingProvider } from './adapters/messaging/africastalking';
 import { SinchProvider } from './adapters/messaging/sinch';
 import { VibesProvider } from './adapters/messaging/vibes';
@@ -286,6 +287,17 @@ export class ProviderRegistry {
       latencyMin: 90,
       latencyMax: 140,
       messageCost: 0.008
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
+
+    this.register(new TwilioProvider({
+      id: 'twilio',
+      name: 'Twilio',
+      category: 'messaging',
+      status: 'online',
+      weight: 55,
+      latencyMin: 100,
+      latencyMax: 160,
+      messageCost: 0.0079
     }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
 
     this.register(new AfricasTalkingProvider({

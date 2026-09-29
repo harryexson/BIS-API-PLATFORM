@@ -17,6 +17,7 @@ export { ExamplePaymentProvider } from './adapters/payments/example';
 
 export { SignalHouseProvider } from './adapters/messaging/signalhouse';
 export { InfobipProvider } from './adapters/messaging/infobip';
+export { TwilioProvider } from './adapters/messaging/twilio';
 export { FutureSMSProvider } from './adapters/messaging/futuresms';
 export { EmailProvider } from './adapters/messaging/email';
 export { ExampleMessagingProvider } from './adapters/messaging/example';

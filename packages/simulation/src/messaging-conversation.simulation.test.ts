@@ -42,7 +42,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -207,12 +207,12 @@ describe('Provider Selection edge cases', () => {
     // it failed over away from signalhouse to some other real SMS-capable
     // provider, via the dynamic failover path.
     expect(res.body.providerId).not.toBe('signalhouse');
-    expect(['infobip', 'africastalking', 'sinch', 'vibes', 'futuresms', 'example-msg']).toContain(res.body.providerId);
+    expect(['infobip', 'africastalking', 'sinch', 'vibes', 'futuresms', 'example-msg', 'twilio']).toContain(res.body.providerId);
     expect(String(res.body.decisionReason)).toContain('Dynamic Failover');
   });
 
   it('when all SMS providers are offline, an SMS silently falls back to email (documented gap)', async () => {
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 
@@ -235,7 +235,7 @@ describe('Provider Selection edge cases', () => {
     // routing engine now cascades through every remaining ranked candidate
     // (packages/routing/src/index.ts), not a single fixed fallback hop, so
     // proving genuine exhaustion means genuinely exhausting the pool.
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes'];
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
     for (const p of smsProviders) {
       patchProviderProcessRequest(p, async () => {
         await sleep(5);

@@ -24,6 +24,7 @@ describe('RoutingEngine', () => {
     registry.updateProviderConfig('paystack', { status: 'online' });
     registry.updateProviderConfig('square', { status: 'online' });
     registry.updateProviderConfig('infobip', { status: 'online' });
+    registry.updateProviderConfig('twilio', { status: 'online' });
     registry.updateProviderConfig('futuresms', { status: 'online' });
     registry.updateProviderConfig('signalhouse', { status: 'online' });
     registry.updateProviderConfig('africastalking', { status: 'online' });
@@ -180,7 +181,7 @@ describe('RoutingEngine', () => {
       // an unlisted one (this exact bug bit example-msg before). example-msg
       // is a test-environment provider that remains a candidate outside
       // NODE_ENV=production.
-      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking', 'sinch', 'vibes']).toContain(result.providerId);
+      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
@@ -188,8 +189,8 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: 'wa: Hello this is a WhatsApp message'
       });
-      // Both infobip and signalhouse have whatsapp capability
-      expect(['infobip', 'signalhouse']).toContain(result.providerId);
+      // infobip, signalhouse, and twilio all have whatsapp capability
+      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
     });
 
     it('routes long messages to a whatsapp-capable provider', async () => {
@@ -198,7 +199,7 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: longContent
       });
-      expect(['infobip', 'signalhouse']).toContain(result.providerId);
+      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
     });
 
     it('respects manual override for messaging', async () => {
@@ -232,6 +233,7 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('vibes', { status: 'offline' });
       registry.updateProviderConfig('email', { status: 'offline' });
       registry.updateProviderConfig('example-msg', { status: 'offline' });
+      registry.updateProviderConfig('twilio', { status: 'offline' });
 
       await expect(
         engine.routeMessage('testapp', { recipient: '+15005550006', content: 'Hello' })
