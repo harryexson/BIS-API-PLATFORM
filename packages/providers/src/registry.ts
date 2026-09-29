@@ -29,6 +29,7 @@ import { ExamplePaymentProvider } from './adapters/payments/example';
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
 import { TwilioProvider } from './adapters/messaging/twilio';
+import { WhatsAppProvider } from './adapters/messaging/whatsapp';
 import { AfricasTalkingProvider } from './adapters/messaging/africastalking';
 import { SinchProvider } from './adapters/messaging/sinch';
 import { VibesProvider } from './adapters/messaging/vibes';
@@ -299,6 +300,17 @@ export class ProviderRegistry {
       latencyMax: 160,
       messageCost: 0.0079
     }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
+
+    this.register(new WhatsAppProvider({
+      id: 'whatsapp',
+      name: 'WhatsApp Business Platform',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 110,
+      latencyMax: 170,
+      messageCost: 0.005
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['whatsapp'] });
 
     this.register(new AfricasTalkingProvider({
       id: 'africastalking',

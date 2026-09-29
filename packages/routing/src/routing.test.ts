@@ -25,6 +25,7 @@ describe('RoutingEngine', () => {
     registry.updateProviderConfig('square', { status: 'online' });
     registry.updateProviderConfig('infobip', { status: 'online' });
     registry.updateProviderConfig('twilio', { status: 'online' });
+    registry.updateProviderConfig('whatsapp', { status: 'online' });
     registry.updateProviderConfig('futuresms', { status: 'online' });
     registry.updateProviderConfig('signalhouse', { status: 'online' });
     registry.updateProviderConfig('africastalking', { status: 'online' });
@@ -189,8 +190,8 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: 'wa: Hello this is a WhatsApp message'
       });
-      // infobip, signalhouse, and twilio all have whatsapp capability
-      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
+      // infobip, signalhouse, twilio, and whatsapp all have whatsapp capability
+      expect(['infobip', 'signalhouse', 'twilio', 'whatsapp']).toContain(result.providerId);
     });
 
     it('routes long messages to a whatsapp-capable provider', async () => {
@@ -199,7 +200,7 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: longContent
       });
-      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
+      expect(['infobip', 'signalhouse', 'twilio', 'whatsapp']).toContain(result.providerId);
     });
 
     it('respects manual override for messaging', async () => {
@@ -234,6 +235,7 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('email', { status: 'offline' });
       registry.updateProviderConfig('example-msg', { status: 'offline' });
       registry.updateProviderConfig('twilio', { status: 'offline' });
+      registry.updateProviderConfig('whatsapp', { status: 'offline' });
 
       await expect(
         engine.routeMessage('testapp', { recipient: '+15005550006', content: 'Hello' })

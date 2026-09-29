@@ -212,7 +212,12 @@ describe('Provider Selection edge cases', () => {
   });
 
   it('when all SMS providers are offline, an SMS silently falls back to email (documented gap)', async () => {
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
+    // whatsapp is also offlined here even though it isn't SMS-capable: it's
+    // a real, online, non-SMS messaging channel, and if left online it (not
+    // email) becomes the deterministic fallback pick — this test is about
+    // proving the "any channel, not just email" gap, and needs a single
+    // surviving channel (email) to assert against reliably.
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp'];
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 

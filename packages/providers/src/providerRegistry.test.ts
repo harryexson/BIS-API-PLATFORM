@@ -7,11 +7,11 @@ describe('ProviderRegistry', () => {
     const registry = ProviderRegistry.getInstance();
     registry.updateProviderConfig('stripe', { status: 'online' });
   });
-  it('registers exactly 25 providers across the three categories (14 original + Africa\'s Talking + Sinch + Vibes + Adyen + Braintree + Checkout.com + PayPal + Paystack + Square + Twilio + 2 examples)', () => {
+  it('registers exactly 26 providers across the three categories (14 original + Africa\'s Talking + Sinch + Vibes + Adyen + Braintree + Checkout.com + PayPal + Paystack + Square + Twilio + WhatsApp + 2 examples)', () => {
     const configs = ProviderRegistry.getInstance().getAllConfigs();
-    expect(configs).toHaveLength(25);
+    expect(configs).toHaveLength(26);
     expect(configs.filter((c) => c.category === 'payment')).toHaveLength(13);
-    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(9);
+    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(10);
     expect(configs.filter((c) => c.category === 'other')).toHaveLength(3);
   });
 
@@ -159,7 +159,7 @@ describe('ProviderRegistry management surface', () => {
 
   it('runs health checks for all providers', async () => {
     const summaries = await registry.runHealthChecks();
-    expect(summaries.length).toBe(25);
+    expect(summaries.length).toBe(26);
   });
 });
 

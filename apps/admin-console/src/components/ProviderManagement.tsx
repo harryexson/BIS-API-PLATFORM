@@ -109,6 +109,11 @@ const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]>
     { field: 'auth_token', label: 'Auth Token' },
     { field: 'from_number', label: 'From Number (E.164) or Messaging Service SID' },
   ],
+  whatsapp: [
+    { field: 'access_token', label: 'Access Token (System User token recommended)' },
+    { field: 'phone_number_id', label: 'Phone Number ID' },
+    { field: 'app_secret', label: 'App Secret (optional — for webhook verification)' },
+  ],
   africastalking: [
     { field: 'api_key', label: 'API Key' },
     { field: 'username', label: 'Username' },
