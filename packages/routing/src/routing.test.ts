@@ -17,6 +17,12 @@ describe('RoutingEngine', () => {
     registry.updateProviderConfig('pawapay', { status: 'online' });
     registry.updateProviderConfig('paychangu', { status: 'online' });
     registry.updateProviderConfig('airwallex', { status: 'online' });
+    registry.updateProviderConfig('adyen', { status: 'online' });
+    registry.updateProviderConfig('braintree', { status: 'online' });
+    registry.updateProviderConfig('checkout', { status: 'online' });
+    registry.updateProviderConfig('paypal', { status: 'online' });
+    registry.updateProviderConfig('paystack', { status: 'online' });
+    registry.updateProviderConfig('square', { status: 'online' });
     registry.updateProviderConfig('infobip', { status: 'online' });
     registry.updateProviderConfig('futuresms', { status: 'online' });
     registry.updateProviderConfig('signalhouse', { status: 'online' });
@@ -78,8 +84,9 @@ describe('RoutingEngine', () => {
         expect(result.category).toBe('payment');
         expect(result.status).toBe('success');
         // Multiple providers support card for these currencies (including example-pay)
-        // Stripe may be selected as fallback for unsupported currencies like ZAR
-        expect(['flutterwave', 'nmi', 'airwallex', 'example-pay', 'stripe']).toContain(result.providerId);
+        // Stripe may be selected as fallback for unsupported currencies like ZAR.
+        // Paystack (NGN/GHS/ZAR/KES) is a real, legitimate candidate here too.
+        expect(['flutterwave', 'nmi', 'airwallex', 'example-pay', 'stripe', 'paystack']).toContain(result.providerId);
       }
     });
 
@@ -137,6 +144,7 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('adyen', { status: 'offline' });
       registry.updateProviderConfig('braintree', { status: 'offline' });
       registry.updateProviderConfig('checkout', { status: 'offline' });
+      registry.updateProviderConfig('square', { status: 'offline' });
 
       await expect(
         engine.routePayment('testapp', { amount: 100, currency: 'USD', paymentMethod: 'card' })
@@ -456,7 +464,7 @@ describe('RoutingEngine', () => {
       const registry = ProviderRegistry.getInstance();
       // Narrow the candidate pool to exactly 2 (stripe + nmi) so both can be
       // deterministically stubbed to decline and the cascade exhausts.
-      const sidelined = ['flutterwave', 'pawapay', 'paychangu', 'airwallex', 'example-pay', 'adyen', 'braintree', 'checkout'];
+      const sidelined = ['flutterwave', 'pawapay', 'paychangu', 'airwallex', 'example-pay', 'adyen', 'braintree', 'checkout', 'square'];
       for (const id of sidelined) registry.updateProviderConfig(id, { status: 'offline' });
 
       const stripe = registry.getProvider('stripe')!;
@@ -464,21 +472,26 @@ describe('RoutingEngine', () => {
       const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce(declinedEvent('stripe', 'stub'));
       const nmiSpy = vi.spyOn(nmi, 'processRequest').mockResolvedValueOnce(declinedEvent('nmi', 'stub'));
 
-      const result = await engine.routePayment('testapp', {
-        amount: 100,
-        currency: 'USD',
-        paymentMethod: 'card',
-        providerOverride: 'stripe',
-      });
+      try {
+        const result = await engine.routePayment('testapp', {
+          amount: 100,
+          currency: 'USD',
+          paymentMethod: 'card',
+          providerOverride: 'stripe',
+        });
 
-      expect(result.status).toBe('failed');
-      expect(result.providerId).toBe('nmi');
-      expect(stripeSpy).toHaveBeenCalledTimes(1);
-      expect(nmiSpy).toHaveBeenCalledTimes(1);
-
-      stripeSpy.mockRestore();
-      nmiSpy.mockRestore();
-      for (const id of sidelined) registry.updateProviderConfig(id, { status: 'online' });
+        expect(result.status).toBe('failed');
+        expect(result.providerId).toBe('nmi');
+        expect(stripeSpy).toHaveBeenCalledTimes(1);
+        expect(nmiSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        // Always restore, even on assertion failure — otherwise a failure
+        // here leaves these providers offline for every later test in this
+        // file (a real bug this fix closes, not just this test's own).
+        stripeSpy.mockRestore();
+        nmiSpy.mockRestore();
+        for (const id of sidelined) registry.updateProviderConfig(id, { status: 'online' });
+      }
     });
   });
 

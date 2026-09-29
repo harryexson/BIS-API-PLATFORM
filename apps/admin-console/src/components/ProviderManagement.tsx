@@ -87,6 +87,19 @@ const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]>
     { field: 'client_id', label: 'Client ID (used to derive the per-merchant API subdomain)' },
     { field: 'webhook_signing_key', label: 'Webhook Signing Key (optional — from the Workflows webhook action)' },
   ],
+  paypal: [
+    { field: 'client_id', label: 'Client ID' },
+    { field: 'client_secret', label: 'Client Secret' },
+  ],
+  paystack: [
+    { field: 'api_key', label: 'Secret Key' },
+  ],
+  square: [
+    { field: 'access_token', label: 'Access Token' },
+    { field: 'location_id', label: 'Location ID (optional — defaults to the main location)' },
+    { field: 'webhook_signature_key', label: 'Webhook Signature Key (optional)' },
+    { field: 'webhook_notification_url', label: 'Webhook Notification URL (must match the subscription exactly)' },
+  ],
   infobip: [
     { field: 'api_key', label: 'API Key' },
     { field: 'base_url', label: 'Base URL (e.g. xxxx.api.infobip.com)' },
