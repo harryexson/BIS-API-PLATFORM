@@ -114,6 +114,11 @@ const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]>
     { field: 'phone_number_id', label: 'Phone Number ID' },
     { field: 'app_secret', label: 'App Secret (optional — for webhook verification)' },
   ],
+  vonage: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'api_secret', label: 'API Secret' },
+    { field: 'from_number', label: 'From (sender ID or virtual number)' },
+  ],
   africastalking: [
     { field: 'api_key', label: 'API Key' },
     { field: 'username', label: 'Username' },

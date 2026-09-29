@@ -45,7 +45,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'stripe', 'nmi', 'email'];
+const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'vonage', 'stripe', 'nmi', 'email'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -207,7 +207,7 @@ describe('R4 — all SMS providers offline: silent channel change (GAP)', () => 
     // whatsapp is also offlined here even though it isn't SMS-capable: it's
     // a real, online, non-SMS messaging channel that would otherwise
     // intercept the fallback before email, undermining this test's proof.
-    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp'];
+    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'vonage'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
       const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);
@@ -246,7 +246,7 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
     // genuinely exhausts every ranked candidate -> 503. Breaking only a
     // second provider is no longer enough to prove exhaustion now that
     // routing cascades through more than one fallback.
-    const sms = ['signalhouse', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
+    const sms = ['signalhouse', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
     for (const p of sms) {
       patchProvider(p, async () => {
         throw new Error('down');

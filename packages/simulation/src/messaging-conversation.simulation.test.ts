@@ -42,7 +42,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -207,7 +207,7 @@ describe('Provider Selection edge cases', () => {
     // it failed over away from signalhouse to some other real SMS-capable
     // provider, via the dynamic failover path.
     expect(res.body.providerId).not.toBe('signalhouse');
-    expect(['infobip', 'africastalking', 'sinch', 'vibes', 'futuresms', 'example-msg', 'twilio']).toContain(res.body.providerId);
+    expect(['infobip', 'africastalking', 'sinch', 'vibes', 'futuresms', 'example-msg', 'twilio', 'vonage']).toContain(res.body.providerId);
     expect(String(res.body.decisionReason)).toContain('Dynamic Failover');
   });
 
@@ -217,7 +217,7 @@ describe('Provider Selection edge cases', () => {
     // email) becomes the deterministic fallback pick — this test is about
     // proving the "any channel, not just email" gap, and needs a single
     // surviving channel (email) to assert against reliably.
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp'];
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'vonage'];
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 
@@ -240,7 +240,7 @@ describe('Provider Selection edge cases', () => {
     // routing engine now cascades through every remaining ranked candidate
     // (packages/routing/src/index.ts), not a single fixed fallback hop, so
     // proving genuine exhaustion means genuinely exhausting the pool.
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
     for (const p of smsProviders) {
       patchProviderProcessRequest(p, async () => {
         await sleep(5);

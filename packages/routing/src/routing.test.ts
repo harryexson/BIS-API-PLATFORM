@@ -26,6 +26,7 @@ describe('RoutingEngine', () => {
     registry.updateProviderConfig('infobip', { status: 'online' });
     registry.updateProviderConfig('twilio', { status: 'online' });
     registry.updateProviderConfig('whatsapp', { status: 'online' });
+    registry.updateProviderConfig('vonage', { status: 'online' });
     registry.updateProviderConfig('futuresms', { status: 'online' });
     registry.updateProviderConfig('signalhouse', { status: 'online' });
     registry.updateProviderConfig('africastalking', { status: 'online' });
@@ -182,7 +183,7 @@ describe('RoutingEngine', () => {
       // an unlisted one (this exact bug bit example-msg before). example-msg
       // is a test-environment provider that remains a candidate outside
       // NODE_ENV=production.
-      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio']).toContain(result.providerId);
+      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
@@ -236,6 +237,7 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('example-msg', { status: 'offline' });
       registry.updateProviderConfig('twilio', { status: 'offline' });
       registry.updateProviderConfig('whatsapp', { status: 'offline' });
+      registry.updateProviderConfig('vonage', { status: 'offline' });
 
       await expect(
         engine.routeMessage('testapp', { recipient: '+15005550006', content: 'Hello' })
