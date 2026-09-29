@@ -26,6 +26,29 @@ snapshot of what exists today, before any further phase begins.
 > wired, but the *query* it called down to wasn't actually filtering on
 > the fields it appeared to.
 
+> **2026-09-29 addendum — six new real provider adapters:** three payment
+> gateways (PayPal, Paystack, Square) and three messaging providers
+> (Twilio, WhatsApp Business Platform, Vonage) were added, each following
+> this document's existing "real HTTP + simulated fallback, WebSearch-
+> verified, honest status mapping" pattern — see the adapter table in §2
+> for each one's specifics, and `docs/IMPLEMENTATION_CHANGELOG.md` for the
+> full build notes. This brings the registry to 13 payment providers and
+> 11 messaging providers (27 total, including the 2 reference/example
+> adapters). §4 item 1 below predates this addition and still describes
+> an earlier state (six payment providers) — treat the §2 adapter table
+> as the current source of truth for provider count and status, not the
+> narrative prose in §4.
+>
+> Separately, a real Stripe test-mode secret/publishable key pair was
+> supplied and wired into this environment's local `.env` (gitignored,
+> never committed) — `StripeProvider.isConfigured()` now returns `true`.
+> Live verification against `api.stripe.com` from this sandbox is blocked
+> by its outbound network policy (confirmed via direct `curl`, not a
+> transient failure); the key only takes effect for real once the app is
+> deployed somewhere with outbound internet access, which is separately
+> blocked — see the Vercel deployment gap tracked elsewhere in this repo's
+> task history.
+
 ---
 
 ## 1. Repository Shape
@@ -116,6 +139,9 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | Africa's Talking | `messaging/africastalking.ts` | **Real HTTP** (2026-09-08) — falls back to simulated when credentials unset |
 | Sinch | `messaging/sinch.ts` | **Real HTTP** (2026-09-09) — falls back to simulated when credentials unset |
 | Vibes | `messaging/vibes.ts` | **Real HTTP** (2026-09-09) — **lower confidence**: submit path and response schema inferred, not directly observed; see the adapter's class comment. Falls back to simulated when credentials unset |
+| Twilio | `messaging/twilio.ts` | **Real HTTP** (2026-09-29) — Programmable Messaging API (`Accounts/{sid}/Messages.json`); HTTP Basic auth (`AccountSid:AuthToken`), form-urlencoded body. Handles both SMS and WhatsApp (via a `whatsapp:` prefix on `To`/`From` when `payload.metadata.channel === 'whatsapp'`). "Accepted for processing" convention: any synchronous status other than `failed`/`undelivered` reports `'success'`, matching `infobip.ts`. Falls back to simulated when the account SID, auth token, or from-number is unset. Native webhook signature verification deliberately not implemented — Twilio's `X-Twilio-Signature` scheme needs the exact full public URL plus every POST param sorted alphabetically, HMAC-SHA1'd, which Twilio's own docs warn is easy to get subtly wrong without a live account |
+| WhatsApp Business Platform | `messaging/whatsapp.ts` | **Real HTTP** (2026-09-29) — Meta Cloud API (`/{phone_number_id}/messages`), Bearer auth. No delivery-status field in the synchronous response — success is inferred from a 2xx plus a returned message id. Honestly surfaces Meta's real 24-hour customer-service-window rejection (error 131047) as `'failed'` rather than masking it; template messages (the only way to message outside that window) are deliberately not implemented — no template name/params data this platform has. Webhook verification **is** implemented, reusing the platform's generic hex-HMAC-SHA256 helper since Meta's `x-hub-signature-256` scheme matches it exactly. Falls back to simulated when the access token or phone number id is unset |
+| Vonage (Nexmo) | `messaging/vonage.ts` | **Real HTTP** (2026-09-29) — classic SMS API (`rest.nexmo.com/sms/json`), `api_key`/`api_secret`/`to`/`from`/`text` as a form-urlencoded body. Unlike Twilio/Infobip's "accepted for processing" convention, this API's response is synchronous and definitive per message: status `"0"` is the only success code, every other value (throttled, invalid params, bad credentials, internal error) is a real, immediate rejection mapped to `'failed'`, never `'unknown'`. Falls back to simulated when the API key, API secret, or from-number is unset. Native webhook signature verification deliberately not implemented — only signed when the account has opted into "Signed Webhooks," with a per-account hash algorithm this adapter has no way to know without a live account |
 | ~~Generic SMS~~ | ~~`messaging/sms.ts`~~ | **Removed 2026-09-15** — dead code: never imported by `registry.ts` or exported from the package's `index.ts`, so it was permanently unreachable; its `.env.example` gap the earlier audit found was this file's, and it's gone with it |
 | Email | `messaging/email.ts` | **Simulated** |
 | FutureSMS | `messaging/futuresms.ts` | **Simulated**, explicitly a placeholder/example provider |
@@ -129,6 +155,9 @@ see §7): `PRODUCTION_READINESS_REPORT.md`, `FINAL_CERTIFICATION_REPORT.md`,
 | Adyen | `payments/adyen.ts` | **Real HTTP** (2026-09-25) — Checkout API; same `paymentToken`-gated fallback (mapped to `storedPaymentMethodId`), plus `shopperReference` from `payload.metadata` (falling back to `appId`). Structural quirk: no fixed live host — a per-merchant `live_url_prefix` secret is required for the *live* environment specifically (test host is fixed). Auth is `X-API-Key`, not Bearer — the one exception in this package. Refunds always return `'unknown'` (Adyen's refund endpoint only ever synchronously reports "received"; the real outcome is async via webhook, not built). Native webhook signature verification deliberately not implemented — Adyen's real scheme is a complex per-item HMAC, not a simple raw-body signature |
 | Braintree | `payments/braintree.ts` | **Real HTTP** (2026-09-25) — GraphQL API (a single `POST /graphql` endpoint, not REST); `paymentToken` maps directly to `paymentMethodId`, no extra metadata field required. Structural quirk: amounts are **decimal strings** (e.g. `"49.99"`), not minor-unit integers, unlike every other adapter in this package. Charge success spans `AUTHORIZED` through `SETTLED` (funds captured immediately), but refund success requires `SETTLED` specifically — `SUBMITTED_FOR_SETTLEMENT`/`SETTLING`/`AUTHORIZED` report `'unknown'` on a refund, never a fabricated success |
 | Checkout.com | `payments/checkout.ts` | **Real HTTP** (2026-09-25) — Payments API (NAS platform); `paymentToken` sent as `source: { type: 'token', token }`. Structural quirk: every request must go to a per-merchant subdomain (`{prefix}.api(.sandbox).checkout.com`, `prefix` mechanically derived from the first 8 characters of `client_id`) in **both** environments — there is no shared fallback host. Refunds are asynchronous by Checkout.com's own documentation (a `202` only confirms submission, not outcome) and always report `'unknown'`. Webhook signature verification **is** implemented — `Cko-Signature` is a plain HMAC-SHA256 hex digest of the raw body, the same scheme this platform's generic check already uses, just keyed by Checkout.com's own signing key |
+| PayPal | `payments/paypal.ts` | **Real HTTP** (2026-09-29) — Orders API (`/v2/checkout/orders`), OAuth2 client-credentials (cached Bearer token). `paymentToken` maps to `payment_source.paypal.vault_id` — this platform charges merchant-initiated *vaulted* instruments, not PayPal's normal buyer-approves-first redirect flow, which doesn't fit a server-to-server gateway with no customer-facing redirect surface. The `TransactionEvent.id` is the capture id (`purchase_units[0].payments.captures[0].id`), not the order id — refunds need the capture id, not the order id. Webhook signature verification deliberately not implemented — PayPal's real scheme requires a server-side round-trip to PayPal's own verify-webhook-signature endpoint, not a local computation |
+| Paystack | `payments/paystack.ts` | **Real HTTP** (2026-09-29) — `charge_authorization` endpoint (not the redirect-based `initialize` endpoint); `paymentToken` maps to `authorization_code`, requires a customer email from `payload.metadata.email`. Two-layer status: a top-level `status: boolean` (API-call success) plus `data.status` (the real outcome — `'success'`/`'failed'`/`'abandoned'` etc, the last mapping to `'unknown'`). Webhook signature verification **is** implemented — custom HMAC-SHA512 (not this platform's SHA256 default) of the raw body, hex, keyed by the same secret key (no separate webhook secret) |
+| Square | `payments/square.ts` | **Real HTTP** (2026-09-29) — Payments API (`/v2/payments`); `paymentToken` maps to `source_id` (a card-on-file id), paired with a required `customer_id` from `payload.metadata.squareCustomerId`. Structural quirk: every request needs a `Square-Version` header pinned to a specific API date. Webhook signature verification **is** implemented — custom HMAC-SHA256 of `notification_url + raw_body` (concatenated, no separator), base64-encoded (not hex), keyed by a separate signing key; needs the exact registered subscription URL as an additional secret since the URL itself is part of the signed content |
 | Trembi | *(no file)* | **Not a payment provider** — investigated 2026-09-15 (see §4 item 1a): trembi.com is a sales/marketing automation platform (leads, email/SMS/WhatsApp campaigns) with its own "Messaging API," and itself uses a third party (ElemiTech) for its own payment processing. No payments API exists to build an adapter against. Flagging this rather than leaving it as unstarted work, so a future pass doesn't retry the same dead end |
 | Example (payments) | `payments/example.ts` | **Simulated**, reference implementation only |
 

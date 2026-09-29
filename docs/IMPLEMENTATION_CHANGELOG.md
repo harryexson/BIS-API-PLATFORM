@@ -6,6 +6,184 @@ tests cover it.
 
 ---
 
+## 2026-09-29 — Six New Real Provider Adapters (PayPal, Paystack, Square, Twilio, WhatsApp, Vonage) + Stripe Test Key
+
+**Context:** user asked to "automatically connect Stripe for subscriptions"
+and to add more providers, scoped via two rounds of `AskUserQuestion`:
+Stripe → get the existing adapter live with a real test key (not build a
+new subscription-billing engine); new providers → all three payment
+gateways offered (PayPal, Paystack, Square) and all three messaging
+providers offered (Twilio, WhatsApp Business Platform, Vonage), plus a
+"new category entirely" the user selected but never named — still open,
+tracked as a follow-up. Each adapter follows this repo's established
+discipline: WebSearch-verify every real API fact against current public
+docs before writing code, document the verification date and an explicit
+"built from real, current documentation, not certified against a live
+sandbox" caveat, real HTTP with a labeled simulated fallback whenever
+credentials or a required instrument (`paymentToken`/equivalent) are
+missing, and honest three-state status mapping (`'success'`/`'failed'`/
+`'unknown'`, the last only for genuinely ambiguous/async outcomes).
+
+### PayPal (`packages/providers/src/adapters/payments/paypal.ts`)
+
+Orders API (`/v2/checkout/orders`), OAuth2 client-credentials with a
+cached Bearer token (same pattern as `airwallex.ts`'s login cache).
+`paymentToken` maps to `payment_source.paypal.vault_id` — PayPal's normal
+Orders flow is buyer-approves-first (a redirect), which doesn't fit this
+gateway's server-to-server, no-customer-facing-redirect design; vaulted/
+merchant-initiated charging was the real, documented alternative.
+`TransactionEvent.id` is the **capture id**
+(`purchase_units[0].payments.captures[0].id`), not the order id — refunds
+need the capture id. Status: `COMPLETED`→success, `VOIDED`→failed, else
+(incl. `PAYER_ACTION_REQUIRED`)→unknown. Webhook signature verification
+deliberately not implemented — PayPal's real scheme requires a
+server-side round-trip to PayPal's own verify-webhook-signature endpoint,
+not a local computation. 16 tests.
+
+### Paystack (`packages/providers/src/adapters/payments/paystack.ts`)
+
+`charge_authorization` endpoint (not the redirect-based `initialize`
+endpoint) — `paymentToken` maps to `authorization_code`, requires a
+customer email from `payload.metadata.email`. Two-layer status: top-level
+`status: boolean` (API-call success) plus `data.status` (the real outcome
+— `'success'`/`'failed'`/`'abandoned'` etc., the last mapping to
+`'unknown'`). Webhook signature verification **is** implemented — a
+custom HMAC-SHA512 (Paystack's real scheme; this platform's generic check
+is hardcoded to SHA256) of the raw body, hex, keyed by the same secret key
+(no separate webhook secret). 15 tests.
+
+### Square (`packages/providers/src/adapters/payments/square.ts`)
+
+Payments API (`/v2/payments`) — `paymentToken` maps to `source_id` (a
+card-on-file id), paired with a required `customer_id` from
+`payload.metadata.squareCustomerId`. Requires a `Square-Version` header
+pinned to a specific API date (a lower-confidence, date-pinned constant —
+flagged in the class comment). Webhook signature verification **is**
+implemented — a custom HMAC-SHA256 of `notification_url + raw_body`
+(concatenated, no separator), base64-encoded (not hex, unlike this
+platform's other custom schemes), keyed by a separate signing key; needs
+the exact registered subscription URL as an additional secret since the
+URL itself is part of the signed content. 19 tests.
+
+### Twilio (`packages/providers/src/adapters/messaging/twilio.ts`)
+
+Programmable Messaging API (`Accounts/{sid}/Messages.json`), HTTP Basic
+auth (`AccountSid:AuthToken`), form-urlencoded body — the industry's most
+standard SMS API, and a real gap this package had despite integrating
+many smaller/regional providers. Handles both SMS and WhatsApp via a
+`whatsapp:` prefix on `To`/`From` when `payload.metadata.channel ===
+'whatsapp'`. "Accepted for processing" convention (matching `infobip.ts`):
+any synchronous status other than `failed`/`undelivered` reports
+`'success'` — real delivery confirmation is async, via a status-callback
+webhook this platform doesn't consume. Webhook signature verification
+deliberately not implemented — Twilio's `X-Twilio-Signature` scheme needs
+the exact full public URL plus every POST param sorted alphabetically,
+HMAC-SHA1'd; Twilio's own docs warn this is easy to get subtly wrong
+without a live account. Registered with the highest weight (55) of any
+messaging provider and both `sms`+`whatsapp` capabilities, so its
+addition caused the broadest test fallout of the six (14 failures,
+systematically fixed — see Files changed). 14 tests.
+
+### WhatsApp Business Platform (`packages/providers/src/adapters/messaging/whatsapp.ts`)
+
+Meta Cloud API (`/{phone_number_id}/messages`), Bearer auth. No
+delivery-status field in the synchronous response — success is inferred
+from a 2xx status plus a returned message id. Honestly surfaces Meta's
+real 24-hour customer-service-window rejection (error 131047) as
+`'failed'` rather than masking it, verified via WebSearch against the
+real error text. Template messages (the only way to message outside that
+window) are deliberately not implemented — no template name/params data
+this platform has, documented as a known limitation rather than silently
+unsupported. Webhook verification **is** implemented, reusing
+`BaseProvider.verifyWebhookSignature()` directly (not a custom
+implementation) — Meta's `x-hub-signature-256` scheme (`sha256=` + hex
+HMAC-SHA256 of the raw body) matches this platform's generic check
+exactly. Registered with `capabilities: ['whatsapp']` only (no `'sms'`),
+distinguishing it from Twilio/Infobip. 10 tests.
+
+### Vonage (`packages/providers/src/adapters/messaging/vonage.ts`)
+
+Classic SMS API (`rest.nexmo.com/sms/json`) — chosen over the newer
+multi-channel Messages API, which adds JWT/application-id auth this
+platform's single-channel merchant-initiated sends don't need.
+`api_key`/`api_secret`/`to`/`from`/`text` as a form-urlencoded body.
+Unlike Twilio/Infobip's "accepted for processing" convention, this API's
+response is synchronous and definitive per message: status `"0"` is the
+only success code, every other value (throttled, invalid params, bad
+credentials, internal error) is a real, immediate rejection mapped to
+`'failed'`, never `'unknown'`. Webhook signature verification
+deliberately not implemented — only signed when the account has opted
+into "Signed Webhooks," with a per-account hash algorithm this adapter
+has no way to know without a live account. 12 tests.
+
+### Stripe test-mode key
+
+A real Stripe test-mode secret/publishable key pair was supplied by the
+user mid-session and wired into this environment's local `.env`
+(gitignored, never committed to the repository or referenced in any
+commit). `StripeProvider.isConfigured()` was confirmed to return `true`
+with the real key. Live verification against `api.stripe.com` from this
+sandbox is blocked by its outbound network egress policy (confirmed via
+two separate direct `curl` attempts returning the same `403
+connect_rejected`, not a transient failure) — the key only takes effect
+for real once the app is deployed somewhere with outbound internet
+access, which is separately blocked (Vercel re-authentication gap, see
+task history). No code change was needed or made for this — the adapter
+already correctly gated on `isConfigured()`.
+
+### Files changed
+
+New: `paypal.ts`/`.test.ts`, `paystack.ts`/`.test.ts`, `square.ts`/`.test.ts`,
+`twilio.ts`/`.test.ts`, `whatsapp.ts`/`.test.ts`, `vonage.ts`/`.test.ts` (all
+under `packages/providers/src/adapters/{payments,messaging}/`).
+`packages/providers/src/registry.ts` (6 new registrations) and `index.ts`
+(6 new exports). `apps/admin-console/src/components/ProviderManagement.tsx`
+(secret-field definitions for all 6). `.env.example` (all 6 providers' env
+vars documented). Registry-growth fallout, fixed mechanically across all
+six additions: provider-count assertions in `management.test.ts` /
+`providerRegistry.test.ts` (24→27 total, payment 13, messaging 8→11);
+per-capability tolerance lists and offline-exhaustion tests in
+`packages/routing/src/routing.test.ts` and the `packages/simulation/src/`
+suite (`application-certification`, `messaging-conversation`,
+`resilience-failure`) — every SMS-capable addition (Twilio, Vonage) needed
+adding to every SMS tolerance/offline list; WhatsApp and Vonage both
+needed adding to the "all SMS providers offline, falls back to email"
+gap tests specifically, since a real, online, non-SMS-capable messaging
+provider left online there would otherwise intercept the fallback before
+email, undermining what those tests prove. Two pre-existing, unrelated
+test-hygiene bugs found and fixed while debugging Square's fallout in
+`routing.test.ts`: the global `afterEach` provider-restoration block had
+never been updated for Adyen/Braintree/Checkout.com from an earlier
+phase (now fixed, along with adding every provider from this phase); one
+test restored sidelined-provider state after its own assertions instead
+of in a `finally` block, so a thrown assertion left providers offline for
+every later test in the file — now wrapped in `try`/`finally`.
+
+**Database migrations:** none
+
+**API changes:** none (all 6 are additive provider registrations; no route
+signature changes)
+
+**Security changes:** none beyond each adapter's own webhook-signature
+verification described above (2 of 6 implement a real scheme: Paystack,
+Square; WhatsApp reuses the existing generic HMAC helper since its scheme
+matches; PayPal/Twilio/Vonage deliberately decline, each documented)
+
+**Tests:** `npm test` — 767 passed (up from 681 before this phase), 12
+skipped, stable across 3 repeated runs given weighted-random provider
+selection. `npm run type-check`: 0 errors. `npm run lint`: 0 errors, 331
+warnings (pre-existing, unrelated to this phase). `npm run build:all`:
+clean.
+
+**Known issues carried forward:** the "new category" of provider the user
+selected via `AskUserQuestion` but never named remains unresolved — needs
+a follow-up question before any work can start on it. Stripe's real
+test-mode key is wired but unverified end-to-end (network-blocked from
+this sandbox, see above). The Vercel deployment gap (403
+re-authentication error) is unrelated to this phase and remains open.
+
+---
+
 ## 2026-09-28 — Fraud Scoring (Stripe Radar) + SCA/3D Secure Handling
 
 **Context:** user picked, from the routing-capability audit above,
