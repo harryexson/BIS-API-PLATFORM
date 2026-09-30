@@ -52,3 +52,6 @@ EHthumbs.db
 
 # Prisma
 packages/database/prisma/migrations/**/migration_lock.toml
+
+# Claude Code agent worktrees (local tooling, not project content)
+.claude/worktrees/
