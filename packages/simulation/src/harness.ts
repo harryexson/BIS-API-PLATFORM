@@ -532,8 +532,17 @@ export async function drain(
     label: 'drain in-flight',
   });
 
-  // settle: let any final emits / microtasks flush
-  await sleep(60);
+  // settle: let any final emits / microtasks flush. A fixed sleep, not a
+  // polled condition, because there's nothing to poll for here — this is
+  // purely giving the event loop room to run whatever the just-completed
+  // job's own .then()/microtask chain still has queued (e.g. an
+  // eventBus.emit() call after the job's status already flipped to
+  // 'completed', which is what getInFlight()===0 above actually tracks).
+  // 60ms was comfortable on a quiet machine but measurably flaky running
+  // the full ~600-test suite in parallel across every CPU core (real wall-
+  // clock time per event-loop tick stretches under that contention) —
+  // 300ms held up across repeated full-suite runs where 60ms didn't.
+  await sleep(300);
 }
 
 export async function stopWorker(handle: WorkerHandle): Promise<void> {

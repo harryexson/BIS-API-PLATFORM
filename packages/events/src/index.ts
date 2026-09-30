@@ -15,9 +15,17 @@ const HISTORY_KEY = 'bis:event_history';
 // (token = history.length at mark time; once history is capped, length
 // stops growing even as events keep flowing, so "events since token"
 // always read back as zero) — e.g. donation-system.simulation.test.ts's
-// giving-receipt assertions. 20,000 gives a full suite run comfortable
-// headroom while still bounding memory (each TransactionEvent is small).
-const MAX_HISTORY = 20_000;
+// giving-receipt assertions. Several unrelated simulation test files also
+// filter getHistory() by event *timestamp*, not array position — so it's
+// not just "since token" arithmetic that breaks near the cap, it's the
+// underlying event actually getting evicted (popped) from the shared
+// singleton's bounded array by the sheer combined volume of every other
+// concurrently-running test before this test ever reads it back. 200,000
+// gives a full suite run comfortable headroom — some tests (e.g.
+// resilience-failure's R10) deliberately push thousands of jobs/events
+// through in a single test — while still bounding memory for a
+// long-running production process (each TransactionEvent is small).
+const MAX_HISTORY = 200_000;
 const HISTORY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
