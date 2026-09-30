@@ -71,9 +71,9 @@ export abstract class BaseProvider {
         };
 
         if (body && method !== 'GET') {
-          // A pre-serialized string body (e.g. a URLSearchParams-encoded form
-          // body, as Twilio's API requires) is sent as-is; anything else is
-          // assumed to be a JSON-serializable object.
+          // Pass pre-serialized string bodies through as-is (e.g. XML for
+          // providers that don't speak JSON) — a caller-supplied
+          // Content-Type header above already overrides the JSON default.
           fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
         }
 
@@ -157,43 +157,53 @@ export abstract class BaseProvider {
     return timingSafeEqual(a, b);
   }
 
-  // Simulates provider processing delay (for simulated mode)
-  protected async simulateLatency(): Promise<number> {
-    const min = this.config.latencyMin;
-    const max = this.config.latencyMax;
-    const latency = Math.floor(Math.random() * (max - min + 1) + min);
-    await new Promise((resolve) => setTimeout(resolve, latency));
-    return latency;
+  /**
+   * Verifies this provider's own native inbound-webhook signature scheme
+   * — the real header format and algorithm the provider itself documents
+   * (e.g. Stripe's `Stripe-Signature: t=...,v1=...`), not the platform's
+   * generic `WEBHOOK_HMAC_SECRET` fallback every provider uses today.
+   *
+   * Returns:
+   *   - `null` — no real per-provider scheme is implemented for this
+   *     adapter, OR one is implemented but no webhook secret is
+   *     configured for it. The caller (the gateway's webhook route)
+   *     should fall back to the generic platform HMAC check.
+   *   - `true`/`false` — a real scheme ran and the request did or didn't
+   *     pass it. Once a provider's native secret is configured, this is
+   *     authoritative — the caller must not additionally fall back to
+   *     the generic check on `false` (that would let an attacker bypass
+   *     the provider's real protection by supplying a valid platform
+   *     signature instead of a valid provider one).
+   *
+   * Each adapter's override was verified against that provider's real,
+   * current documentation (WebSearch, 2026-09-17) before being written —
+   * see docs/providers/ADDING_A_PROVIDER.md and each override's own
+   * comment for the source. The default here (no override) is honest:
+   * this base class has no way to know a provider's real scheme, so it
+   * always defers to the platform fallback rather than guessing.
+   */
+  public async verifyProviderWebhookSignature(
+    _rawBody: string,
+    _headers: Record<string, string | undefined>,
+  ): Promise<boolean | null> {
+    return null;
   }
-
-  // Public wrapper used by health checks to measure current latency.
-  public async measureLatency(): Promise<number> {
-    return this.simulateLatency();
-  }
-
-  // Checks status, throwing error if not online
-  protected verifyAvailability() {
-    if (this.config.status === 'offline') {
-      throw new Error(`Provider ${this.config.name} is currently OFFLINE`);
-    }
-    if (this.config.status === 'maintenance') {
-      throw new Error(`Provider ${this.config.name} is undergoing MAINTENANCE`);
-    }
-  }
-
-  abstract processRequest(
-    appId: string,
-    payload: PaymentRequest | MessageRequest | OtherRequest,
-    decisionReason: string
-  ): Promise<TransactionEvent>;
 
   /**
-   * Refunds a previously captured payment.
+   * Refunds a previously captured payment. `payload.originalTransactionId`
+   * is this adapter's own id for that charge (whatever it returned as
+   * TransactionEvent.id when it succeeded — e.g. Stripe's PaymentIntent
+   * id) — the caller (services/api-gateway's POST /v1/portal/refunds or
+   * /v1/api/gateway/refund route) resolves that from the platform's own
+   * `transactions` table, never from client input directly.
    *
-   * Default implementation simulates the refund — payment adapters with a
-   * real refund API (currently Stripe) override this to call it for real
-   * when credentials are configured, matching the same real-with-simulated-
-   * fallback pattern as processRequest().
+   * The default here simulates a successful refund — payment adapters with
+   * a real, WebSearch-verified refund API override this to call it for
+   * real when credentials are configured, matching the same
+   * real-with-simulated-fallback pattern as processRequest(). Adapters
+   * that have never had their refund API verified against real
+   * documentation keep this simulated default rather than claiming false
+   * confidence — see docs/providers/ADDING_A_PROVIDER.md.
    */
   async refund(appId: string, payload: RefundRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
@@ -221,4 +231,73 @@ export abstract class BaseProvider {
       },
     };
   }
+
+  /**
+   * Encodes params as application/x-www-form-urlencoded, the body format
+   * several payment gateways (Stripe, NMI) require instead of JSON — a
+   * JSON body against those APIs is rejected outright, not merely
+   * misparsed. One level of nested-object flattening via bracket notation
+   * (e.g. { metadata: { appId: 'x' } } -> "metadata[appId]=x"), which is
+   * as deep as this platform's provider payloads currently nest. Skips
+   * undefined/null values rather than serializing them as the literal
+   * strings "undefined"/"null".
+   */
+  protected toFormBody(params: Record<string, unknown>): string {
+    const parts: string[] = [];
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'object' && !Array.isArray(value)) {
+        for (const [nestedKey, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+          if (nestedValue === undefined || nestedValue === null) continue;
+          parts.push(`${encodeURIComponent(key)}[${encodeURIComponent(nestedKey)}]=${encodeURIComponent(String(nestedValue))}`);
+        }
+      } else {
+        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+      }
+    }
+    return parts.join('&');
+  }
+
+  // Simulates provider processing delay (for simulated mode)
+  protected async simulateLatency(): Promise<number> {
+    const min = this.config.latencyMin;
+    const max = this.config.latencyMax;
+    const latency = Math.floor(Math.random() * (max - min + 1) + min);
+    await new Promise((resolve) => setTimeout(resolve, latency));
+    return latency;
+  }
+
+  // Public wrapper used by health checks to measure current latency.
+  public async measureLatency(): Promise<number> {
+    return this.simulateLatency();
+  }
+
+  // Whether this adapter currently has the real credentials it needs to
+  // make a live API call — i.e. the same condition each adapter's
+  // processRequest() already checks before falling back to simulated
+  // processing (see each adapter's own `if (!this.apiKey ...)` guard).
+  // Default true: simulation-only adapters (no real HTTP integration,
+  // e.g. SignalHouse/FutureSMS/Email/the example adapters) never need real
+  // credentials, so there's nothing to be "unconfigured" about. Adapters
+  // with a real HTTP integration override this with their own credential
+  // check — see registry.ts's getManagementView() for where this surfaces.
+  public isConfigured(): boolean {
+    return true;
+  }
+
+  // Checks status, throwing error if not online
+  protected verifyAvailability() {
+    if (this.config.status === 'offline') {
+      throw new Error(`Provider ${this.config.name} is currently OFFLINE`);
+    }
+    if (this.config.status === 'maintenance') {
+      throw new Error(`Provider ${this.config.name} is undergoing MAINTENANCE`);
+    }
+  }
+
+  abstract processRequest(
+    appId: string,
+    payload: PaymentRequest | MessageRequest | OtherRequest,
+    decisionReason: string
+  ): Promise<TransactionEvent>;
 }

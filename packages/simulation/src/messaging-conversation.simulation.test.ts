@@ -42,7 +42,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'africastalking', 'sinch', 'vibes', 'vonage'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -183,13 +183,15 @@ describe('Provider Selection edge cases', () => {
       providerOverride: 'signalhouse',
     });
     expect(res.status).toBe(200);
-    // Deterministic: fallback is the first other online messaging provider (Infobip).
-    expect(res.body.providerId).toBe('infobip');
+    // Not deterministic to a single id: the routing engine's cascade ranks
+    // all remaining SMS-capable candidates by live success rate/cost and
+    // weighted-randomly picks among them (packages/routing/src/scoring.ts).
+    expect(SMS_CAPABLE.filter((id) => id !== 'signalhouse')).toContain(res.body.providerId);
     expect(String(res.body.decisionReason)).toContain('Dynamic Failover');
   });
 
   it('when all SMS providers are offline, an SMS silently falls back to email (documented gap)', async () => {
-    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
+    const smsProviders = [...SMS_CAPABLE];
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 
@@ -208,14 +210,16 @@ describe('Provider Selection edge cases', () => {
   });
 
   it('a hard routing failure returns 503 and emits a failed routing event', async () => {
-    patchProviderProcessRequest('signalhouse', async () => {
-      await sleep(5);
-      throw new Error('down');
-    });
-    patchProviderProcessRequest('infobip', async () => {
-      await sleep(5);
-      throw new Error('down');
-    });
+    // Break every SMS-capable provider, not just the override target — the
+    // routing engine cascades through every remaining ranked candidate
+    // (packages/routing/src/index.ts), not a single fixed fallback hop, so
+    // proving genuine exhaustion means genuinely exhausting the pool.
+    for (const p of SMS_CAPABLE) {
+      patchProviderProcessRequest(p, async () => {
+        await sleep(5);
+        throw new Error('down');
+      });
+    }
 
     const token = mark();
     const res = await sendMessage(runtime, { recipient: DONOR_PHONE, content: 'x', providerOverride: 'signalhouse' });
@@ -398,7 +402,7 @@ describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS 
     },
   );
 
-  it('inbound STOP opts the number out and closes the conversation (FIXED)', async () => {
+  it('inbound STOP records opt-out consent, leaving the conversation active for a future JOIN (FIXED)', async () => {
     const phone = '+15551000stop';
     const before = await (async () => {
       await sendMessage(runtime, { recipient: phone, content: 'hi', providerOverride: 'signalhouse' });
@@ -413,12 +417,19 @@ describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS 
     await pipeline.queue.enqueue('webhook_job_poller', {});
     await drain(pipeline, ['webhook_job_poller', 'inbound_message', 'keyword_response_delivery']);
 
+    // Deliberately does NOT close the conversation: inbound routing
+    // (ConversationResolver) requires an ACTIVE conversation to attribute a
+    // reply to the right app, and a recipient must still be able to route a
+    // future JOIN back to this app to opt back in — see
+    // packages/routing/src/keywords.ts's class comment. The durable
+    // opt-out itself is consent_records, checked by the outbound send path
+    // (RoutingEngine.routeMessage), not the conversation's own status.
     const after = findConversation(APP_SLUG, phone);
-    expect(after?.status).toBe('closed');
+    expect(after?.status).toBe('active');
     expect(
       busEventsAfter(token, 'messaging').some((e: any) => e.decisionReason === 'keyword_response:opt_out'),
     ).toBe(true);
-    console.warn('[FIXED] inbound STOP now invokes conversationRepository.close() and the number is opted out');
+    console.warn('[FIXED] inbound STOP now records durable opt-out consent; conversation stays active so JOIN can still route');
   });
 
   // App-specific keywords (a church "check-in" feature, a logistics app's driver

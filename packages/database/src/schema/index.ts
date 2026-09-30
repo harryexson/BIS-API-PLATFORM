@@ -19,3 +19,17 @@ export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord }
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
 export { webhookJobs, type WebhookJob, type NewWebhookJob } from './webhook-jobs';
 export { checkoutSessions, type CheckoutSession, type NewCheckoutSession } from './checkout-sessions';
+export { userSessions, type UserSession, type NewUserSession } from './user-sessions';
+export {
+  userVerificationTokens,
+  type UserVerificationToken,
+  type NewUserVerificationToken,
+} from './user-verification-tokens';
+export { plans, type Plan, type NewPlan } from './plans';
+export { subscriptions, type Subscription, type NewSubscription } from './subscriptions';
+export { customerNotes, type CustomerNote, type NewCustomerNote } from './customer-notes';
+export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
+export { ticketComments, type TicketComment, type NewTicketComment } from './ticket-comments';
+export { consentRecords, type ConsentRecord, type NewConsentRecord } from './consent-records';
+export { messagingProfiles, type MessagingProfile, type NewMessagingProfile } from './messaging-profiles';
+export { webhookEndpoints, type WebhookEndpoint, type NewWebhookEndpoint } from './webhook-endpoints';

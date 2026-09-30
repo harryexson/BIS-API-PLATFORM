@@ -1,5 +1,5 @@
 export { BaseProvider } from './base';
-export { ProviderRegistry } from './registry';
+export { ProviderRegistry, type PersistableProviderSecret } from './registry';
 
 export { StripeProvider } from './adapters/payments/stripe';
 export { NMIProvider } from './adapters/payments/nmi';
@@ -7,16 +7,25 @@ export { FlutterwaveProvider } from './adapters/payments/flutterwave';
 export { PawaPayProvider } from './adapters/payments/pawapay';
 export { PayChanguProvider } from './adapters/payments/paychangu';
 export { AirwallexProvider } from './adapters/payments/airwallex';
+export { AdyenProvider } from './adapters/payments/adyen';
+export { BraintreeProvider } from './adapters/payments/braintree';
 export { AuthorizeNetProvider } from './adapters/payments/authorizenet';
 export { CheckoutComProvider } from './adapters/payments/checkout';
+export { PayPalProvider } from './adapters/payments/paypal';
 export { PaystackProvider } from './adapters/payments/paystack';
+export { SquareProvider } from './adapters/payments/square';
 export { ExamplePaymentProvider } from './adapters/payments/example';
 
 export { SignalHouseProvider } from './adapters/messaging/signalhouse';
 export { InfobipProvider } from './adapters/messaging/infobip';
+export { AfricasTalkingProvider } from './adapters/messaging/africastalking';
+export { SinchProvider } from './adapters/messaging/sinch';
+export { VibesProvider } from './adapters/messaging/vibes';
+export { TwilioProvider } from './adapters/messaging/twilio';
+export { WhatsAppProvider } from './adapters/messaging/whatsapp';
+export { VonageProvider } from './adapters/messaging/vonage';
 export { FutureSMSProvider } from './adapters/messaging/futuresms';
 export { EmailProvider } from './adapters/messaging/email';
-export { TwilioProvider } from './adapters/messaging/twilio';
 export { ExampleMessagingProvider } from './adapters/messaging/example';
 
 export { MapsProvider } from './adapters/other/maps';

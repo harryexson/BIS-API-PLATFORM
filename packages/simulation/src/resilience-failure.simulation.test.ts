@@ -201,7 +201,7 @@ describe('R3 — primary SMS provider offline: failover works (OK)', () => {
 
 describe('R4 — all SMS providers offline: silent channel change (GAP)', () => {
   it('an SMS is silently routed over email when no SMS provider is available', async () => {
-    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
+    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'whatsapp', 'vonage', 'africastalking', 'sinch', 'vibes'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
       const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);

@@ -314,7 +314,7 @@ function requirePortalAuth(req: Request, res: Response, next: NextFunction) {
 }
 
 // Records live traffic outcomes against the provider management stats.
-function recordTrafficResult(providerId: string | undefined, status: 'success' | 'failed' | 'pending', latency: number) {
+function recordTrafficResult(providerId: string | undefined, status: 'success' | 'failed' | 'pending' | 'unknown', latency: number) {
   if (!providerId) return;
   registry.recordTraffic(providerId, status === 'success', latency);
 }
@@ -783,11 +783,12 @@ app.post('/v1/portal/auth/login', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'email and password are required' });
   }
 
-  const candidates = await userRepository.findByEmail(email);
-  for (const user of candidates) {
-    if (user.passwordHash && verifyPassword(password, user.passwordHash)) {
-      const application = await applicationRepository.findById(user.applicationId);
-      if (!application) continue;
+  // email is now enforced globally unique (idx_users_email — see
+  // schema/users.ts), so findByEmail resolves at most one account.
+  const user = await userRepository.findByEmail(email);
+  if (user?.passwordHash && verifyPassword(password, user.passwordHash)) {
+    const application = await applicationRepository.findById(user.applicationId);
+    if (application) {
       const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
       return res.json({
         token,
@@ -1398,11 +1399,11 @@ app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res
 });
 
 app.post('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
-  const { label, value } = req.body || {};
-  if (!label || !value) {
-    return res.status(400).json({ error: 'Missing parameters: label and value are required' });
+  const { field, label, value } = req.body || {};
+  if (!field || !label || !value) {
+    return res.status(400).json({ error: 'Missing parameters: field, label, and value are required' });
   }
-  const meta = registry.addSecret(req.params.id, { label, value });
+  const meta = registry.addSecret(req.params.id, { field, label, value });
   if (!meta) {
     return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
   }
