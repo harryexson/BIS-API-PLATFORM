@@ -98,17 +98,29 @@ function newRows<T extends { createdAt: Date }>(all: T[], baseline: T[]) {
 // (`expect(['email', 'example-msg']).toContain(result.providerId)`).
 const EMAIL_CAPABLE_PROVIDERS = ['email', 'example-msg'];
 
+// token = runtime.bus.getHistory().length at mark() time (see the MAX_HISTORY
+// comment in packages/events/src/index.ts, which documents this as the
+// intended pattern). getHistory() is newest-first (EventBus.emit() does
+// history.unshift()), so anything added since the mark is now sitting at
+// the front of the array, at indices [0, history.length - token). Using
+// array growth instead of a wall-clock timestamp comparison (the previous
+// `Date.now() - 1` / `timestamp >= token` version) sidesteps a real race:
+// an event created in the same millisecond as mark() — e.g. the payment
+// charge createDonation() triggers right before a test captures its
+// baseline — would satisfy `>= token` and get miscounted as "since the
+// mark" purely from clock-resolution collision, independent of actual
+// event ordering.
 function busEventsAfter(token: number, category?: string, providerId?: string | string[]) {
   const history = runtime.bus.getHistory();
   const providerIds = typeof providerId === 'string' ? [providerId] : providerId;
-  return history
-    .filter((e: any) => new Date(e.timestamp).getTime() >= token)
+  const sinceMark = history.slice(0, Math.max(0, history.length - token));
+  return sinceMark
     .filter((e: any) => (category ? e.category === category : true))
     .filter((e: any) => (providerIds ? providerIds.includes(e.providerId) : true));
 }
 
 function mark(): number {
-  return Date.now() - 1;
+  return runtime.bus.getHistory().length;
 }
 
 // ---------------------------------------------------------------------------
