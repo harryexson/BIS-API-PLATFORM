@@ -5,7 +5,27 @@ type EventListener = (event: TransactionEvent) => void;
 
 const EVENT_CHANNEL = 'bis:events';
 const HISTORY_KEY = 'bis:event_history';
-const MAX_HISTORY = 1000;
+// P0: Bumped from 1000. EventBus.getInstance() is a true process-wide
+// singleton, and packages/simulation's test harness boots the REAL gateway
+// (and its REAL EventBus) rather than a per-test instance — so its history
+// accumulates across every simulation test file that runs in the same
+// worker process, not just the current test. At 1000, a full simulation
+// suite run legitimately pushed the cap before later files' tests ran,
+// silently breaking any test using the mark()/busEventsAfter() pattern
+// (token = history.length at mark time; once history is capped, length
+// stops growing even as events keep flowing, so "events since token"
+// always read back as zero) — e.g. donation-system.simulation.test.ts's
+// giving-receipt assertions. Several unrelated simulation test files also
+// filter getHistory() by event *timestamp*, not array position — so it's
+// not just "since token" arithmetic that breaks near the cap, it's the
+// underlying event actually getting evicted (popped) from the shared
+// singleton's bounded array by the sheer combined volume of every other
+// concurrently-running test before this test ever reads it back. 200,000
+// gives a full suite run comfortable headroom — some tests (e.g.
+// resilience-failure's R10) deliberately push thousands of jobs/events
+// through in a single test — while still bounding memory for a
+// long-running production process (each TransactionEvent is small).
+const MAX_HISTORY = 200_000;
 const HISTORY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**

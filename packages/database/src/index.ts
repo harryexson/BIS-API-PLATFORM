@@ -16,8 +16,11 @@ export {
   decryptSecret,
   hashApiKey,
   generateApiKey,
+  hashToken,
   hashPassword,
   verifyPassword,
+  generateSessionToken,
+  generateVerificationToken,
   type EncryptedPayload,
 } from './crypto';
 
@@ -45,3 +48,70 @@ export {
   type TenantApplicationLinkRepository,
   type TenantAccessContext,
 } from './tenant-registry';
+
+// Auth Registry (customer signup/login — see docstring in auth-registry.ts
+// for how this differs from application API-key auth and admin auth)
+export {
+  AuthRegistry,
+  AuthError,
+  ValidationError,
+  ConflictError,
+  type UserRecord,
+  type PublicUser,
+  type UserSessionRecord,
+  type UserVerificationTokenRecord,
+  type RoleRecord,
+  type SignupInput,
+  type SignupResult,
+  type LoginInput,
+  type LoginResult,
+  type UserRepositoryForAuth,
+  type UserSessionRepositoryForAuth,
+  type UserVerificationTokenRepositoryForAuth,
+  type RoleRepositoryForAuth,
+} from './auth-registry';
+
+// Subscription Registry (platform customer billing — see docstring in
+// subscription-registry.ts)
+export {
+  SubscriptionRegistry,
+  SubscriptionError,
+  type PlanRecord,
+  type SubscriptionRecord,
+  type PlanRepositoryForBilling,
+  type SubscriptionRepositoryForBilling,
+  type ApplicationLookupForBilling,
+} from './subscription-registry';
+
+// Provider secrets persistence (survives a restart for packages/providers'
+// in-memory ProviderRegistry — see docstring in provider-secrets.ts)
+export {
+  ensureProviderRow,
+  persistProviderSecrets,
+  loadAllProviderSecrets,
+  currentDeploymentTier,
+  type PersistableSecret,
+} from './provider-secrets';
+
+// CRM Registry (developer/support back office — see docstring in
+// crm-registry.ts)
+export {
+  CrmRegistry,
+  CrmError,
+  type ApplicationSummary,
+  type SubscriptionSummary,
+  type PlanSummary,
+  type UserSummary,
+  type CustomerNoteRecord,
+  type SupportTicketRecord,
+  type TicketCommentRecord,
+  type CustomerSummary,
+  type CustomerDetail,
+  type ApplicationRepositoryForCrm,
+  type SubscriptionRepositoryForCrm,
+  type PlanRepositoryForCrm,
+  type UserRepositoryForCrm,
+  type CustomerNoteRepositoryForCrm,
+  type SupportTicketRepositoryForCrm,
+  type TicketCommentRepositoryForCrm,
+} from './crm-registry';

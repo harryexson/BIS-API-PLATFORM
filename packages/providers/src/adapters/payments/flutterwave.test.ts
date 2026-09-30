@@ -1,0 +1,323 @@
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { FlutterwaveProvider } from './flutterwave';
+import { ProviderConfig } from '@company/schemas';
+
+function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
+  return {
+    id: 'flutterwave',
+    name: 'Flutterwave',
+    category: 'payment',
+    status: 'online',
+    weight: 50,
+    latencyMin: 10,
+    latencyMax: 20,
+    ...overrides,
+  };
+}
+
+describe('FlutterwaveProvider', () => {
+  const originalApiKey = process.env.FLUTTERWAVE_SECRET_KEY;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (originalApiKey === undefined) delete process.env.FLUTTERWAVE_SECRET_KEY;
+    else process.env.FLUTTERWAVE_SECRET_KEY = originalApiKey;
+  });
+
+  describe('isConfigured()', () => {
+    it('is false with no credentials, true once set via env or setSecrets()', () => {
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      const provider = new FlutterwaveProvider(makeConfig());
+      expect(provider.isConfigured()).toBe(false);
+
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      expect(provider.isConfigured()).toBe(true);
+
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      provider.setSecrets({ api_key: 'FLWSECK_from_admin' });
+      expect(provider.isConfigured()).toBe(true);
+    });
+  });
+
+  describe('verifyProviderWebhookSignature()', () => {
+    const originalHash = process.env.FLUTTERWAVE_SECRET_HASH;
+    afterEach(() => {
+      if (originalHash === undefined) delete process.env.FLUTTERWAVE_SECRET_HASH;
+      else process.env.FLUTTERWAVE_SECRET_HASH = originalHash;
+    });
+
+    it('returns null when no secret hash is configured', async () => {
+      delete process.env.FLUTTERWAVE_SECRET_HASH;
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'verif-hash': 'anything' });
+      expect(result).toBeNull();
+    });
+
+    it('returns true when verif-hash matches the configured secret hash verbatim', async () => {
+      process.env.FLUTTERWAVE_SECRET_HASH = 'my-dashboard-secret-hash';
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'verif-hash': 'my-dashboard-secret-hash' });
+      expect(result).toBe(true);
+    });
+
+    it('returns false when verif-hash does not match', async () => {
+      process.env.FLUTTERWAVE_SECRET_HASH = 'my-dashboard-secret-hash';
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', { 'verif-hash': 'wrong-value' });
+      expect(result).toBe(false);
+    });
+
+    it('returns false when the header is missing', async () => {
+      process.env.FLUTTERWAVE_SECRET_HASH = 'my-dashboard-secret-hash';
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.verifyProviderWebhookSignature('{}', {});
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('refund()', () => {
+    it('returns a labeled simulated success with no API key configured, never calling fetch', async () => {
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.refund('app1', { originalTransactionId: '123456', amount: 1000, currency: 'NGN' }, 'test');
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe('success');
+      expect(result.id).toMatch(/^re_/);
+    });
+
+    it('POSTs to /v3/transactions/{id}/refund with a JSON body, reporting unknown (async settlement)', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'success', message: 'Refund processed', data: { id: 999, amount_refunded: 1000 } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.refund('app1', { originalTransactionId: '123456', amount: 1000, currency: 'NGN' }, 'test');
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toBe('https://api.flutterwave.com/v3/transactions/123456/refund');
+      expect(JSON.parse(opts.body)).toEqual({ amount: 1000 });
+
+      // Flutterwave documents refunds settling asynchronously (3-15
+      // working days) — accepted must not be reported as a confirmed
+      // success.
+      expect(result.status).toBe('unknown');
+      expect(result.id).toBe('999');
+    });
+
+    it('reports failed on a non-2xx response', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'error', message: 'Transaction not found' }),
+          { status: 404, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const result = await provider.refund('app1', { originalTransactionId: 'nonexistent', amount: 1000, currency: 'NGN' }, 'test');
+      expect(result.status).toBe('failed');
+      expect(result.error).toBe('Transaction not found');
+    });
+  });
+
+  describe('without an API key configured (simulated fallback)', () => {
+    it('never makes a real HTTP call and returns a fabricated-but-labeled simulated response', async () => {
+      delete process.env.FLUTTERWAVE_SECRET_KEY;
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', { amount: 1000, currency: 'NGN', paymentMethod: 'card' }, 'test');
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(event.status).toBe('success');
+      expect(event.response.data.status).toBe('successful');
+    });
+  });
+
+  describe('with an API key but missing a token or email', () => {
+    it('falls back to simulated when there is no paymentToken', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest(
+        'app1',
+        { amount: 1000, currency: 'NGN', paymentMethod: 'card', metadata: { email: 'buyer@example.com' } },
+        'test',
+      );
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(event.status).toBe('success');
+    });
+
+    it('falls back to simulated when there is no customer email', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest(
+        'app1',
+        { amount: 1000, currency: 'NGN', paymentMethod: 'card', paymentToken: 'flw-t1nf-abc' },
+        'test',
+      );
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(event.status).toBe('success');
+    });
+  });
+
+  describe('with an API key, token, and email (real HTTP path)', () => {
+    const validPayload = {
+      amount: 1000,
+      currency: 'NGN',
+      paymentMethod: 'card',
+      paymentToken: 'flw-t1nf-93da56b24f8ee332304cd2eea40a1fc4-m03k',
+      metadata: { email: 'buyer@example.com' },
+    };
+
+    it('sends a JSON body to POST /v3/tokenized-charges with Bearer auth', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            status: 'success',
+            message: 'Charge successful',
+            data: { id: 12345, tx_ref: 'flw-ref-1', status: 'successful', processor_response: 'Approved' },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', validPayload, 'test');
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toBe('https://api.flutterwave.com/v3/tokenized-charges');
+      expect(opts.method).toBe('POST');
+      expect(opts.headers.Authorization).toBe('Bearer FLWSECK_TEST');
+      const body = JSON.parse(opts.body);
+      expect(body.token).toBe(validPayload.paymentToken);
+      expect(body.email).toBe('buyer@example.com');
+      expect(body.currency).toBe('NGN');
+      expect(body.country).toBe('NG');
+      expect(body.amount).toBe(1000);
+
+      expect(event.status).toBe('success');
+      expect(event.id).toBe('12345');
+    });
+
+    it('reports failure when data.status is "failed", even though the top-level status is "success"', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            status: 'success',
+            message: 'Charge attempted',
+            data: { id: 999, status: 'failed', processor_response: 'Insufficient Funds' },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', validPayload, 'test');
+
+      expect(event.status).toBe('failed');
+      expect(event.error).toBe('Insufficient Funds');
+    });
+
+    it('reports an unresolved outcome (unknown, not failed) when data.status is "pending"', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'success', message: 'Charge pending', data: { id: 1000, status: 'pending' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', validPayload, 'test');
+
+      expect(event.status).toBe('unknown');
+    });
+
+    it('does not fabricate a success from a 200 response whose top-level status is "error"', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'error', message: 'Invalid token supplied', data: null }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', validPayload, 'test');
+
+      expect(event.status).toBe('failed');
+      expect(event.error).toBe('Invalid token supplied');
+    });
+
+    it("parses Flutterwave's documented error envelope on a non-2xx response", async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ status: 'error', message: 'merchant secret key required', data: null }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', validPayload, 'test');
+
+      expect(event.status).toBe('failed');
+      expect(event.error).toBe('merchant secret key required');
+    });
+
+    it('retries on 5xx (via BaseProvider.http_request) and eventually reports failure if every attempt fails', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ status: 'error', message: 'Internal error' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig());
+      const event = await provider.processRequest('app1', validPayload, 'test');
+
+      expect(fetchSpy.mock.calls.length).toBeGreaterThan(1);
+      expect(event.status).toBe('failed');
+    }, 15_000);
+
+    it('reports offline/maintenance status without making an HTTP call', async () => {
+      process.env.FLUTTERWAVE_SECRET_KEY = 'FLWSECK_TEST';
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new FlutterwaveProvider(makeConfig({ status: 'offline' }));
+      await expect(provider.processRequest('app1', validPayload, 'test')).rejects.toThrow(/OFFLINE/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+  });
+});

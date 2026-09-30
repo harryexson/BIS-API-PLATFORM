@@ -1,4 +1,4 @@
-import { conversationRepository, eventRepository } from '@company/database';
+import { eventRepository, consentRecordRepository } from '@company/database';
 
 export interface KeywordContext {
   senderPhone: string;
@@ -6,6 +6,10 @@ export interface KeywordContext {
   tenantId: string;
   content: string;
   providerId: string;
+  // Channel the keyword arrived on (sms/whatsapp/email/...), used to scope
+  // the consent record. Defaults to 'sms' when the caller doesn't know it
+  // (channel-specific consent still resolves correctly for the common case).
+  channel?: string;
 }
 
 export interface KeywordResult {
@@ -20,7 +24,8 @@ export interface KeywordResult {
  * Processes common SMS/WhatsApp keywords like STOP, HELP, YES, NO, PRAY.
  * Each keyword triggers a specific action and returns a response message.
  *
- * STOP/UNSUBSCRIBE — Opts the user out, closes conversation
+ * STOP/UNSUBSCRIBE — Records opt-out consent (blocks future outbound sends);
+ *   the conversation itself stays active so a later JOIN can still route
  * HELP — Returns help information
  * YES/NO — Confirmation responses (for opt-in flows, surveys, etc.)
  * PRAY — Triggers a prayer request flow
@@ -76,9 +81,24 @@ function isJoinKeyword(text: string): boolean {
 }
 
 async function handleStop(ctx: KeywordContext): Promise<KeywordResult> {
-  // Close the conversation (opt-out)
   try {
-    await conversationRepository.close(ctx.senderPhone, ctx.appId, ctx.tenantId);
+    // Record durable consent state — this is what the outbound send path
+    // checks before dispatching (RoutingEngine.routeMessage). Deliberately
+    // does NOT close the conversation: inbound routing
+    // (ConversationResolver) requires an ACTIVE conversation to attribute
+    // a reply to the right app, and a recipient must still be able to
+    // route a future JOIN back to this app to opt back in. Consent and
+    // conversation/routing state are separate concerns — closing the
+    // conversation here would silently break re-subscribe.
+    await consentRecordRepository.upsert({
+      appId: ctx.appId,
+      tenantId: ctx.tenantId,
+      recipient: ctx.senderPhone,
+      channel: ctx.channel || 'sms',
+      status: 'opted_out',
+      source: 'keyword',
+      keyword: 'STOP',
+    });
 
     // Log the opt-out event
     await eventRepository.create({
@@ -194,6 +214,16 @@ async function handlePrayer(ctx: KeywordContext): Promise<KeywordResult> {
 
 async function handleJoin(ctx: KeywordContext): Promise<KeywordResult> {
   try {
+    await consentRecordRepository.upsert({
+      appId: ctx.appId,
+      tenantId: ctx.tenantId,
+      recipient: ctx.senderPhone,
+      channel: ctx.channel || 'sms',
+      status: 'opted_in',
+      source: 'keyword',
+      keyword: 'JOIN',
+    });
+
     // Log the opt-in event
     await eventRepository.create({
       appId: ctx.appId,

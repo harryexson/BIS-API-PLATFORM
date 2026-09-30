@@ -19,3 +19,10 @@ export const DEFAULT_PORT = 3001;
 export const DEFAULT_VITE_PORT = 5173;
 
 export { PlatformIdempotencyService } from './idempotency';
+export {
+  sendTransactionalEmail,
+  verificationEmailHtml,
+  passwordResetEmailHtml,
+  type SendEmailParams,
+  type SendEmailResult,
+} from './email';

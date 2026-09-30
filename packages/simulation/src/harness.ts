@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { EventBus } from '@company/events';
+import { EventBus, WebhookDelivery } from '@company/events';
 import { ProviderRegistry } from '@company/providers';
 import { RoutingEngine } from '@company/routing';
 import {
@@ -108,6 +108,19 @@ export interface SimRuntime {
   server: Server;
   bus: EventBus;
   registry: ProviderRegistry;
+  // The exact store/keys the real gateway's enqueueInboundMessage/
+  // enqueuePaymentWebhook/enqueueProviderWebhook (services/api-gateway/src/
+  // app.ts) enqueue jobs into — pass these to makeWorker() to attach a
+  // worker to jobs the gateway itself enqueued via a real HTTP request
+  // (e.g. through deliverWebhook), rather than the bypass helpers below
+  // that enqueue directly onto an arbitrary queue.
+  gatewayStore: KVStore;
+  gatewayKeys: Keys;
+  // The real WebhookDelivery instance services/api-gateway/src/app.ts's
+  // EventBus listener enqueues outbound webhook deliveries into — call
+  // .flush() on it to force an immediate delivery attempt instead of
+  // waiting on its real 5s interval timer.
+  gatewayWebhookDelivery: WebhookDelivery;
   // stop the booted HTTP server
   close(): Promise<void>;
   // spawn an isolated worker (own store/keys unless supplied) against the
@@ -131,11 +144,21 @@ export async function createSimulation(
   process.env.WEBHOOK_HMAC_SECRET = WEBHOOK_SECRET;
   if (!process.env.RATE_LIMIT_MAX_REQUESTS) process.env.RATE_LIMIT_MAX_REQUESTS = '100000';
 
+  // Always re-import (cheap: Node's module cache makes this a no-op after
+  // the first call) — this is how we also reach the getGatewayQueueForTests/
+  // getWebhookDeliveryForTests test-hook exports below, not just the app's
+  // default export.
+  const gatewayModule = await import('../../../services/api-gateway/src/app');
   if (bootedApp === null) {
-    const module = await import('../../../services/api-gateway/src/app');
-    bootedApp = module.default;
+    bootedApp = gatewayModule.default;
   }
   const app = bootedApp as { listen: (port: number, cb: () => void) => Server };
+  const { store: gatewayStore, keys: gatewayKeys } = await (
+    gatewayModule as unknown as { getGatewayQueueForTests(): Promise<{ store: KVStore; keys: Keys }> }
+  ).getGatewayQueueForTests();
+  const gatewayWebhookDelivery = (
+    gatewayModule as unknown as { getWebhookDeliveryForTests(): WebhookDelivery }
+  ).getWebhookDeliveryForTests();
 
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
@@ -197,7 +220,7 @@ export async function createSimulation(
     return fetch(`${baseUrl}${path}`, { method: 'GET', headers });
   }
 
-  return { baseUrl, server, bus, registry, close, makeWorker, request, post, postText, get };
+  return { baseUrl, server, bus, registry, gatewayStore, gatewayKeys, gatewayWebhookDelivery, close, makeWorker, request, post, postText, get };
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +425,21 @@ export function enqueueProviderWebhook(
   return queue.enqueue('provider_webhook', input);
 }
 
+/**
+ * Directly enqueues an inbound_message job onto an arbitrary queue, matching
+ * the shape services/api-gateway/src/app.ts's enqueueInboundMessage() pushes.
+ * Same bypass-vs-real-path relationship as enqueueProviderWebhook above: use
+ * this to exercise keyword handling without a real HTTP round trip; use
+ * deliverWebhook() + a worker attached to runtime.gatewayStore/gatewayKeys
+ * to exercise the real gateway enqueue path end-to-end.
+ */
+export function enqueueInboundMessage(
+  queue: JobQueue,
+  input: { providerId: string; payload: unknown },
+): Promise<Job> {
+  return queue.enqueue('inbound_message', input);
+}
+
 /** Active/closed conversation the platform tracked for (appId, phoneNumber, tenantId?). */
 export function findConversation(
   appId: string,
@@ -464,38 +502,53 @@ export function counts(handle: WorkerHandle, type: string): Promise<QueueCounts>
   ]).then(([ready, delayed, dead]) => ({ ready, delayed, dead }));
 }
 
+async function isQuiet(handle: WorkerHandle, types: string[]): Promise<boolean> {
+  if (pendingBusEffects.length > 0) return false;
+  if (handle.manager.getInFlight() !== 0) return false;
+  for (const type of types) {
+    const c = await counts(handle, type);
+    if (c.ready > 0 || c.delayed > 0) return false;
+  }
+  return true;
+}
+
 export async function drain(
   handle: WorkerHandle,
   types: string[],
   opts: { timeoutMs?: number } = {},
 ): Promise<void> {
-  // First: wait for any fire-and-forget EventBus side-effects to resolve
-  // (e.g. wireReceiptPipeline enqueueing a message_delivery job).
-  if (pendingBusEffects.length > 0) {
-    await waitFor(async () => pendingBusEffects.length === 0, {
-      timeoutMs: opts.timeoutMs ?? 15_000,
-      everyMs: 5,
-      label: 'drain pending bus effects',
-    });
-  }
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => Math.max(1, deadline - Date.now());
 
-  await waitFor(async () => {
-    for (const type of types) {
-      const c = await counts(handle, type);
-      if (c.ready > 0 || c.delayed > 0) return false;
+  // A single "everything's empty right now" snapshot is not proof the work
+  // is done: a job's handler can flip to in-flight===0 the instant before
+  // it enqueues follow-on work (e.g. payment_webhook -> message_delivery),
+  // and a poll landing in that exact gap sees an all-quiet queue for a job
+  // type that simply hasn't been enqueued into yet. So instead of trusting
+  // one pass plus a fixed settle sleep, we loop: wait for quiescence, then
+  // re-sample after a short delay, and only stop once the state holds
+  // quiet across two consecutive checks — which any newly-enqueued or
+  // still-settling follow-on work will break, sending us back around.
+  let consecutiveQuietChecks = 0;
+  while (consecutiveQuietChecks < 2) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitFor timed out: drain ${types.join(',')}`);
     }
-    return true;
-  }, { timeoutMs: opts.timeoutMs ?? 15_000, everyMs: 25, label: `drain ${types.join(',')}` });
 
-  // Wait for in-flight jobs to complete so bus events are flushed.
-  await waitFor(async () => handle.manager.getInFlight() === 0, {
-    timeoutMs: opts.timeoutMs ?? 15_000,
-    everyMs: 5,
-    label: 'drain in-flight',
-  });
+    await waitFor(() => isQuiet(handle, types), {
+      timeoutMs: remaining(),
+      everyMs: 10,
+      label: `drain ${types.join(',')}`,
+    });
 
-  // settle: let any final emits / microtasks flush
-  await sleep(60);
+    // Give the event loop room to run whatever the just-completed job's own
+    // .then()/microtask chain still has queued, then re-verify nothing new
+    // appeared (a follow-on enqueue, a fire-and-forget bus effect, ...).
+    await sleep(25);
+
+    consecutiveQuietChecks = (await isQuiet(handle, types)) ? consecutiveQuietChecks + 1 : 0;
+  }
 }
 
 export async function stopWorker(handle: WorkerHandle): Promise<void> {

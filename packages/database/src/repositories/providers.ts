@@ -47,6 +47,23 @@ export const providerRepository = {
     return rows[0];
   },
 
+  // Idempotent find-or-create by slug, atomic via ON CONFLICT — used to
+  // seed a stable UUID row for each in-memory ProviderRegistry entry
+  // (packages/providers) the first time it's needed as a foreign key
+  // target (see provider-secrets.ts), without a separate manual seed step.
+  async upsertBySlug(data: NewProvider): Promise<Provider> {
+    const db = getDb();
+    const rows = await db
+      .insert(providers)
+      .values(data)
+      .onConflictDoUpdate({
+        target: providers.slug,
+        set: { name: data.name, category: data.category, updatedAt: new Date() },
+      })
+      .returning();
+    return rows[0];
+  },
+
   async update(
     id: string,
     data: Partial<NewProvider>,
