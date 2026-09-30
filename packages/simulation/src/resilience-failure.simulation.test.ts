@@ -36,6 +36,14 @@ import { QueueBackpressureError } from '@company/workers';
 
 console.warn('\n[audit] AUDIT 5 — Resilience, Load & Failure Engineering\n');
 
+// Every SMS-capable provider currently registered — see the identical list
+// (and rationale) in messaging-conversation.simulation.test.ts. A hard
+// "all providers exhausted" test must break every one of these, not just
+// one or two: packages/routing/src/scoring.ts's cascade ranks and tries
+// every remaining online candidate, not a single fixed fallback hop, so
+// proving genuine exhaustion means genuinely exhausting the pool.
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
+
 // Avoid a crashing rejection when the failing-store worker loop dies (R2).
 let unhandledRejections = 0;
 process.on('unhandledRejection', () => {
@@ -221,7 +229,7 @@ describe('R4 — all SMS providers offline: silent channel change (GAP)', () => 
 // ---------------------------------------------------------------------------
 
 describe('R5 — single provider failover then hard 503 (OK)', () => {
-  it('fails over on one provider error and returns 503 when all fail', async () => {
+  it('fails over on one provider error and returns 503 once every SMS-capable provider is broken', async () => {
     const infobip = runtime.registry.getProvider('infobip') as unknown as {
       processRequest: (...a: any[]) => Promise<any>;
     };
@@ -233,7 +241,9 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
       infobip.processRequest = origInfo;
     });
 
-    // signalhouse is online by default -> single failover target.
+    // Several other SMS providers are still online -> failover succeeds to
+    // some other real SMS-capable provider (the specific winner is scored,
+    // not a fixed "first in list" pick).
     const first = await sendMessage(
       runtime,
       { recipient: DONOR_PHONE, content: 'x', providerOverride: 'infobip' },
@@ -241,18 +251,25 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
     );
     expect(first.status).toBe(200);
     expect(first.body.providerId).not.toBe('infobip');
+    expect(SMS_CAPABLE).toContain(first.body.providerId);
 
-    // Now also break signalhouse -> nothing left -> 503.
-    const signalhouse = runtime.registry.getProvider('signalhouse') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const origSig = signalhouse.processRequest.bind(signalhouse);
-    signalhouse.processRequest = async () => {
-      throw new Error('down');
-    };
-    patches.push(() => {
-      signalhouse.processRequest = origSig;
-    });
+    // Now break every remaining SMS-capable provider — the routing engine
+    // cascades through every remaining ranked candidate (not a single fixed
+    // fallback hop), so proving genuine exhaustion means genuinely
+    // exhausting the pool, not just breaking one more.
+    for (const id of SMS_CAPABLE) {
+      if (id === 'infobip') continue;
+      const provider = runtime.registry.getProvider(id) as unknown as {
+        processRequest: (...a: any[]) => Promise<any>;
+      };
+      const original = provider.processRequest.bind(provider);
+      provider.processRequest = async () => {
+        throw new Error('down');
+      };
+      patches.push(() => {
+        provider.processRequest = original;
+      });
+    }
 
     const second = await sendMessage(
       runtime,
@@ -260,7 +277,7 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
       AUTH,
     );
     expect(second.status).toBe(503);
-    console.warn('[OK] single-provider failover and hard-failure 503 both work');
+    console.warn('[OK] single-provider failover and hard-failure 503 (once the whole SMS pool is exhausted) both work');
   });
 });
 
@@ -268,9 +285,9 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
 // R6) Stripe timeout / hang — no server-side timeout (DEFECT)
 // ---------------------------------------------------------------------------
 
-describe('R6 — provider hang: gateway request timeout + failover (FIXED)', () => {
+describe('R6 — provider hang: gateway request timeout, ambiguous outcome not retried (FIXED)', () => {
   it(
-    'a hung provider is timed out after PROVIDER_TIMEOUT_MS and the request fails over to a healthy provider',
+    'a hung PAYMENT provider is timed out after PROVIDER_TIMEOUT_MS and returned as an ambiguous 202, never retried via another provider',
     async () => {
       const stripe = runtime.registry.getProvider('stripe') as unknown as {
         processRequest: (...a: any[]) => Promise<any>;
@@ -288,14 +305,26 @@ describe('R6 — provider hang: gateway request timeout + failover (FIXED)', () 
       // real timeout. Race against the real value instead of an arbitrary
       // short window that can't distinguish "hung" from "just slow so far".
       const result = await Promise.race([
-        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, providerId: r.body.providerId as string | undefined })),
-        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, providerId: undefined as string | undefined })),
+        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, status: r.status, providerId: r.body.providerId as string | undefined, eventStatus: r.body.status as string | undefined })),
+        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, status: undefined as number | undefined, providerId: undefined as string | undefined, eventStatus: undefined as string | undefined })),
       ]);
 
       expect(result.done).toBe(true);
-      expect(result.providerId).not.toBe('stripe');
+      // A PAYMENT timeout is genuinely ambiguous — the charge may have
+      // reached Stripe and succeeded before the response was lost, so
+      // packages/routing/src/index.ts's routePayment() deliberately does
+      // NOT cascade to another provider on a timeout (unlike a soft
+      // decline or thrown error, which do cascade) — retrying here risks
+      // a real double charge. It returns the timed-out provider's own id
+      // with status 'unknown' (202) instead, leaving reconciliation via
+      // webhook/status-check as the only safe next step. See the
+      // ProviderTimeoutError branch in routePayment for the full
+      // reasoning.
+      expect(result.status).toBe(202);
+      expect(result.eventStatus).toBe('unknown');
+      expect(result.providerId).toBe('stripe');
       console.warn(
-        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and failed over to '${result.providerId}' instead of stalling indefinitely`,
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was returned as an ambiguous 'unknown' (202) rather than stalling indefinitely or risking a double charge via blind failover`,
       );
     },
     PROVIDER_TIMEOUT_MS + 15_000,

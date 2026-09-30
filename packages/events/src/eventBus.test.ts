@@ -49,7 +49,7 @@ describe('EventBus', () => {
 
   it('keeps history bounded to the latest N events (newest first)', () => {
     const bus = EventBus.getInstance();
-    const cap = 120; // below MAX_HISTORY (1000), so this exercises ordering, not the cap
+    const cap = 120; // below MAX_HISTORY (20,000), so this exercises ordering, not the cap
     for (let i = 0; i < cap; i++) {
       bus.emit(makeEvent({ providerId: `p${i}` }));
     }
@@ -60,17 +60,17 @@ describe('EventBus', () => {
     expect(history[cap - 1].providerId).toBe('p0');
   });
 
-  it('keeps history bounded to MAX_HISTORY (1000) when exceeded', () => {
+  it('keeps history bounded to MAX_HISTORY (20,000) when exceeded', () => {
     const bus = EventBus.getInstance();
-    const total = 1010;
+    const total = 20_010;
     for (let i = 0; i < total; i++) {
       bus.emit(makeEvent({ providerId: `p${i}` }));
     }
 
     const history = bus.getHistory();
-    expect(history).toHaveLength(1000);
+    expect(history).toHaveLength(20_000);
     expect(history[0].providerId).toBe(`p${total - 1}`);
-    expect(history[999].providerId).toBe(`p${total - 1000}`);
+    expect(history[19_999].providerId).toBe(`p${total - 20_000}`);
   });
 
   it('a throwing listener does not prevent delivery to other listeners', () => {

@@ -255,7 +255,7 @@ describe('deliberate: provider timeout', () => {
   });
 
   it(
-    'a hung provider is timed out and fails over instead of hanging forever (FIXED)',
+    'a hung provider is timed out and returned as an ambiguous 202, never retried via another provider (FIXED)',
     async () => {
       patchStripeProcessRequest(() => new Promise(() => undefined));
       const pending = runtime.request('POST', '/v1/api/gateway/payment', {
@@ -268,16 +268,23 @@ describe('deliberate: provider timeout', () => {
       });
 
       // packages/routing/src/index.ts wraps every provider call in
-      // withProviderTimeout() (PROVIDER_TIMEOUT_MS, 30s default) and fails
-      // over on timeout — this was never actually being exercised by a
-      // 1200ms local race, which can't distinguish "hung" from "just slow
-      // so far". See the equivalent fix in resilience-failure's R6 test.
+      // withProviderTimeout() (PROVIDER_TIMEOUT_MS, 30s default) — this was
+      // never actually being exercised by a 1200ms local race, which can't
+      // distinguish "hung" from "just slow so far". A PAYMENT timeout is
+      // genuinely ambiguous (the charge may have reached Stripe and
+      // succeeded before the response was lost), so routePayment()
+      // deliberately does NOT cascade to another provider on a timeout —
+      // only on a soft decline or thrown error, where the outcome is known
+      // NOT to have moved money. Retrying a timed-out charge risks a real
+      // double charge. See the equivalent fix in resilience-failure's R6
+      // test and the ProviderTimeoutError branch in routePayment.
       const res = await withTimeout(pending, PROVIDER_TIMEOUT_MS + 5000, 'gateway response to hanging provider');
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
       const body = await res.json();
-      expect(body.providerId).not.toBe('stripe');
+      expect(body.status).toBe('unknown');
+      expect(body.providerId).toBe('stripe');
       console.warn(
-        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and failed over to '${body.providerId}'`,
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was returned as an ambiguous 'unknown' (202) rather than stalling indefinitely or risking a double charge via blind failover`,
       );
     },
     PROVIDER_TIMEOUT_MS + 15_000,

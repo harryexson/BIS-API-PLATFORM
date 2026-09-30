@@ -22,10 +22,10 @@ import {
   buildInboundSms,
   signWebhook,
   enqueueProviderWebhook,
+  enqueueInboundMessage,
   enqueueReceipt,
   drain,
   waitFor,
-  counts,
   sleep,
   stopWorker,
   findConversation,
@@ -42,10 +42,17 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'africastalking', 'sinch', 'vibes', 'vonage'];
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
+// Attached to the SAME store/keys the real gateway enqueues into (see
+// SimRuntime.gatewayStore/gatewayKeys) — unlike `pipeline` above, which is
+// its own isolated queue used by the enqueueXxx() bypass helpers throughout
+// this file. gatewayPipeline exercises the real end-to-end path: a real
+// HTTP webhook delivery (deliverWebhook) all the way through to a worker
+// actually processing the job the gateway itself enqueued.
+let gatewayPipeline: WorkerHandle;
 
 const patches: Array<() => void> = [];
 
@@ -54,10 +61,12 @@ beforeAll(async () => {
   seedReachChurch();
   runtime = await createSimulation();
   pipeline = await runtime.makeWorker({});
+  gatewayPipeline = await runtime.makeWorker({ store: runtime.gatewayStore, keys: runtime.gatewayKeys });
 }, 30_000);
 
 afterAll(async () => {
   await stopWorker(pipeline);
+  await stopWorker(gatewayPipeline);
   await runtime.close();
 }, 15_000);
 
@@ -86,16 +95,21 @@ function patchProviderProcessRequest(
   });
 }
 
+// history is newest-first (EventBus.unshift); a "mark" is the history length
+// at capture time, so events added since are the leading `length - token`
+// entries. Millisecond timestamps are unreliable here — events created in
+// the same tick as the mark can otherwise be misclassified as "after" it.
 function busEventsAfter(token: number, category?: string, providerId?: string) {
   const history = runtime.bus.getHistory();
+  const newCount = Math.max(0, history.length - token);
   return history
-    .filter((e: any) => new Date(e.timestamp).getTime() >= token)
+    .slice(0, newCount)
     .filter((e: any) => (category ? e.category === category : true))
     .filter((e: any) => (providerId ? e.providerId === providerId : true));
 }
 
 function mark(): number {
-  return Date.now() - 1;
+  return runtime.bus.getHistory().length;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,17 +149,20 @@ describe('outbound messaging (POST /messages -> gateway -> router -> provider ->
     expect(conv!.providerId).toBe(res.body.providerId);
   });
 
-  it('routes an email recipient to the email provider by capability', async () => {
+  it('routes an email recipient to an email-capable provider by capability', async () => {
     const res = await sendMessage(runtime, {
       recipient: DONOR_EMAIL,
       content: 'Your e-statement is ready.',
     });
     expect(res.status).toBe(200);
-    expect(res.body.providerId).toBe('email');
+    // Either provider that actually declares 'email' capability is a
+    // legitimate outcome — selection is score-weighted-random (packages/
+    // routing/src/scoring.ts), not always the single highest-weight pick.
+    expect(['email', 'example-msg']).toContain(res.body.providerId);
     expect(res.body.messageType).toBe('email');
     const conv = findConversation(APP_SLUG, DONOR_EMAIL);
     expect(conv?.channel).toBe('email');
-    expect(conv?.providerId).toBe('email');
+    expect(conv?.providerId).toBe(res.body.providerId);
   });
 
   it('enforces auth, tenant isolation, and required fields (401/403/400)', async () => {
@@ -183,15 +200,24 @@ describe('Provider Selection edge cases', () => {
       providerOverride: 'signalhouse',
     });
     expect(res.status).toBe(200);
-    // Not deterministic to a single id: the routing engine's cascade ranks
-    // all remaining SMS-capable candidates by live success rate/cost and
-    // weighted-randomly picks among them (packages/routing/src/scoring.ts).
-    expect(SMS_CAPABLE.filter((id) => id !== 'signalhouse')).toContain(res.body.providerId);
+    // The specific fallback target is no longer a fixed "first in list" —
+    // packages/routing/src/scoring.ts ranks candidates by live success
+    // rate and cost, so the winner among several equally-weighted,
+    // healthy SMS providers can legitimately shift. What must still hold:
+    // it failed over away from signalhouse to some other real SMS-capable
+    // provider, via the dynamic failover path.
+    expect(res.body.providerId).not.toBe('signalhouse');
+    expect(['infobip', 'africastalking', 'sinch', 'vibes', 'futuresms', 'example-msg', 'twilio', 'vonage']).toContain(res.body.providerId);
     expect(String(res.body.decisionReason)).toContain('Dynamic Failover');
   });
 
   it('when all SMS providers are offline, an SMS silently falls back to email (documented gap)', async () => {
-    const smsProviders = [...SMS_CAPABLE];
+    // whatsapp is also offlined here even though it isn't SMS-capable: it's
+    // a real, online, non-SMS messaging channel, and if left online it (not
+    // email) becomes the deterministic fallback pick — this test is about
+    // proving the "any channel, not just email" gap, and needs a single
+    // surviving channel (email) to assert against reliably.
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'vonage'];
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 
@@ -211,10 +237,11 @@ describe('Provider Selection edge cases', () => {
 
   it('a hard routing failure returns 503 and emits a failed routing event', async () => {
     // Break every SMS-capable provider, not just the override target — the
-    // routing engine cascades through every remaining ranked candidate
+    // routing engine now cascades through every remaining ranked candidate
     // (packages/routing/src/index.ts), not a single fixed fallback hop, so
     // proving genuine exhaustion means genuinely exhausting the pool.
-    for (const p of SMS_CAPABLE) {
+    const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
+    for (const p of smsProviders) {
       patchProviderProcessRequest(p, async () => {
         await sleep(5);
         throw new Error('down');
@@ -248,8 +275,13 @@ describe('Delivery Event -> Platform Webhook (worker durable path)', () => {
 
     const created = dbState.events.filter((r) => !rowsBefore.includes(r));
     expect(created.some((r) => r.category === 'messaging')).toBe(true);
-    expect(created.some((r) => r.providerId === 'email')).toBe(true);
-    expect(busEventsAfter(token, 'messaging', 'email').length).toBe(1);
+    // Either provider that actually declares the 'email' capability is a
+    // legitimate outcome — selection is score-weighted-random (packages/
+    // routing/src/scoring.ts), not always the single highest-weight pick;
+    // same tolerance routing.test.ts already uses for this exact case.
+    const emailCapable = created.filter((r) => r.category === 'messaging' && ['email', 'example-msg'].includes(r.providerId as string));
+    expect(emailCapable.length).toBe(1);
+    expect(busEventsAfter(token, 'messaging', emailCapable[0].providerId as string).length).toBe(1);
   });
 
   it('the provider_webhook job verifies, records, flips provider status, and de-dupes replays', async () => {
@@ -296,30 +328,26 @@ describe('Delivery Event -> Platform Webhook (worker durable path)', () => {
     void job1;
   });
 
-  it('the gateway durably enqueues a correctly signed inbound webhook via the DB fallback (FIXED)', async () => {
-    // No REDIS_URL is configured here, so this exercises the fallback path
-    // added to enqueueInboundMessage/enqueuePaymentWebhook/enqueueProviderWebhook
-    // in services/api-gateway/src/app.ts: a durable `webhook_jobs` row instead
-    // of the old silent no-op. Bridging that row into `pipeline`'s live queue
-    // (via webhook_job_poller) is exercised end-to-end in the keyword-handling
-    // tests below — this test only asserts the gateway's side of the fix.
-    const inboundJobsBefore = dbState.webhookJobs.filter((j) => j.jobType === 'inbound_message').length;
+  it('the gateway accepts a correctly signed inbound webhook and really enqueues it for worker processing', async () => {
+    // Previously "documented gap": the gateway's enqueueProviderWebhook used
+    // a raw ioredis client that silently no-opped with no REDIS_URL
+    // configured, so a verified webhook was acked then dropped. It now goes
+    // through the real shared job queue (see app.ts's getGatewayQueueForTests
+    // and SimRuntime.gatewayStore/gatewayKeys), so a worker attached to that
+    // same queue (gatewayPipeline, not the isolated `pipeline` the
+    // enqueueXxx() bypass helpers elsewhere in this file use) really
+    // processes it end-to-end from a real HTTP delivery.
+    const rowsBefore = dbState.events.filter((r) => r.category === 'provider_webhook').length;
+    const token = mark();
 
     const delivery = await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ text: 'STOP' }));
     expect(delivery.status).toBe(200);
     expect(delivery.json.received).toBe(true);
 
-    // The gateway also fires enqueuePaymentWebhook/enqueueProviderWebhook for
-    // every webhook regardless of provider category, so filter to the job
-    // type this test cares about rather than assuming array order.
-    await waitFor(
-      async () => dbState.webhookJobs.filter((j) => j.jobType === 'inbound_message').length > inboundJobsBefore,
-      { label: 'inbound_message webhook_jobs row created' },
-    );
-    const created = dbState.webhookJobs.filter((j) => j.jobType === 'inbound_message').at(-1)!;
-    expect(created.status).toBe('pending');
+    await drain(gatewayPipeline, ['provider_webhook']);
 
-    console.warn('[FIXED] gateway now durably enqueues the inbound webhook (webhook_jobs row) instead of silently dropping it');
+    expect(dbState.events.filter((r) => r.category === 'provider_webhook').length).toBe(rowsBefore + 1);
+    expect(busEventsAfter(token).some((e: any) => e.decisionReason === 'provider_webhook_processed')).toBe(true);
   });
 });
 
@@ -354,110 +382,183 @@ describe('Conversation Update (ConversationManager record + continuity)', () => 
 });
 
 describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS MY DRIVER?', () => {
-  // The gateway's inbound webhook route only ever enqueued inbound_message jobs
-  // via Redis (services/api-gateway/src/app.ts's enqueueInboundMessage) with no
-  // fallback — so with no REDIS_URL configured (the common/default case), every
-  // inbound webhook was silently dropped and packages/routing's handleKeyword
-  // (which fully implements STOP/HELP/YES/NO/PRAY) never ran. Now the gateway
-  // falls back to a durable `webhook_jobs` DB row when Redis is unavailable, and
-  // webhook_job_poller bridges it into the worker's queue — see
-  // packages/database/src/schema/webhook-jobs.ts and
-  // packages/workers/src/jobs/webhookJobPoller.ts.
-  async function establishConversationAndDeliver(phone: string, text: string) {
-    // Establish an active conversation on the same provider the inbound webhook
-    // claims to come from — ConversationResolver requires both to route the
-    // inbound message to an owning app.
-    await sendMessage(runtime, { recipient: phone, content: 'hi', providerOverride: 'signalhouse' });
-
-    const token = mark();
-    const delivery = await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ from: phone, text }));
-    expect(delivery.status).toBe(200);
-    expect(delivery.json.received).toBe(true);
-
-    // Bridge the DB-fallback-queued job into the worker and let it run.
-    await pipeline.queue.enqueue('webhook_job_poller', {});
-    await drain(pipeline, ['webhook_job_poller', 'inbound_message', 'keyword_response_delivery']);
-
-    return token;
-  }
-
-  const HANDLED_KEYWORDS = [
-    { keyword: 'YES', action: 'confirmation' },
-    { keyword: 'NO', action: 'confirmation' },
-    { keyword: 'HELP', action: 'help' },
-    { keyword: 'PRAY', action: 'prayer' },
+  // `handled` reflects whether packages/routing/src/keywords.ts's
+  // handleKeyword() actually has a case for this keyword today — CHECK IN
+  // and WHERE IS MY DRIVER? fall through to `{ handled: false }`, a
+  // separate, still-open gap (no app-specific keyword handler exists for
+  // either) that this file doesn't attempt to close. What this describe
+  // block used to document as "no keyword handler runs" for ALL of these
+  // was really one gap upstream of that: the inbound webhook never reached
+  // handleKeyword() at all (see the enqueue-path fix below).
+  const KEYWORDS = [
+    { keyword: 'YES', compliant: 'acknowledge/confirm the intent and auto-reply with a confirmation', handled: true, phone: '+15556010001' },
+    { keyword: 'NO', compliant: 'acknowledge the cancellation and halt the confirmation flow', handled: true, phone: '+15556010002' },
+    { keyword: 'HELP', compliant: 'reply with the help text including the STOP opt-out', handled: true, phone: '+15556010003' },
+    { keyword: 'STOP', compliant: 'record opt-out consent and block all further outbound messaging to this recipient', handled: true, phone: '+15556010004' },
+    { keyword: 'PRAY', compliant: 'log a prayer request and reply with a confirmation + guidance', handled: true, phone: '+15556010005' },
+    { keyword: 'CHECK IN', compliant: 'respond with the member’s check-in status', handled: false, phone: '+15556010006' },
+    { keyword: 'WHERE IS MY DRIVER?', compliant: 'resolve the trip and reply with the driver/location update', handled: false, phone: '+15556010007' },
   ];
 
-  it.each(HANDLED_KEYWORDS)(
-    'inbound "$keyword" is routed end-to-end and gets a keyword auto-reply (FIXED)',
-    async ({ keyword, action }, index) => {
-      const phone = `+15551000${index}`;
-      const token = await establishConversationAndDeliver(phone, keyword);
+  it.each(KEYWORDS)(
+    'inbound "$keyword" is verified, really enqueued, and routed through handleKeyword() end-to-end',
+    async ({ keyword, compliant, handled, phone }) => {
+      // Provider -> Platform Webhook only delivers a reply for a number the
+      // app has an active conversation with; seed one via an outbound send
+      // (mirrors what ConversationResolver requires — see inboundMessage.ts).
+      await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
 
-      const responses = busEventsAfter(token, 'messaging').filter(
-        (e: any) => e.decisionReason === `keyword_response:${action}`,
-      );
-      expect(responses.length).toBe(1);
-      console.warn(`[FIXED] inbound "${keyword}" is routed to handleKeyword() and produces a "${action}" auto-reply`);
+      const token = mark();
+      const inbound = buildInboundSms({ from: phone, text: keyword });
+
+      // Provider -> Platform Webhook (real HMAC verification).
+      const delivery = await deliverWebhook(runtime, 'signalhouse', inbound);
+      expect(delivery.status).toBe(200);
+      expect(delivery.json.received).toBe(true);
+
+      // Previously "documented gap": the gateway's enqueueInboundMessage used
+      // a raw ioredis client that silently no-opped with no REDIS_URL
+      // configured, so this webhook was acked then dropped before ever
+      // reaching handleKeyword(). It now goes through the real shared job
+      // queue, so a worker attached to that same queue (gatewayPipeline)
+      // really processes it.
+      await drain(gatewayPipeline, ['inbound_message']);
+
+      const events = busEventsAfter(token, 'messaging');
+      expect(events.length).toBeGreaterThan(0);
+      if (handled) {
+        expect(events.some((e: any) => String(e.decisionReason).startsWith('keyword_response:'))).toBe(true);
+      } else {
+        // Reaches handleKeyword() for real now, but there's no case for this
+        // keyword — falls through to the generic "inbound_routed" event
+        // (inboundMessage.ts Step 5), same as any unrecognized text.
+        expect(events.some((e: any) => String(e.decisionReason).startsWith('inbound_routed:'))).toBe(true);
+        console.warn(`[gap] "${keyword}" reaches handleKeyword() for real now, but no handler exists for it — a compliant platform would: ${compliant}`);
+      }
     },
   );
 
-  it('inbound STOP records opt-out consent, leaving the conversation active for a future JOIN (FIXED)', async () => {
-    const phone = '+15551000stop';
-    const before = await (async () => {
-      await sendMessage(runtime, { recipient: phone, content: 'hi', providerOverride: 'signalhouse' });
-      return findConversation(APP_SLUG, phone);
-    })();
+  it('inbound STOP via the real webhook route is really processed end-to-end: consent recorded, conversation stays active', async () => {
+    // ConversationResolver matches sender+provider, so the seed send must
+    // use the same provider ('signalhouse') the inbound webhook arrives on.
+    await sendMessage(runtime, { recipient: DONOR_PHONE, content: 'Keeping you in the loop.', providerOverride: 'signalhouse' });
+
+    const before = findConversation(APP_SLUG, DONOR_PHONE);
     expect(before?.status).toBe('active');
 
-    const token = mark();
-    const delivery = await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ from: phone, text: 'STOP' }));
+    const delivery = await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ text: 'STOP' }));
     expect(delivery.status).toBe(200);
 
-    await pipeline.queue.enqueue('webhook_job_poller', {});
-    await drain(pipeline, ['webhook_job_poller', 'inbound_message', 'keyword_response_delivery']);
+    // Previously "documented gap, separate from consent enforcement": the
+    // gateway's enqueueInboundMessage silently no-opped without REDIS_URL,
+    // so this STOP never reached handleKeyword() via the real webhook route
+    // at all — only the direct-queue bypass path (see "Consent enforcement"
+    // below) could exercise it. It now really does.
+    await drain(gatewayPipeline, ['inbound_message']);
 
-    // Deliberately does NOT close the conversation: inbound routing
-    // (ConversationResolver) requires an ACTIVE conversation to attribute a
-    // reply to the right app, and a recipient must still be able to route a
-    // future JOIN back to this app to opt back in — see
-    // packages/routing/src/keywords.ts's class comment. The durable
-    // opt-out itself is consent_records, checked by the outbound send path
-    // (RoutingEngine.routeMessage), not the conversation's own status.
-    const after = findConversation(APP_SLUG, phone);
+    // The conversation stays active regardless — that's correct behavior by
+    // design (handleStop() deliberately doesn't close it — see
+    // packages/routing/src/keywords.ts — so a later JOIN can still route).
+    const after = findConversation(APP_SLUG, DONOR_PHONE);
     expect(after?.status).toBe('active');
-    expect(
-      busEventsAfter(token, 'messaging').some((e: any) => e.decisionReason === 'keyword_response:opt_out'),
-    ).toBe(true);
-    console.warn('[FIXED] inbound STOP now records durable opt-out consent; conversation stays active so JOIN can still route');
+    expect(after?.providerId).toBe(before?.providerId);
+    expect(after?.channel).toBe(before?.channel);
+
+    const consent = dbState.consentRecords.find((c) => c.recipient === DONOR_PHONE);
+    expect(consent?.status).toBe('opted_out');
+    expect(consent?.source).toBe('keyword');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Consent enforcement (STOP blocks sends; JOIN restores them)
+// ---------------------------------------------------------------------------
+// The describe blocks above now exercise the real gateway webhook route
+// end-to-end (deliverWebhook + a worker attached to the gateway's own
+// queue — see gatewayPipeline). These tests below still use the direct
+// enqueueInboundMessage(pipeline.queue, ...) bypass instead, deliberately —
+// it's a faster, more direct way to drive keyword handling and the consent
+// enforcement it feeds without the extra HTTP round trip, now that both
+// paths are known to reach the same inbound_message processor.
+describe('Consent enforcement: STOP blocks outbound sends, JOIN restores them', () => {
+  it('STOP records opt-out and a subsequent send to that recipient is blocked with 403', async () => {
+    const phone = '+15556667777';
+
+    const first = await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    expect(first.status).toBe(200);
+    expect(SMS_CAPABLE).toContain(first.body.providerId);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: phone, text: 'STOP' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    const consent = dbState.consentRecords.find(
+      (c) => c.appId === APP_SLUG && c.recipient === phone && c.channel === 'sms',
+    );
+    expect(consent?.status).toBe('opted_out');
+    expect(consent?.source).toBe('keyword');
+
+    const blocked = await sendMessage(runtime, { recipient: phone, content: 'Are you still there?' });
+    expect(blocked.status).toBe(403);
+    expect(String(blocked.body.error)).toMatch(/opted out/i);
   });
 
-  // App-specific keywords (a church "check-in" feature, a logistics app's driver
-  // lookup) are business logic that belongs to the consuming application, not
-  // the platform's generic keyword handler — packages/routing's handleKeyword
-  // only implements the universal SMS commands (STOP/HELP/YES/NO/PRAY/JOIN).
-  // This remains a real, intentional gap: there is no app-level keyword
-  // registration API yet, so these fall through to plain inbound routing.
-  const APP_SPECIFIC_KEYWORDS = [
-    { keyword: 'CHECK IN', compliant: 'respond with the member’s check-in status' },
-    { keyword: 'WHERE IS MY DRIVER?', compliant: 'resolve the trip and reply with the driver/location update' },
-  ];
+  it('JOIN after STOP restores consent and outbound sends succeed again', async () => {
+    const phone = '+15558889999';
 
-  it.each(APP_SPECIFIC_KEYWORDS)(
-    'inbound "$keyword" is routed to the app as a plain message — no app-specific handler exists yet (documented gap)',
-    async ({ keyword, compliant }, index) => {
-      const phone = `+15551001${index}`;
-      const token = await establishConversationAndDeliver(phone, keyword);
+    // Inbound routing matches sender -> active conversation -> owning app,
+    // so a conversation must exist before an inbound STOP can be attributed
+    // to this app.
+    const seed = await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    expect(seed.status).toBe(200);
 
-      // It's no longer silently dropped — it reaches the app as a routed inbound
-      // message — but nothing gives it app-specific business meaning.
-      const routed = busEventsAfter(token, 'messaging').filter((e: any) =>
-        String(e.decisionReason).startsWith('inbound_routed:'),
-      );
-      expect(routed.length).toBe(1);
-      console.warn(
-        `[gap] inbound "${keyword}" now reaches the app as a routed message (previously silently dropped), but a compliant platform would also: ${compliant}`,
-      );
-    },
-  );
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: phone, text: 'STOP' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    const blocked = await sendMessage(runtime, { recipient: phone, content: 'Still blocked?' });
+    expect(blocked.status).toBe(403);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: phone, text: 'JOIN' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    const consent = dbState.consentRecords.find(
+      (c) => c.appId === APP_SLUG && c.recipient === phone && c.channel === 'sms',
+    );
+    expect(consent?.status).toBe('opted_in');
+
+    const allowed = await sendMessage(runtime, { recipient: phone, content: 'Welcome back!' });
+    expect(allowed.status).toBe(200);
+    expect(SMS_CAPABLE).toContain(allowed.body.providerId);
+  });
+
+  it('opting out on SMS does not block a different recipient', async () => {
+    const optedOutPhone = '+15551112222';
+    const otherPhone = '+15559990000';
+
+    const seed = await sendMessage(runtime, { recipient: optedOutPhone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    expect(seed.status).toBe(200);
+
+    await enqueueInboundMessage(pipeline.queue, {
+      providerId: 'signalhouse',
+      payload: buildInboundSms({ from: optedOutPhone, text: 'STOP' }),
+    });
+    await drain(pipeline, ['inbound_message']);
+
+    // Confirm the opt-out actually took effect for this recipient, so the
+    // "other recipient still allowed" assertion below is meaningful rather
+    // than trivially true.
+    const stillBlocked = await sendMessage(runtime, { recipient: optedOutPhone, content: 'Blocked?' });
+    expect(stillBlocked.status).toBe(403);
+
+    const stillAllowed = await sendMessage(runtime, { recipient: otherPhone, content: 'Hello' });
+    expect(stillAllowed.status).toBe(200);
+  });
 });

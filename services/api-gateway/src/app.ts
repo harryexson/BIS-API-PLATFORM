@@ -737,7 +737,11 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
       await platformIdempotency.complete(idempotencyRecordId, { requestFingerprint, event }).catch(() => undefined);
     }
 
-    return res.json(event);
+    // 202 for 'unknown' — e.g. a provider timeout (see routePayment's
+    // ProviderTimeoutError branch). The outcome is genuinely unresolved
+    // until the provider's own webhook confirms it, not something a client
+    // should treat as a definite 200 success.
+    return res.status(event.status === 'unknown' ? 202 : 200).json(event);
   } catch (err: any) {
     const errorEvent = {
       id: 'err_' + randomUUID(),
@@ -787,6 +791,10 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
     observe(event);
     return res.json(event);
   } catch (err: any) {
+    // Consent block is not a transient/retryable failure — surface it
+    // distinctly (403) rather than the generic 503 routing failure, so
+    // callers don't retry a send that will never succeed.
+    const isConsentBlock = err instanceof ConsentBlockedError;
     const errorEvent = {
       id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
@@ -796,14 +804,17 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
       status: 'failed' as const,
       latency: 30,
       cost: 0,
-      decisionReason: 'routing_failure',
+      decisionReason: isConsentBlock ? 'consent_blocked' : 'routing_failure',
       payload: {},
       response: null,
-      error: 'Message routing failed'
+      error: isConsentBlock ? 'Recipient has opted out' : 'Message routing failed'
     };
     eventBus.emit(errorEvent);
-    observeFailure('messaging', errorEvent.providerId, 'ROUTING_FAILED');
+    observeFailure('messaging', errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
     observe(errorEvent);
+    if (isConsentBlock) {
+      return res.status(403).json({ error: 'Recipient has opted out of messaging on this channel', id: errorEvent.id });
+    }
     return res.status(503).json({ error: 'Message routing failed', id: errorEvent.id });
   }
 });

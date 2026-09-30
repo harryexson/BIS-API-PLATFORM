@@ -20,10 +20,15 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
       throw new Error('provider_webhook requires providerId');
     }
 
+    // Namespaced by job type ('provider:') — see the matching comment in
+    // paymentWebhook.ts. Without this, this job would collide with the
+    // payment_webhook job the gateway enqueues for the very same delivery
+    // (same providerEventId), and whichever ran second would always fail
+    // as a false "replay".
     const eventId = id || job.payload.eventId;
     if (eventId && ctx?.store) {
       const seen = await ctx.store.setNx(
-        deps.keys.idempotency(`webhook:${eventId}`),
+        deps.keys.idempotency(`webhook:provider:${eventId}`),
         '1',
         deps.config.idempotencyTtlMs,
       );

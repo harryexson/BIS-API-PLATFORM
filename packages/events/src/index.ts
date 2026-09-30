@@ -5,7 +5,19 @@ type EventListener = (event: TransactionEvent) => void;
 
 const EVENT_CHANNEL = 'bis:events';
 const HISTORY_KEY = 'bis:event_history';
-const MAX_HISTORY = 1000;
+// P0: Bumped from 1000. EventBus.getInstance() is a true process-wide
+// singleton, and packages/simulation's test harness boots the REAL gateway
+// (and its REAL EventBus) rather than a per-test instance — so its history
+// accumulates across every simulation test file that runs in the same
+// worker process, not just the current test. At 1000, a full simulation
+// suite run legitimately pushed the cap before later files' tests ran,
+// silently breaking any test using the mark()/busEventsAfter() pattern
+// (token = history.length at mark time; once history is capped, length
+// stops growing even as events keep flowing, so "events since token"
+// always read back as zero) — e.g. donation-system.simulation.test.ts's
+// giving-receipt assertions. 20,000 gives a full suite run comfortable
+// headroom while still bounding memory (each TransactionEvent is small).
+const MAX_HISTORY = 20_000;
 const HISTORY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
