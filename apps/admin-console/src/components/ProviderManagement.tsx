@@ -43,6 +43,101 @@ const HEALTH_COLOR: Record<ProviderHealthStatus, string> = {
   unknown: 'var(--text-muted)',
 };
 
+// The named secret fields each real adapter's HTTP calls actually read
+// (this.secrets.<field> in packages/providers/src/adapters/**) — lets the
+// Add Secret form guide an admin to the right field name instead of a blind
+// free-text box. Providers not listed here are simulation-only and don't
+// need real credentials (their isConfigured() always returns true).
+const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]> = {
+  stripe: [
+    { field: 'api_key', label: 'Secret Key' },
+    { field: 'webhook_secret', label: 'Webhook Signing Secret (whsec_...)' },
+  ],
+  nmi: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'gateway_id', label: 'Gateway Hostname (optional, defaults to secure.nmi.com)' },
+    { field: 'webhook_secret', label: 'Webhook Signing Key' },
+  ],
+  flutterwave: [
+    { field: 'api_key', label: 'Secret Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret Hash (from dashboard webhook settings)' },
+  ],
+  pawapay: [{ field: 'api_key', label: 'API Key' }],
+  paychangu: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret (web secret key)' },
+  ],
+  airwallex: [
+    { field: 'client_id', label: 'Client ID' },
+    { field: 'api_key', label: 'API Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret (per notification URL)' },
+  ],
+  adyen: [
+    { field: 'api_key', label: 'API Key (from the Customer Area)' },
+    { field: 'merchant_account', label: 'Merchant Account code' },
+    { field: 'live_url_prefix', label: 'Live URL Prefix (optional — leave unset to call the test API)' },
+  ],
+  braintree: [
+    { field: 'public_key', label: 'Public Key' },
+    { field: 'private_key', label: 'Private Key' },
+    { field: 'merchant_id', label: 'Merchant ID' },
+  ],
+  checkout: [
+    { field: 'secret_key', label: 'Secret Key' },
+    { field: 'client_id', label: 'Client ID (used to derive the per-merchant API subdomain)' },
+    { field: 'webhook_signing_key', label: 'Webhook Signing Key (optional — from the Workflows webhook action)' },
+  ],
+  paypal: [
+    { field: 'client_id', label: 'Client ID' },
+    { field: 'client_secret', label: 'Client Secret' },
+  ],
+  paystack: [
+    { field: 'api_key', label: 'Secret Key' },
+  ],
+  square: [
+    { field: 'access_token', label: 'Access Token' },
+    { field: 'location_id', label: 'Location ID (optional — defaults to the main location)' },
+    { field: 'webhook_signature_key', label: 'Webhook Signature Key (optional)' },
+    { field: 'webhook_notification_url', label: 'Webhook Notification URL (must match the subscription exactly)' },
+  ],
+  authorizenet: [
+    { field: 'login_id', label: 'API Login ID' },
+    { field: 'transaction_key', label: 'Transaction Key' },
+  ],
+  infobip: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'base_url', label: 'Base URL (e.g. xxxx.api.infobip.com)' },
+  ],
+  twilio: [
+    { field: 'account_sid', label: 'Account SID' },
+    { field: 'auth_token', label: 'Auth Token' },
+    { field: 'from_number', label: 'From Number (E.164) or Messaging Service SID' },
+  ],
+  whatsapp: [
+    { field: 'access_token', label: 'Access Token (System User token recommended)' },
+    { field: 'phone_number_id', label: 'Phone Number ID' },
+    { field: 'app_secret', label: 'App Secret (optional — for webhook verification)' },
+  ],
+  vonage: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'api_secret', label: 'API Secret' },
+    { field: 'from_number', label: 'From (sender ID or virtual number)' },
+  ],
+  africastalking: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'username', label: 'Username' },
+  ],
+  sinch: [
+    { field: 'api_key', label: 'API Token' },
+    { field: 'service_plan_id', label: 'Service Plan ID' },
+  ],
+  vibes: [
+    { field: 'username', label: 'Username' },
+    { field: 'password', label: 'Password' },
+  ],
+  email: [{ field: 'api_key', label: 'Resend API Key (re_...)' }],
+};
+
 function parseList(value: string): string[] {
   return value
     .split(',')
@@ -199,21 +294,24 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
   };
 
   // ---- Secret handlers ----
+  const [newSecretField, setNewSecretField] = useState('');
   const [newSecretLabel, setNewSecretLabel] = useState('');
   const [newSecretValue, setNewSecretValue] = useState('');
 
   const addSecret = async (providerId: string) => {
-    if (!newSecretLabel || !newSecretValue) {
-      setError('Secret label and value are required');
+    if (!newSecretField || !newSecretLabel || !newSecretValue) {
+      setError('Field, label, and value are all required');
       return;
     }
     setBusyId(providerId);
     setError(null);
     try {
       await mutate(`/api/dashboard/providers/${providerId}/secrets`, 'POST', {
+        field: newSecretField,
         label: newSecretLabel,
         value: newSecretValue,
       });
+      setNewSecretField('');
       setNewSecretLabel('');
       setNewSecretValue('');
       const data = await mutate(`/api/dashboard/providers/${providerId}/secrets`, 'GET');
@@ -260,6 +358,8 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
         onDeleteRule={(rule) => deleteRule(selected.id, rule.id)}
         onAddSecret={() => addSecret(selected.id)}
         onDeleteSecret={(secretId) => deleteSecret(selected.id, secretId)}
+        newSecretField={newSecretField}
+        setNewSecretField={setNewSecretField}
         newSecretLabel={newSecretLabel}
         setNewSecretLabel={setNewSecretLabel}
         newSecretValue={newSecretValue}
@@ -384,6 +484,8 @@ interface DetailProps {
   onDeleteRule: (rule: RoutingRule) => void;
   onAddSecret: () => void;
   onDeleteSecret: (secretId: string) => void;
+  newSecretField: string;
+  setNewSecretField: (v: string) => void;
   newSecretLabel: string;
   setNewSecretLabel: (v: string) => void;
   newSecretValue: string;
@@ -408,11 +510,15 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
     onDeleteRule,
     onAddSecret,
     onDeleteSecret,
+    newSecretField,
+    setNewSecretField,
     newSecretLabel,
     setNewSecretLabel,
     newSecretValue,
     setNewSecretValue,
   } = props;
+
+  const knownFields = PROVIDER_SECRET_FIELDS[provider.id];
 
   const [localCountries, setLocalCountries] = useState(provider.countries.join(', '));
   const [localCurrencies, setLocalCurrencies] = useState(provider.currencies.join(', '));
@@ -614,6 +720,32 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
 
           {isAdmin && (
             <div style={{ display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' }}>
+              {knownFields ? (
+                <select
+                  value={newSecretField}
+                  disabled={disabled}
+                  onChange={(e) => {
+                    const field = e.target.value;
+                    setNewSecretField(field);
+                    const known = knownFields.find((f) => f.field === field);
+                    if (known && !newSecretLabel) setNewSecretLabel(known.label);
+                  }}
+                  style={selectStyle}
+                >
+                  <option value="">Field…</option>
+                  {knownFields.map((f) => (
+                    <option key={f.field} value={f.field}>{f.field} — {f.label}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  placeholder="Field (e.g. api_key)"
+                  value={newSecretField}
+                  disabled={disabled}
+                  onChange={(e) => setNewSecretField(e.target.value)}
+                  style={inputStyle}
+                />
+              )}
               <input
                 placeholder="Label (e.g. Live API Key)"
                 value={newSecretLabel}
