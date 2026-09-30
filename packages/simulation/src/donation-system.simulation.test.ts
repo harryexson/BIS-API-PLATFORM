@@ -91,12 +91,20 @@ function newRows<T extends { createdAt: Date }>(all: T[], baseline: T[]) {
   return all.filter((row) => !known.has(row));
 }
 
-function busEventsAfter(token: number, category?: string, providerId?: string) {
+// 'email' and 'example-msg' both declare the 'email' capability (see
+// packages/providers/src/registry.ts), so the routing engine's weighted
+// candidate selection can legitimately pick either one for an email send —
+// same tolerance packages/routing/src/routing.test.ts already asserts
+// (`expect(['email', 'example-msg']).toContain(result.providerId)`).
+const EMAIL_CAPABLE_PROVIDERS = ['email', 'example-msg'];
+
+function busEventsAfter(token: number, category?: string, providerId?: string | string[]) {
   const history = runtime.bus.getHistory();
+  const providerIds = typeof providerId === 'string' ? [providerId] : providerId;
   return history
     .filter((e: any) => new Date(e.timestamp).getTime() >= token)
     .filter((e: any) => (category ? e.category === category : true))
-    .filter((e: any) => (providerId ? e.providerId === providerId : true));
+    .filter((e: any) => (providerIds ? providerIds.includes(e.providerId) : true));
 }
 
 function mark(): number {
@@ -160,7 +168,7 @@ describe('complete donation flow (Reach Church -> ... -> Giving Receipt)', () =>
     expect(newRows(dbState.events, rowsBefore).some((r) => r.category === 'payment' && r.providerId === 'stripe')).toBe(true);
 
     // ---- Giving Receipt (wired pipeline) ----
-    const messaging = busEventsAfter(busToken, 'messaging', 'email');
+    const messaging = busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS);
     expect(messaging.some((e: any) => (e.payload?.recipient ?? e.response?.recipient) === DONOR_EMAIL)).toBe(true);
 
     // ---- Client can poll transaction status ----
@@ -228,7 +236,7 @@ describe('deliberate: duplicate requests', () => {
 
     // Exactly one record and one receipt — no double charge / double receipt.
     expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
-    expect(busEventsAfter(busToken, 'messaging', 'email').length).toBe(1);
+    expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
 
     // The replay was rejected at the idempotency guard and dead-lettered.
     const finalJob = await pipeline.queue.getJob(job2.id);
@@ -323,7 +331,7 @@ describe('deliberate: webhook arriving twice', () => {
     await drain(pipeline, ['payment_webhook', 'message_delivery']);
 
     expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
-    expect(busEventsAfter(busToken, 'messaging', 'email').length).toBe(1);
+    expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
     const job2State = await pipeline.queue.getJob(job2.id);
     expect(job2State?.status).toBe('dead');
     void job1;
@@ -480,7 +488,7 @@ describe('deliberate: database failure during processing', () => {
 
       // The flow did NOT continue in-memory: DB failure prevented further processing.
       expect(busEventsAfter(busToken, 'payment').some((e: any) => e.id === txId)).toBe(false);
-      expect(busEventsAfter(busToken, 'messaging', 'email').length).toBe(0);
+      expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(0);
 
       console.warn(
         '[gap] DB outage causes job dead-lettering; no receipt fired — provider webhook replay (or reconciliation) is the recovery path',
@@ -517,7 +525,7 @@ describe('deliberate: worker restart', () => {
     const failingJob = await worker1.queue.enqueue('message_delivery', { appId: APP_SLUG });
     await drain(worker1, ['message_delivery']);
 
-    expect(busEventsAfter(historyToken, 'messaging', 'email').length).toBe(1);
+    expect(busEventsAfter(historyToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
     expect((await worker1.queue.getJob(goodJob.id))?.status).toBe('completed');
     expect((await worker1.queue.getJob(failingJob.id))?.status).toBe('dead');
     expect((await counts(worker1, 'message_delivery')).dead).toBe(1);
@@ -547,7 +555,7 @@ describe('deliberate: worker restart', () => {
       timeoutMs: 10_000,
       label: 'idempotent gift',
     });
-    expect(busEventsAfter(historyToken, 'messaging', 'email').length).toBe(2);
+    expect(busEventsAfter(historyToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(2);
     await stopWorker(worker2);
 
     // ---- Worker #3: same idempotency key must NOT reprocess ----
@@ -561,7 +569,7 @@ describe('deliberate: worker restart', () => {
       timeoutMs: 10_000,
       label: 'idempotent replay after restart',
     });
-    expect(busEventsAfter(historyToken, 'messaging', 'email').length).toBe(2);
+    expect(busEventsAfter(historyToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(2);
     await stopWorker(worker3);
   }, 30_000);
 });
@@ -634,7 +642,7 @@ describe('deliberate: refund', () => {
     await drain(pipeline, ['payment_webhook', 'message_delivery']);
 
     expect(dbState.events.filter((r) => (r.payload as any)?.type === 'charge.refunded').length).toBe(rowsBefore + 1);
-    const notices = busEventsAfter(busToken, 'messaging', 'email');
+    const notices = busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS);
     expect(notices.some((e: any) => String(e.payload?.content).includes('refunded'))).toBe(true);
   });
 });
