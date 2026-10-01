@@ -1,25 +1,39 @@
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, desc, and } from 'drizzle-orm';
 import { getDb } from '../connection';
 import { supportTickets, type SupportTicket, type NewSupportTicket } from '../schema';
 
 export const supportTicketRepository = {
-  async findById(id: string, appId: string): Promise<SupportTicket | undefined> {
+  async findById(id: string): Promise<SupportTicket | undefined> {
     const db = getDb();
-    const rows = await db
-      .select()
-      .from(supportTickets)
-      .where(and(eq(supportTickets.id, id), eq(supportTickets.appId, appId)))
-      .limit(1);
+    const rows = await db.select().from(supportTickets).where(eq(supportTickets.id, id)).limit(1);
     return rows[0];
   },
 
-  async listByAppAndTenant(appId: string, tenantId: string): Promise<SupportTicket[]> {
+  async findByApplicationId(applicationId: string): Promise<SupportTicket[]> {
     const db = getDb();
     return db
       .select()
       .from(supportTickets)
-      .where(and(eq(supportTickets.appId, appId), eq(supportTickets.tenantId, tenantId)))
+      .where(eq(supportTickets.applicationId, applicationId))
       .orderBy(desc(supportTickets.createdAt));
+  },
+
+  async findAll(status?: string): Promise<SupportTicket[]> {
+    const db = getDb();
+    const query = db.select().from(supportTickets);
+    if (status) {
+      return query.where(eq(supportTickets.status, status)).orderBy(desc(supportTickets.createdAt));
+    }
+    return query.orderBy(desc(supportTickets.createdAt));
+  },
+
+  async countOpenByApplicationId(applicationId: string): Promise<number> {
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(supportTickets)
+      .where(and(eq(supportTickets.applicationId, applicationId), eq(supportTickets.status, 'open')));
+    return rows.length;
   },
 
   async create(data: NewSupportTicket): Promise<SupportTicket> {
@@ -28,16 +42,12 @@ export const supportTicketRepository = {
     return rows[0];
   },
 
-  async updateStatus(id: string, appId: string, status: string): Promise<SupportTicket | undefined> {
+  async update(id: string, data: Partial<NewSupportTicket>): Promise<SupportTicket | undefined> {
     const db = getDb();
     const rows = await db
       .update(supportTickets)
-      .set({
-        status,
-        updatedAt: new Date(),
-        resolvedAt: status === 'resolved' || status === 'closed' ? new Date() : null,
-      })
-      .where(and(eq(supportTickets.id, id), eq(supportTickets.appId, appId)))
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(supportTickets.id, id))
       .returning();
     return rows[0];
   },

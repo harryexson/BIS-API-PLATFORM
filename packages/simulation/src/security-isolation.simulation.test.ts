@@ -146,7 +146,14 @@ describe('F) Forged webhook signature rejected (control)', () => {
     const body = buildStripeWebhook('chg_forged1');
     const rawBody = JSON.stringify(body);
     const correct = signWebhook(rawBody);
-    const tampered = 'a' + correct.slice(1); // flip first nibble; still valid-length hex
+    // Flip the first hex nibble to something guaranteed to differ from the
+    // original — the webhook body includes a random event id and current
+    // timestamp, so `correct[0]` is effectively random per run; a fixed
+    // 'a' would occasionally BE the original nibble (~1/16 of runs),
+    // producing a byte-for-byte "tampered" signature that's actually
+    // still valid and flaking this test.
+    const tamperedNibble = correct[0] === 'a' ? 'b' : 'a';
+    const tampered = tamperedNibble + correct.slice(1); // still valid-length hex, guaranteed to differ
     const res = await runtime.postText('/v1/api/webhooks/stripe', rawBody, {
       'x-webhook-signature': tampered,
     });

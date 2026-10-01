@@ -32,7 +32,6 @@ export const SubscriptionManagement: React.FC<SubscriptionManagementProps> = ({ 
   const [form, setForm] = useState({ slug: '', name: '', priceCents: '', currency: 'USD', billingInterval: 'month' });
 
   const [assignAppSlug, setAssignAppSlug] = useState('');
-  const [assignTenantId, setAssignTenantId] = useState('default');
   const [assignPlanSlug, setAssignPlanSlug] = useState('');
   const [assignResult, setAssignResult] = useState<string | null>(null);
 
@@ -85,12 +84,12 @@ export const SubscriptionManagement: React.FC<SubscriptionManagementProps> = ({ 
     setAssignResult(null);
     try {
       await api(
-        `/api/dashboard/applications/${assignAppSlug.trim()}/tenants/${assignTenantId.trim() || 'default'}/subscription`,
+        `/api/dashboard/applications/${assignAppSlug.trim()}/subscription`,
         token,
         'POST',
         { planSlug: assignPlanSlug.trim() },
       );
-      setAssignResult(`Subscribed ${assignAppSlug.trim()}/${assignTenantId.trim() || 'default'} to ${assignPlanSlug.trim()}.`);
+      setAssignResult(`Subscribed ${assignAppSlug.trim()} to ${assignPlanSlug.trim()}.`);
     } catch (err: any) {
       setError(err.message);
     }
@@ -137,10 +136,9 @@ export const SubscriptionManagement: React.FC<SubscriptionManagementProps> = ({ 
       </div>
 
       <div className="glass-card">
-        <h3 style={{ marginTop: 0 }}>Assign a tenant to a plan</h3>
+        <h3 style={{ marginTop: 0 }}>Assign an application to a plan</h3>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
           <input placeholder="application slug" value={assignAppSlug} onChange={(e) => setAssignAppSlug(e.target.value)} style={inputStyle} />
-          <input placeholder="tenant id (default: 'default')" value={assignTenantId} onChange={(e) => setAssignTenantId(e.target.value)} style={inputStyle} />
           <select value={assignPlanSlug} onChange={(e) => setAssignPlanSlug(e.target.value)} style={inputStyle}>
             <option value="">Select a plan…</option>
             {plans.filter((p) => p.isActive).map((p) => (

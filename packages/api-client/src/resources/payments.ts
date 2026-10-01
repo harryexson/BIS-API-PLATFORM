@@ -1,5 +1,5 @@
 import { HttpClient } from '../http';
-import { PaymentCreate, RequestOptions, TransactionEvent, TransactionStatusResponse } from '../types';
+import { PaymentCreate, RefundCreate, RequestOptions, TransactionEvent, TransactionStatusResponse } from '../types';
 
 export class PaymentsResource {
   constructor(private readonly http: HttpClient) {}
@@ -9,6 +9,21 @@ export class PaymentsResource {
     return this.http.request<TransactionEvent>('POST', '/v1/api/gateway/payment', {
       body: input,
       idempotencyKey: opts?.idempotencyKey,
+      correlationId: opts?.correlationId,
+      signal: opts?.signal,
+    });
+  }
+
+  /**
+   * POST /v1/api/gateway/refund — real support exists server-side for
+   * Stripe, NMI, and Flutterwave (verified against each provider's own
+   * API); any other provider resolves the returned TransactionEvent with
+   * status 'failed' rather than fabricating a result. Does not accept an
+   * idempotency key — the gateway route doesn't read one for this route.
+   */
+  async refund(input: RefundCreate, opts?: Omit<RequestOptions, 'idempotencyKey'>): Promise<TransactionEvent> {
+    return this.http.request<TransactionEvent>('POST', '/v1/api/gateway/refund', {
+      body: input,
       correlationId: opts?.correlationId,
       signal: opts?.signal,
     });

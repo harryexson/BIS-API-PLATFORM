@@ -129,6 +129,26 @@ describe('ApplicationRegistry', () => {
       expect(result.apiKey.prefix).toMatch(/^bap_test_/);
     });
 
+    it('sets a default expiry on the newly issued key', async () => {
+      const before = Date.now();
+      await registry.createApplication({
+        name: 'Expiry Default',
+        slug: 'expiry-default',
+      });
+      const after = Date.now();
+
+      const keyRecord = keyRepo._keys.find(
+        (k) => k.keyHash && k.applicationId,
+      );
+      expect(keyRecord?.expiresAt).toBeInstanceOf(Date);
+      const expiryMs = (keyRecord!.expiresAt as Date).getTime();
+      // Default is API_KEY_DEFAULT_EXPIRY_DAYS (365 unless overridden) days out.
+      const expectedDays = Number(process.env.API_KEY_DEFAULT_EXPIRY_DAYS ?? 365);
+      const expectedMs = expectedDays * 24 * 60 * 60 * 1000;
+      expect(expiryMs).toBeGreaterThanOrEqual(before + expectedMs - 5000);
+      expect(expiryMs).toBeLessThanOrEqual(after + expectedMs + 5000);
+    });
+
     it('creates application with custom environment', async () => {
       const result = await registry.createApplication({
         name: 'Prod App',
@@ -205,6 +225,32 @@ describe('ApplicationRegistry', () => {
       expect(result.authenticated).toBe(true);
       expect(result.application?.id).toBe(application.id);
       expect(result.error).toBeUndefined();
+    });
+
+    it('surfaces the matched key scopes on success', async () => {
+      const { apiKey, application } = await registry.createApplication({
+        name: 'Scope Auth',
+        slug: 'scope-auth',
+      });
+      const keyRecord = keyRepo._keys.find(
+        (k) => k.applicationId === application.id,
+      );
+      if (keyRecord) keyRecord.scopes = 'messaging:send';
+
+      const result = await registry.authenticateApplication(apiKey.raw);
+      expect(result.authenticated).toBe(true);
+      expect(result.scopes).toBe('messaging:send');
+    });
+
+    it('scopes is null when the key has none configured (unrestricted)', async () => {
+      const { apiKey } = await registry.createApplication({
+        name: 'No Scope Auth',
+        slug: 'no-scope-auth',
+      });
+
+      const result = await registry.authenticateApplication(apiKey.raw);
+      expect(result.authenticated).toBe(true);
+      expect(result.scopes).toBeNull();
     });
 
     it('invalid application → rejected', async () => {

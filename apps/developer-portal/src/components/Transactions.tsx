@@ -15,7 +15,7 @@ export default function Transactions({ token }: { token: string }) {
   const [transactions, setTransactions] = useState<Transaction[] | null>(null);
 
   useEffect(() => {
-    portalFetch(token, '/v1/portal/transactions')
+    portalFetch(token, '/v1/api/transactions')
       .then((res) => res.json())
       .then((body) => setTransactions(body.transactions || []));
   }, [token]);

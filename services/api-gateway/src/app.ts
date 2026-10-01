@@ -2,8 +2,8 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
-import { RoutingEngine } from '@company/routing';
-import { EventBus } from '@company/events';
+import { RoutingEngine, ConsentBlockedError } from '@company/routing';
+import { EventBus, WebhookDelivery } from '@company/events';
 import { TransactionEvent, TransactionStatusResponse, TransactionStatus, ProviderCapabilityMatch } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
 import {
@@ -21,13 +21,32 @@ import {
   verifyPassword,
   generateApiKey,
   checkDatabaseHealth,
-  roleRepository,
   permissionRepository,
   userRoleRepository,
-  subscriptionPlanRepository,
-  tenantSubscriptionRepository,
+  consentRecordRepository,
+  messagingProfileRepository,
+  ApplicationRegistry,
+  AuthRegistry,
+  AuthError,
+  ValidationError,
+  ConflictError,
+  userSessionRepository,
+  userVerificationTokenRepository,
+  roleRepository,
+  type PublicUser,
+  SubscriptionRegistry,
+  SubscriptionError,
+  planRepository,
+  subscriptionRepository,
+  CrmRegistry,
+  CrmError,
+  customerNoteRepository,
   supportTicketRepository,
-  supportTicketMessageRepository,
+  ticketCommentRepository,
+  ensureProviderRow,
+  persistProviderSecrets,
+  loadAllProviderSecrets,
+  webhookEndpointRepository,
 } from '@company/database';
 import {
   logger,
@@ -36,8 +55,17 @@ import {
   getContext,
   setContextField,
 } from '@company/observability';
-import { PlatformIdempotencyService } from '@company/shared';
-import { signPortalToken, verifyPortalToken, PortalTokenPayload } from './jwt';
+import { PlatformIdempotencyService, sendTransactionalEmail, verificationEmailHtml, passwordResetEmailHtml } from '@company/shared';
+import {
+  createStore,
+  createKeys,
+  createWorkerConfig,
+  JobQueue,
+  RedisStore,
+  type KVStore,
+  type Keys,
+  type WorkerConfig,
+} from '@company/workers';
 
 const platformIdempotency = new PlatformIdempotencyService();
 
@@ -89,7 +117,17 @@ app.use((_req, res, next) => {
 });
 
 // P1-3: Explicit body size limit
-app.use(express.json({ limit: '100kb' }));
+// `verify` stashes the raw request bytes on req.rawBody alongside the
+// parsed JSON — needed by the Stripe billing webhook route below, whose
+// signature verification is computed over the exact raw body, not a
+// re-serialized JSON.stringify(req.body) (which can differ in key order/
+// whitespace and would break the signature).
+app.use(express.json({
+  limit: '100kb',
+  verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
+    req.rawBody = buf;
+  },
+}));
 
 // ----------------------------------------------------
 // P3-1: REQUEST/RESPONSE LOGGING + TRACING
@@ -190,6 +228,43 @@ function observe(event: TransactionEvent) {
   });
 }
 
+// apps/web's /verify-email and /reset-password pages (VerifyEmailPage.tsx,
+// ResetPasswordPage.tsx) land this link and call the two routes below
+// directly — PLATFORM_APP_URL points at wherever that deployment lives.
+// Left unset, the link falls back to a relative path so the email is
+// still well-formed; the raw token is always included as plain text too,
+// so the email stays actionable (e.g. via a support-assisted API call)
+// even if PLATFORM_APP_URL is misconfigured or that deployment is down.
+function buildAccountLink(path: string, token: string): string {
+  const base = (process.env.PLATFORM_APP_URL || '').replace(/\/+$/, '');
+  return `${base}${path}?token=${encodeURIComponent(token)}`;
+}
+
+// Fire-and-forget email sends for account flows — a failed/unconfigured
+// send must never block signup, verification-resend, or a password-reset
+// request. Errors are logged, not thrown.
+function sendAccountEmail(kind: 'verify' | 'reset', to: string, token: string) {
+  const url = kind === 'verify' ? buildAccountLink('/verify-email', token) : buildAccountLink('/reset-password', token);
+  const html =
+    (kind === 'verify' ? verificationEmailHtml(url) : passwordResetEmailHtml(url)) +
+    `<p style="color:#64748b;font-size:13px">Token: <code>${token}</code></p>`;
+
+  sendTransactionalEmail({
+    to,
+    subject: kind === 'verify' ? 'Verify your email' : 'Reset your password',
+    html,
+  }).then((result) => {
+    if (!result.sent) {
+      logger.warn('transactional email not sent', {
+        operation: kind === 'verify' ? 'auth-verification-email' : 'auth-password-reset-email',
+        errorCode: 'EMAIL_NOT_SENT',
+        status: 'failed',
+        error: result.error,
+      });
+    }
+  });
+}
+
 function observeFailure(category: 'payment' | 'messaging' | 'other', providerId: string, errorCode: string) {
   metrics.increment('routingFailures');
   logger.error('gateway operation failed', {
@@ -198,6 +273,21 @@ function observeFailure(category: 'payment' | 'messaging' | 'other', providerId:
     errorCode,
     status: 'failed',
   });
+}
+
+// Express 4 does not catch a rejected promise thrown by an async route
+// handler — it becomes an unhandled promise rejection at the Node process
+// level instead of reaching the `app.use((err, ...))` error middleware
+// below, which crashes the entire gateway (every tenant, every route) on
+// a single failed query. Wrap any async handler that doesn't already have
+// its own try/catch with this so the error middleware gets a chance to
+// turn it into a normal 500 response instead.
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
 const auth = new AuthService({
@@ -229,6 +319,132 @@ app.use('/v1/api/gateway/*', (req, res, next) => {
 const registry = ProviderRegistry.getInstance();
 const routingEngine = new RoutingEngine();
 const eventBus = EventBus.getInstance();
+
+// P0: Outbound platform webhooks. Previously docs/openapi.yaml and
+// docs/DEVELOPER_GUIDE.md §9b documented a working "register a URL,
+// receive a signed event" feature that wasn't reachable end-to-end —
+// packages/events/src/webhook-delivery.ts's WebhookDelivery was a real,
+// working POST-with-retry engine that nothing ever instantiated, and there
+// was no table/route for a developer to register a callback URL at all
+// (see docs/IMPLEMENTATION_BASELINE.md item 24). This wires it up: every
+// event this gateway emits is fanned out to every active, subscribed
+// webhook_endpoints row for that event's appId (TransactionEvent carries
+// no tenantId, so dispatch can only key on appId — see the schema's class
+// comment), signed with that endpoint's own secret.
+const webhookDelivery = new WebhookDelivery();
+webhookDelivery.start();
+
+async function dispatchOutboundWebhooks(event: TransactionEvent): Promise<void> {
+  if (!event.appId) return;
+  let endpoints;
+  try {
+    endpoints = await webhookEndpointRepository.findActiveByAppId(event.appId);
+  } catch {
+    // No DB configured (e.g. some simulation/test contexts) — nothing to
+    // dispatch to; never let this block the event that triggered it.
+    return;
+  }
+  if (endpoints.length === 0) return;
+
+  for (const endpoint of endpoints) {
+    const eventTypes = Array.isArray(endpoint.eventTypes) ? (endpoint.eventTypes as string[]) : ['*'];
+    if (!eventTypes.includes('*') && !eventTypes.includes(event.category)) continue;
+
+    let secret: string | undefined;
+    try {
+      secret = webhookEndpointRepository.resolveSecret(endpoint);
+    } catch {
+      logger.error('failed to decrypt webhook endpoint secret — skipping delivery', {
+        operation: 'webhook-dispatch',
+        errorCode: 'SECRET_DECRYPT_FAILED',
+        status: 'failed',
+      });
+      continue;
+    }
+    // Namespaced by endpoint + event id: the same event can fan out to
+    // several endpoints, each tracked as its own independent delivery.
+    webhookDelivery.enqueue(`${endpoint.id}:${event.id}`, { url: endpoint.url, secret }, event);
+  }
+}
+
+eventBus.subscribe((event) => {
+  dispatchOutboundWebhooks(event).catch(() => {
+    logger.error('outbound webhook dispatch failed', {
+      operation: 'webhook-dispatch',
+      errorCode: 'DISPATCH_FAILED',
+      status: 'failed',
+    });
+  });
+});
+
+// P0: Provider secrets added through the admin console previously lived
+// only in ProviderRegistry's in-memory Map — a real gap this platform
+// documented rather than hid (see docs/IMPLEMENTATION_BASELINE.md, "Provider
+// secrets DB persistence"): a secret survived until the next restart, then
+// silently reverted to whatever the process.env fallback provided (or
+// nothing). packages/providers stays DB-free by design (a synchronous
+// singleton constructor, shared by every packages/simulation test, that
+// cannot itself await a real DB call) — this gateway, which already
+// depends on both packages, owns bridging the two: read back every
+// already-persisted provider's secrets into the registry once at startup,
+// and persist the full current set — seeding that provider's `providers`
+// row first, idempotently, if this is its very first secret — after every
+// admin add/delete (see the /api/dashboard/providers/:id/secrets routes
+// below).
+//
+// Fire-and-forget and non-blocking — server startup (app.listen in
+// index.ts) must not wait on a DB round trip, and a provider with no
+// persisted secrets yet (or SECRET_ENCRYPTION_KEY unset, e.g. most
+// non-production environments) is expected, not an error: the adapter's
+// process.env fallback still works exactly as before this existed.
+async function hydrateProviderSecretsFromDb(): Promise<void> {
+  try {
+    const snapshot = await loadAllProviderSecrets();
+    for (const [slug, secrets] of Object.entries(snapshot)) {
+      registry.hydrateSecrets(slug, secrets);
+    }
+  } catch (err) {
+    logger.warn('provider secrets hydration failed — adapters still work via env-var fallback', {
+      operation: 'startup',
+      errorCode: 'PROVIDER_SECRETS_HYDRATE_FAILED',
+      status: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+void hydrateProviderSecretsFromDb();
+
+// Encrypts and stores the provider's full current secrets set — called
+// fire-and-forget after every successful addSecret()/deleteSecret() below.
+// Never blocks or fails the HTTP response: the in-memory registry (what
+// every real adapter call actually reads) is already correct the moment
+// addSecret()/deleteSecret() returns; this only affects whether that state
+// survives the *next* restart, not the current request.
+//
+// Seeds this provider's `providers` row on every call (upsert, so a
+// repeat is a cheap no-op) rather than relying on startup hydration having
+// already done it — an admin can add a secret before that fire-and-forget
+// loop finishes, or (for a provider that has never had a secret before)
+// there may be no row yet at all.
+function persistProviderSecretsAsync(id: string): void {
+  const secrets = registry.exportSecretsForPersistence(id);
+  if (secrets === null) return;
+  const config = registry.getAllConfigs().find((c) => c.id === id);
+  if (!config) return;
+
+  (async () => {
+    await ensureProviderRow({ slug: id, name: config.name, category: config.category });
+    await persistProviderSecrets(id, secrets);
+  })().catch((err) => {
+    logger.warn('provider secrets persistence failed — in-memory state is still correct', {
+      operation: 'provider_secrets_persist',
+      providerId: id,
+      errorCode: 'PROVIDER_SECRETS_PERSIST_FAILED',
+      status: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
 
 // ----------------------------------------------------
 // P0-4: TENANT ISOLATION MIDDLEWARE (ENFORCED)
@@ -309,37 +525,6 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
   return next();
 }
 
-// ----------------------------------------------------
-// DEVELOPER PORTAL AUTHORIZATION
-// ----------------------------------------------------
-// Per-user JWT session auth for the developer portal (apps/developer-portal),
-// distinct from the API-key auth used by server-to-server traffic routes and
-// the shared-passcode admin auth above. In production PORTAL_JWT_SECRET must
-// be explicitly set — falls back to a random per-process secret otherwise
-// (fine for local dev; existing sessions just don't survive a restart).
-const PORTAL_JWT_SECRET = process.env.PORTAL_JWT_SECRET || randomUUID() + randomUUID();
-if (!process.env.PORTAL_JWT_SECRET && isProduction) {
-  logger.error('PORTAL_JWT_SECRET is not set in production — portal sessions will not survive a restart', {
-    operation: 'startup',
-    errorCode: 'MISSING_PORTAL_SECRET',
-    status: 'failed',
-  });
-}
-
-function requirePortalAuth(req: Request, res: Response, next: NextFunction) {
-  const header = req.header('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : undefined;
-  if (!token) {
-    return res.status(401).json({ error: 'Missing bearer token' });
-  }
-  const payload = verifyPortalToken(token, PORTAL_JWT_SECRET);
-  if (!payload) {
-    return res.status(401).json({ error: 'Invalid or expired session' });
-  }
-  (req as Request & { portalUser?: PortalTokenPayload }).portalUser = payload;
-  return next();
-}
-
 // Records live traffic outcomes against the provider management stats.
 function recordTrafficResult(providerId: string | undefined, status: TransactionStatus, latency: number) {
   if (!providerId) return;
@@ -350,6 +535,432 @@ function recordTrafficResult(providerId: string | undefined, status: Transaction
   if (status === 'unknown') return;
   registry.recordTraffic(providerId, status === 'success', latency);
 }
+
+// ----------------------------------------------------
+// CUSTOMER ACCOUNT AUTH
+// ----------------------------------------------------
+// Signup/login for the developers/businesses that own a BIS Platform
+// application (e.g. "Reach Church") — distinct from the per-application
+// API-key auth (mw.apiKey, above) used on /v1/api/gateway/* and the
+// single shared-secret admin auth (requireAdmin) used on /api/dashboard/*.
+// Session tokens are opaque and revocable, not stateless JWTs — see
+// AuthRegistry's docstring in packages/database/src/auth-registry.ts.
+// Rate-limited by the existing `app.use('/v1/api', mw.rateLimit)` above
+// (keyed by IP, since these routes carry no API key).
+const authRegistry = new AuthRegistry(
+  userRepository,
+  userSessionRepository,
+  userVerificationTokenRepository,
+  roleRepository,
+  new ApplicationRegistry(applicationRepository, apiKeyRepository),
+);
+
+type SessionAuthedRequest = Request & { user?: PublicUser };
+
+async function requireSession(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers['authorization'];
+  const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : undefined;
+  if (!token) {
+    return res.status(401).json({ error: 'Session token required' });
+  }
+  const user = await authRegistry.verifySession(token);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+  (req as SessionAuthedRequest).user = user;
+  return next();
+}
+
+app.post('/v1/api/auth/signup', async (req: Request, res: Response) => {
+  const { email, password, name, applicationName, applicationSlug } = req.body || {};
+  try {
+    const result = await authRegistry.signup({ email, password, name, applicationName, applicationSlug });
+    logger.info('account signup', {
+      operation: 'auth-signup',
+      applicationId: result.application.id,
+      status: 'success',
+    });
+    sendAccountEmail('verify', result.user.email, result.emailVerificationToken);
+
+    // A new application is useless without a tenant to send traffic under —
+    // resolveTenantContext rejects every /v1/api/gateway/* request until one
+    // exists and is linked. Provision a default one so the account is usable
+    // immediately; additional tenants can still be created later.
+    const defaultTenant = await tenantRepository.create({
+      name: 'Default',
+      slug: `${result.application.slug}-default`,
+    });
+    await tenantApplicationLinkRepository.link(defaultTenant.id, result.application.id);
+
+    // Signup doesn't require email verification before a usable session
+    // exists (verification gates other things, not login) — mint one here
+    // via the same login path rather than duplicating session-creation
+    // logic, so the developer portal can go straight from signup to the
+    // dashboard without a second round trip.
+    const session = await authRegistry.login({
+      email,
+      password,
+      userAgent: req.header('user-agent'),
+      ipAddress: req.ip,
+    });
+
+    return res.status(201).json({
+      user: result.user,
+      application: result.application,
+      apiKey: result.apiKey,
+      tenant: { id: defaultTenant.id, name: defaultTenant.name, slug: defaultTenant.slug },
+      token: session.token,
+      expiresAt: session.expiresAt,
+      // The token is also surfaced directly outside production, in
+      // addition to the real send above — keeps signup/verification
+      // testable end to end without depending on a real inbox, and gives
+      // a fallback if RESEND_API_KEY isn't configured in a dev/staging
+      // environment.
+      ...(process.env.NODE_ENV !== 'production'
+        ? { emailVerificationToken: result.emailVerificationToken }
+        : {}),
+    });
+  } catch (err: any) {
+    const status = err instanceof ValidationError ? 400 : err instanceof ConflictError ? 409 : 500;
+    if (status === 500) {
+      logger.error('signup failed', { operation: 'auth-signup', errorCode: 'SIGNUP_FAILED', status: 'failed' });
+    }
+    return res.status(status).json({ error: err.message || 'Signup failed' });
+  }
+});
+
+app.post('/v1/api/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
+  try {
+    const result = await authRegistry.login({
+      email,
+      password,
+      userAgent: req.header('user-agent'),
+      ipAddress: req.ip,
+    });
+    const application = await applicationRepository.findById(result.user.applicationId);
+    return res.json({
+      user: result.user,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      application: application
+        ? { id: application.id, name: application.name, slug: application.slug }
+        : null,
+    });
+  } catch (err: any) {
+    const status = err instanceof AuthError ? 401 : 500;
+    return res.status(status).json({ error: err.message || 'Login failed' });
+  }
+});
+
+app.post('/v1/api/auth/logout', requireSession, asyncHandler(async (req: Request, res: Response) => {
+  const header = req.headers['authorization'] as string;
+  await authRegistry.logout(header.slice(7));
+  return res.status(204).send();
+}));
+
+app.get('/v1/api/auth/me', requireSession, (req: Request, res: Response) => {
+  return res.json({ user: (req as SessionAuthedRequest).user });
+});
+
+app.post('/v1/api/auth/verify-email', async (req: Request, res: Response) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token is required' });
+  try {
+    const user = await authRegistry.verifyEmail(token);
+    return res.json({ user });
+  } catch (err: any) {
+    return res.status(err instanceof AuthError ? 400 : 500).json({ error: err.message || 'Verification failed' });
+  }
+});
+
+app.post('/v1/api/auth/resend-verification', requireSession, asyncHandler(async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const { token } = await authRegistry.resendEmailVerification(user.id);
+  sendAccountEmail('verify', user.email, token);
+  return res.json({
+    message: 'Verification email requested',
+    ...(process.env.NODE_ENV !== 'production' ? { emailVerificationToken: token } : {}),
+  });
+}));
+
+app.post('/v1/api/auth/request-password-reset', asyncHandler(async (req: Request, res: Response) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email is required' });
+  const result = await authRegistry.requestPasswordReset(email);
+  if (result) sendAccountEmail('reset', email, result.token);
+  // Always a generic success — never reveal whether the account exists.
+  return res.json({
+    message: 'If an account exists for this email, a password reset link has been sent.',
+    ...(process.env.NODE_ENV !== 'production' && result ? { passwordResetToken: result.token } : {}),
+  });
+}));
+
+app.post('/v1/api/auth/reset-password', async (req: Request, res: Response) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: 'token and password are required' });
+  try {
+    await authRegistry.resetPassword(token, password);
+    return res.json({ message: 'Password reset successful' });
+  } catch (err: any) {
+    const status = err instanceof ValidationError || err instanceof AuthError ? 400 : 500;
+    return res.status(status).json({ error: err.message || 'Password reset failed' });
+  }
+});
+
+// ----------------------------------------------------
+// SUBSCRIPTIONS / BILLING
+// ----------------------------------------------------
+// Billing for the platform's own customers (the businesses that hold an
+// application) — distinct from packages/providers/payments, which routes
+// one-off payments those businesses make on their own behalf. Plan
+// management is session-authed (requireSession, above); the webhook
+// route is signature-verified instead, since Stripe calls it directly.
+const subscriptionRegistry = new SubscriptionRegistry(planRepository, subscriptionRepository, applicationRepository);
+
+// Plan usage-limit enforcement. Previously messageLimit/
+// paymentVolumeLimitCents were stored on the plans table and never
+// checked anywhere — a starter-plan application could send unlimited
+// messages/payment volume. An application with no active subscription
+// (most of them today — signup doesn't auto-subscribe to a plan) or
+// whose plan has a null limit is intentionally unrestricted: there is no
+// limit to enforce, not a bug to work around. Counts/sums only
+// successful sends within the subscription's current billing period —
+// a failed attempt never consumed the resource it would be charged
+// against.
+async function checkPlanLimit(
+  appId: string,
+  kind: 'message' | 'payment',
+  amount?: number,
+): Promise<{ blocked: boolean; reason?: string }> {
+  const subscription = await subscriptionRepository.findByApplicationId(appId);
+  if (!subscription || subscription.status !== 'active' || !subscription.currentPeriodStart) {
+    return { blocked: false };
+  }
+  const plan = await planRepository.findById(subscription.planId);
+  if (!plan) return { blocked: false };
+
+  if (kind === 'message') {
+    if (plan.messageLimit == null) return { blocked: false };
+    const used = await eventRepository.countSuccessfulByCategorySince(appId, 'messaging', subscription.currentPeriodStart);
+    if (used >= plan.messageLimit) {
+      return {
+        blocked: true,
+        reason: `Plan message limit reached (${plan.messageLimit} messages this billing period). Upgrade your plan to send more.`,
+      };
+    }
+  } else {
+    if (plan.paymentVolumeLimitCents == null) return { blocked: false };
+    const usedCents = await transactionRepository.sumSuccessfulAmountCentsSince(appId, subscription.currentPeriodStart);
+    const projectedCents = usedCents + Math.round((amount ?? 0) * 100);
+    if (projectedCents > plan.paymentVolumeLimitCents) {
+      return {
+        blocked: true,
+        reason: `Plan payment volume limit reached ($${(plan.paymentVolumeLimitCents / 100).toFixed(2)} this billing period). Upgrade your plan to process more.`,
+      };
+    }
+  }
+  return { blocked: false };
+}
+
+app.get('/v1/api/billing/plans', asyncHandler(async (_req: Request, res: Response) => {
+  const plans = await subscriptionRegistry.listPlans();
+  return res.json({ plans });
+}));
+
+app.get('/v1/api/billing/subscription', requireSession, asyncHandler(async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const subscription = await subscriptionRegistry.getSubscription(user.applicationId);
+  return res.json({ subscription: subscription ?? null });
+}));
+
+app.post('/v1/api/billing/subscribe', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const { planSlug } = req.body || {};
+  if (!planSlug) return res.status(400).json({ error: 'planSlug is required' });
+  try {
+    const subscription = await subscriptionRegistry.subscribe(user.applicationId, planSlug, user.email);
+    return res.json({ subscription });
+  } catch (err: any) {
+    const status = err instanceof SubscriptionError ? 400 : 500;
+    if (status === 500) {
+      logger.error('subscribe failed', {
+        operation: 'billing-subscribe',
+        applicationId: user.applicationId,
+        errorCode: 'SUBSCRIBE_FAILED',
+        status: 'failed',
+      });
+    }
+    return res.status(status).json({ error: err.message || 'Subscription failed' });
+  }
+});
+
+app.post('/v1/api/billing/cancel', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const atPeriodEnd = req.body?.atPeriodEnd !== false; // defaults to true — cancel at period end, not immediately
+  try {
+    const subscription = await subscriptionRegistry.cancelSubscription(user.applicationId, atPeriodEnd);
+    return res.json({ subscription });
+  } catch (err: any) {
+    const status = err instanceof SubscriptionError ? 400 : 500;
+    return res.status(status).json({ error: err.message || 'Cancellation failed' });
+  }
+});
+
+// Real Stripe webhook signature verification (Stripe-Signature header:
+// t=<unix seconds>,v1=<hex hmac-sha256(`${t}.${rawBody}`, secret)>) — NOT
+// the generic WEBHOOK_HMAC_SECRET scheme used by /v1/api/webhooks/:provider
+// above, which only ever compares against this platform's own signing
+// convention and would reject every genuine Stripe delivery. Verified via
+// web search against Stripe's current docs (2026-09-09), not memory.
+function verifyStripeSignature(rawBody: Buffer, header: string | undefined, secret: string): boolean {
+  if (!header) return false;
+  const parts = Object.fromEntries(
+    header.split(',').map((kv) => {
+      const [k, v] = kv.split('=');
+      return [k, v];
+    }),
+  );
+  const timestamp = parts.t;
+  const signature = parts.v1;
+  if (!timestamp || !signature) return false;
+
+  // 5-minute tolerance, matching Stripe's own library default.
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(age) || age > 5 * 60) return false;
+
+  const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody.toString('utf8')}`).digest('hex');
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signature, 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+app.post('/v1/api/billing/webhooks/stripe', async (req: Request, res: Response) => {
+  const secret = process.env.STRIPE_BILLING_WEBHOOK_SECRET;
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+
+  if (!secret) {
+    logger.error('billing webhook rejected — no secret configured', {
+      operation: 'billing-webhook',
+      errorCode: 'NO_WEBHOOK_SECRET',
+      status: 'failed',
+    });
+    return res.status(503).json({ error: 'Webhook verification not configured' });
+  }
+  if (!rawBody || !verifyStripeSignature(rawBody, req.header('stripe-signature'), secret)) {
+    logger.error('billing webhook rejected — invalid signature', {
+      operation: 'billing-webhook',
+      errorCode: 'INVALID_SIGNATURE',
+      status: 'failed',
+    });
+    return res.status(401).json({ error: 'Invalid webhook signature' });
+  }
+
+  try {
+    const event = req.body;
+    const updated = await subscriptionRegistry.syncFromStripeEvent(event);
+    logger.info('billing webhook processed', {
+      operation: 'billing-webhook',
+      status: 'success',
+      applicationId: updated?.applicationId,
+    });
+    return res.json({ received: true });
+  } catch (err: any) {
+    logger.error('billing webhook processing failed', {
+      operation: 'billing-webhook',
+      errorCode: 'PROCESSING_FAILED',
+      status: 'failed',
+    });
+    return res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
+// ----------------------------------------------------
+// DEVELOPER CRM / SUPPORT BACK OFFICE
+// ----------------------------------------------------
+// BIS staff-facing (requireAdmin-gated, same single shared-secret admin
+// auth used by every other /api/dashboard/* route below) — a "customer"
+// here is an `application`. Confirmed absent entirely by a 2026-09-09
+// audit: no endpoint anywhere listed applications for admin use before
+// this section.
+const crmRegistry = new CrmRegistry(
+  applicationRepository,
+  subscriptionRepository,
+  planRepository,
+  userRepository,
+  customerNoteRepository,
+  supportTicketRepository,
+  ticketCommentRepository,
+);
+
+app.get('/api/dashboard/customers', requireAdmin, asyncHandler(async (_req: Request, res: Response) => {
+  const customers = await crmRegistry.listCustomers();
+  return res.json({ customers });
+}));
+
+app.get('/api/dashboard/customers/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const customer = await crmRegistry.getCustomer(req.params.id);
+  if (!customer) return res.status(404).json({ error: 'Customer not found' });
+  return res.json(customer);
+}));
+
+app.post('/api/dashboard/customers/:id/notes', requireAdmin, async (req: Request, res: Response) => {
+  const { body, authorName } = req.body || {};
+  try {
+    const note = await crmRegistry.addNote(req.params.id, authorName, body);
+    return res.status(201).json(note);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add note' });
+  }
+});
+
+app.get('/api/dashboard/tickets', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const tickets = await crmRegistry.listTickets(req.query.status as string | undefined);
+    return res.json({ tickets });
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to list tickets' });
+  }
+});
+
+app.get('/api/dashboard/tickets/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const result = await crmRegistry.getTicket(req.params.id);
+  if (!result) return res.status(404).json({ error: 'Ticket not found' });
+  return res.json(result);
+}));
+
+app.post('/api/dashboard/customers/:id/tickets', requireAdmin, async (req: Request, res: Response) => {
+  const { subject, description, priority, requesterEmail } = req.body || {};
+  try {
+    const ticket = await crmRegistry.createTicket(req.params.id, { subject, description, priority, requesterEmail });
+    return res.status(201).json(ticket);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to create ticket' });
+  }
+});
+
+app.patch('/api/dashboard/tickets/:id', requireAdmin, async (req: Request, res: Response) => {
+  const { status, priority } = req.body || {};
+  try {
+    const ticket = await crmRegistry.updateTicket(req.params.id, { status, priority });
+    return res.json(ticket);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to update ticket' });
+  }
+});
+
+app.post('/api/dashboard/tickets/:id/comments', requireAdmin, async (req: Request, res: Response) => {
+  const { body, authorName } = req.body || {};
+  try {
+    const comment = await crmRegistry.addTicketComment(req.params.id, authorName, body);
+    return res.status(201).json(comment);
+  } catch (err: any) {
+    return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add comment' });
+  }
+});
 
 // ----------------------------------------------------
 // OPERATIONAL ENDPOINTS
@@ -372,6 +983,14 @@ app.get('/ready', async (req: Request, res: Response) => {
   // check must fail fast, never hang the process waiting on a stuck
   // connection (a hung /ready is worse than a fast 503: it leaks a pending
   // request per probe and gives orchestrators no signal to act on).
+  //
+  // was `const dbOk = await checkDatabaseHealth(); deps.database = dbOk ? 'healthy' : 'unhealthy'` —
+  // checkDatabaseHealth() resolves to an object ({status, latencyMs, details}),
+  // which is always truthy, so this unconditionally reported 'healthy' for
+  // any non-throwing result, silently discarding the degraded/unhealthy
+  // status it computed from query latency. Only a hard failure (e.g.
+  // connection refused, or this timeout) throws — read .status rather than
+  // treating any resolved value as healthy.
   try {
     const dbHealth = await Promise.race([
       checkDatabaseHealth(),
@@ -379,11 +998,6 @@ app.get('/ready', async (req: Request, res: Response) => {
         setTimeout(() => reject(new Error('database health check timed out')), READY_CHECK_TIMEOUT_MS),
       ),
     ]);
-    // was `const dbOk = await checkDatabaseHealth(); deps.database = dbOk ? 'healthy' : 'unhealthy'` —
-    // checkDatabaseHealth() resolves to an object ({status, latencyMs, details}),
-    // which is always truthy, so this unconditionally reported 'healthy' for
-    // any non-throwing result, silently discarding the degraded/unhealthy
-    // status it computed from query latency.
     deps.database = dbHealth.status;
   } catch {
     deps.database = 'unreachable';
@@ -393,11 +1007,41 @@ app.get('/ready', async (req: Request, res: Response) => {
   const rlInfo = auth.getRateLimiterInfo();
   deps.rateLimiter = rlInfo.storeBacked ? 'redis' : 'in-memory';
 
+  // Queue/worker-store backend: when REDIS_URL isn't configured, inbound
+  // webhooks fall back to DB-only persistence (no async worker hand-off) —
+  // that's a real degraded mode, but a separate, intentional one from a
+  // configured Redis actually being unreachable. Only the latter should
+  // fail readiness.
+  if (process.env.REDIS_URL) {
+    try {
+      const { store } = await getGatewayQueue();
+      // createStore() itself degrades a configured-but-unreachable Redis to
+      // an in-memory fallback rather than throwing — so an unreachable
+      // Redis wouldn't otherwise surface here as anything but 'healthy'.
+      // Check the store's own connection state, not just that it exists.
+      if (!(store instanceof RedisStore) || !store.isConnected()) {
+        throw new Error('redis store unavailable — degraded to in-memory');
+      }
+      await Promise.race([
+        store.ping(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ping timeout')), 2000)),
+      ]);
+      deps.queue = 'healthy';
+    } catch {
+      deps.queue = 'unreachable';
+    }
+  } else {
+    deps.queue = 'unconfigured';
+  }
+
   // Provider registry is in-memory — always "ready" if process is up
   deps.providers = 'ready';
 
+  // 'degraded' (e.g. a slow-but-connected DB) doesn't fail readiness — the
+  // dependency is still serving, just worth surfacing to operators. Only
+  // 'unhealthy'/'unreachable' fail it.
   const allHealthy = Object.values(deps).every(
-    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis',
+    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis' || v === 'unconfigured' || v === 'degraded',
   );
   const status = allHealthy ? 'ready' : 'degraded';
 
@@ -413,9 +1057,9 @@ app.get('/ready', async (req: Request, res: Response) => {
 // GATEWAY TRAFFIC ENDPOINTS — P2-1: Versioned under /v1
 // ----------------------------------------------------
 
-app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/payment', mw.apiKey('payments:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
-  const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
+  const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken, country } = req.body;
   const tenantId = req.header('x-tenant-id') || 'default';
   // Canonical header per docs/openapi.yaml is `Idempotency-Key`; `idempotency_key`
   // in the body is the documented fallback. (The previous `x-idempotency-key`
@@ -427,9 +1071,14 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
   }
 
+  const limitCheck = await checkPlanLimit(appId, 'payment', Number(amount));
+  if (limitCheck.blocked) {
+    return res.status(402).json({ error: limitCheck.reason });
+  }
+
   // Fingerprint the mutating fields so a replayed key with a *different*
   // payload is rejected instead of silently returning the wrong cached charge.
-  const requestFingerprint = JSON.stringify({ amount, currency, paymentMethod, providerOverride, phoneNumber });
+  const requestFingerprint = JSON.stringify({ amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken, country });
   let idempotencyRecordId: string | undefined;
 
   if (idempotencyKey) {
@@ -461,7 +1110,9 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
       currency,
       paymentMethod,
       providerOverride,
-      phoneNumber
+      phoneNumber,
+      paymentToken,
+      country
     });
 
     // P0: Create a transaction record for state tracking.
@@ -482,6 +1133,9 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
         currency: event.currency || 'USD',
         paymentMethod: paymentMethod || null,
         idempotencyKey: idempotencyKey || null,
+        ...(event.fraudRiskLevel !== undefined || event.fraudRiskScore !== undefined
+          ? { metadata: { fraudRiskLevel: event.fraudRiskLevel, fraudRiskScore: event.fraudRiskScore } }
+          : {}),
       });
     } catch (txErr) {
       // Transaction creation is best-effort — don't fail the payment if it fails
@@ -529,7 +1183,116 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
   }
 });
 
-app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+// P0: Refund a previously successful payment. This capability was
+// entirely absent before this pass — docs/openapi.yaml documented a
+// Refunds tag but no such route existed anywhere in the real gateway
+// (see docs/IMPLEMENTATION_BASELINE.md). Reuses the 'payments:send' scope
+// — a refund is a payment-writing action, not a separate capability an
+// API key would reasonably be granted independently of send access.
+app.post('/v1/api/gateway/refund', mw.apiKey('payments:send'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { transactionId, amount, reason } = req.body || {};
+
+  if (!transactionId) {
+    return res.status(400).json({ error: 'Missing parameter: transactionId is required' });
+  }
+
+  // transactionId here is the id the client actually has — the same
+  // `id` field GET /v1/api/gateway/transaction/:id already keys off and
+  // the original POST /v1/api/gateway/payment response returned (each
+  // adapter's own provider-side id, e.g. Stripe's PaymentIntent id, not
+  // this platform's internal transactions.id UUID the client never sees).
+  const transaction = await transactionRepository.findByProviderTransactionId(transactionId);
+  // P0: Ownership check — a refund must never be issued against another
+  // application's (or another tenant's) transaction just because the
+  // caller guessed a valid id.
+  if (!transaction || transaction.appId !== appId || transaction.tenantId !== tenantId) {
+    return res.status(404).json({ error: `Transaction '${transactionId}' not found` });
+  }
+
+  // Only a confirmed-successful charge can be refunded — 'pending'/
+  // 'unknown' hasn't definitely moved money yet, and 'failed'/'refunded'
+  // either never moved money or already gave it back. The transactions
+  // table's own state machine (packages/database/src/repositories/
+  // transactions.ts) agrees: only 'success' → 'refunded' is a normal
+  // transition here (its 'processing' → 'refunded' entry exists for a
+  // provider-initiated refund arriving via webhook mid-flight, not for
+  // this caller-initiated route).
+  if (transaction.status !== 'success') {
+    return res.status(409).json({ error: `Transaction '${transactionId}' is '${transaction.status}', not 'success' — only a confirmed-successful charge can be refunded` });
+  }
+
+  const provider = registry.getProvider(transaction.providerId);
+  if (!provider) {
+    return res.status(404).json({ error: `Provider '${transaction.providerId}' not found` });
+  }
+
+  const originalAmount = Number(transaction.amount);
+  const refundAmount = amount !== undefined ? Number(amount) : originalAmount;
+  if (!Number.isFinite(refundAmount) || refundAmount <= 0 || refundAmount > originalAmount) {
+    return res.status(400).json({ error: `Invalid refund amount — must be > 0 and <= the original amount (${originalAmount})` });
+  }
+
+  // Type-narrowing only, not a reachable branch in practice: the lookup
+  // above matched on this exact field, so a non-null transaction always
+  // has a non-null providerTransactionId.
+  if (!transaction.providerTransactionId) {
+    return res.status(409).json({ error: `Transaction '${transactionId}' has no provider transaction id on record — cannot refund` });
+  }
+
+  const startTime = Date.now();
+  const result = await provider.processRefund(transaction.providerTransactionId, refundAmount, transaction.currency);
+  const latency = Date.now() - startTime;
+
+  // Only a confirmed 'success' updates the transaction's own status here.
+  // An 'unknown' (async, e.g. Flutterwave's refund settling in 3-15 days)
+  // is left as-is — the existing charge.refunded webhook handling in
+  // packages/workers/src/jobs/paymentWebhook.ts already transitions it to
+  // 'refunded' once the provider confirms it, the same real, already-built
+  // path a webhook-only refund (e.g. one issued from a provider's own
+  // dashboard) already goes through.
+  if (result.status === 'success') {
+    await transactionRepository.updateStatus(transaction.id, 'refunded').catch((err) => {
+      logger.error('refund succeeded but failed to update transaction status', {
+        operation: 'refund',
+        providerId: transaction.providerId,
+        errorCode: 'REFUND_STATUS_UPDATE_FAILED',
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  const event: TransactionEvent = {
+    id: result.refundId || `refund_${randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    appId,
+    category: 'payment',
+    providerId: transaction.providerId,
+    status: result.status,
+    amount: result.amount,
+    currency: result.currency,
+    latency,
+    cost: 0,
+    decisionReason: reason || 'refund_requested',
+    payload: { transactionId, amount: refundAmount },
+    response: result.response ?? null,
+    ...(result.error ? { error: result.error } : {}),
+  };
+  eventBus.emit(event);
+  observe(event);
+
+  if (result.status === 'failed') {
+    return res.status(502).json(event);
+  }
+  // 202 for 'unknown' — same convention as the payment route: the outcome
+  // is genuinely unresolved until the provider's own webhook confirms it,
+  // not something a client should treat as done.
+  return res.status(result.status === 'unknown' ? 202 : 200).json(event);
+}));
+
+app.post('/v1/api/gateway/messaging', mw.apiKey('messaging:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { recipient, content, providerOverride } = req.body;
   // P0: Use authenticated tenant from header, NOT from request body
@@ -537,6 +1300,11 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
 
   if (!appId || !recipient || !content) {
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
+  }
+
+  const limitCheck = await checkPlanLimit(appId, 'message');
+  if (limitCheck.blocked) {
+    return res.status(402).json({ error: limitCheck.reason });
   }
 
   try {
@@ -547,10 +1315,35 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
       tenantId, // Pass authenticated tenant to routing engine
     });
 
+    // Durable record of the send — the only source countSuccessfulByCategorySince
+    // (plan message-limit enforcement, above) has to count against. Best-
+    // effort: a failure here must not fail a message that already sent.
+    try {
+      await eventRepository.create({
+        appId,
+        tenantId: tenantId || 'default',
+        category: 'messaging',
+        providerId: event.providerId,
+        status: event.status,
+        latency: event.latency,
+        cost: String(event.cost),
+        decisionReason: event.decisionReason,
+        payload: event.payload as any,
+        response: event.response as any,
+        error: event.error,
+      });
+    } catch (recordErr) {
+      console.error('[messaging] Failed to create event record', recordErr);
+    }
+
     eventBus.emit(event);
     observe(event);
     return res.json(event);
   } catch (err: any) {
+    // Consent block is not a transient/retryable failure — surface it
+    // distinctly (403) rather than the generic 503 routing failure, so
+    // callers don't retry a send that will never succeed.
+    const isConsentBlock = err instanceof ConsentBlockedError;
     const errorEvent = {
       id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
@@ -560,19 +1353,22 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
       status: 'failed' as const,
       latency: 30,
       cost: 0,
-      decisionReason: 'routing_failure',
+      decisionReason: isConsentBlock ? 'consent_blocked' : 'routing_failure',
       payload: {},
       response: null,
-      error: 'Message routing failed'
+      error: isConsentBlock ? 'Recipient has opted out' : 'Message routing failed'
     };
     eventBus.emit(errorEvent);
-    observeFailure('messaging', errorEvent.providerId, 'ROUTING_FAILED');
+    observeFailure('messaging', errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
     observe(errorEvent);
+    if (isConsentBlock) {
+      return res.status(403).json({ error: 'Recipient has opted out of messaging on this channel', id: errorEvent.id });
+    }
     return res.status(503).json({ error: 'Message routing failed', id: errorEvent.id });
   }
 });
 
-app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/other', mw.apiKey('other:send'), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { serviceType, payload, providerOverride } = req.body;
 
@@ -617,7 +1413,7 @@ app.post('/v1/api/gateway/other', mw.apiKey, resolveTenantContext, async (req: R
 // ----------------------------------------------------
 // Consuming applications can poll for transaction status after submission.
 
-app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
+app.get('/v1/api/gateway/transaction/:id', mw.apiKey('transactions:read'), resolveTenantContext, (req: Request, res: Response) => {
   const { id } = req.params;
   const appId = (req as Request & { appId?: string }).appId;
   const events = eventBus.getHistory();
@@ -648,7 +1444,7 @@ app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req
 });
 
 // POST /refunds — refund a previously captured payment. See docs/openapi.yaml.
-app.post('/refunds', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/refunds', mw.apiKey(), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const tenantId = req.header('x-tenant-id') || 'default';
   const { payment_id: paymentId, amount, currency, reason, metadata } = req.body;
@@ -749,137 +1545,23 @@ app.post('/refunds', mw.apiKey, resolveTenantContext, async (req: Request, res: 
 });
 
 // ----------------------------------------------------
-// DEVELOPER PORTAL — self-service account, API keys, transaction history.
-// Consumed by apps/developer-portal. Session auth (Bearer JWT), not the
+// DEVELOPER PORTAL — self-service API keys and transaction history.
+// Consumed by apps/developer-portal. Session-authed (requireSession, the
+// same AuthRegistry session used by /v1/api/auth/* above) — not the
 // server-to-server API-key auth the traffic routes above use.
 // ----------------------------------------------------
 
-function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '')
-    .slice(0, 60) || 'app';
-}
-
-app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
-  const { companyName, email, password } = req.body;
-  if (!companyName || !email || !password) {
-    return res.status(400).json({ error: 'companyName, email, and password are required' });
-  }
-  if (String(password).length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters' });
-  }
-
-  try {
-    const baseSlug = slugify(companyName);
-    let slug = baseSlug;
-    let suffix = 1;
-    while (await applicationRepository.findBySlug(slug)) {
-      slug = `${baseSlug}-${++suffix}`;
-    }
-
-    const application = await applicationRepository.create({
-      name: companyName,
-      slug,
-      environment: 'development',
-    });
-
-    const existingUser = await userRepository.findByApplicationAndEmail(application.id, email);
-    if (existingUser) {
-      return res.status(409).json({ error: 'An account with this email already exists' });
-    }
-
-    const user = await userRepository.create({
-      applicationId: application.id,
-      email,
-      passwordHash: hashPassword(password),
-    });
-
-    const apiKey = generateApiKey();
-    await apiKeyRepository.create({
-      applicationId: application.id,
-      keyHash: apiKey.hash,
-      prefix: apiKey.prefix,
-      environment: 'test',
-    });
-
-    // A new signup is useless without a tenant to send traffic under —
-    // resolveTenantContext rejects every /v1/api/gateway/* request until one
-    // exists and is linked. Provision a default one so the account is usable
-    // immediately; additional tenants can still be created later.
-    const defaultTenant = await tenantRepository.create({
-      name: 'Default',
-      slug: `${slug}-default`,
-    });
-    await tenantApplicationLinkRepository.link(defaultTenant.id, application.id);
-
-    const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
-
-    return res.status(201).json({
-      token,
-      application: { id: application.id, name: application.name, slug: application.slug },
-      apiKey: { prefix: apiKey.prefix, raw: apiKey.raw },
-      tenant: { id: defaultTenant.id, name: defaultTenant.name, slug: defaultTenant.slug },
-    });
-  } catch (err: any) {
-    logger.error('portal signup failed', {
-      operation: 'portal-signup',
-      errorCode: 'SIGNUP_FAILED',
-      status: 'failed',
-      errorMessage: err?.message,
-      stack: err?.stack,
-    });
-    return res.status(500).json({ error: 'Signup failed' });
-  }
-});
-
-app.post('/v1/portal/auth/login', async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'email and password are required' });
-  }
-
-  const candidates = await userRepository.findByEmail(email);
-  for (const user of candidates) {
-    if (user.passwordHash && verifyPassword(password, user.passwordHash)) {
-      const application = await applicationRepository.findById(user.applicationId);
-      if (!application) continue;
-      const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
-      return res.json({
-        token,
-        application: { id: application.id, name: application.name, slug: application.slug },
-      });
-    }
-  }
-
-  return res.status(401).json({ error: 'Invalid email or password' });
-});
-
-app.get('/v1/portal/me', requirePortalAuth, async (req: Request, res: Response) => {
-  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
-  const application = await applicationRepository.findById(portalUser.applicationId);
-  if (!application) {
-    return res.status(404).json({ error: 'Application not found' });
-  }
-  return res.json({
-    user: { id: portalUser.userId, email: portalUser.email },
-    application: { id: application.id, name: application.name, slug: application.slug, environment: application.environment },
-  });
-});
-
-app.get('/v1/portal/tenants', requirePortalAuth, async (req: Request, res: Response) => {
-  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
-  const tenants = await tenantRepository.findActiveByApplicationId(portalUser.applicationId);
+app.get('/v1/api/tenants', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const tenants = await tenantRepository.findActiveByApplicationId(user.applicationId);
   return res.json({
     tenants: tenants.map((t) => ({ id: t.id, name: t.name, slug: t.slug })),
   });
 });
 
-app.get('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Response) => {
-  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
-  const keys = await apiKeyRepository.findByApplicationId(portalUser.applicationId);
+app.get('/v1/api/api-keys', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const keys = await apiKeyRepository.findByApplicationId(user.applicationId);
   return res.json({
     apiKeys: keys.map((k) => ({
       id: k.id,
@@ -892,12 +1574,12 @@ app.get('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Resp
   });
 });
 
-app.post('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Response) => {
-  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+app.post('/v1/api/api-keys', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
   const environment = req.body?.environment === 'live' ? 'live' : 'test';
   const apiKey = generateApiKey();
   const created = await apiKeyRepository.create({
-    applicationId: portalUser.applicationId,
+    applicationId: user.applicationId,
     keyHash: apiKey.hash,
     prefix: apiKey.prefix,
     environment,
@@ -906,19 +1588,19 @@ app.post('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Res
   return res.status(201).json({ id: created.id, prefix: apiKey.prefix, raw: apiKey.raw, environment });
 });
 
-app.delete('/v1/portal/api-keys/:id', requirePortalAuth, async (req: Request, res: Response) => {
-  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+app.delete('/v1/api/api-keys/:id', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
   const key = await apiKeyRepository.findById(req.params.id);
-  if (!key || key.applicationId !== portalUser.applicationId) {
+  if (!key || key.applicationId !== user.applicationId) {
     return res.status(404).json({ error: 'API key not found' });
   }
   await apiKeyRepository.revoke(req.params.id);
   return res.status(204).send();
 });
 
-app.get('/v1/portal/transactions', requirePortalAuth, async (req: Request, res: Response) => {
-  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
-  const application = await applicationRepository.findById(portalUser.applicationId);
+app.get('/v1/api/transactions', requireSession, async (req: Request, res: Response) => {
+  const user = (req as SessionAuthedRequest).user!;
+  const application = await applicationRepository.findById(user.applicationId);
   if (!application) {
     return res.status(404).json({ error: 'Application not found' });
   }
@@ -937,7 +1619,7 @@ app.get('/v1/portal/transactions', requirePortalAuth, async (req: Request, res: 
 const CHECKOUT_SESSION_TTL_MS = 30 * 60_000; // 30 minutes
 const CHECKOUT_BASE_URL = process.env.CHECKOUT_BASE_URL || 'http://localhost:5174';
 
-app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/checkout-sessions', mw.apiKey(), resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const tenantId = req.header('x-tenant-id') || 'default';
   const { amount, currency, successUrl, cancelUrl, metadata } = req.body;
@@ -1054,7 +1736,7 @@ app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response)
 // ----------------------------------------------------
 // Consuming applications can discover available providers and their capabilities.
 
-app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Request, res: Response) => {
+app.get('/v1/api/gateway/providers', mw.apiKey('providers:read'), resolveTenantContext, (req: Request, res: Response) => {
   const { category, capability, currency } = req.query;
 
   if (category && typeof category === 'string') {
@@ -1073,6 +1755,197 @@ app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Requ
   return res.json({ providers: views, count: views.length });
 });
 
+// Master plan Phase 39/section 66: consent management. STOP/JOIN keyword
+// handling already writes these records (packages/routing/src/keywords.ts);
+// these routes let an application query current status and set it directly
+// (e.g. importing an existing suppression list) without a keyword round-trip.
+app.get('/v1/api/consent/:recipient', mw.apiKey('consent:read'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const recipient = req.params.recipient;
+  const channel = typeof req.query.channel === 'string' ? req.query.channel : 'sms';
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+
+  const record = await consentRecordRepository.findByRecipient(appId, tenantId, recipient, channel);
+  return res.json({
+    recipient,
+    channel,
+    status: record?.status ?? 'unknown',
+    source: record?.source ?? null,
+    updatedAt: record?.updatedAt ?? null,
+  });
+}));
+
+app.post('/v1/api/consent', mw.apiKey('consent:write'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { recipient, channel, status } = req.body;
+
+  if (!appId || !recipient || !channel || !status) {
+    return res.status(400).json({ error: 'Missing required parameters: recipient, channel, and status are required' });
+  }
+  if (!['opted_in', 'opted_out', 'unknown'].includes(status)) {
+    return res.status(400).json({ error: 'status must be one of: opted_in, opted_out, unknown' });
+  }
+
+  const record = await consentRecordRepository.upsert({
+    appId,
+    tenantId,
+    recipient,
+    channel,
+    status,
+    source: 'api',
+  });
+  return res.json({
+    recipient: record.recipient,
+    channel: record.channel,
+    status: record.status,
+    source: record.source,
+    updatedAt: record.updatedAt,
+  });
+}));
+
+// Master plan Phase 40/41 (A2P/10DLC compliance model). An application
+// registers the senders it uses per country/provider; complianceStatus
+// tracks real-world registration state (e.g. US 10DLC campaign approval).
+// Scope of this pass: the registration record and its CRUD surface — NOT
+// enforcement (outbound sends are not blocked on complianceStatus here)
+// and NOT integration with a real carrier/registrar API. See
+// docs/IMPLEMENTATION_BASELINE.md for what's intentionally not done yet.
+app.get('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:read'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  const profiles = await messagingProfileRepository.findByApplicationId(appId);
+  return res.json({ profiles, count: profiles.length });
+}));
+
+app.post('/v1/api/gateway/messaging-profiles', mw.apiKey('messaging-profiles:write'), resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { country, senderType, sender, provider, campaignId, brandId } = req.body;
+
+  if (!appId || !country || !senderType || !sender || !provider) {
+    return res.status(400).json({ error: 'Missing required parameters: country, senderType, sender, and provider are required' });
+  }
+
+  try {
+    const profile = await messagingProfileRepository.create({
+      appId,
+      tenantId,
+      country,
+      senderType,
+      sender,
+      provider,
+      campaignId,
+      brandId,
+    });
+    return res.json(profile);
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to create messaging profile' });
+  }
+});
+
+// P0: Outbound webhook registration. Register a callback URL to receive a
+// signed TransactionEvent (see dispatchOutboundWebhooks, above) as this
+// application's payments/messages/other events happen. The signing secret
+// is returned exactly once, here — it's never re-displayed, only used
+// server-side to compute each delivery's X-Webhook-Signature header.
+app.post('/v1/api/gateway/webhooks', mw.apiKey('webhooks:write'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { url, events } = req.body || {};
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'url must be a valid URL' });
+  }
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && process.env.NODE_ENV !== 'production')) {
+    return res.status(400).json({ error: 'url must use https (http is only allowed outside production)' });
+  }
+  if (events !== undefined && (!Array.isArray(events) || events.some((e: unknown) => typeof e !== 'string'))) {
+    return res.status(400).json({ error: 'events must be an array of strings when provided' });
+  }
+
+  try {
+    const { endpoint, secret } = await webhookEndpointRepository.create({
+      appId,
+      tenantId,
+      url,
+      eventTypes: events,
+    });
+    return res.status(201).json({
+      id: endpoint.id,
+      url: endpoint.url,
+      events: endpoint.eventTypes,
+      active: endpoint.active,
+      createdAt: endpoint.createdAt,
+      // Shown once — store it now. Every subsequent GET omits it.
+      secret,
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to register webhook endpoint' });
+  }
+}));
+
+app.get('/v1/api/gateway/webhooks', mw.apiKey('webhooks:read'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  const endpoints = await webhookEndpointRepository.findByAppId(appId);
+  return res.json({
+    endpoints: endpoints.map((e) => ({
+      id: e.id,
+      url: e.url,
+      events: e.eventTypes,
+      active: e.active,
+      createdAt: e.createdAt,
+    })),
+    count: endpoints.length,
+  });
+}));
+
+app.delete('/v1/api/gateway/webhooks/:id', mw.apiKey('webhooks:write'), resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing authenticated appId' });
+  }
+  const deleted = await webhookEndpointRepository.deleteScoped(req.params.id, appId);
+  if (!deleted) {
+    return res.status(404).json({ error: 'Webhook endpoint not found' });
+  }
+  return res.status(204).send();
+}));
+
+app.patch('/api/dashboard/messaging-profiles/:id', requireAdmin, async (req: Request, res: Response) => {
+  const { complianceStatus } = req.body;
+  if (!complianceStatus) {
+    return res.status(400).json({ error: 'complianceStatus is required' });
+  }
+  try {
+    const updated = await messagingProfileRepository.updateComplianceStatus(req.params.id, complianceStatus);
+    if (!updated) {
+      return res.status(404).json({ error: 'Messaging profile not found' });
+    }
+    return res.json(updated);
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to update messaging profile' });
+  }
+});
+
 // P0-5: Inbound provider webhooks with HMAC signature verification.
 // The signature is validated against WEBHOOK_HMAC_SECRET before processing.
 // P0: Gateway-level webhook deduplication — reject duplicate deliveries.
@@ -1087,10 +1960,9 @@ setInterval(() => {
   }
 }, 60_000);
 
-app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
+app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Response) => {
   const provider = req.params.provider;
   setContextField('providerId', provider);
-  const signature = req.header('x-webhook-signature');
   const known = registry.getProvider(provider);
 
   if (!known) {
@@ -1104,35 +1976,71 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Unknown provider' });
   }
 
-  const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
-  if (!webhookSecret) {
-    metrics.increment('webhookFailures');
-    logger.error('webhook rejected — no secret configured', {
-      operation: 'webhook',
-      providerId: provider,
-      errorCode: 'NO_WEBHOOK_SECRET',
-      status: 'failed',
-    });
-    return res.status(503).json({ error: 'Webhook verification not configured' });
-  }
-
-  if (!signature) {
-    metrics.increment('webhookFailures');
-    logger.error('webhook rejected', {
-      operation: 'webhook',
-      providerId: provider,
-      errorCode: 'MISSING_SIGNATURE',
-      status: 'failed',
-    });
-    return res.status(401).json({ error: 'Missing webhook signature' });
-  }
-
-  // Timing-safe HMAC verification
   const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-  const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(signature, 'hex');
-  const valid = a.length === b.length && timingSafeEqual(a, b);
+
+  // P0: Prefer the provider's own real, native webhook signature scheme
+  // when one is implemented and configured (see BaseProvider.
+  // verifyProviderWebhookSignature and each real adapter's override) —
+  // this is what actually lets this platform ingest a genuine webhook
+  // from that provider, which signs with its own secret in its own
+  // format, not this platform's. Falls back to the generic platform-wide
+  // WEBHOOK_HMAC_SECRET check only when no native scheme applies
+  // (verifyProviderWebhookSignature returns null, not false) — once a
+  // native check is available it is authoritative: failing it must never
+  // fall through to the weaker generic check, or a compromised
+  // WEBHOOK_HMAC_SECRET could be used to forge webhooks for a provider
+  // that has its own, separate, real protection configured.
+  const normalizedHeaders: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    normalizedHeaders[key] = Array.isArray(value) ? value[0] : value;
+  }
+  const nativeResult = await known.verifyProviderWebhookSignature(rawBody, normalizedHeaders);
+
+  let valid: boolean;
+  let verificationMethod: 'native' | 'platform';
+  // Only populated on the 'platform' path — a native check uses the
+  // provider's own scheme/header(s), not this generic one, so there is no
+  // single "the signature" to hand the worker's defense-in-depth re-check.
+  // See the enqueue calls below and packages/workers/src/jobs/
+  // {paymentWebhook,providerWebhook}.ts for how verificationMethod is used
+  // to decide whether that re-check applies.
+  let signature: string | undefined;
+
+  if (nativeResult !== null) {
+    verificationMethod = 'native';
+    valid = nativeResult;
+  } else {
+    verificationMethod = 'platform';
+    const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
+    if (!webhookSecret) {
+      metrics.increment('webhookFailures');
+      logger.error('webhook rejected — no secret configured', {
+        operation: 'webhook',
+        providerId: provider,
+        errorCode: 'NO_WEBHOOK_SECRET',
+        status: 'failed',
+      });
+      return res.status(503).json({ error: 'Webhook verification not configured' });
+    }
+
+    signature = req.header('x-webhook-signature');
+    if (!signature) {
+      metrics.increment('webhookFailures');
+      logger.error('webhook rejected', {
+        operation: 'webhook',
+        providerId: provider,
+        errorCode: 'MISSING_SIGNATURE',
+        status: 'failed',
+      });
+      return res.status(401).json({ error: 'Missing webhook signature' });
+    }
+
+    // Timing-safe HMAC verification
+    const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(signature, 'hex');
+    valid = a.length === b.length && timingSafeEqual(a, b);
+  }
 
   if (!valid) {
     metrics.increment('webhookFailures');
@@ -1141,6 +2049,7 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
       providerId: provider,
       errorCode: 'INVALID_SIGNATURE',
       status: 'failed',
+      verificationMethod,
     });
     return res.status(401).json({ error: 'Invalid webhook signature' });
   }
@@ -1201,7 +2110,8 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
   enqueuePaymentWebhook({
     providerId: provider,
     rawBody: typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
-    signature: signature || '',
+    signature,
+    verificationMethod,
     providerEventId: providerEventId || req.body?.id,
     applicationId: req.body?.data?.object?.metadata?.appId,
   }).catch((err) => {
@@ -1218,7 +2128,8 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
   enqueueProviderWebhook({
     providerId: provider,
     rawBody: typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
-    signature: signature || '',
+    signature,
+    verificationMethod,
     providerEventId: providerEventId || req.body?.id,
     status: req.body?.type,
   }).catch((err) => {
@@ -1231,65 +2142,69 @@ app.post('/v1/api/webhooks/:provider', async (req: Request, res: Response) => {
   });
 
   return res.json({ received: true });
-});
+}));
 
-// P0: Lightweight helper to enqueue inbound messages to the worker queue.
-// Uses Redis directly if available; falls back to no-op if Redis is down.
-// The worker polls from this queue and routes inbound messages to apps.
-let _redisClient: any = null;
-function getRedisClient(): any {
-  if (_redisClient !== null) return _redisClient === false ? null : _redisClient;
-  const redisUrl = process.env.REDIS_URL;
-  if (!redisUrl) { _redisClient = false; return null; }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const Redis = require('ioredis');
-    _redisClient = new Redis(redisUrl, {
-      maxRetriesPerRequest: 3,
-      enableOfflineQueue: false,
-      lazyConnect: true,
-    });
-    return _redisClient;
-  } catch {
-    _redisClient = false;
-    return null;
+// P0: Enqueue inbound webhooks through the platform's real, shared job
+// queue (@company/workers) — the same JobQueue/KVStore abstraction the
+// worker service itself uses (services/worker/src/index.ts), instead of a
+// hand-rolled raw ioredis client. The previous implementation constructed
+// its own ad hoc key names (which happened to match @company/workers's
+// scheme, but with no shared code to guarantee it stayed that way) and
+// fully no-opped — silently dropping the message, including a STOP
+// opt-out request, with no durability at all — whenever REDIS_URL wasn't
+// set or wasn't reachable at that exact moment. createStore() degrades the
+// same way the rest of the platform already does when Redis is
+// unavailable (falls back to an ephemeral in-memory store, logging a
+// warning) rather than dropping the job outright.
+let _gatewayQueuePromise: Promise<{
+  queue: JobQueue;
+  store: KVStore;
+  keys: Keys;
+  config: WorkerConfig;
+}> | null = null;
+
+function getGatewayQueue() {
+  if (!_gatewayQueuePromise) {
+    _gatewayQueuePromise = (async () => {
+      const config = createWorkerConfig();
+      const store = await createStore(config.redisUrl);
+      const keys = createKeys(config.queuePrefix);
+      return { queue: new JobQueue(store, keys, config), store, keys, config };
+    })();
   }
+  return _gatewayQueuePromise;
+}
+
+// Exposed only so packages/simulation's test harness can attach a worker to
+// the exact same store/keys this gateway enqueues into — see
+// packages/simulation/src/harness.ts. Not used by any production code path.
+export async function getGatewayQueueForTests() {
+  return getGatewayQueue();
+}
+
+// Exposed only so packages/simulation's tests can force an immediate
+// outbound-webhook delivery attempt instead of waiting on the real 5s
+// interval timer. Not used by any production code path.
+export function getWebhookDeliveryForTests() {
+  return webhookDelivery;
 }
 
 async function enqueueInboundMessage(providerId: string, payload: any): Promise<void> {
-  const client = getRedisClient();
-  if (!client) {
-    // No Redis — gateway and worker are separate processes with no shared
-    // memory, so write a durable row the worker's webhook_job_poller will
-    // pick up and bridge into its own live queue. See
-    // packages/database/src/schema/webhook-jobs.ts.
+  const { queue, store } = await getGatewayQueue();
+  // createStore() degrades a configured-but-unreachable (or unconfigured)
+  // Redis to an in-memory fallback rather than throwing — but an in-memory
+  // queue lives only in this gateway process's heap. The worker runs as a
+  // separate process with no shared memory, so a job enqueued there would
+  // never be seen. Fall back to a durable DB row the worker's
+  // webhook_job_poller claims and bridges into its own live queue instead.
+  // See packages/database/src/schema/webhook-jobs.ts.
+  if (!(store instanceof RedisStore) || !store.isConnected()) {
     await webhookJobRepository
       .create({ jobType: 'inbound_message', payload: { providerId, payload } })
       .catch((err) => console.error('[webhook] Failed to enqueue inbound_message to DB fallback', err));
     return;
   }
-
-  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
-  const jobId = `job_${randomUUID()}`;
-  const job = {
-    id: jobId,
-    type: 'inbound_message',
-    payload: { providerId, payload },
-    attempts: 0,
-    maxAttempts: 5,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    runAt: Date.now(),
-  };
-
-  try {
-    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
-    await client.rpush(`${queuePrefix}:ready:inbound_message`, jobId);
-    await client.publish(`${queuePrefix}:notify:inbound_message`, jobId);
-  } catch (err) {
-    console.error('[webhook] Failed to enqueue inbound_message to Redis', err);
-  }
+  await queue.enqueue('inbound_message', { providerId, payload });
 }
 
 // P0: Enqueue payment webhooks for worker processing.
@@ -1298,7 +2213,8 @@ async function enqueueInboundMessage(providerId: string, payload: any): Promise<
 async function enqueuePaymentWebhook(input: {
   providerId: string;
   rawBody: string;
-  signature: string;
+  signature?: string;
+  verificationMethod: 'native' | 'platform';
   providerEventId?: string;
   applicationId?: string;
 }): Promise<void> {
@@ -1306,46 +2222,27 @@ async function enqueuePaymentWebhook(input: {
     provider: input.providerId,
     rawBody: input.rawBody,
     signature: input.signature,
+    verificationMethod: input.verificationMethod,
     providerEventId: input.providerEventId,
     applicationId: input.applicationId || 'webhook',
   };
 
-  const client = getRedisClient();
-  if (!client) {
+  const { queue, store } = await getGatewayQueue();
+  if (!(store instanceof RedisStore) || !store.isConnected()) {
     await webhookJobRepository
       .create({ jobType: 'payment_webhook', payload: jobPayload })
       .catch((err) => console.error('[webhook] Failed to enqueue payment_webhook to DB fallback', err));
     return;
   }
-
-  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
-  const jobId = `job_${randomUUID()}`;
-  const job = {
-    id: jobId,
-    type: 'payment_webhook',
-    payload: jobPayload,
-    attempts: 0,
-    maxAttempts: 5,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    runAt: Date.now(),
-  };
-
-  try {
-    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
-    await client.rpush(`${queuePrefix}:ready:payment_webhook`, jobId);
-    await client.publish(`${queuePrefix}:notify:payment_webhook`, jobId);
-  } catch (err) {
-    console.error('[webhook] Failed to enqueue payment_webhook to Redis', err);
-  }
+  await queue.enqueue('payment_webhook', jobPayload);
 }
 
 // P0: Enqueue provider webhooks (delivery status, etc.) for worker processing.
 async function enqueueProviderWebhook(input: {
   providerId: string;
   rawBody: string;
-  signature: string;
+  signature?: string;
+  verificationMethod: 'native' | 'platform';
   providerEventId?: string;
   status?: string;
 }): Promise<void> {
@@ -1353,39 +2250,19 @@ async function enqueueProviderWebhook(input: {
     providerId: input.providerId,
     rawBody: input.rawBody,
     signature: input.signature,
+    verificationMethod: input.verificationMethod,
     eventId: input.providerEventId,
     status: input.status,
   };
 
-  const client = getRedisClient();
-  if (!client) {
+  const { queue, store } = await getGatewayQueue();
+  if (!(store instanceof RedisStore) || !store.isConnected()) {
     await webhookJobRepository
       .create({ jobType: 'provider_webhook', payload: jobPayload })
       .catch((err) => console.error('[webhook] Failed to enqueue provider_webhook to DB fallback', err));
     return;
   }
-
-  const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
-  const jobId = `job_${randomUUID()}`;
-  const job = {
-    id: jobId,
-    type: 'provider_webhook',
-    payload: jobPayload,
-    attempts: 0,
-    maxAttempts: 5,
-    status: 'pending',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    runAt: Date.now(),
-  };
-
-  try {
-    await client.set(`${queuePrefix}:job:${jobId}`, JSON.stringify(job), 'EX', 86400);
-    await client.rpush(`${queuePrefix}:ready:provider_webhook`, jobId);
-    await client.publish(`${queuePrefix}:notify:provider_webhook`, jobId);
-  } catch (err) {
-    console.error('[webhook] Failed to enqueue provider_webhook to Redis', err);
-  }
+  await queue.enqueue('provider_webhook', jobPayload);
 }
 
 // ----------------------------------------------------
@@ -1398,10 +2275,11 @@ async function enqueueProviderWebhook(input: {
 // frontend actually use (`x-admin-token` / ADMIN_API_TOKEN). Because this
 // blanket check ran first and always failed against the frontend's header,
 // no request from the admin console could ever authenticate against any
-// /api/dashboard/* route. requireAdmin is the credential the UI is built
-// against; standardizing on it here makes the console usable again without
-// weakening the gate — the route was never reachable without matching
-// PLATFORM_ADMIN_KEY, now it requires the token the UI actually sends.
+// /api/dashboard/* route — including every route added in this merge's
+// own auth/billing/CRM work, which already (correctly) used requireAdmin
+// per-route but never got reached. requireAdmin is the credential the UI
+// is actually built against; standardizing on it here is what makes every
+// /api/dashboard/* route reachable at all.
 //
 // This also brings GET /providers under the gate. A parallel branch left it
 // unauthenticated on the theory that only mutating routes need protection,
@@ -1414,6 +2292,72 @@ app.use('/api/dashboard', requireAdmin);
 
 app.get('/api/dashboard/providers', (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());
+});
+
+// Backs the admin console's "Interactive Request Playground" — an
+// admin-authenticated way to exercise real routing decisions without a
+// per-application API key. Previously the playground called
+// /api/gateway/{category} (no /v1 prefix), which was never a real route
+// on this gateway — every "Dispatch Request" click 404'd silently
+// against the frontend's own catch block. Routes through the same
+// routingEngine.route*() calls the real, API-key-authed
+// /v1/api/gateway/* routes use (and emits the same events), so a
+// dispatched request shows up in Observability/AuditLogs/LiveTopology
+// exactly like real traffic would.
+app.post('/api/dashboard/playground/dispatch', async (req: Request, res: Response) => {
+  const { category, appId, ...fields } = req.body || {};
+
+  if (!appId || !category) {
+    return res.status(400).json({ error: 'appId and category are required' });
+  }
+
+  try {
+    let event: TransactionEvent;
+    if (category === 'payment') {
+      const { amount, currency, paymentMethod, providerOverride, phoneNumber, paymentToken, country } = fields;
+      event = await routingEngine.routePayment(appId, {
+        amount: Number(amount),
+        currency,
+        paymentMethod,
+        providerOverride,
+        phoneNumber,
+        paymentToken,
+        country,
+      });
+    } else if (category === 'messaging') {
+      const { recipient, content, providerOverride } = fields;
+      event = await routingEngine.routeMessage(appId, { recipient, content, providerOverride });
+    } else if (category === 'other') {
+      const { serviceType, payload, providerOverride } = fields;
+      event = await routingEngine.routeOther(appId, { serviceType, payload, providerOverride });
+    } else {
+      return res.status(400).json({ error: `Unknown category: ${category}` });
+    }
+
+    eventBus.emit(event);
+    observe(event);
+    return res.status(event.status === 'unknown' ? 202 : 200).json(event);
+  } catch (err: any) {
+    const isConsentBlock = err instanceof ConsentBlockedError;
+    const errorEvent = {
+      id: 'err_' + randomUUID(),
+      timestamp: new Date().toISOString(),
+      appId,
+      category,
+      providerId: fields.providerOverride || 'failed_route',
+      status: 'failed' as const,
+      latency: 30,
+      cost: 0,
+      decisionReason: isConsentBlock ? 'consent_blocked' : 'routing_failure',
+      payload: {},
+      response: null,
+      error: isConsentBlock ? 'Recipient has opted out' : err.message || 'Routing failed',
+    };
+    eventBus.emit(errorEvent);
+    observeFailure(category, errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
+    observe(errorEvent);
+    return res.status(isConsentBlock ? 403 : 503).json({ error: errorEvent.error, id: errorEvent.id });
+  }
 });
 
 app.patch('/api/dashboard/providers/:id', requireAdmin, (req: Request, res: Response) => {
@@ -1472,14 +2416,15 @@ app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res
 });
 
 app.post('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
-  const { label, value } = req.body || {};
-  if (!label || !value) {
-    return res.status(400).json({ error: 'Missing parameters: label and value are required' });
+  const { field, label, value } = req.body || {};
+  if (!field || !label || !value) {
+    return res.status(400).json({ error: 'Missing parameters: field, label, and value are required' });
   }
-  const meta = registry.addSecret(req.params.id, { label, value });
+  const meta = registry.addSecret(req.params.id, { field, label, value });
   if (!meta) {
     return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
   }
+  persistProviderSecretsAsync(req.params.id);
   return res.status(201).json(meta);
 });
 
@@ -1488,6 +2433,7 @@ app.delete('/api/dashboard/providers/:id/secrets/:secretId', requireAdmin, (req:
   if (!removed) {
     return res.status(404).json({ error: `Secret '${req.params.secretId}' not found for provider '${req.params.id}'` });
   }
+  persistProviderSecretsAsync(req.params.id);
   return res.json({ success: true });
 });
 
@@ -1641,6 +2587,32 @@ app.get('/api/dashboard/metrics', requireAdmin, (req: Request, res: Response) =>
   });
 });
 
+// P0: On-demand version of packages/workers/src/jobs/reconciliation.ts's
+// periodic stale-transaction report — an operator investigating "why
+// hasn't this payment settled" shouldn't have to wait for (or dig through
+// audit log entries from) the next scheduled run. Same detection-only
+// contract: lists what's unresolved, does not guess an outcome.
+app.get('/api/dashboard/reconciliation', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const thresholdMs = Number(req.query.thresholdMs) || Number(process.env.RECONCILIATION_STALE_THRESHOLD_MS) || 60 * 60_000;
+  const stale = await transactionRepository.findStaleUnresolved(thresholdMs);
+
+  return res.json({
+    generatedAt: new Date().toISOString(),
+    staleThresholdMs: thresholdMs,
+    staleCount: stale.length,
+    stale: stale.map((t) => ({
+      id: t.id,
+      appId: t.appId,
+      providerId: t.providerId,
+      providerTransactionId: t.providerTransactionId,
+      status: t.status,
+      amount: t.amount,
+      currency: t.currency,
+      updatedAt: t.updatedAt,
+    })),
+  });
+}));
+
 app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -1781,13 +2753,25 @@ app.get('/api/dashboard/users/:userId/permissions', requireAdmin, async (req: Re
 
 // ----------------------------------------------------
 // SUBSCRIPTIONS & PRICING — plan catalog is admin-managed; each consuming
-// application can read its own tenant's subscription/entitlement.
+// application can read its own subscription/entitlement. Billing enforcement
+// itself lives in checkPlanLimit() above; these routes are the admin CRUD
+// and the application's own read-only view of its plan.
+//
+// 'billingInterval' is this API's field name; packages/database/src/schema/
+// plans.ts's DB column is 'interval' (see SubscriptionPlan in the
+// admin-console's types.ts) — mapped at this boundary so the DB schema's
+// terser column name doesn't leak into the public contract.
 // ----------------------------------------------------
+
+function planToApi(plan: { id: string; slug: string; name: string; description: string | null; priceCents: number; currency: string; interval: string; messageLimit: number | null; paymentVolumeLimitCents: number | null; isActive: boolean; stripePriceId: string | null; createdAt: Date; updatedAt: Date }) {
+  const { interval, ...rest } = plan;
+  return { ...rest, billingInterval: interval };
+}
 
 app.get('/api/dashboard/plans', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const plans = await subscriptionPlanRepository.listAll();
-    return res.json({ plans });
+    const plans = await planRepository.list();
+    return res.json({ plans: plans.map(planToApi) });
   } catch {
     logger.error('failed to list plans', { operation: 'billing', status: 'failed' });
     return res.status(500).json({ error: 'Failed to list plans' });
@@ -1796,14 +2780,14 @@ app.get('/api/dashboard/plans', requireAdmin, async (req: Request, res: Response
 
 app.post('/api/dashboard/plans', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const { slug, name, description, priceCents, currency, billingInterval, features } = req.body || {};
+    const { slug, name, description, priceCents, currency, billingInterval, messageLimit, paymentVolumeLimitCents } = req.body || {};
     if (!slug || !name || typeof priceCents !== 'number') {
       return res.status(400).json({ error: 'slug, name, and priceCents are required' });
     }
-    const plan = await subscriptionPlanRepository.create({
-      slug, name, description, priceCents, currency, billingInterval, features,
+    const plan = await planRepository.create({
+      slug, name, description, priceCents, currency, interval: billingInterval, messageLimit, paymentVolumeLimitCents,
     });
-    return res.status(201).json({ plan });
+    return res.status(201).json({ plan: planToApi(plan) });
   } catch {
     logger.error('failed to create plan', { operation: 'billing', status: 'failed' });
     return res.status(500).json({ error: 'Failed to create plan' });
@@ -1812,9 +2796,11 @@ app.post('/api/dashboard/plans', requireAdmin, async (req: Request, res: Respons
 
 app.patch('/api/dashboard/plans/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const plan = await subscriptionPlanRepository.update(req.params.id, req.body || {});
+    const { billingInterval, ...rest } = req.body || {};
+    const updates = billingInterval !== undefined ? { ...rest, interval: billingInterval } : rest;
+    const plan = await planRepository.update(req.params.id, updates);
     if (!plan) return res.status(404).json({ error: 'Plan not found' });
-    return res.json({ plan });
+    return res.json({ plan: planToApi(plan) });
   } catch {
     logger.error('failed to update plan', { operation: 'billing', status: 'failed' });
     return res.status(500).json({ error: 'Failed to update plan' });
@@ -1823,7 +2809,7 @@ app.patch('/api/dashboard/plans/:id', requireAdmin, async (req: Request, res: Re
 
 app.delete('/api/dashboard/plans/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const plan = await subscriptionPlanRepository.deactivate(req.params.id);
+    const plan = await planRepository.update(req.params.id, { isActive: false });
     if (!plan) return res.status(404).json({ error: 'Plan not found' });
     return res.status(204).send();
   } catch {
@@ -1832,17 +2818,21 @@ app.delete('/api/dashboard/plans/:id', requireAdmin, async (req: Request, res: R
   }
 });
 
-app.post('/api/dashboard/applications/:appSlug/tenants/:tenantId/subscription', requireAdmin, async (req: Request, res: Response) => {
+// One subscription per application (not per tenant) — see
+// packages/database/src/schema/subscriptions.ts.
+app.post('/api/dashboard/applications/:appSlug/subscription', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { planSlug, status } = req.body || {};
     if (!planSlug) return res.status(400).json({ error: 'planSlug is required' });
-    const plan = await subscriptionPlanRepository.findBySlug(planSlug);
+    const application = await applicationRepository.findBySlug(req.params.appSlug);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const plan = await planRepository.findBySlug(planSlug);
     if (!plan) return res.status(404).json({ error: 'Plan not found' });
-    const subscription = await tenantSubscriptionRepository.create({
-      appId: req.params.appSlug,
-      tenantId: req.params.tenantId,
+    const subscription = await subscriptionRepository.create({
+      applicationId: application.id,
       planId: plan.id,
       status: status || 'trialing',
+      currentPeriodStart: new Date(),
     });
     return res.status(201).json({ subscription });
   } catch {
@@ -1851,18 +2841,22 @@ app.post('/api/dashboard/applications/:appSlug/tenants/:tenantId/subscription', 
   }
 });
 
-app.patch('/api/dashboard/applications/:appSlug/tenants/:tenantId/subscription', requireAdmin, async (req: Request, res: Response) => {
+app.patch('/api/dashboard/applications/:appSlug/subscription', requireAdmin, async (req: Request, res: Response) => {
   try {
+    const application = await applicationRepository.findBySlug(req.params.appSlug);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const existing = await subscriptionRepository.findByApplicationId(application.id);
+    if (!existing) return res.status(404).json({ error: 'Subscription not found' });
+
     const { status, planSlug } = req.body || {};
+    const updates: Record<string, unknown> = {};
+    if (status) updates.status = status;
     if (planSlug) {
-      const plan = await subscriptionPlanRepository.findBySlug(planSlug);
+      const plan = await planRepository.findBySlug(planSlug);
       if (!plan) return res.status(404).json({ error: 'Plan not found' });
-      await tenantSubscriptionRepository.changePlan(req.params.appSlug, req.params.tenantId, plan.id);
+      updates.planId = plan.id;
     }
-    const subscription = status
-      ? await tenantSubscriptionRepository.updateStatus(req.params.appSlug, req.params.tenantId, status)
-      : await tenantSubscriptionRepository.findByAppAndTenant(req.params.appSlug, req.params.tenantId);
-    if (!subscription) return res.status(404).json({ error: 'Subscription not found' });
+    const subscription = await subscriptionRepository.update(existing.id, updates);
     return res.json({ subscription });
   } catch {
     logger.error('failed to update subscription', { operation: 'billing', status: 'failed' });
@@ -1870,14 +2864,15 @@ app.patch('/api/dashboard/applications/:appSlug/tenants/:tenantId/subscription',
   }
 });
 
-app.get('/v1/api/gateway/subscription', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.get('/v1/api/gateway/subscription', mw.apiKey(), resolveTenantContext, async (req: Request, res: Response) => {
   try {
     const appId = (req as Request & { appId?: string }).appId!;
-    const tenantId = req.header('x-tenant-id')!;
-    const subscription = await tenantSubscriptionRepository.findByAppAndTenant(appId, tenantId);
-    if (!subscription) return res.status(404).json({ error: 'No subscription found for this tenant' });
-    const plan = await subscriptionPlanRepository.findById(subscription.planId);
-    return res.json({ subscription, plan });
+    const application = await applicationRepository.findBySlug(appId);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const subscription = await subscriptionRepository.findByApplicationId(application.id);
+    if (!subscription) return res.status(404).json({ error: 'No subscription found for this application' });
+    const plan = await planRepository.findById(subscription.planId);
+    return res.json({ subscription, plan: plan ? planToApi(plan) : null });
   } catch {
     logger.error('failed to read subscription', { operation: 'billing', status: 'failed' });
     return res.status(500).json({ error: 'Failed to read subscription' });
@@ -1885,19 +2880,27 @@ app.get('/v1/api/gateway/subscription', mw.apiKey, resolveTenantContext, async (
 });
 
 // ----------------------------------------------------
-// SUPPORT — thin in-house ticket log. externalProvider/externalRef exist to
-// sync against a real helpdesk (Zendesk/Intercom) once one is connected.
+// SUPPORT — customer-facing ticket creation/listing. The admin side (list
+// all tickets, respond, resolve) is the CRM surface above
+// (/api/dashboard/customers, /api/dashboard/tickets), not duplicated here.
 // ----------------------------------------------------
 
-app.post('/v1/api/gateway/support/tickets', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.post('/v1/api/gateway/support/tickets', mw.apiKey(), resolveTenantContext, async (req: Request, res: Response) => {
   try {
     const appId = (req as Request & { appId?: string }).appId!;
-    const tenantId = req.header('x-tenant-id')!;
-    const { requesterEmail, subject, priority } = req.body || {};
-    if (!requesterEmail || !subject) {
-      return res.status(400).json({ error: 'requesterEmail and subject are required' });
+    const application = await applicationRepository.findBySlug(appId);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const { requesterEmail, subject, description, priority } = req.body || {};
+    if (!requesterEmail || !subject || !description) {
+      return res.status(400).json({ error: 'requesterEmail, subject, and description are required' });
     }
-    const ticket = await supportTicketRepository.create({ appId, tenantId, requesterEmail, subject, priority });
+    const ticket = await supportTicketRepository.create({
+      applicationId: application.id,
+      requesterEmail,
+      subject,
+      description,
+      priority,
+    });
     return res.status(201).json({ ticket });
   } catch {
     logger.error('failed to create support ticket', { operation: 'support', status: 'failed' });
@@ -1905,69 +2908,16 @@ app.post('/v1/api/gateway/support/tickets', mw.apiKey, resolveTenantContext, asy
   }
 });
 
-app.get('/v1/api/gateway/support/tickets', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+app.get('/v1/api/gateway/support/tickets', mw.apiKey(), resolveTenantContext, async (req: Request, res: Response) => {
   try {
     const appId = (req as Request & { appId?: string }).appId!;
-    const tenantId = req.header('x-tenant-id')!;
-    const tickets = await supportTicketRepository.listByAppAndTenant(appId, tenantId);
+    const application = await applicationRepository.findBySlug(appId);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    const tickets = await supportTicketRepository.findByApplicationId(application.id);
     return res.json({ tickets });
   } catch {
     logger.error('failed to list support tickets', { operation: 'support', status: 'failed' });
     return res.status(500).json({ error: 'Failed to list support tickets' });
-  }
-});
-
-app.get('/api/dashboard/support/tickets', requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const appId = req.query.appId as string | undefined;
-    const tenantId = (req.query.tenantId as string | undefined) || 'default';
-    if (!appId) return res.status(400).json({ error: 'appId query param is required' });
-    const tickets = await supportTicketRepository.listByAppAndTenant(appId, tenantId);
-    return res.json({ tickets });
-  } catch {
-    logger.error('failed to list support tickets', { operation: 'support', status: 'failed' });
-    return res.status(500).json({ error: 'Failed to list support tickets' });
-  }
-});
-
-app.patch('/api/dashboard/support/tickets/:id', requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const appId = req.query.appId as string | undefined;
-    const { status } = req.body || {};
-    if (!appId || !status) return res.status(400).json({ error: 'appId query param and status are required' });
-    const ticket = await supportTicketRepository.updateStatus(req.params.id, appId, status);
-    if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-    return res.json({ ticket });
-  } catch {
-    logger.error('failed to update support ticket', { operation: 'support', status: 'failed' });
-    return res.status(500).json({ error: 'Failed to update support ticket' });
-  }
-});
-
-app.post('/api/dashboard/support/tickets/:id/messages', requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const { body, authorEmail } = req.body || {};
-    if (!body) return res.status(400).json({ error: 'body is required' });
-    const message = await supportTicketMessageRepository.create({
-      ticketId: req.params.id,
-      authorType: 'agent',
-      authorEmail,
-      body,
-    });
-    return res.status(201).json({ message });
-  } catch {
-    logger.error('failed to post support ticket message', { operation: 'support', status: 'failed' });
-    return res.status(500).json({ error: 'Failed to post message' });
-  }
-});
-
-app.get('/api/dashboard/support/tickets/:id/messages', requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const messages = await supportTicketMessageRepository.listByTicketId(req.params.id);
-    return res.json({ messages });
-  } catch {
-    logger.error('failed to list support ticket messages', { operation: 'support', status: 'failed' });
-    return res.status(500).json({ error: 'Failed to list messages' });
   }
 });
 

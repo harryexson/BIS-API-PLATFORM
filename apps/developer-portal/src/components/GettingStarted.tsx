@@ -16,7 +16,7 @@ export default function GettingStarted({ token, appSlug }: Props) {
   const [tenants, setTenants] = useState<Tenant[] | null>(null);
 
   useEffect(() => {
-    portalFetch(token, '/v1/portal/tenants')
+    portalFetch(token, '/v1/api/tenants')
       .then((res) => res.json())
       .then((body) => setTenants(body.tenants || []))
       .catch(() => setTenants([]));

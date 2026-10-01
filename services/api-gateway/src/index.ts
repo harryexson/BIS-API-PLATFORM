@@ -1,7 +1,12 @@
 import path from 'node:path';
 import dotenv from 'dotenv';
+import { assertStartupConfig } from '@company/shared';
 
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+
+// P26: Fail fast on invalid configuration rather than degrading silently —
+// see packages/shared/src/startup-config.ts for exactly what's checked and why.
+assertStartupConfig();
 
 import app from './app';
 

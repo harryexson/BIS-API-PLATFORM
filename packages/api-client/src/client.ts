@@ -57,7 +57,7 @@ export class CompanyApiClient {
     this.payments = new PaymentsResource(this.http);
     this.messages = new MessagesResource(this.http);
     this.providers = new ProvidersResource(this.http);
-    this.webhooks = new WebhooksResource();
+    this.webhooks = new WebhooksResource(this.http);
     this.health = new HealthResource(this.http);
   }
 }

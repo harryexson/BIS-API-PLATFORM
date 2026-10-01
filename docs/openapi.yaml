@@ -4,21 +4,32 @@ info:
   version: 1.0.0
   summary: Unified payments, messaging, and provider orchestration API.
   description: |
-    ⚠️ STALE — DOES NOT MATCH THE IMPLEMENTED GATEWAY. This document
-    describes a `/payments`, `/refunds`, `/messages`, `/conversations/{id}`,
-    `/providers` REST-resource design that was never built. The actual
-    routes live in services/api-gateway/src/app.ts under `/v1/api/gateway/
-    {payment,messaging,other}`, `/v1/api/gateway/transaction/{id}`, and
-    `/v1/api/gateway/providers`, take differently-shaped request bodies,
-    require an `x-tenant-id` header this spec doesn't mention, use
-    `x-idempotency-key` (not `Idempotency-Key`), and return a flat
-    `{ error: string }` on failure rather than the nested error object
-    documented below. packages/api-client was found calling the paths
-    documented here — which 404'd or 400'd against the real gateway on
-    every single call — and has been rewritten to match the real routes;
-    this spec has not been. Treat everything below as aspirational until
-    it's reconciled with services/api-gateway, not as ground truth for what
-    the platform actually accepts.
+    Reconciled with the real implementation in
+    services/api-gateway/src/app.ts as of 2026-09-17. An earlier version of
+    this document described a `/payments`, `/refunds`, `/messages`,
+    `/conversations/{id}`, `/providers` REST-resource design that was never
+    built — real routes live under `/v1/api/gateway/*`, take
+    differently-shaped request bodies, require an `x-tenant-id` header,
+    use `x-idempotency-key` (not `Idempotency-Key`), and return a flat
+    `{ error: string }` on failure, not a nested error object. The Auth and
+    Billing sections were corrected first (docs/IMPLEMENTATION_CHANGELOG.md,
+    2026-09-14/15); Payments/Refunds/Messaging/Providers/Webhooks below were
+    rewritten to match on 2026-09-17, at the same time a real
+    `POST /v1/api/gateway/refund` route was built (previously, "Refunds"
+    was a tag with no route behind it at all — see the changelog entry
+    "Real payment refund capability"). There is still no real
+    `GET /conversations/{id}`-equivalent read API — see the Messaging
+    section's note. This same pass found the outbound-webhook design
+    (developer-registered callback URLs, `WebhookEvent`) was documented but
+    never built — that gap closed 2026-09-17 (see
+    `docs/IMPLEMENTATION_BASELINE.md` item 24 and
+    `docs/IMPLEMENTATION_CHANGELOG.md`): `POST/GET/DELETE
+    /v1/api/gateway/webhooks` now register/list/remove a real callback URL,
+    and every event fans out to it, signed, through
+    `packages/events/src/webhook-delivery.ts`. If a future change to
+    services/api-gateway drifts from this document again, correct this
+    file in the same pass, the way this rewrite did — don't let it go
+    stale a second time.
 
     The BIS API Platform exposes a single, versioned surface for initiating
     payments, sending messages, managing providers, and receiving asynchronous
@@ -30,29 +41,37 @@ info:
     providers directly; provider topology changes are invisible to API consumers.
 
     ## Base URL
-    - Production: `https://api.company.com/v1`
-    - Sandbox:   `https://sandbox.api.company.com/v1`
+    Every path below is written in full (including its own `/v1` or bare
+    prefix) — the server URLs below are the domain root, not `/v1`, since
+    `/health` and `/ready` live outside `/v1` on the real gateway while
+    everything else lives under `/v1/api/...`.
+    - Production: `https://api.company.com`
+    - Sandbox:   `https://sandbox.api.company.com`
 
     ## Conventions
     - All request and response bodies are JSON (`Content-Type: application/json`).
-    - All timestamps are RFC 3339 / ISO 8601 UTC strings.
-    - All monetary amounts are expressed in the smallest currency unit
-      (e.g. cents) unless explicitly noted, and are always accompanied by a
-      `currency` ISO 4217 code.
-    - Identifiers are prefixed strings (e.g. `pay_...`, `msg_...`, `ref_...`,
-      `conv_...`, `prov_...`).
+    - All timestamps are ISO 8601 UTC strings.
+    - `amount` is a decimal number in the currency's **major** unit (e.g.
+      `49.99` for $49.99 USD), not the smallest unit — unlike many payment
+      APIs. Each adapter converts to whatever unit its own provider expects
+      (e.g. Stripe's minor-unit cents) internally.
+    - Identifiers are **not** uniformly prefixed by resource type. A
+      `TransactionEvent.id` is whatever the selected adapter produced for
+      it — often the real upstream provider's own id (e.g. Stripe's
+      `pi_...`), sometimes this platform's own generated id — never assume
+      a fixed prefix scheme when parsing one.
 
     ## Cross-cutting headers
-    Every response includes the following headers (see `parameters` / `responses`
-    sections for per-operation detail):
+    | Header               | Direction | Description                                                                 |
+    |-----------------------|-----------|-------------------------------------------------------------------------------|
+    | `Authorization`        | Request   | `Bearer <api key>` — see `bearerAuth` below.                                   |
+    | `x-tenant-id`          | Request   | Required on every `/v1/api/gateway/*` route — see `TenantIdHeader` below.      |
+    | `x-idempotency-key`    | Request   | Optional, payment-create only — see `IdempotencyKeyHeader` below.              |
+    | `x-correlation-id`     | Request   | Optional; used for this gateway's own internal log correlation only — **not** echoed back as a response header. |
+    | `X-Request-Id`         | Response  | Unique UUID generated per request, on every response from every route.        |
 
-    | Header             | Description                                                          |
-    |--------------------|----------------------------------------------------------------------|
-    | `X-Request-Id`     | Unique UUID for this HTTP request. Include it in support tickets.    |
-    | `X-Correlation-Id` | Traces a logical operation across services and async webhooks.       |
-
-    Errors follow a single structured envelope — see the `Error` schema and the
-    `ErrorResponse` response.
+    Errors are a flat `{ "error": "<human-readable message>" }` — see the
+    `Error` schema. There is no machine-readable error code field today.
   contact:
     name: Platform Team
     email: platform@company.com
@@ -60,24 +79,37 @@ info:
     name: Proprietary
 
 servers:
-  - url: https://api.company.com/v1
+  - url: https://api.company.com
     description: Production
-  - url: https://sandbox.api.company.com/v1
+  - url: https://sandbox.api.company.com
     description: Sandbox (test API keys, simulated providers)
 
 tags:
+  - name: Auth
+    description: >-
+      Signup/login for the developer/business accounts that own a BIS
+      Platform application — distinct from the per-application API key
+      (`bearerAuth`) used on every other tagged section below.
+  - name: Billing
+    description: >-
+      Subscription plans for the platform's own customers (the businesses
+      that hold an application), billed for platform usage — distinct
+      from Payments, which routes one-off payments those businesses make
+      on their own behalf.
   - name: Payments
-    description: Create and retrieve payments.
-  - name: Refunds
-    description: Refund previously captured payments.
-  - name: Messages
-    description: Send and retrieve messages (SMS, WhatsApp, email).
-  - name: Conversations
-    description: Retrieve message threads.
+    description: Create, retrieve, and refund payments.
+  - name: Messaging
+    description: >-
+      Send messages (SMS, WhatsApp, email). There is no real read API for
+      an individual message or a conversation thread today — see this
+      section's note.
   - name: Providers
     description: Read-only discovery of available upstream providers.
   - name: Webhooks
-    description: Inbound provider webhook ingestion and outbound event delivery.
+    description: >-
+      Inbound provider webhook ingestion, and outbound delivery of your own
+      application's events to a callback URL you register — see the
+      WebhookEvent schema and the /v1/api/gateway/webhooks paths below.
   - name: Health
     description: Service and dependency health.
 
@@ -85,350 +117,645 @@ security:
   - bearerAuth: []
 
 paths:
-  /payments:
+  /v1/api/auth/signup:
     post:
-      tags: [Payments]
-      operationId: createPayment
-      summary: Create a payment
+      tags: [Auth]
+      operationId: signup
+      summary: Create an account and its BIS Platform application
       description: |
-        Initiate a payment. The gateway authenticates the request, selects a
-        provider via the routing engine, and returns a `Payment` object.
-
-        For card payments the status is typically `success`/`failed`
-        synchronously. For mobile money (PawaPay, PayChangu) the initial status
-        is `pending` and final settlement is delivered via webhook minutes later.
-
-        **Idempotency:** send an `Idempotency-Key` header. Replaying the same
-        key returns the original `Payment` without a new provider charge. If the
-        key is reused after the original succeeded, a `409` is returned with the
-        original resource.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CorrelationId'
+        Self-service signup: creates a customer account (user) and the BIS
+        Platform application it owns in one step, and issues that
+        application's first live API key. Returns 409 if the email is
+        already registered.
+      security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PaymentCreate'
-            examples:
-              card:
-                summary: Card payment in USD
-                value:
-                  app_id: app_reachchurch
-                  amount: 4999
-                  currency: USD
-                  payment_method: card
-                  customer:
-                    email: jane@example.com
-                    phone: "+265999123456"
-                  metadata:
-                    order_id: "ORD-1001"
-              mobile_money:
-                summary: Mobile money in MWK
-                value:
-                  app_id: app_haulpro
-                  amount: 5000
-                  currency: MWK
-                  payment_method: mobile_money
-                  phone_number: "+265888000111"
+              type: object
+              required: [email, password, applicationName, applicationSlug]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+                name: { type: string }
+                applicationName: { type: string }
+                applicationSlug: { type: string }
       responses:
         '201':
-          description: Payment created.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
+          description: Account and application created.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Payment' }
-        '202':
-          description: Payment accepted and pending async settlement (mobile money).
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Payment' }
+              schema: { $ref: '#/components/schemas/SignupResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/IdempotencyConflict' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '500': { $ref: '#/components/responses/ServerError' }
-        '503': { $ref: '#/components/responses/ProviderUnavailable' }
-
-  /payments/{id}:
-    parameters:
-      - $ref: '#/components/parameters/PaymentId'
-    get:
-      tags: [Payments]
-      operationId: getPayment
-      summary: Retrieve a payment
-      description: |
-        Retrieve a payment by ID. For mobile money, poll this endpoint (or
-        subscribe to webhooks) until the status converges to `success` or
-        `failed`.
-      parameters:
-        - $ref: '#/components/parameters/CorrelationId'
-      responses:
-        '200':
-          description: The payment.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
+        '409':
+          description: An account with this email already exists.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Payment' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
+              schema: { $ref: '#/components/schemas/Error' }
 
-  /refunds:
+  /v1/api/auth/login:
     post:
-      tags: [Refunds]
-      operationId: createRefund
-      summary: Create a refund
+      tags: [Auth]
+      operationId: login
+      summary: Log in with email and password
       description: |
-        Refund a previously captured payment. A refund is recorded as a separate,
-        immutable transaction linked to the original via `payment_id`. Partial
-        refunds are supported by supplying `amount`.
-
-        **Idempotency:** send `Idempotency-Key` to safely retry.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CorrelationId'
+        Returns an opaque, revocable session token (not a JWT) — send it as
+        `Authorization: Bearer <token>` on `/v1/api/auth/me`, `/v1/api/auth/logout`,
+        and `/v1/api/auth/resend-verification`. Accounts lock temporarily after
+        repeated failed attempts.
+      security: []
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/RefundCreate' }
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Invalid credentials, or account temporarily locked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/api/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke the current session
+      security: [{ sessionAuth: [] }]
+      responses:
+        '204': { description: Session revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/api/auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Get the currently authenticated user
+      security: [{ sessionAuth: [] }]
+      responses:
+        '200':
+          description: The authenticated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/api/auth/verify-email:
+    post:
+      tags: [Auth]
+      operationId: verifyEmail
+      summary: Verify an account's email address
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        '200':
+          description: Email verified.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400':
+          description: Invalid or expired verification token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/api/auth/resend-verification:
+    post:
+      tags: [Auth]
+      operationId: resendVerification
+      summary: Request a new email verification token
+      security: [{ sessionAuth: [] }]
+      responses:
+        '200': { description: Verification requested. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/api/auth/request-password-reset:
+    post:
+      tags: [Auth]
+      operationId: requestPasswordReset
+      summary: Request a password reset token
+      description: >-
+        Always returns 200 with a generic message, whether or not the email
+        is registered — this endpoint never reveals account existence.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Reset requested (generic — see description). }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/api/auth/reset-password:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: Reset a password using a reset token
+      description: >-
+        On success, every existing session for the account is revoked.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Password reset. }
+        '400':
+          description: Invalid/expired token, or password too short.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/api/billing/plans:
+    get:
+      tags: [Billing]
+      operationId: listPlans
+      summary: List active subscription plans
+      security: []
+      responses:
+        '200':
+          description: Active plans.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plans:
+                    type: array
+                    items: { $ref: '#/components/schemas/Plan' }
+
+  /v1/api/billing/subscription:
+    get:
+      tags: [Billing]
+      operationId: getSubscription
+      summary: Get the authenticated account's current subscription
+      security: [{ sessionAuth: [] }]
+      responses:
+        '200':
+          description: The current subscription, or null if never subscribed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription:
+                    nullable: true
+                    allOf: [{ $ref: '#/components/schemas/Subscription' }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/api/billing/subscribe:
+    post:
+      tags: [Billing]
+      operationId: subscribe
+      summary: Subscribe (or change plan) to a plan by slug
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planSlug]
+              properties:
+                planSlug: { type: string, example: growth }
+      responses:
+        '200':
+          description: Current subscription after the change.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: Unknown/inactive plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/api/billing/cancel:
+    post:
+      tags: [Billing]
+      operationId: cancelSubscription
+      summary: Cancel the current subscription
+      description: >-
+        `atPeriodEnd` defaults to true (schedules cancellation at the
+        current period's end rather than cutting access off immediately).
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                atPeriodEnd: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Updated subscription.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: No subscription exists for this account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/api/billing/webhooks/stripe:
+    post:
+      tags: [Billing]
+      operationId: stripeBillingWebhook
+      summary: Stripe subscription lifecycle webhook (internal — called by Stripe)
+      description: >-
+        Verified against the real `Stripe-Signature` header (not the
+        generic provider-webhook HMAC scheme used elsewhere in this API).
+        Handles `customer.subscription.updated`, `.deleted`, and
+        `invoice.payment_failed`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200': { description: Event processed (or a recognized-but-irrelevant event type, a no-op). }
+        '401': { description: Missing or invalid Stripe-Signature. }
+        '503': { description: STRIPE_BILLING_WEBHOOK_SECRET not configured. }
+
+  /v1/api/gateway/payment:
+    post:
+      tags: [Payments]
+      operationId: createPayment
+      summary: Create a payment
+      description: |
+        Initiate a payment. The gateway authenticates the request, checks the
+        account's plan payment-volume limit, selects a provider via the
+        routing engine, and returns a `TransactionEvent`.
+
+        `status` is one of `success`, `failed`, or `unknown` — `unknown` is a
+        genuinely ambiguous outcome (e.g. a provider timeout, or a mobile-
+        money charge whose real result arrives later via webhook), never a
+        synonym for `failed`; retrying it is not automatically safe unless
+        done with the same `x-idempotency-key`. HTTP status mirrors this:
+        `200` for a resolved outcome (success or failed), `202` for
+        `unknown` — poll `GET /v1/api/gateway/transaction/{id}` or wait for
+        the provider's webhook to find out what actually happened.
+
+        **Idempotency:** send an `x-idempotency-key` header (not the
+        `Idempotency-Key` header name used elsewhere in the industry).
+        Replaying the same key within a 5-minute window returns the original
+        cached `TransactionEvent` without a new provider charge.
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentCreateRequest'
+            examples:
+              card:
+                summary: Card payment in USD (paymentToken from client-side tokenization)
+                value:
+                  amount: 49.99
+                  currency: USD
+                  paymentMethod: card
+                  paymentToken: pm_card_visa
+              mobile_money:
+                summary: Mobile money in MWK
+                value:
+                  amount: 50.00
+                  currency: MWK
+                  paymentMethod: mobile_money
+                  phoneNumber: "+265888000111"
+      responses:
+        '200':
+          description: Payment resolved (success or failed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
+        '202':
+          description: Payment outcome genuinely unresolved — see the operation description.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Blocked by the account's plan payment-volume limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: Routing failed — no eligible provider, or the selected provider's request failed outright.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/api/gateway/refund:
+    post:
+      tags: [Payments]
+      operationId: createRefund
+      summary: Refund a previously successful payment
+      description: |
+        Refunds a payment this application owns. Only a transaction whose
+        current status is `success` can be refunded — one still `pending`/
+        `unknown` hasn't definitely moved money yet, and one already
+        `failed`/`refunded` either never moved money or already gave it
+        back. `transactionId` is the `id` field from the original
+        `POST /v1/api/gateway/payment` response (or from
+        `GET /v1/api/gateway/transaction/{id}`) — this platform's own
+        internal database id is never exposed to callers.
+
+        Real refund support (verified against each provider's current API,
+        not simulated) exists today for Stripe, NMI, and Flutterwave. Any
+        other provider reports `status: failed` with an explanatory
+        `error` — this platform never fabricates a refund result for a
+        provider whose real refund API hasn't been integrated and verified.
+
+        A `success` result also transitions the transaction's own status to
+        `refunded`. An `unknown` result (e.g. Flutterwave's refunds settle
+        asynchronously, 3-15 working days) leaves the transaction's status
+        as-is — the existing inbound-webhook handling already transitions
+        it to `refunded` once the provider's own webhook confirms it, the
+        same path a refund issued from the provider's own dashboard goes
+        through.
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefundCreateRequest' }
             examples:
               full:
                 summary: Full refund
                 value:
-                  payment_id: pay_8f2c1a9b
-                  reason: customer_requested
+                  transactionId: pi_3MtwBwLkdIwHu7ix28a3tqPa
               partial:
                 summary: Partial refund
                 value:
-                  payment_id: pay_8f2c1a9b
-                  amount: 2000
-                  currency: USD
+                  transactionId: pi_3MtwBwLkdIwHu7ix28a3tqPa
+                  amount: 20.00
                   reason: partial_shipment
       responses:
-        '201':
-          description: Refund created.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
+        '200':
+          description: Refund resolved (success or failed).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Refund' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
+        '202':
+          description: Refund accepted for async processing — outcome not yet confirmed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
+        '400':
+          description: Missing transactionId, or amount is <= 0 or exceeds the original amount.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/IdempotencyConflict' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
+        '404':
+          description: Transaction not found, or not owned by this application/tenant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Transaction is not currently 'success' — cannot be refunded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '429': { $ref: '#/components/responses/RateLimited' }
-        '500': { $ref: '#/components/responses/ServerError' }
+        '502':
+          description: The provider's refund call itself failed (see the returned TransactionEvent's error field).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
 
-  /messages:
-    post:
-      tags: [Messages]
-      operationId: createMessage
-      summary: Send a message
+  /v1/api/gateway/transaction/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: >-
+          The `id` field from the original payment/messaging/refund
+          response — a provider-side or adapter-generated identifier (e.g.
+          Stripe's PaymentIntent id), not this platform's internal database
+          id.
+        schema: { type: string }
+    get:
+      tags: [Payments]
+      operationId: getTransaction
+      summary: Retrieve a payment or messaging transaction's current status
       description: |
-        Send a message over the configured channel (SMS, WhatsApp, or email).
-        The gateway selects a provider via the routing engine and returns a
-        `Message` object. Delivery receipts arrive asynchronously via webhook.
+        Works for both payment and messaging transactions — the one status
+        endpoint for anything `POST /v1/api/gateway/payment`,
+        `/messaging`, or `/refund` returned. Looked up from this gateway
+        process's own recent in-memory event history, not the durable
+        database — a transaction that has aged out of that history (this
+        is a short, bounded ring buffer, not long-term storage) 404s even
+        though it happened; use it to check on something recent, not as a
+        general transaction-history API.
       parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: The transaction's current status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionStatusResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '404':
+          description: Not found in recent history, or not owned by this application.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/api/gateway/messaging:
+    post:
+      tags: [Messaging]
+      operationId: sendMessage
+      summary: Send a message (SMS, WhatsApp, or email)
+      description: |
+        Sends a message over whichever channel the selected provider
+        supports (SMS, WhatsApp, or email — the messaging-category
+        providers registered on this platform, not a `channel` field the
+        caller picks directly; use `providerOverride` to target a specific
+        provider, e.g. `email` for the real Resend-backed email adapter).
+        Delivery receipts, where a provider sends them, arrive
+        asynchronously via `POST /v1/api/webhooks/{provider}`.
+
+        **There is no real `GET` read API for an individual message or a
+        conversation thread today** — only
+        `GET /v1/api/gateway/transaction/{id}` (recent in-memory history,
+        see above). An earlier version of this document described
+        `GET /messages/{id}` and `GET /conversations/{id}`; neither exists
+        in the real gateway.
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/MessageCreate' }
+            schema: { $ref: '#/components/schemas/MessageCreateRequest' }
             examples:
               sms:
                 summary: SMS
                 value:
-                  app_id: app_reachchurch
-                  channel: sms
                   recipient: "+265888000111"
                   content: "Your appointment is confirmed."
               email:
-                summary: Email
+                summary: Email (routed to the real Resend-backed adapter)
                 value:
-                  app_id: app_reachchurch
-                  channel: email
                   recipient: "jane@example.com"
-                  subject: "Receipt"
                   content: "Thank you for your order."
+                  providerOverride: email
       responses:
-        '201':
-          description: Message accepted.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
+        '200':
+          description: Message resolved (success or failed).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Message' }
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
+        '202':
+          description: Message outcome genuinely unresolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionEvent' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/IdempotencyConflict' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
         '429': { $ref: '#/components/responses/RateLimited' }
-        '500': { $ref: '#/components/responses/ServerError' }
-
-  /messages/{id}:
-    parameters:
-      - $ref: '#/components/parameters/MessageId'
-    get:
-      tags: [Messages]
-      operationId: getMessage
-      summary: Retrieve a message
-      description: Retrieve a message and its current delivery status.
-      parameters:
-        - $ref: '#/components/parameters/CorrelationId'
-      responses:
-        '200':
-          description: The message.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
+        '503':
+          description: Routing failed — no eligible provider, or the selected provider's request failed outright.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Message' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
+              schema: { $ref: '#/components/schemas/Error' }
 
-  /conversations/{id}:
-    parameters:
-      - $ref: '#/components/parameters/ConversationId'
-    get:
-      tags: [Conversations]
-      operationId: getConversation
-      summary: Retrieve a conversation
-      description: |
-        Retrieve a conversation (a thread of messages to/from a recipient) with
-        its most recent messages. Results are cursor-paginated.
-      parameters:
-        - $ref: '#/components/parameters/CorrelationId'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
-      responses:
-        '200':
-          description: The conversation.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Conversation' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /providers:
+  /v1/api/gateway/providers:
     get:
       tags: [Providers]
       operationId: listProviders
       summary: List providers
       description: |
-        List available upstream providers and their public capabilities. Secrets
-        are never returned. Supports cursor pagination and filtering.
+        Without `category`, returns every registered provider's full
+        management view (`ProviderManagement`) — including `configured`
+        (whether it currently has real credentials, vs. running in
+        simulated mode) and live circuit-breaker/health state. Secrets are
+        never returned, regardless. With `category`, returns a narrower
+        capability-match view (`ProviderCapabilityMatch`) filtered by
+        `capability`/`currency` and current availability — the same list
+        the routing engine itself selects from.
       parameters:
-        - $ref: '#/components/parameters/CorrelationId'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/TenantIdHeader'
         - name: category
           in: query
-          description: Filter by provider category.
+          description: Filter by provider category — switches the response shape (see description).
           schema:
             $ref: '#/components/schemas/ProviderCategory'
         - name: capability
           in: query
-          description: Filter by supported capability (e.g. `mobile_money`).
+          description: Only with `category` set. Required capability (e.g. `mobile_money`).
           schema: { type: string }
-        - name: country
+        - name: currency
           in: query
-          description: Filter by supported ISO country code (e.g. `MW`).
+          description: Only with `category` set. Filter by supported ISO currency code.
           schema: { type: string }
       responses:
         '200':
-          description: A paginated list of providers.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
+          description: A list of providers (shape depends on whether `category` was supplied — see description).
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ProviderList' }
+              schema: { $ref: '#/components/schemas/ProviderListResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
-  /providers/{id}:
-    parameters:
-      - $ref: '#/components/parameters/ProviderId'
-    get:
-      tags: [Providers]
-      operationId: getProvider
-      summary: Retrieve a provider
-      description: Retrieve a single provider's public configuration and live health.
-      parameters:
-        - $ref: '#/components/parameters/CorrelationId'
-      responses:
-        '200':
-          description: The provider.
-          headers:
-            X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-            X-Correlation-Id: { $ref: '#/components/parameters/CorrelationIdHeader' }
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Provider' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /webhooks/{provider}:
+  /v1/api/webhooks/{provider}:
     parameters:
       - name: provider
         in: path
         required: true
-        description: |
-          Provider identifier whose webhook is being delivered
-          (e.g. `stripe`, `flutterwave`, `pawapay`, `paychangu`, `infobip`,
-          `signalhouse`).
+        description: >-
+          Provider identifier whose webhook is being delivered (any id
+          registered in the provider registry, e.g. `stripe`, `nmi`,
+          `flutterwave`, `pawapay`, `paychangu`, `airwallex`, `infobip`).
         schema: { type: string }
     post:
       tags: [Webhooks]
       operationId: receiveProviderWebhook
       summary: Receive an inbound provider webhook
       description: |
-        Provider-agnostic inbound webhook receiver. This endpoint is called by
-        upstream providers (not by API consumers).
+        Provider-agnostic inbound webhook receiver, called by upstream
+        providers (not by API consumers). Verification is native-first: if
+        the named provider has a real, WebSearch-verified signature scheme
+        implemented and configured — today: Stripe (`Stripe-Signature`),
+        NMI (`Webhook-Signature`), Flutterwave (`verif-hash`, a static
+        configured value, not a computed HMAC), PayChangu (`Signature`),
+        Airwallex (`x-timestamp`/`x-signature`) — that scheme is checked
+        and is authoritative: a failure there rejects the request outright
+        and never falls back to the platform-wide check below. Only when
+        no native scheme applies (including every provider not listed
+        above, e.g. PawaPay, whose real scheme is RFC-9421 and not yet
+        implemented — see docs/providers/ADDING_A_PROVIDER.md) does it fall
+        back to a generic `x-webhook-signature` HMAC-SHA256 header, keyed
+        by this platform's own `WEBHOOK_HMAC_SECRET`.
 
-        The raw request body is captured before parsing for HMAC/JWT signature
-        verification. Each provider uses a distinct signature scheme — see the
-        `WEBHOOK_ARCHITECTURE` doc. Verification failures return `401`.
+        The raw request body is captured before parsing, for whichever
+        check applies.
 
-        **Idempotency:** each event is deduplicated by
-        `(provider, provider_event_id)`. Duplicate deliveries return `200`
-        without re-processing.
+        **Idempotency:** deliveries are deduplicated by the payload's own
+        `id` field, both at the gateway (a short in-memory window) and
+        durably by the worker that processes the enqueued job. A duplicate
+        returns `409`, not a silent `200`.
       security: []
-      parameters:
-        - name: stripe-signature
-          in: header
-          description: Stripe `Stripe-Signature` header (HMAC).
-          schema: { type: string }
-        - name: verif-hash
-          in: header
-          description: Flutterwave `verif-hash` header.
-          schema: { type: string }
-        - name: x-paychangu-signature
-          in: header
-          description: PayChangu `X-PayChangu-Signature` header (`sha256=...`).
-          schema: { type: string }
-        - name: Authorization
-          in: header
-          description: PawaPay JWT bearer token.
-          schema: { type: string }
       requestBody:
         required: true
         description: Raw provider payload. Consumed as `application/json` after signature verification.
@@ -437,9 +764,7 @@ paths:
             schema: { type: object }
       responses:
         '200':
-          description: |
-            Accepted. Returned immediately after persistence; async processing
-            (status update, event emission) happens after the response.
+          description: Accepted. Async processing (status update, event emission) happens after the response.
           content:
             application/json:
               schema:
@@ -447,36 +772,134 @@ paths:
                 properties:
                   received: { type: boolean, example: true }
         '401':
-          description: Signature verification failed.
+          description: Unknown provider, missing signature, or signature verification failed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '404':
-          description: Unknown provider.
+        '409':
+          description: Duplicate delivery (already processed).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: No native scheme applied and WEBHOOK_HMAC_SECRET isn't configured.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/api/gateway/webhooks:
+    post:
+      tags: [Webhooks]
+      operationId: registerWebhookEndpoint
+      summary: Register an outbound webhook endpoint
+      description: >-
+        Register a callback URL to receive every TransactionEvent this
+        application generates (payments, refunds, messages), signed with a
+        per-endpoint secret. The response's `secret` field is shown exactly
+        once — store it now; `GET` never re-displays it. `url` must be
+        `https://` (plain `http://` is only accepted outside production).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEndpointCreate' }
+      responses:
+        '201':
+          description: Endpoint registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookEndpoints
+      summary: List this application's webhook endpoints
+      description: Never includes the signing secret — only present on the create response.
+      responses:
+        '200':
+          description: The authenticated application's own registered endpoints.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoints:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEndpointSummary' }
+                  count: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/api/gateway/webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The endpoint id returned by `POST /v1/api/gateway/webhooks`.
+        schema: { type: string }
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhookEndpoint
+      summary: Remove a webhook endpoint
+      description: >-
+        Scoped to the authenticated application — deleting an id owned by a
+        different application 404s rather than revealing it exists.
+      responses:
+        '204': { description: Removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/TenantForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /health:
     get:
       tags: [Health]
       operationId: getHealth
-      summary: Service health
+      summary: Liveness probe
       description: |
-        Liveness/readiness probe for the platform and its dependencies. Safe to
-        call without authentication.
+        Trivial "is the process up" check — always `200` if the gateway is
+        running at all, no dependency checks. Safe to call without
+        authentication. For dependency status, use `GET /ready` instead.
       security: []
       responses:
         '200':
-          description: Service healthy (or degraded with details).
+          description: The process is up.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Health' }
+
+  /ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Readiness probe (dependency health)
+      description: |
+        Checks the database (bounded by a 3s timeout — a hung connection
+        fails fast rather than hanging the probe), the configured rate
+        limiter backend, and the job queue/worker-store backend, each
+        reported independently in `dependencies`. `providers` is always
+        `ready` (the provider registry is in-memory). Overall `status` is
+        `ready` (`200`) unless the database or a *configured* queue backend
+        is unreachable — `queue: unconfigured` (no `REDIS_URL` set, a real
+        and expected degraded mode, not a failure) does not fail readiness
+        by itself.
+      security: []
+      responses:
+        '200':
+          description: Ready — all checked dependencies healthy or in an expected degraded mode.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
         '503':
-          description: One or more critical dependencies are down.
+          description: Not ready — the database or a configured queue backend is unreachable.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Health' }
+              schema: { $ref: '#/components/schemas/Readiness' }
 
 components:
   securitySchemes:
@@ -495,220 +918,92 @@ components:
         `app_id`; the gateway validates the key against the `api_keys` table and
         rejects requests whose `app_id` does not match the key's scope.
 
+    sessionAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: SESSION_TOKEN
+      description: |
+        Opaque, revocable session token returned by `POST /v1/api/auth/login`
+        (`sess_...`). Distinct from `bearerAuth` — a session authenticates
+        a person (account owner), not an application.
+
   parameters:
-    RequestIdHeader:
-      name: X-Request-Id
+    TenantIdHeader:
+      name: x-tenant-id
       in: header
-      description: Unique UUID for this HTTP request.
-      schema: { type: string, format: uuid }
-    CorrelationIdHeader:
-      name: X-Correlation-Id
-      in: header
+      required: true
       description: |
-        Correlation ID tracing a logical operation across services and async
-        webhooks. Echoed back from any webhook events derived from this request.
+        Required on every `/v1/api/gateway/*` route. The tenant this
+        request acts on behalf of, validated against the authenticated
+        application's tenant access — never taken from the request body.
+        Missing returns `400`; present but not linked to this application
+        returns `403`.
       schema: { type: string }
-    IdempotencyKey:
-      name: Idempotency-Key
+    IdempotencyKeyHeader:
+      name: x-idempotency-key
       in: header
       required: false
       description: |
-        Client-supplied unique key (UUID or opaque string). Replaying the same
-        key for a mutating request returns the original response without
-        re-executing the operation. If the original already succeeded and the
-        payload differs, a `409` is returned.
-      schema: { type: string, maxLength: 255 }
-    CorrelationId:
-      name: X-Correlation-Id
-      in: header
-      required: false
-      description: Optional correlation ID. If omitted, the gateway generates one.
-      schema: { type: string }
-    Limit:
-      name: limit
-      in: query
-      description: Maximum number of items to return (default 20, max 100).
-      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
-    Cursor:
-      name: cursor
-      in: query
-      description: Opaque pagination cursor returned by a previous response.
-      schema: { type: string }
-    PaymentId:
-      name: id
-      in: path
-      required: true
-      description: Payment identifier (prefix `pay_`).
-      schema: { type: string }
-    MessageId:
-      name: id
-      in: path
-      required: true
-      description: Message identifier (prefix `msg_`).
-      schema: { type: string }
-    ConversationId:
-      name: id
-      in: path
-      required: true
-      description: Conversation identifier (prefix `conv_`).
-      schema: { type: string }
-    ProviderId:
-      name: id
-      in: path
-      required: true
-      description: Provider identifier (e.g. `stripe`, `pawapay`).
+        Only honored on `POST /v1/api/gateway/payment`. Replaying the same
+        key within a 5-minute window returns the original cached
+        `TransactionEvent` without a new provider charge. Not supported on
+        any other route today (refund, messaging).
       schema: { type: string }
 
   responses:
     BadRequest:
-      description: Malformed request (invalid JSON or missing required field).
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
+      description: Malformed request — missing or invalid required field.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: invalid_request
-              message: "Missing required field: amount"
-              request_id: "req_1a2b3c4d"
+          example: { error: "Missing parameter: amount is required" }
     Unauthorized:
-      description: Authentication failed or key not authorized for `app_id`.
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
+      description: Missing or invalid API key.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: authentication_failed
-              message: "Invalid or missing API key"
-              request_id: "req_9z8y7x6w"
+          example: { error: "Invalid or missing API key" }
+    TenantForbidden:
+      description: >-
+        Either the API key isn't authorized for this route's required
+        scope, or `x-tenant-id` names a tenant not linked to this
+        application.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: "Access denied: tenant not linked to this application" }
     NotFound:
       description: Resource not found.
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: not_found
-              message: "Payment pay_8f2c1a9b not found"
-              request_id: "req_aa11bb22"
-    Unprocessable:
-      description: Well-formed but semantically invalid (e.g. refund exceeds amount).
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: invalid_operation
-              message: "Refund amount exceeds remaining captured amount"
-              request_id: "req_cc33dd44"
-    IdempotencyConflict:
-      description: |
-        `Idempotency-Key` reused with a conflicting payload after the original
-        request already succeeded. The original resource is returned in
-        `error.resource`.
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-      content:
-        application/json:
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/Error'
-              - type: object
-                properties:
-                  resource: { description: The originally created resource. }
-          example:
-            error:
-              code: idempotency_conflict
-              message: "Idempotency-Key already used with a different payload"
-              request_id: "req_ee55ff66"
+          example: { error: "Transaction 'pi_8f2c1a9b' not found" }
     RateLimited:
-      description: Rate limit exceeded. Retry after `Retry-After`.
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-        Retry-After:
-          name: Retry-After
-          in: header
-          schema: { type: integer }
-          description: Seconds to wait before retrying.
+      description: Rate limit exceeded (applies to every `/v1/api/*` route).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: rate_limited
-              message: "Too many requests"
-              request_id: "req_gg77hh88"
+          example: { error: "Rate limit exceeded" }
     ServerError:
       description: Unexpected internal error.
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: internal_error
-              message: "An unexpected error occurred"
-              request_id: "req_ii99jj00"
-    ProviderUnavailable:
-      description: Upstream provider unreachable or returned an error.
-      headers:
-        X-Request-Id: { $ref: '#/components/parameters/RequestIdHeader' }
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
-          example:
-            error:
-              code: provider_error
-              message: "Provider pawapay returned 502"
-              request_id: "req_kk11ll22"
+          example: { error: "Internal server error" }
 
   schemas:
     Error:
       type: object
       required: [error]
+      description: >-
+        The real, flat error envelope every route in this API returns on
+        failure — no nested object, no machine-readable code, no request-id
+        echo field.
       properties:
         error:
-          type: object
-          required: [code, message, request_id]
-          properties:
-            code:
-              type: string
-              description: Stable machine-readable error code.
-              enum:
-                - invalid_request
-                - authentication_failed
-                - permission_denied
-                - not_found
-                - invalid_operation
-                - idempotency_conflict
-                - rate_limited
-                - provider_error
-                - internal_error
-            message:
-              type: string
-              description: Human-readable description.
-            request_id:
-              type: string
-              description: Echo of `X-Request-Id` for support correlation.
-            correlation_id:
-              type: string
-              description: Echo of `X-Correlation-Id` if supplied.
-            details:
-              type: array
-              description: Field-level validation errors.
-              items:
-                type: object
-                properties:
-                  field: { type: string }
-                  issue: { type: string }
+          type: string
+          description: Human-readable error message.
+          example: "Missing parameter: amount is required"
 
     ProviderCategory:
       type: string
@@ -722,234 +1017,276 @@ components:
       type: string
       enum: [healthy, degraded, down, unknown]
 
+    ProviderEnvironment:
+      type: string
+      enum: [test, live]
+
+    TransactionStatus:
+      type: string
+      enum: [success, failed, unknown]
+      description: >-
+        `unknown` is a genuinely ambiguous outcome (e.g. a provider
+        timeout) — never a synonym for `failed`. See each operation's
+        description for the HTTP status this maps to.
+
     PaymentMethod:
       type: string
-      enum: [card, mobile_money, bank_transfer, wallet]
+      description: >-
+        Free-form — not a validated enum on the real gateway. Common values
+        seen across the real payment adapters: `card`, `mobile_money`,
+        `bank_transfer`.
+      example: card
 
-    PaymentStatus:
-      type: string
-      enum: [pending, success, failed, reconciling]
-      description: |
-        `pending` is returned synchronously for mobile money; final state
-        arrives via webhook. `reconciling` indicates the worker is querying the
-        provider for an in-flight transaction.
-
-    Fee:
+    PaymentCreateRequest:
       type: object
-      description: Computed transaction fees.
+      required: [amount, currency, paymentMethod]
+      description: >-
+        `appId` is never part of the body — it's resolved from the
+        authenticated API key, and any client-supplied `appId` field is
+        silently overwritten with it.
       properties:
-        percent: { type: number, description: Percentage fee applied. }
-        flat: { type: number, description: Flat fee applied (smallest unit). }
-        total: { type: number, description: Total fee in smallest currency unit. }
-
-    PaymentCreate:
-      type: object
-      required: [app_id, amount, currency, payment_method]
-      properties:
-        app_id:
-          type: string
-          description: Application identifier the payment is billed to.
-          example: app_reachchurch
         amount:
-          type: integer
-          minimum: 1
-          description: Amount in the smallest currency unit (e.g. cents).
-          example: 4999
+          type: number
+          minimum: 0.01
+          description: Amount in the currency's major unit (see Conventions above), not the smallest unit.
+          example: 49.99
         currency:
           type: string
           description: ISO 4217 currency code.
           example: USD
-        payment_method:
+        paymentMethod:
           $ref: '#/components/schemas/PaymentMethod'
-        phone_number:
+        phoneNumber:
           type: string
           description: Required for `mobile_money`.
           example: "+265888000111"
-        customer:
-          type: object
-          properties:
-            email: { type: string, format: email }
-            phone: { type: string }
-            reference: { type: string }
-        provider_override:
+        paymentToken:
           type: string
-          description: Force a specific provider (e.g. `stripe`).
+          description: >-
+            A pre-tokenized payment instrument the selected provider's own
+            API understands (e.g. a Stripe PaymentMethod id created
+            client-side via Stripe.js/Elements — this gateway never
+            collects raw card data). Without one, card-based providers
+            (Stripe, NMI, Flutterwave, Airwallex) fall back to simulated
+            processing rather than fabricating a charge with nothing to
+            charge.
+          example: pm_card_visa
+        providerOverride:
+          type: string
+          description: Force a specific provider by id (e.g. `stripe`), bypassing routing.
           example: stripe
+        country:
+          type: string
+          description: >-
+            ISO 3166-1 alpha-2 country code (e.g. `US`, `KE`) the
+            transaction is associated with — the caller's or cardholder's
+            country, not the merchant's. When present, routing filters
+            candidates to providers whose configured `countries` list
+            includes it (or `*`), and admin routing rules can match on it
+            (`country == KE`). Optional — omitting it leaves routing
+            behavior unchanged.
+          example: US
         metadata:
           type: object
-          description: Free-form key/value pairs echoed back on the payment and webhooks.
           additionalProperties: true
-        idempotency_key:
-          type: string
-          description: Alternative to the `Idempotency-Key` header.
 
-    Payment:
+    User:
       type: object
-      required: [id, object, status, amount, currency, app_id, created_at]
       properties:
-        id: { type: string, example: pay_8f2c1a9b }
-        object: { type: string, enum: [payment] }
-        status:
-          $ref: '#/components/schemas/PaymentStatus'
-        amount: { type: integer, example: 4999 }
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        roleId: { type: string, format: uuid, nullable: true }
+        email: { type: string, format: email }
+        name: { type: string, nullable: true }
+        emailVerifiedAt: { type: string, format: date-time, nullable: true }
+        lastLoginAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    SignupResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        application:
+          type: object
+          description: The BIS Platform application created for this account.
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            slug: { type: string }
+            status: { type: string }
+            environment: { type: string }
+        apiKey:
+          type: object
+          description: This application's first API key. Shown once — store it now.
+          properties:
+            raw: { type: string, example: sk_live_a1b2c3... }
+            prefix: { type: string }
+            environment: { type: string }
+        emailVerificationToken:
+          type: string
+          description: >-
+            Present only outside production. In production this token is
+            emailed via Resend (see docs/IMPLEMENTATION_CHANGELOG.md, "Real
+            Transactional Email"), not returned in the response.
+
+    LoginResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        token:
+          type: string
+          description: Opaque session token — send as `Authorization Bearer` on session-authed routes.
+          example: sess_a1b2c3...
+        expiresAt: { type: string, format: date-time }
+
+    Plan:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string, example: growth }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        priceCents: { type: integer, example: 4900 }
         currency: { type: string, example: USD }
-        payment_method:
-          $ref: '#/components/schemas/PaymentMethod'
-        app_id: { type: string, example: app_reachchurch }
-        provider:
-          type: string
-          description: Provider selected by the routing engine.
-          example: stripe
-        provider_transaction_id:
-          type: string
-          description: Provider-side transaction reference.
-          example: "pi_3MtwBwLkdIwHu7ix28a3tqPa"
-        fee:
-          $ref: '#/components/schemas/Fee'
-        customer:
-          type: object
-          properties:
-            email: { type: string }
-            phone: { type: string }
-        idempotency_key: { type: string }
-        metadata: { type: object, additionalProperties: true }
-        error:
-          type: object
-          description: Present when `status` is `failed`.
-          properties:
-            code: { type: string }
-            message: { type: string }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-        settled_at:
-          type: string
-          format: date-time
-          description: Present once settlement confirmed via webhook.
-
-    RefundCreate:
-      type: object
-      required: [payment_id]
-      properties:
-        payment_id:
-          type: string
-          example: pay_8f2c1a9b
-        amount:
+        interval: { type: string, enum: [month, year] }
+        messageLimit:
           type: integer
-          description: Refund amount (smallest unit). Omit for a full refund.
-          example: 2000
-        currency:
+          nullable: true
+          description: Informational only in this pass — not yet enforced by the gateway.
+        paymentVolumeLimitCents:
+          type: integer
+          nullable: true
+          description: Informational only in this pass — not yet enforced by the gateway.
+
+    Subscription:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        applicationId: { type: string, format: uuid }
+        planId: { type: string, format: uuid }
+        status:
           type: string
-          description: Required when `amount` is supplied.
-          example: USD
+          enum: [trialing, active, past_due, canceled, incomplete]
+        stripeCustomerId: { type: string, nullable: true }
+        stripeSubscriptionId:
+          type: string
+          nullable: true
+          description: Prefixed `sim_sub_` when no live Stripe key is configured.
+        currentPeriodStart: { type: string, format: date-time, nullable: true }
+        currentPeriodEnd: { type: string, format: date-time, nullable: true }
+        cancelAtPeriodEnd: { type: boolean }
+        canceledAt: { type: string, format: date-time, nullable: true }
+
+    TransactionEvent:
+      type: object
+      required: [id, timestamp, appId, category, providerId, status, latency, cost, decisionReason, payload, response]
+      description: >-
+        Returned by all three of POST /v1/api/gateway/payment,
+        /messaging, and /refund — one shape for every transaction type
+        this gateway handles, not a separate Payment/Message/Refund
+        resource per operation.
+      properties:
+        id:
+          type: string
+          description: Adapter-generated or provider-side id — see Conventions above.
+          example: "pi_3MtwBwLkdIwHu7ix28a3tqPa"
+        timestamp: { type: string, format: date-time }
+        appId: { type: string, description: The authenticated application's slug. }
+        category:
+          $ref: '#/components/schemas/ProviderCategory'
+        providerId:
+          type: string
+          description: The provider actually selected/used.
+          example: stripe
+        status:
+          $ref: '#/components/schemas/TransactionStatus'
+        amount: { type: number, example: 49.99 }
+        currency: { type: string, example: USD }
+        messageType:
+          type: string
+          description: Present on messaging-category events (e.g. `sms`, `email`).
+        latency: { type: integer, description: Milliseconds. }
+        cost: { type: number, description: Cost incurred, in account currency. }
+        decisionReason:
+          type: string
+          description: Why this provider/outcome was chosen (routing reason, or the refund's `reason` if supplied).
+        payload:
+          description: The original request payload (or, for a refund, `{ transactionId, amount }`).
+        response:
+          description: The raw (or simulated) provider response. Shape is provider-specific.
+        error:
+          type: string
+          description: Present when `status` is `failed`.
+
+    TransactionStatusResponse:
+      type: object
+      required: [id, status, providerId, category, cost, latency, timestamp]
+      properties:
+        id: { type: string }
+        status:
+          $ref: '#/components/schemas/TransactionStatus'
+        providerId: { type: string }
+        category:
+          $ref: '#/components/schemas/ProviderCategory'
+        amount: { type: number }
+        currency: { type: string }
+        messageType: { type: string }
+        cost: { type: number }
+        latency: { type: integer }
+        timestamp: { type: string, format: date-time }
+        providerTransactionId:
+          type: string
+          description: Extracted from the underlying event's response, when present.
+        error: { type: string }
+
+    RefundCreateRequest:
+      type: object
+      required: [transactionId]
+      properties:
+        transactionId:
+          type: string
+          description: The `id` from the original payment's TransactionEvent — see the operation description.
+          example: "pi_3MtwBwLkdIwHu7ix28a3tqPa"
+        amount:
+          type: number
+          description: >-
+            Refund amount in the currency's major unit. Omit for a full
+            refund. Must be > 0 and <= the original transaction's amount.
+          example: 20.00
         reason:
           type: string
-          enum:
-            - customer_requested
-            - duplicate
-            - fraudulent
-            - partial_shipment
-            - other
-        metadata:
-          type: object
-          additionalProperties: true
+          description: Free-form — echoed back as the resulting TransactionEvent's `decisionReason`.
+          example: partial_shipment
 
-    Refund:
+    MessageCreateRequest:
       type: object
-      required: [id, object, payment_id, status, amount, currency, created_at]
+      required: [recipient, content]
+      description: >-
+        `appId` is never part of the body — resolved from the
+        authenticated API key, same as payments.
       properties:
-        id: { type: string, example: ref_1c2d3e4f }
-        object: { type: string, enum: [refund] }
-        payment_id: { type: string, example: pay_8f2c1a9b }
-        status:
-          type: string
-          enum: [pending, success, failed]
-        amount: { type: integer, example: 2000 }
-        currency: { type: string, example: USD }
-        reason: { type: string }
-        provider_refund_id:
-          type: string
-          example: "re_1MtwBwLkdIwHu7ix99bZxYz"
-        created_at: { type: string, format: date-time }
-
-    MessageChannel:
-      type: string
-      enum: [sms, whatsapp, email]
-
-    MessageStatus:
-      type: string
-      enum: [queued, sent, delivered, failed, undeliverable]
-
-    MessageCreate:
-      type: object
-      required: [app_id, channel, recipient, content]
-      properties:
-        app_id: { type: string, example: app_reachchurch }
-        channel:
-          $ref: '#/components/schemas/MessageChannel'
         recipient:
           type: string
-          description: Phone number (sms/whatsapp) or email address.
+          description: Phone number (SMS/WhatsApp) or email address, depending on which provider handles it.
           example: "+265888000111"
-        subject:
-          type: string
-          description: Required for `email`.
         content:
           type: string
           example: "Your appointment is confirmed."
-        provider_override: { type: string, example: infobip }
-        metadata: { type: object, additionalProperties: true }
-
-    Message:
-      type: object
-      required: [id, object, status, channel, recipient, app_id, created_at]
-      properties:
-        id: { type: string, example: msg_5a6b7c8d }
-        object: { type: string, enum: [message] }
-        status:
-          $ref: '#/components/schemas/MessageStatus'
-        channel:
-          $ref: '#/components/schemas/MessageChannel'
-        recipient: { type: string, example: "+265888000111" }
-        subject: { type: string }
-        content: { type: string }
-        app_id: { type: string, example: app_reachchurch }
-        provider: { type: string, example: infobip }
-        provider_message_id: { type: string }
-        conversation_id:
+        providerOverride:
           type: string
-          description: Thread this message belongs to.
-          example: conv_9z8y7x6w
-        cost:
-          type: number
-          description: Cost incurred (in account currency).
-        created_at: { type: string, format: date-time }
-        delivered_at: { type: string, format: date-time }
+          description: >-
+            Force a specific provider by id, bypassing routing — e.g.
+            `email` to target the real Resend-backed adapter regardless of
+            `recipient`'s shape.
+          example: infobip
+        metadata:
+          type: object
+          additionalProperties: true
 
-    Conversation:
+    ProviderManagement:
       type: object
-      required: [id, object, participant, messages]
-      properties:
-        id: { type: string, example: conv_9z8y7x6w }
-        object: { type: string, enum: [conversation] }
-        participant:
-          type: string
-          description: The external recipient of the thread.
-          example: "+265888000111"
-        app_id: { type: string, example: app_reachchurch }
-        message_count: { type: integer, example: 12 }
-        messages:
-          type: array
-          items: { $ref: '#/components/schemas/Message' }
-        has_more:
-          type: boolean
-          description: Whether more messages exist before the cursor.
-        next_cursor: { type: string }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-
-    Provider:
-      type: object
-      required: [id, name, category, status, capabilities]
+      required: [id, name, category, status, weight, latencyMin, latencyMax, environment, countries, currencies, capabilities, priority, health, errorRate, routingRules, circuitState, consecutiveFailures, configured]
+      description: Returned by GET /v1/api/gateway/providers when `category` is omitted.
       properties:
         id: { type: string, example: pawapay }
         name: { type: string, example: "PawaPay" }
@@ -957,9 +1294,14 @@ components:
           $ref: '#/components/schemas/ProviderCategory'
         status:
           $ref: '#/components/schemas/ProviderStatus'
+        weight: { type: number, description: Routing priority (0-100). }
+        latencyMin: { type: integer, description: Simulated-mode latency floor, ms. }
+        latencyMax: { type: integer, description: Simulated-mode latency ceiling, ms. }
+        transactionFeePercent: { type: number }
+        transactionFeeFlat: { type: number }
+        messageCost: { type: number }
         environment:
-          type: string
-          enum: [test, live]
+          $ref: '#/components/schemas/ProviderEnvironment'
         countries:
           type: array
           description: Supported ISO country codes, or `['*']` for global.
@@ -973,114 +1315,152 @@ components:
           type: array
           items: { type: string }
           example: ["mobile_money"]
-        weight:
-          type: number
-          description: Routing priority (0-100).
+        priority: { type: number }
         health:
           $ref: '#/components/schemas/ProviderHealthStatus'
-        last_successful_request:
+        lastSuccessfulRequest:
           type: string
           nullable: true
           format: date-time
-        error_rate:
+        errorRate:
           type: number
           description: Rolling error rate percentage (0-100).
-        latency_estimate_ms:
-          type: object
-          properties:
-            min: { type: number }
-            max: { type: number }
-
-    ProviderList:
-      type: object
-      required: [object, data]
-      properties:
-        object: { type: string, enum: [list] }
-        data:
+        routingRules:
           type: array
-          items: { $ref: '#/components/schemas/Provider' }
-        has_more: { type: boolean, example: false }
-        next_cursor:
+          items: { type: object }
+        circuitState:
           type: string
-          nullable: true
+          enum: [closed, open, half_open]
+        consecutiveFailures: { type: integer }
+        configured:
+          type: boolean
+          description: >-
+            Whether this provider currently has real credentials
+            configured — `false` on a `'live'`-environment provider means
+            every request to it is silently simulated, not a live charge.
+
+    ProviderCapabilityMatch:
+      type: object
+      required: [id, name, category, capabilities, currencies, countries, weight, status]
+      description: >-
+        Returned by GET /v1/api/gateway/providers when `category` is
+        supplied — the same filtered, availability-checked list the
+        routing engine itself selects from, not the full management view.
+      properties:
+        id: { type: string, example: pawapay }
+        name: { type: string }
+        category:
+          $ref: '#/components/schemas/ProviderCategory'
+        capabilities:
+          type: array
+          items: { type: string }
+        currencies:
+          type: array
+          items: { type: string }
+        countries:
+          type: array
+          items: { type: string }
+        weight: { type: number }
+        status:
+          $ref: '#/components/schemas/ProviderStatus'
+
+    ProviderListResponse:
+      type: object
+      required: [providers, count]
+      properties:
+        providers:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/ProviderManagement'
+              - $ref: '#/components/schemas/ProviderCapabilityMatch'
+        count: { type: integer }
 
     Health:
       type: object
-      required: [status, timestamp]
+      required: [status, service, timestamp]
+      description: The real GET /health liveness response — no dependency detail (see Readiness for that).
+      properties:
+        status: { type: string, enum: [healthy] }
+        service: { type: string, example: api-gateway }
+        timestamp: { type: string, format: date-time }
+
+    Readiness:
+      type: object
+      required: [status, service, dependencies, timestamp]
       properties:
         status:
           type: string
-          enum: [healthy, degraded, down]
-        version: { type: string, example: "1.0.0" }
-        timestamp: { type: string, format: date-time }
+          enum: [ready, degraded]
+        service: { type: string, example: api-gateway }
         dependencies:
           type: object
+          required: [database, rateLimiter, queue, providers]
           properties:
             database:
               type: string
-              enum: [healthy, degraded, down]
-            event_bus:
+              description: 'healthy/degraded/unhealthy (from the DB health check), or unreachable.'
+              example: healthy
+            rateLimiter:
               type: string
-              enum: [healthy, degraded, down]
+              enum: [redis, in-memory]
+            queue:
+              type: string
+              description: unconfigured (no REDIS_URL — expected outside production), healthy, or unreachable.
+              example: healthy
             providers:
               type: string
-              enum: [healthy, degraded, down]
+              enum: [ready]
+              description: Always `ready` — the provider registry is in-memory.
+        timestamp: { type: string, format: date-time }
 
     WebhookEvent:
+      allOf:
+        - $ref: '#/components/schemas/TransactionEvent'
+      description: >-
+        The exact POST body delivered to a registered webhook endpoint —
+        the **raw `TransactionEvent` itself**, not a separate wrapping
+        envelope with its own `id`/`type`/`created_at`/`data` fields (an
+        earlier version of this schema invented that envelope; it doesn't
+        exist). Delivered by `packages/events/src/webhook-delivery.ts`'s
+        `WebhookDelivery`, signed with `X-Webhook-Signature:
+        sha256=<hmac-sha256(secret, body)>` — see `WebhookEndpointCreated`
+        and `docs/DEVELOPER_GUIDE.md` §9b for registration and
+        verification. Closed 2026-09-17 (`docs/IMPLEMENTATION_BASELINE.md`
+        item 24) — this schema previously described a feature that was
+        documented but not reachable end-to-end.
+    WebhookEndpointCreate:
       type: object
-      description: |
-        Envelope delivered to developer-registered webhook URLs (outbound).
-      required: [id, object, type, created_at, data]
+      required: [url]
       properties:
-        id: { type: string, example: ev_2f3a4b5c }
-        object: { type: string, enum: [event] }
-        type:
+        url:
           type: string
-          description: Event type (see Webhook Events table).
-          example: payment.succeeded
-        created_at: { type: string, format: date-time }
-        livemode: { type: boolean, description: false in sandbox. }
-        correlation_id:
-          type: string
-          description: Matches the `X-Correlation-Id` of the originating request.
-        data:
-          type: object
-          description: The affected resource (Payment, Message, Refund, ...).
-
-    WebhookEventTypes:
-      type: string
-      description: |
-        Supported outbound event types:
-        - `payment.pending`, `payment.succeeded`, `payment.failed`
-        - `refund.pending`, `refund.succeeded`, `refund.failed`
-        - `message.sent`, `message.delivered`, `message.failed`, `message.undeliverable`
-      enum:
-        - payment.pending
-        - payment.succeeded
-        - payment.failed
-        - refund.pending
-        - refund.succeeded
-        - refund.failed
-        - message.sent
-        - message.delivered
-        - message.failed
-        - message.undeliverable
-
-  examples:
-    WebhookEventExample:
-      summary: payment.succeeded outbound webhook
-      value:
-        id: ev_2f3a4b5c
-        object: event
-        type: payment.succeeded
-        created_at: "2026-08-24T12:34:56Z"
-        livemode: true
-        correlation_id: corr_abc123
-        data:
-          id: pay_8f2c1a9b
-          object: payment
-          status: success
-          amount: 4999
-          currency: USD
-          provider: stripe
-          settled_at: "2026-08-24T12:34:58Z"
+          format: uri
+          description: >-
+            Must be `https://` (plain `http://` accepted only outside
+            production, for local testing).
+          example: https://your-app.example.com/webhooks/company
+        events:
+          type: array
+          items: { type: string, enum: [payment, messaging, other, '*'] }
+          description: Event categories to receive. Omit (or pass `["*"]`) for every category.
+          example: [payment]
+    WebhookEndpointSummary:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string, format: uri }
+        events: { type: array, items: { type: string } }
+        active: { type: boolean }
+        createdAt: { type: string, format: date-time }
+    WebhookEndpointCreated:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEndpointSummary'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: >-
+                The signing secret (`whsec_...`), generated once and shown
+                exactly here — never re-displayed. Store it immediately.
+              example: whsec_9f2492b5de8b4a1c9f2492b5de8b4a1c

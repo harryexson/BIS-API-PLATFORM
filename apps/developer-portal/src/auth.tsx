@@ -45,10 +45,24 @@ export function PortalAuthProvider({ children }: { children: React.ReactNode }) 
 
   const signup = useCallback<PortalAuthState['signup']>(async (input) => {
     try {
-      const res = await fetch('/v1/portal/auth/signup', {
+      // The gateway's self-serve signup provisions one application per
+      // account (users.applicationId is a required FK) — derive a slug
+      // from the company name the same way the old portal-only signup did.
+      const applicationSlug = input.companyName
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '')
+        .slice(0, 60) || 'app';
+      const res = await fetch('/v1/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
+        body: JSON.stringify({
+          email: input.email,
+          password: input.password,
+          applicationName: input.companyName,
+          applicationSlug,
+        }),
       });
       const body = await res.json();
       if (!res.ok) return { ok: false, error: body.error || 'Signup failed' };
@@ -65,7 +79,7 @@ export function PortalAuthProvider({ children }: { children: React.ReactNode }) 
 
   const login = useCallback<PortalAuthState['login']>(async (input) => {
     try {
-      const res = await fetch('/v1/portal/auth/login', {
+      const res = await fetch('/v1/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
@@ -80,10 +94,15 @@ export function PortalAuthProvider({ children }: { children: React.ReactNode }) 
   }, [persist]);
 
   const logout = useCallback(() => {
+    // Best-effort server-side session revocation — the local session is
+    // cleared either way, so a failed/offline request here never blocks sign-out.
+    if (token) {
+      fetch('/v1/api/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined);
+    }
     localStorage.removeItem(STORAGE_KEY);
     setToken(null);
     setApplication(null);
-  }, []);
+  }, [token]);
 
   const value = useMemo<PortalAuthState>(
     () => ({ token, application, isAuthenticated: !!token, signup, completeSignup, login, logout }),

@@ -5,6 +5,7 @@ import {
   ProviderHealthStatus,
   ProviderSecretMeta,
   ProviderCapabilityMatch,
+  ProviderCircuitState,
   RoutingRule,
   HealthCheckSummary,
 } from '@company/schemas';
@@ -18,15 +19,23 @@ import { PawaPayProvider } from './adapters/payments/pawapay';
 import { PayChanguProvider } from './adapters/payments/paychangu';
 import { AirwallexProvider } from './adapters/payments/airwallex';
 import { AuthorizeNetProvider } from './adapters/payments/authorizenet';
+import { AdyenProvider } from './adapters/payments/adyen';
+import { BraintreeProvider } from './adapters/payments/braintree';
 import { CheckoutComProvider } from './adapters/payments/checkout';
+import { PayPalProvider } from './adapters/payments/paypal';
 import { PaystackProvider } from './adapters/payments/paystack';
+import { SquareProvider } from './adapters/payments/square';
 import { ExamplePaymentProvider } from './adapters/payments/example';
 
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
+import { TwilioProvider } from './adapters/messaging/twilio';
+import { WhatsAppProvider } from './adapters/messaging/whatsapp';
+import { AfricasTalkingProvider } from './adapters/messaging/africastalking';
+import { SinchProvider } from './adapters/messaging/sinch';
+import { VibesProvider } from './adapters/messaging/vibes';
 import { FutureSMSProvider } from './adapters/messaging/futuresms';
 import { EmailProvider } from './adapters/messaging/email';
-import { TwilioProvider } from './adapters/messaging/twilio';
 import { ExampleMessagingProvider } from './adapters/messaging/example';
 
 import { MapsProvider } from './adapters/other/maps';
@@ -37,6 +46,18 @@ import { AIProvider } from './adapters/other/ai';
 // Only masked metadata is ever returned to callers.
 interface StoredSecret {
   meta: ProviderSecretMeta;
+  value: string;
+}
+
+// Plain, DB-shape-agnostic form of a secret used only at the
+// export/hydrate boundary with whatever's calling this package (see
+// exportSecretsForPersistence/hydrateSecrets below) — deliberately not the
+// same type as ProviderSecretMeta, which also carries the masked/id/
+// lastUpdated fields this package derives itself, not a persistence
+// layer's job to supply.
+export interface PersistableProviderSecret {
+  field: string;
+  label: string;
   value: string;
 }
 
@@ -51,7 +72,18 @@ export interface ManagementState {
   errorRate: number;
   routingRules: RoutingRule[];
   secrets: StoredSecret[];
+  circuitState: ProviderCircuitState;
+  consecutiveFailures: number;
+  circuitOpenedAt: number | null;
 }
+
+// Circuit breaker tuning. Configurable per Phase 21 of the master plan:
+// failure threshold, open duration, half-open attempts, recovery threshold.
+// A single failed half-open probe re-opens the circuit (recovery threshold
+// of 1); this keeps the breaker simple while still preventing a flapping
+// provider from being hammered.
+const CIRCUIT_FAILURE_THRESHOLD = Number(process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD) || 5;
+const CIRCUIT_COOLDOWN_MS = Number(process.env.CIRCUIT_BREAKER_COOLDOWN_MS) || 30_000;
 
 export class ProviderRegistry {
   private static instance: ProviderRegistry;
@@ -60,6 +92,29 @@ export class ProviderRegistry {
 
   private constructor() {
     this.initializeProviders();
+    this.warnUnconfiguredLiveProviders();
+  }
+
+  // P0: There was previously zero registration-time validation of any
+  // kind — a 'live'-environment provider with a missing/wrong credential
+  // silently fell back to simulated processing on every real request, with
+  // no signal anywhere except the admin console's Provider Management tab
+  // (which an operator has to think to check). This doesn't block startup
+  // (a genuinely broken provider shouldn't take the whole gateway down —
+  // other providers still need to serve traffic), but it does put the gap
+  // in the startup logs where an operator deploying a new provider will
+  // actually see it.
+  private warnUnconfiguredLiveProviders(): void {
+    for (const [id, provider] of this.providers) {
+      const state = this.management.get(id);
+      if (state?.environment === 'live' && !provider.isConfigured()) {
+        console.warn(
+          `[providers] '${id}' is registered as environment: 'live' but has no real credentials configured — ` +
+          `every request will silently fall back to simulated processing until an admin adds its secret(s) ` +
+          `(POST /api/dashboard/providers/${id}/secrets) or the matching env var(s) are set.`,
+        );
+      }
+    }
   }
 
   public static getInstance(): ProviderRegistry {
@@ -154,17 +209,53 @@ export class ProviderRegistry {
       transactionFeeFlat: 0.30
     }), { environment: 'live', countries: ['US', 'CA'], currencies: ['USD', 'CAD'], capabilities: ['card'] });
 
+    this.register(new AdyenProvider({
+      id: 'adyen',
+      name: 'Adyen',
+      category: 'payment',
+      status: 'online',
+      weight: 50,
+      latencyMin: 130,
+      latencyMax: 190,
+      transactionFeePercent: 1.9,
+      transactionFeeFlat: 0.12
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP'], capabilities: ['card'] });
+
+    this.register(new BraintreeProvider({
+      id: 'braintree',
+      name: 'Braintree',
+      category: 'payment',
+      status: 'online',
+      weight: 45,
+      latencyMin: 150,
+      latencyMax: 210,
+      transactionFeePercent: 2.59,
+      transactionFeeFlat: 0.49
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP', 'AUD', 'CAD'], capabilities: ['card'] });
+
     this.register(new CheckoutComProvider({
       id: 'checkout',
       name: 'Checkout.com',
       category: 'payment',
       status: 'online',
-      weight: 45,
-      latencyMin: 130,
-      latencyMax: 190,
-      transactionFeePercent: 2.6,
-      transactionFeeFlat: 0.25
-    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP', 'AED'], capabilities: ['card'] });
+      weight: 50,
+      latencyMin: 140,
+      latencyMax: 200,
+      transactionFeePercent: 1.8,
+      transactionFeeFlat: 0.10
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP'], capabilities: ['card'] });
+
+    this.register(new PayPalProvider({
+      id: 'paypal',
+      name: 'PayPal',
+      category: 'payment',
+      status: 'online',
+      weight: 50,
+      latencyMin: 160,
+      latencyMax: 230,
+      transactionFeePercent: 3.49,
+      transactionFeeFlat: 0.49
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP'], capabilities: ['wallet'] });
 
     this.register(new PaystackProvider({
       id: 'paystack',
@@ -172,11 +263,23 @@ export class ProviderRegistry {
       category: 'payment',
       status: 'online',
       weight: 50,
-      latencyMin: 190,
-      latencyMax: 250,
+      latencyMin: 170,
+      latencyMax: 240,
       transactionFeePercent: 1.5,
       transactionFeeFlat: 0.0
     }), { environment: 'live', countries: ['NG', 'GH', 'ZA', 'KE'], currencies: ['NGN', 'GHS', 'ZAR', 'KES', 'USD'], capabilities: ['card', 'bank_transfer', 'mobile_money'] });
+
+    this.register(new SquareProvider({
+      id: 'square',
+      name: 'Square',
+      category: 'payment',
+      status: 'online',
+      weight: 50,
+      latencyMin: 150,
+      latencyMax: 210,
+      transactionFeePercent: 2.6,
+      transactionFeeFlat: 0.10
+    }), { environment: 'live', countries: ['US', 'CA', 'GB', 'AU'], currencies: ['USD', 'CAD', 'GBP', 'AUD'], capabilities: ['card'] });
 
     this.register(new SignalHouseProvider({
       id: 'signalhouse',
@@ -200,6 +303,66 @@ export class ProviderRegistry {
       messageCost: 0.008
     }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
 
+    this.register(new TwilioProvider({
+      id: 'twilio',
+      name: 'Twilio',
+      category: 'messaging',
+      status: 'online',
+      weight: 55,
+      latencyMin: 100,
+      latencyMax: 160,
+      messageCost: 0.0079
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
+
+    this.register(new WhatsAppProvider({
+      id: 'whatsapp',
+      name: 'WhatsApp Business Platform',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 110,
+      latencyMax: 170,
+      messageCost: 0.005
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['whatsapp'] });
+
+    this.register(new AfricasTalkingProvider({
+      id: 'africastalking',
+      name: "Africa's Talking",
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 150,
+      latencyMax: 220,
+      messageCost: 0.006
+    }), {
+      environment: 'live',
+      countries: ['KE', 'UG', 'TZ', 'RW', 'MW', 'NG', 'ZM', 'CI', 'ET', 'GH', 'ZA'],
+      currencies: ['KES', 'UGX', 'TZS', 'RWF', 'MWK', 'NGN', 'ZMW', 'GHS', 'ZAR'],
+      capabilities: ['sms']
+    });
+
+    this.register(new SinchProvider({
+      id: 'sinch',
+      name: 'Sinch',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 100,
+      latencyMax: 160,
+      messageCost: 0.007
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms'] });
+
+    this.register(new VibesProvider({
+      id: 'vibes',
+      name: 'Vibes',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 120,
+      latencyMax: 200,
+      messageCost: 0.007
+    }), { environment: 'live', countries: ['US', 'CA'], currencies: ['USD', 'CAD'], capabilities: ['sms'] });
+
     this.register(new FutureSMSProvider({
       id: 'futuresms',
       name: 'Future SMS',
@@ -210,17 +373,6 @@ export class ProviderRegistry {
       latencyMax: 250,
       messageCost: 0.002
     }), { environment: 'live', countries: ['MW', 'ZM'], currencies: ['MWK', 'ZMW'], capabilities: ['sms'] });
-
-    this.register(new TwilioProvider({
-      id: 'twilio',
-      name: 'Twilio',
-      category: 'messaging',
-      status: 'online',
-      weight: 50,
-      latencyMin: 100,
-      latencyMax: 160,
-      messageCost: 0.0075
-    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
 
     this.register(new EmailProvider({
       id: 'email',
@@ -301,7 +453,14 @@ export class ProviderRegistry {
   }) {
     this.providers.set(provider.config.id, provider);
     const id = provider.config.id;
-    const generated = 'sk_' + randomUUID().replace(/-/g, '').slice(0, 32);
+    // No secrets at registration time — real credentials come from the
+    // adapter's own process.env fallback (documented in .env.example) until
+    // an admin adds one via addSecret(), which syncs into the adapter's
+    // real BaseProvider.setSecrets(). This used to seed a fake random
+    // 'sk_...' secret here that nothing ever consumed — purely decorative,
+    // and actively dangerous once addSecret()/setSecrets() were wired for
+    // real: it would have shadowed every adapter's process.env fallback
+    // with garbage the moment secrets syncing went live.
     this.management.set(id, {
       environment: managementDefaults.environment,
       countries: managementDefaults.countries,
@@ -312,16 +471,28 @@ export class ProviderRegistry {
       lastSuccessfulRequest: null,
       errorRate: 0,
       routingRules: [],
-      secrets: [{
-        meta: {
-          id: `${id}_api_key`,
-          label: 'API Key',
-          masked: this.maskSecret(generated),
-          lastUpdated: new Date().toISOString()
-        },
-        value: generated
-      }]
+      circuitState: 'closed',
+      consecutiveFailures: 0,
+      circuitOpenedAt: null,
+      secrets: [],
     });
+  }
+
+  // Rebuilds the { field: value } map the adapter's real HTTP calls read
+  // (this.secrets.<field> — see BaseProvider.setSecrets()) from whatever
+  // secrets are currently stored for this provider, and pushes it into the
+  // live provider instance. Called after every add/delete so the adapter's
+  // next request sees the change immediately — no restart required.
+  private syncSecrets(id: string): void {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return;
+
+    const record: Record<string, string> = {};
+    for (const s of state.secrets) {
+      record[s.meta.field] = s.value;
+    }
+    provider.setSecrets(record);
   }
 
   public getProvider(id: string): BaseProvider | undefined {
@@ -340,18 +511,52 @@ export class ProviderRegistry {
     return Array.from(this.providers.values()).map(p => p.config);
   }
 
+  // Circuit breaker: whether a provider may currently receive routed
+  // traffic. CLOSED — yes. OPEN — no, unless the cooldown has elapsed, in
+  // which case this call transitions the circuit to HALF_OPEN and allows
+  // exactly one probe request through. HALF_OPEN — yes (the probe already
+  // in flight); recordTraffic() resolves it to CLOSED or back to OPEN.
+  public isCircuitAvailable(id: string): boolean {
+    const state = this.management.get(id);
+    if (!state) return false;
+
+    if (state.circuitState === 'closed') return true;
+
+    if (state.circuitState === 'open') {
+      const openedAt = state.circuitOpenedAt ?? 0;
+      if (Date.now() - openedAt >= CIRCUIT_COOLDOWN_MS) {
+        state.circuitState = 'half_open';
+        return true;
+      }
+      return false;
+    }
+
+    // half_open: allow the in-flight probe.
+    return true;
+  }
+
+  // Combines the admin-controlled online/offline/maintenance status with
+  // circuit breaker availability — this is the single check routing should
+  // use to decide whether a provider is eligible for a request right now.
+  public isProviderAvailable(id: string): boolean {
+    const provider = this.providers.get(id);
+    if (!provider || provider.config.status !== 'online') return false;
+    return this.isCircuitAvailable(id);
+  }
+
   // Capability-based routing: find providers by category + required capabilities + supported currencies
   public findByCategoryAndCapabilities(
     category: 'payment' | 'messaging' | 'other',
     requiredCapabilities: string[],
     currency?: string,
+    country?: string,
   ): ProviderCapabilityMatch[] {
     const matches: ProviderCapabilityMatch[] = [];
 
     for (const [id, provider] of this.providers) {
       const config = provider.config;
       if (config.category !== category) continue;
-      if (config.status !== 'online') continue;
+      if (!this.isProviderAvailable(id)) continue;
 
       const state = this.management.get(id);
       if (!state) continue;
@@ -372,6 +577,16 @@ export class ProviderRegistry {
         if (!state.currencies.includes(cur) && !state.currencies.includes('*')) continue;
       }
 
+      // Check country support if specified — real routing input as of
+      // this pass: previously `countries` was collected and admin-
+      // configurable but never actually consulted here, the same
+      // "decorative field" gap routing rules and transaction fees had
+      // before earlier passes wired those in too.
+      if (country) {
+        const c = country.toUpperCase();
+        if (!state.countries.includes(c) && !state.countries.includes('*')) continue;
+      }
+
       matches.push({
         id,
         name: config.name,
@@ -381,12 +596,37 @@ export class ProviderRegistry {
         countries: state.countries,
         weight: config.weight,
         status: config.status,
+        errorRate: state.errorRate,
+        transactionFeePercent: config.transactionFeePercent,
+        transactionFeeFlat: config.transactionFeeFlat,
+        messageCost: config.messageCost,
       });
     }
 
-    // Sort by weight descending
+    // Sort by weight descending — callers that want success-rate/cost-aware
+    // ordering re-sort by packages/routing's computeProviderScore() instead;
+    // this default keeps every existing caller of this method unaffected.
     matches.sort((a, b) => b.weight - a.weight);
     return matches;
+  }
+
+  // Every enabled routing rule across every provider's management state —
+  // RoutingRule.target is an explicit provider id, not necessarily the
+  // provider the rule happens to be stored under (the admin console's "Add
+  // Rule" lives on a provider's own page for convenience, but a rule means
+  // "IF <match> route to <target>" regardless of storage location). Added
+  // 2026-09-25: this data had full CRUD (add/update/delete) and an admin
+  // console UI since an earlier pass, but nothing ever read it back —
+  // RoutingEngine never called this method, so every rule an admin created
+  // was purely decorative. See docs/IMPLEMENTATION_BASELINE.md.
+  public getEnabledRoutingRules(): RoutingRule[] {
+    const rules: RoutingRule[] = [];
+    for (const state of this.management.values()) {
+      for (const rule of state.routingRules) {
+        if (rule.enabled) rules.push(rule);
+      }
+    }
+    return rules;
   }
 
   public updateProviderConfig(id: string, updates: Partial<ProviderConfig>): ProviderConfig | null {
@@ -397,6 +637,18 @@ export class ProviderRegistry {
       ...provider.config,
       ...updates
     };
+
+    // Manually bringing a provider back online resets the circuit — an
+    // operator's explicit judgment overrides the automatic breaker.
+    if (updates.status === 'online') {
+      const state = this.management.get(id);
+      if (state) {
+        state.circuitState = 'closed';
+        state.consecutiveFailures = 0;
+        state.circuitOpenedAt = null;
+      }
+    }
+
     return provider.config;
   }
 
@@ -419,7 +671,10 @@ export class ProviderRegistry {
       health: state.health,
       lastSuccessfulRequest: state.lastSuccessfulRequest,
       errorRate: state.errorRate,
-      routingRules: state.routingRules
+      routingRules: state.routingRules,
+      circuitState: state.circuitState,
+      consecutiveFailures: state.consecutiveFailures,
+      configured: provider.isConfigured(),
     };
   }
 
@@ -446,6 +701,13 @@ export class ProviderRegistry {
     }
     if (updates.status !== undefined) {
       provider.config.status = updates.status;
+      // Manually bringing a provider back online resets the circuit —
+      // an operator's explicit judgment overrides the automatic breaker.
+      if (updates.status === 'online') {
+        state.circuitState = 'closed';
+        state.consecutiveFailures = 0;
+        state.circuitOpenedAt = null;
+      }
     }
     if (updates.latencyMin !== undefined) {
       provider.config.latencyMin = updates.latencyMin;
@@ -494,18 +756,27 @@ export class ProviderRegistry {
 
   public addSecret(
     id: string,
-    input: { label: string; value: string }
+    input: { field: string; label: string; value: string }
   ): ProviderSecretMeta | null {
     const state = this.management.get(id);
     if (!state) return null;
 
+    // Upsert by field: setting the same field again (e.g. rotating an API
+    // key) replaces the previous entry rather than leaving a stale
+    // duplicate that syncSecrets() would silently shadow anyway (a
+    // Record<field,value> can only hold one value per field — the last one
+    // written wins, so an unreplaced duplicate would be confusing dead
+    // weight in the admin console's secrets list for no reason).
     const meta: ProviderSecretMeta = {
       id: 'sec_' + randomUUID().replace(/-/g, '').slice(0, 12),
+      field: input.field,
       label: input.label,
       masked: this.maskSecret(input.value),
       lastUpdated: new Date().toISOString()
     };
+    state.secrets = state.secrets.filter(s => s.meta.field !== input.field);
     state.secrets.push({ meta, value: input.value });
+    this.syncSecrets(id);
     return meta;
   }
 
@@ -514,7 +785,52 @@ export class ProviderRegistry {
     if (!state) return false;
     const before = state.secrets.length;
     state.secrets = state.secrets.filter(s => s.meta.id !== secretId);
-    return state.secrets.length < before;
+    const removed = state.secrets.length < before;
+    if (removed) this.syncSecrets(id);
+    return removed;
+  }
+
+  // ----------------------------------------------------
+  // SECRETS PERSISTENCE (caller-driven — this package stays DB-free)
+  // ----------------------------------------------------
+  // packages/providers has no dependency on @company/database (see
+  // docs/providers/ADDING_A_PROVIDER.md) and ProviderRegistry's
+  // constructor is synchronous, so it cannot load from a real DB itself.
+  // Instead, services/api-gateway (which already depends on both
+  // packages) calls exportSecretsForPersistence() after every
+  // addSecret()/deleteSecret() to get what to encrypt and store, and
+  // calls hydrateSecrets() once at startup with whatever it decrypts back
+  // — this stays a plain in-memory operation either way, so
+  // packages/simulation's tests need no special-casing to exercise it.
+
+  // Exposes the current plaintext secrets for a provider so the caller can
+  // encrypt and persist them. Not a new trust boundary: every value here
+  // is exactly what the caller's own prior addSecret() call already
+  // supplied in plaintext.
+  public exportSecretsForPersistence(id: string): PersistableProviderSecret[] | null {
+    const state = this.management.get(id);
+    if (!state) return null;
+    return state.secrets.map(s => ({ field: s.meta.field, label: s.meta.label, value: s.value }));
+  }
+
+  // Restores secrets loaded from persisted storage at startup. Never
+  // clobbers secrets already present — a fresh addSecret() call earlier in
+  // this same process (e.g. from a test, or a request that raced startup)
+  // always wins over what was loaded from disk.
+  public hydrateSecrets(id: string, secrets: PersistableProviderSecret[]): void {
+    const state = this.management.get(id);
+    if (!state || state.secrets.length > 0 || secrets.length === 0) return;
+    state.secrets = secrets.map(s => ({
+      meta: {
+        id: 'sec_' + randomUUID().replace(/-/g, '').slice(0, 12),
+        field: s.field,
+        label: s.label,
+        masked: this.maskSecret(s.value),
+        lastUpdated: new Date().toISOString(),
+      },
+      value: s.value,
+    }));
+    this.syncSecrets(id);
   }
 
   // ----------------------------------------------------
@@ -574,8 +890,25 @@ export class ProviderRegistry {
     if (success) {
       state.lastSuccessfulRequest = new Date().toISOString();
       state.errorRate = Math.round(state.errorRate * 0.9 * 10) / 10;
+      state.consecutiveFailures = 0;
+      // A successful half-open probe closes the circuit; a success while
+      // closed is a no-op for circuit state.
+      if (state.circuitState === 'half_open') {
+        state.circuitState = 'closed';
+        state.circuitOpenedAt = null;
+      }
     } else {
       state.errorRate = Math.min(100, Math.round((state.errorRate * 0.9 + 10) * 10) / 10);
+      state.consecutiveFailures += 1;
+
+      if (state.circuitState === 'half_open') {
+        // Recovery probe failed — back to OPEN, restart the cooldown.
+        state.circuitState = 'open';
+        state.circuitOpenedAt = Date.now();
+      } else if (state.circuitState === 'closed' && state.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD) {
+        state.circuitState = 'open';
+        state.circuitOpenedAt = Date.now();
+      }
     }
 
     if (latencyMs > 0) {

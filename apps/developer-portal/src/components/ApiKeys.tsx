@@ -16,7 +16,7 @@ export default function ApiKeys({ token }: { token: string }) {
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
-    const res = await portalFetch(token, '/v1/portal/api-keys');
+    const res = await portalFetch(token, '/v1/api/api-keys');
     const body = await res.json();
     setKeys(body.apiKeys || []);
   }, [token]);
@@ -27,7 +27,7 @@ export default function ApiKeys({ token }: { token: string }) {
 
   async function createKey() {
     setBusy(true);
-    const res = await portalFetch(token, '/v1/portal/api-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const res = await portalFetch(token, '/v1/api/api-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     const body = await res.json();
     setBusy(false);
     if (res.ok) {
@@ -38,7 +38,7 @@ export default function ApiKeys({ token }: { token: string }) {
 
   async function revoke(id: string) {
     if (!confirm('Revoke this API key? Anything using it will stop working immediately.')) return;
-    await portalFetch(token, `/v1/portal/api-keys/${id}`, { method: 'DELETE' });
+    await portalFetch(token, `/v1/api/api-keys/${id}`, { method: 'DELETE' });
     load();
   }
 

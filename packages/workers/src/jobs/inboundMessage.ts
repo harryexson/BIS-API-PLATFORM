@@ -79,6 +79,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       tenantId,
       content: inbound.content,
       providerId,
+      channel: conversation.channel,
     });
 
     if (keywordResult.handled) {

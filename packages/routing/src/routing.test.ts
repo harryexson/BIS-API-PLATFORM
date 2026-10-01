@@ -17,9 +17,21 @@ describe('RoutingEngine', () => {
     registry.updateProviderConfig('pawapay', { status: 'online' });
     registry.updateProviderConfig('paychangu', { status: 'online' });
     registry.updateProviderConfig('airwallex', { status: 'online' });
+    registry.updateProviderConfig('authorizenet', { status: 'online' });
+    registry.updateProviderConfig('adyen', { status: 'online' });
+    registry.updateProviderConfig('braintree', { status: 'online' });
+    registry.updateProviderConfig('checkout', { status: 'online' });
+    registry.updateProviderConfig('paypal', { status: 'online' });
+    registry.updateProviderConfig('paystack', { status: 'online' });
+    registry.updateProviderConfig('square', { status: 'online' });
     registry.updateProviderConfig('infobip', { status: 'online' });
+    registry.updateProviderConfig('twilio', { status: 'online' });
+    registry.updateProviderConfig('whatsapp', { status: 'online' });
     registry.updateProviderConfig('futuresms', { status: 'online' });
     registry.updateProviderConfig('signalhouse', { status: 'online' });
+    registry.updateProviderConfig('africastalking', { status: 'online' });
+    registry.updateProviderConfig('sinch', { status: 'online' });
+    registry.updateProviderConfig('vibes', { status: 'online' });
     registry.updateProviderConfig('email', { status: 'online' });
     registry.updateProviderConfig('example-pay', { status: 'online' });
     registry.updateProviderConfig('example-msg', { status: 'online' });
@@ -75,7 +87,8 @@ describe('RoutingEngine', () => {
         expect(result.category).toBe('payment');
         expect(result.status).toBe('success');
         // Multiple providers support card for these currencies (including example-pay)
-        // Stripe may be selected as fallback for unsupported currencies like ZAR
+        // Stripe may be selected as fallback for unsupported currencies like ZAR.
+        // Paystack (NGN/GHS/ZAR/KES) is a real, legitimate candidate here too.
         expect(['flutterwave', 'nmi', 'airwallex', 'example-pay', 'stripe', 'paystack']).toContain(result.providerId);
       }
     });
@@ -134,6 +147,10 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('checkout', { status: 'offline' });
       registry.updateProviderConfig('paystack', { status: 'offline' });
       registry.updateProviderConfig('example-pay', { status: 'offline' });
+      registry.updateProviderConfig('adyen', { status: 'offline' });
+      registry.updateProviderConfig('braintree', { status: 'offline' });
+      registry.updateProviderConfig('checkout', { status: 'offline' });
+      registry.updateProviderConfig('square', { status: 'offline' });
 
       await expect(
         engine.routePayment('testapp', { amount: 100, currency: 'USD', paymentMethod: 'card' })
@@ -149,8 +166,11 @@ describe('RoutingEngine', () => {
       });
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
-      // Email provider has email capability
-      expect(['email', 'signalhouse']).toContain(result.providerId);
+      // Every provider that actually declares the 'email' capability —
+      // selection among them is now score-weighted-random (packages/
+      // routing/src/scoring.ts), not always the single highest-weight
+      // pick, so both are legitimate outcomes.
+      expect(['email', 'example-msg']).toContain(result.providerId);
     });
 
     it('routes SMS to an SMS-capable provider', async () => {
@@ -160,9 +180,13 @@ describe('RoutingEngine', () => {
       });
       expect(result.category).toBe('messaging');
       expect(result.status).toBe('success');
-      // Multiple providers have SMS capability (example-msg is a test-environment
-      // provider that remains a candidate outside NODE_ENV=production).
-      expect(['infobip', 'futuresms', 'signalhouse', 'twilio', 'example-msg']).toContain(result.providerId);
+      // Multiple providers have SMS capability and are all real,
+      // weighted-random candidates for this send — every one of them must
+      // be listed here or the test flakes whenever the random draw picks
+      // an unlisted one (this exact bug bit example-msg before). example-msg
+      // is a test-environment provider that remains a candidate outside
+      // NODE_ENV=production.
+      expect(['infobip', 'futuresms', 'signalhouse', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio']).toContain(result.providerId);
     });
 
     it('routes WhatsApp-format messages to a whatsapp-capable provider', async () => {
@@ -170,8 +194,8 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: 'wa: Hello this is a WhatsApp message'
       });
-      // Both infobip and signalhouse have whatsapp capability
-      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
+      // infobip, signalhouse, twilio, and whatsapp all have whatsapp capability
+      expect(['infobip', 'signalhouse', 'twilio', 'whatsapp']).toContain(result.providerId);
     });
 
     it('routes long messages to a whatsapp-capable provider', async () => {
@@ -180,7 +204,7 @@ describe('RoutingEngine', () => {
         recipient: '+15005550006',
         content: longContent
       });
-      expect(['infobip', 'signalhouse', 'twilio']).toContain(result.providerId);
+      expect(['infobip', 'signalhouse', 'twilio', 'whatsapp']).toContain(result.providerId);
     });
 
     it('respects manual override for messaging', async () => {
@@ -209,9 +233,14 @@ describe('RoutingEngine', () => {
       registry.updateProviderConfig('infobip', { status: 'offline' });
       registry.updateProviderConfig('futuresms', { status: 'offline' });
       registry.updateProviderConfig('signalhouse', { status: 'offline' });
+      registry.updateProviderConfig('africastalking', { status: 'offline' });
+      registry.updateProviderConfig('sinch', { status: 'offline' });
+      registry.updateProviderConfig('vibes', { status: 'offline' });
       registry.updateProviderConfig('email', { status: 'offline' });
       registry.updateProviderConfig('twilio', { status: 'offline' });
       registry.updateProviderConfig('example-msg', { status: 'offline' });
+      registry.updateProviderConfig('twilio', { status: 'offline' });
+      registry.updateProviderConfig('whatsapp', { status: 'offline' });
 
       await expect(
         engine.routeMessage('testapp', { recipient: '+15005550006', content: 'Hello' })
@@ -324,6 +353,41 @@ describe('RoutingEngine', () => {
     });
   });
 
+  describe('circuit breaker integration', () => {
+    it('excludes a provider whose circuit is open from capability-based routing, without an admin having to mark it offline', async () => {
+      const registry = ProviderRegistry.getInstance();
+      // Trip the breaker purely through repeated recorded failures — the
+      // provider's admin-controlled `status` stays 'online' throughout.
+      for (let i = 0; i < 5; i++) {
+        registry.recordTraffic('stripe', false, 100);
+      }
+      expect(registry.getProvider('stripe')!.config.status).toBe('online');
+      expect(registry.isProviderAvailable('stripe')).toBe(false);
+
+      const result = await engine.routePayment('testapp', {
+        amount: 1000,
+        currency: 'USD',
+        paymentMethod: 'card',
+      });
+      expect(result.providerId).not.toBe('stripe');
+    });
+
+    it('a manual override onto an open-circuit provider falls through to normal routing', async () => {
+      const registry = ProviderRegistry.getInstance();
+      for (let i = 0; i < 5; i++) {
+        registry.recordTraffic('stripe', false, 100);
+      }
+
+      const result = await engine.routePayment('testapp', {
+        amount: 1000,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+      expect(result.providerId).not.toBe('stripe');
+    });
+  });
+
   describe('ambiguous payment outcomes (provider timeout)', () => {
     it('never fails over to a second provider on a timeout — a timeout may already have charged the card', async () => {
       const registry = ProviderRegistry.getInstance();
@@ -374,6 +438,153 @@ describe('RoutingEngine', () => {
       expect(result.providerId).not.toBe('stripe');
 
       stripeSpy.mockRestore();
+    });
+  });
+
+  describe('retry logic: soft declines (resolved status "failed", not a thrown error)', () => {
+    // A real gateway call that completes and reports the card as declined
+    // never throws — it resolves normally with status:'failed'. Before this
+    // pass, routePayment's cascade only triggered on a *thrown* exception,
+    // so an ordinary decline silently returned as failed with no failover
+    // at all, despite the cascade machinery existing right here.
+    function declinedEvent(providerId: string, reason: string) {
+      return {
+        id: `${providerId}_declined`,
+        timestamp: new Date().toISOString(),
+        appId: 'testapp',
+        category: 'payment' as const,
+        providerId,
+        status: 'failed' as const,
+        amount: 100,
+        currency: 'USD',
+        latency: 50,
+        cost: 0,
+        decisionReason: reason,
+        payload: {},
+        response: { declined: true },
+        error: 'card_declined',
+      };
+    }
+
+    it('cascades to the next-best provider when the first one resolves with a soft decline', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const stripe = registry.getProvider('stripe')!;
+
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce(
+        declinedEvent('stripe', 'stub'),
+      );
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      expect(result.status).toBe('success');
+      expect(result.providerId).not.toBe('stripe');
+      expect(String(result.decisionReason)).toContain('declined');
+      expect(stripeSpy).toHaveBeenCalledTimes(1);
+
+      stripeSpy.mockRestore();
+    });
+
+    it('never cascades on a resolved "unknown" status — same double-charge risk as a timeout', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const stripe = registry.getProvider('stripe')!;
+      const nmi = registry.getProvider('nmi')!;
+
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce({
+        ...declinedEvent('stripe', 'stub'),
+        status: 'unknown' as const,
+        error: 'ambiguous processor response',
+      });
+      const nmiSpy = vi.spyOn(nmi, 'processRequest');
+
+      const result = await engine.routePayment('testapp', {
+        amount: 100,
+        currency: 'USD',
+        paymentMethod: 'card',
+        providerOverride: 'stripe',
+      });
+
+      expect(result.status).toBe('unknown');
+      expect(result.providerId).toBe('stripe');
+      expect(nmiSpy).not.toHaveBeenCalled();
+
+      stripeSpy.mockRestore();
+      nmiSpy.mockRestore();
+    });
+
+    it('returns the final declined TransactionEvent (not a thrown error) when every candidate in the cascade declines', async () => {
+      const registry = ProviderRegistry.getInstance();
+      // Narrow the candidate pool to exactly 2 (stripe + nmi) so both can be
+      // deterministically stubbed to decline and the cascade exhausts.
+      const sidelined = ['flutterwave', 'pawapay', 'paychangu', 'airwallex', 'example-pay', 'adyen', 'braintree', 'checkout', 'square', 'authorizenet', 'paystack'];
+      for (const id of sidelined) registry.updateProviderConfig(id, { status: 'offline' });
+
+      const stripe = registry.getProvider('stripe')!;
+      const nmi = registry.getProvider('nmi')!;
+      const stripeSpy = vi.spyOn(stripe, 'processRequest').mockResolvedValueOnce(declinedEvent('stripe', 'stub'));
+      const nmiSpy = vi.spyOn(nmi, 'processRequest').mockResolvedValueOnce(declinedEvent('nmi', 'stub'));
+
+      try {
+        const result = await engine.routePayment('testapp', {
+          amount: 100,
+          currency: 'USD',
+          paymentMethod: 'card',
+          providerOverride: 'stripe',
+        });
+
+        expect(result.status).toBe('failed');
+        expect(result.providerId).toBe('nmi');
+        expect(stripeSpy).toHaveBeenCalledTimes(1);
+        expect(nmiSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        // Always restore, even on assertion failure — otherwise a failure
+        // here leaves these providers offline for every later test in this
+        // file (a real bug this fix closes, not just this test's own).
+        stripeSpy.mockRestore();
+        nmiSpy.mockRestore();
+        for (const id of sidelined) registry.updateProviderConfig(id, { status: 'online' });
+      }
+    });
+  });
+
+  describe('geographic-region-aware smart routing', () => {
+    it('threads PaymentRequest.country into the capability match, narrowing the candidate pool', async () => {
+      const registry = ProviderRegistry.getInstance();
+      // PawaPay is configured for MW/ZM/TZ/UG specifically (not '*') and
+      // supports TZS/mobile_money — without a country filter it's a real
+      // candidate for TZS mobile_money; asking for a country it doesn't
+      // serve (US) must exclude it even though currency/capability match.
+      const pawapay = registry.getManagementView('pawapay')!;
+      expect(pawapay.countries).not.toContain('*');
+      expect(pawapay.countries).toContain('TZ');
+      expect(pawapay.countries).not.toContain('US');
+
+      const withoutCountry = registry.findByCategoryAndCapabilities('payment', ['mobile_money'], 'TZS');
+      expect(withoutCountry.map(m => m.id)).toContain('pawapay');
+
+      const withCountry = registry.findByCategoryAndCapabilities('payment', ['mobile_money'], 'TZS', 'US');
+      expect(withCountry.map(m => m.id)).not.toContain('pawapay');
+    });
+
+    it('an admin routing rule can match on country', async () => {
+      const registry = ProviderRegistry.getInstance();
+      const rule = registry.addRoutingRule('nmi', { match: 'country == US', target: 'nmi', enabled: true })!;
+      try {
+        const result = await engine.routePayment('testapp', {
+          amount: 100,
+          currency: 'USD',
+          paymentMethod: 'card',
+          country: 'US',
+        });
+        expect(result.providerId).toBe('nmi');
+        expect(String(result.decisionReason)).toContain('Routing rule matched');
+      } finally {
+        registry.deleteRoutingRule('nmi', rule.id);
+      }
     });
   });
 });

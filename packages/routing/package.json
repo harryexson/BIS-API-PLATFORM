@@ -6,6 +6,7 @@
   "types": "src/index.ts",
   "dependencies": {
     "@company/schemas": "*",
-    "@company/providers": "*"
+    "@company/providers": "*",
+    "@company/database": "*"
   }
 }

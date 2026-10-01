@@ -7,11 +7,11 @@ describe('ProviderRegistry', () => {
     const registry = ProviderRegistry.getInstance();
     registry.updateProviderConfig('stripe', { status: 'online' });
   });
-  it('registers exactly 19 providers across the three categories (17 original + 2 examples)', () => {
+  it('registers exactly 27 providers across the three categories (14 payment + 10 messaging + 3 other)', () => {
     const configs = ProviderRegistry.getInstance().getAllConfigs();
-    expect(configs).toHaveLength(19);
-    expect(configs.filter((c) => c.category === 'payment')).toHaveLength(10);
-    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(6);
+    expect(configs).toHaveLength(27);
+    expect(configs.filter((c) => c.category === 'payment')).toHaveLength(14);
+    expect(configs.filter((c) => c.category === 'messaging')).toHaveLength(10);
     expect(configs.filter((c) => c.category === 'other')).toHaveLength(3);
   });
 
@@ -71,7 +71,7 @@ describe('ProviderRegistry management surface', () => {
   });
 
   it('adds, lists and deletes a secret (metadata only)', () => {
-    const meta = registry.addSecret('stripe', { label: 'Live Key', value: 'sk_live_abcdef123456' });
+    const meta = registry.addSecret('stripe', { field: 'api_key', label: 'Live Key', value: 'sk_live_abcdef123456' });
     expect(meta).not.toBeNull();
     expect(meta!.label).toBe('Live Key');
     expect(meta!.masked).not.toContain('abcdef123456');
@@ -82,6 +82,58 @@ describe('ProviderRegistry management surface', () => {
 
     expect(registry.deleteSecret('stripe', meta!.id)).toBe(true);
     expect(registry.getSecrets('stripe')!.some(s => s.id === meta!.id)).toBe(false);
+  });
+
+  it('exportSecretsForPersistence returns null for an unknown provider, [] for one with no secrets', () => {
+    expect(registry.exportSecretsForPersistence('ghost')).toBeNull();
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([]);
+  });
+
+  it('exportSecretsForPersistence mirrors the current plaintext secrets after addSecret/deleteSecret', () => {
+    const meta = registry.addSecret('example-msg', { field: 'api_key', label: 'API Key', value: 'em_live_abc123' });
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([
+      { field: 'api_key', label: 'API Key', value: 'em_live_abc123' },
+    ]);
+
+    registry.deleteSecret('example-msg', meta!.id);
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([]);
+  });
+
+  it('hydrateSecrets restores secrets and syncs them into the live adapter instance', () => {
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([]);
+
+    registry.hydrateSecrets('example-msg', [
+      { field: 'api_key', label: 'API Key', value: 'em_hydrated_key' },
+    ]);
+
+    const secrets = registry.getSecrets('example-msg');
+    expect(secrets).toHaveLength(1);
+    expect(secrets![0].field).toBe('api_key');
+    expect(secrets![0].masked).not.toContain('em_hydrated_key');
+
+    // Cleanup so this doesn't leak into other tests sharing the singleton.
+    registry.deleteSecret('example-msg', secrets![0].id);
+  });
+
+  it('hydrateSecrets never clobbers a secret already added this process', () => {
+    const meta = registry.addSecret('example-msg', { field: 'api_key', label: 'API Key', value: 'em_added_first' });
+
+    registry.hydrateSecrets('example-msg', [
+      { field: 'api_key', label: 'API Key', value: 'em_from_disk_should_be_ignored' },
+    ]);
+
+    const secrets = registry.getSecrets('example-msg');
+    expect(secrets).toHaveLength(1);
+    expect(secrets![0].id).toBe(meta!.id);
+    expect(registry.exportSecretsForPersistence('example-msg')).toEqual([
+      { field: 'api_key', label: 'API Key', value: 'em_added_first' },
+    ]);
+
+    registry.deleteSecret('example-msg', meta!.id);
+  });
+
+  it('hydrateSecrets no-ops for an unknown provider', () => {
+    expect(() => registry.hydrateSecrets('ghost', [{ field: 'api_key', label: 'x', value: 'y' }])).not.toThrow();
   });
 
   it('adds, updates and deletes routing rules', () => {
@@ -107,7 +159,7 @@ describe('ProviderRegistry management surface', () => {
 
   it('runs health checks for all providers', async () => {
     const summaries = await registry.runHealthChecks();
-    expect(summaries.length).toBe(19);
+    expect(summaries.length).toBe(27);
   });
 });
 
@@ -145,7 +197,7 @@ describe('Provider Addition Dry Run (Phase 16)', () => {
   });
 
   it('new providers support secrets management', () => {
-    const meta = registry.addSecret('example-pay', { label: 'API Key', value: 'ex_test_key_12345' });
+    const meta = registry.addSecret('example-pay', { field: 'api_key', label: 'API Key', value: 'ex_test_key_12345' });
     expect(meta).not.toBeNull();
     expect(meta!.masked).toContain('••••');
 

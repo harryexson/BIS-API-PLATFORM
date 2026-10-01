@@ -1,6 +1,7 @@
 import { eq, and, desc } from 'drizzle-orm';
 import { getDb } from '../connection';
-import { roles, type Role, type NewRole } from '../schema';
+import { roles, permissions, type Role, type NewRole, type Permission, type NewPermission } from '../schema';
+import { permissionRepository } from './permissions';
 
 export const roleRepository = {
   async findById(id: string): Promise<Role | undefined> {
@@ -48,5 +49,17 @@ export const roleRepository = {
     const db = getDb();
     const rows = await db.delete(roles).where(eq(roles.id, id)).returning();
     return rows.length > 0;
+  },
+
+  // Thin wrapper so AuthRegistry's RoleRepositoryForAuth interface can be
+  // satisfied without a second code path for granting a permission —
+  // permissionRepository.grant() already does this idempotently.
+  async addPermission(data: NewPermission): Promise<Permission> {
+    return permissionRepository.grant(data);
+  },
+
+  async findPermissionsByRoleId(roleId: string): Promise<Permission[]> {
+    const db = getDb();
+    return db.select().from(permissions).where(eq(permissions.roleId, roleId));
   },
 };

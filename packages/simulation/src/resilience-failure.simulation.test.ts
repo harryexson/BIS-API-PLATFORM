@@ -47,7 +47,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'stripe', 'nmi', 'email'];
+const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'stripe', 'nmi', 'email'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -91,13 +91,18 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 function mark(): number {
-  return Date.now() - 1;
+  return runtime.bus.getHistory().length;
 }
 
+// history is newest-first (EventBus.unshift); a "mark" is the history length
+// at capture time, so events added since are the leading `length - token`
+// entries. Millisecond timestamps are unreliable here — events created in
+// the same tick as the mark can otherwise be misclassified as "after" it.
 function busEventsAfter(token: number, category?: string, providerId?: string) {
-  return runtime.bus
-    .getHistory()
-    .filter((e: any) => new Date(e.timestamp).getTime() >= token)
+  const history = runtime.bus.getHistory();
+  const newCount = Math.max(0, history.length - token);
+  return history
+    .slice(0, newCount)
     .filter((e: any) => (category ? e.category === category : true))
     .filter((e: any) => (providerId ? e.providerId === providerId : true));
 }
@@ -201,7 +206,10 @@ describe('R3 — primary SMS provider offline: failover works (OK)', () => {
 
 describe('R4 — all SMS providers offline: silent channel change (GAP)', () => {
   it('an SMS is silently routed over email when no SMS provider is available', async () => {
-    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
+    // whatsapp is also offlined here even though it isn't SMS-capable: it's
+    // a real, online, non-SMS messaging channel that would otherwise
+    // intercept the fallback before email, undermining this test's proof.
+    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
       const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);
@@ -222,18 +230,12 @@ describe('R4 — all SMS providers offline: silent channel change (GAP)', () => 
 
 describe('R5 — single provider failover then hard 503 (OK)', () => {
   it('fails over on one provider error and returns 503 when all fail', async () => {
-    const infobip = runtime.registry.getProvider('infobip') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const origInfo = infobip.processRequest.bind(infobip);
-    infobip.processRequest = async () => {
+    patchProvider('infobip', async () => {
       throw new Error('429');
-    };
-    patches.push(() => {
-      infobip.processRequest = origInfo;
     });
 
-    // signalhouse is online by default -> single failover target.
+    // Every other SMS-capable provider is still healthy -> the cascading
+    // waterfall (packages/routing/src/index.ts) finds one of them.
     const first = await sendMessage(
       runtime,
       { recipient: DONOR_PHONE, content: 'x', providerOverride: 'infobip' },
@@ -242,17 +244,16 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
     expect(first.status).toBe(200);
     expect(first.body.providerId).not.toBe('infobip');
 
-    // Now also break signalhouse -> nothing left -> 503.
-    const signalhouse = runtime.registry.getProvider('signalhouse') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const origSig = signalhouse.processRequest.bind(signalhouse);
-    signalhouse.processRequest = async () => {
-      throw new Error('down');
-    };
-    patches.push(() => {
-      signalhouse.processRequest = origSig;
-    });
+    // Now break every other SMS-capable provider too -> the cascade
+    // genuinely exhausts every ranked candidate -> 503. Breaking only a
+    // second provider is no longer enough to prove exhaustion now that
+    // routing cascades through more than one fallback.
+    const sms = ['signalhouse', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio'];
+    for (const p of sms) {
+      patchProvider(p, async () => {
+        throw new Error('down');
+      });
+    }
 
     const second = await sendMessage(
       runtime,
@@ -260,7 +261,7 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
       AUTH,
     );
     expect(second.status).toBe(503);
-    console.warn('[OK] single-provider failover and hard-failure 503 both work');
+    console.warn('[OK] cascading failover and hard-failure 503 both work');
   });
 });
 

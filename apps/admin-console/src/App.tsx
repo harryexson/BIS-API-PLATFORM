@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users, CreditCard, LifeBuoy } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users, CreditCard } from 'lucide-react';
 import { MetricCards } from './components/MetricCards';
 import { LiveTopology } from './components/LiveTopology';
 import { ProviderRegistry } from './components/ProviderRegistry';
@@ -7,10 +8,10 @@ import { RequestPlayground } from './components/RequestPlayground';
 import { AuditLogs } from './components/AuditLogs';
 import { ProviderManagement } from './components/ProviderManagement';
 import { Observability } from './components/Observability';
+import { Customers } from './components/Customers';
 import { LoginGate } from './components/LoginGate';
 import { RBACManagement } from './components/RBACManagement';
 import { SubscriptionManagement } from './components/SubscriptionManagement';
-import { SupportDesk } from './components/SupportDesk';
 import { useAuth } from './auth';
 import { ProviderConfig, ProviderManagement as ProviderManagementType, TransactionEvent, DashboardMetrics } from './types';
 
@@ -23,11 +24,39 @@ const INITIAL_METRICS: DashboardMetrics = {
   volumePerApp: {}
 };
 
-type Tab = 'operations' | 'management' | 'observability' | 'rbac' | 'billing' | 'support';
+type Tab = 'operations' | 'management' | 'customers' | 'observability' | 'rbac' | 'billing';
+
+const TAB_PATHS: Record<Tab, string> = {
+  operations: '/',
+  management: '/providers',
+  customers: '/customers',
+  observability: '/observability',
+  rbac: '/roles',
+  billing: '/billing',
+};
+
+function tabFromPathname(pathname: string): Tab {
+  switch (pathname) {
+    case '/providers':
+      return 'management';
+    case '/customers':
+      return 'customers';
+    case '/observability':
+      return 'observability';
+    case '/roles':
+      return 'rbac';
+    case '/billing':
+      return 'billing';
+    default:
+      return 'operations';
+  }
+}
 
 export const App: React.FC = () => {
   const { token, isAdmin, logout } = useAuth();
-  const [tab, setTab] = useState<Tab>('operations');
+  const location = useLocation();
+  const navigate = useNavigate();
+  const tab = tabFromPathname(location.pathname);
   const [showLogin, setShowLogin] = useState(false);
 
   const [providers, setProviders] = useState<ProviderManagementType[]>([]);
@@ -45,6 +74,10 @@ export const App: React.FC = () => {
       const res = await fetch('/api/dashboard/providers', {
         headers: token ? { 'x-admin-token': token } : undefined,
       });
+      // Every /api/dashboard/* route requires an admin token. Without one
+      // (or with an invalid one) this 403s/503s — bail out rather than
+      // setting the error body as state, which crashed every child
+      // expecting an array/object shape.
       if (!res.ok) return;
       const data = await res.json();
       if (Array.isArray(data)) setProviders(data);
@@ -154,7 +187,7 @@ export const App: React.FC = () => {
     try {
       const res = await fetch('/api/dashboard/logs/clear', {
         method: 'POST',
-        headers: { 'x-admin-token': token || '' },
+        headers: token ? { 'x-admin-token': token } : undefined,
       });
       if (res.ok) {
         setLogs([]);
@@ -168,8 +201,10 @@ export const App: React.FC = () => {
   };
 
   // Every /api/dashboard/* route requires an admin token (by design — this
-  // used to leak cross-tenant data unauthenticated). Don't attempt any of
-  // this until logged in, and re-fetch once a token becomes available.
+  // used to leak cross-tenant traffic to anyone with the URL, since these
+  // fetches ran unconditionally before admin login existed as a gate).
+  // Don't attempt any of this until logged in, and re-fetch once a token
+  // becomes available.
   useEffect(() => {
     if (!isAdmin) return;
 
@@ -289,12 +324,12 @@ export const App: React.FC = () => {
 
       {/* Tabs */}
       <div style={{ display: 'flex', gap: '8px', marginBottom: '24px' }}>
-        <TabButton active={tab === 'operations'} onClick={() => setTab('operations')} icon={<Cpu className="w-4 h-4" />} label="Operations Dashboard" />
-        <TabButton active={tab === 'management'} onClick={() => setTab('management')} icon={<Server className="w-4 h-4" />} label="Provider Management" />
-        <TabButton active={tab === 'observability'} onClick={() => setTab('observability')} icon={<Activity className="w-4 h-4" />} label="Observability" />
-        <TabButton active={tab === 'rbac'} onClick={() => setTab('rbac')} icon={<Users className="w-4 h-4" />} label="Roles & Access" />
-        <TabButton active={tab === 'billing'} onClick={() => setTab('billing')} icon={<CreditCard className="w-4 h-4" />} label="Billing & Plans" />
-        <TabButton active={tab === 'support'} onClick={() => setTab('support')} icon={<LifeBuoy className="w-4 h-4" />} label="Support" />
+        <TabButton active={tab === 'operations'} onClick={() => navigate(TAB_PATHS.operations)} icon={<Cpu className="w-4 h-4" />} label="Operations Dashboard" />
+        <TabButton active={tab === 'management'} onClick={() => navigate(TAB_PATHS.management)} icon={<Server className="w-4 h-4" />} label="Provider Management" />
+        <TabButton active={tab === 'customers'} onClick={() => navigate(TAB_PATHS.customers)} icon={<Users className="w-4 h-4" />} label="Customers" />
+        <TabButton active={tab === 'observability'} onClick={() => navigate(TAB_PATHS.observability)} icon={<Activity className="w-4 h-4" />} label="Observability" />
+        <TabButton active={tab === 'rbac'} onClick={() => navigate(TAB_PATHS.rbac)} icon={<Users className="w-4 h-4" />} label="Roles & Access" />
+        <TabButton active={tab === 'billing'} onClick={() => navigate(TAB_PATHS.billing)} icon={<CreditCard className="w-4 h-4" />} label="Billing & Plans" />
       </div>
 
       {tab === 'operations' && !isAdmin && (
@@ -349,9 +384,11 @@ export const App: React.FC = () => {
         />
       )}
 
+      {tab === 'customers' && <Customers isAdmin={isAdmin} token={token} />}
+
       {tab === 'observability' && <Observability />}
 
-      {(tab === 'rbac' || tab === 'billing' || tab === 'support') && !isAdmin && (
+      {(tab === 'rbac' || tab === 'billing') && !isAdmin && (
         <div className="glass-card" style={{ textAlign: 'center', padding: '48px' }}>
           <ShieldCheck className="w-8 h-8" style={{ color: 'var(--accent-yellow)', marginBottom: '12px' }} />
           <p>Administrator login is required to manage this section.</p>
@@ -363,7 +400,6 @@ export const App: React.FC = () => {
 
       {tab === 'rbac' && isAdmin && <RBACManagement token={token} />}
       {tab === 'billing' && isAdmin && <SubscriptionManagement token={token} />}
-      {tab === 'support' && isAdmin && <SupportDesk token={token} />}
 
       {showLogin && <LoginGate onClose={() => setShowLogin(false)} />}
     </div>

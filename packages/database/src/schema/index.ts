@@ -6,6 +6,17 @@ export { applicationPermissions, type ApplicationPermission, type NewApplication
 export { users, type User, type NewUser } from './users';
 export { roles, type Role, type NewRole } from './roles';
 export { permissions, type Permission, type NewPermission } from './permissions';
+export { userSessions, type UserSession, type NewUserSession } from './user-sessions';
+export {
+  userVerificationTokens,
+  type UserVerificationToken,
+  type NewUserVerificationToken,
+} from './user-verification-tokens';
+export { plans, type Plan, type NewPlan } from './plans';
+export { subscriptions, type Subscription, type NewSubscription } from './subscriptions';
+export { customerNotes, type CustomerNote, type NewCustomerNote } from './customer-notes';
+export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
+export { ticketComments, type TicketComment, type NewTicketComment } from './ticket-comments';
 export { providers, type Provider, type NewProvider } from './providers';
 export { providerCapabilities, type ProviderCapability, type NewProviderCapability } from './provider-capabilities';
 export { providerConfigs, type ProviderConfig, type NewProviderConfig } from './provider-configs';
@@ -18,9 +29,8 @@ export { transactions, type Transaction, type NewTransaction } from './transacti
 export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
 export { userRoles, type UserRole, type NewUserRole } from './user-roles';
-export { subscriptionPlans, type SubscriptionPlan, type NewSubscriptionPlan } from './subscription-plans';
-export { tenantSubscriptions, type TenantSubscription, type NewTenantSubscription } from './tenant-subscriptions';
-export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
-export { supportTicketMessages, type SupportTicketMessage, type NewSupportTicketMessage } from './support-ticket-messages';
 export { webhookJobs, type WebhookJob, type NewWebhookJob } from './webhook-jobs';
 export { checkoutSessions, type CheckoutSession, type NewCheckoutSession } from './checkout-sessions';
+export { consentRecords, type ConsentRecord, type NewConsentRecord } from './consent-records';
+export { messagingProfiles, type MessagingProfile, type NewMessagingProfile } from './messaging-profiles';
+export { webhookEndpoints, type WebhookEndpoint, type NewWebhookEndpoint } from './webhook-endpoints';

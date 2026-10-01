@@ -1,0 +1,2931 @@
+# BIS API Platform — Implementation Changelog
+
+Chronological record of implementation phases against the master
+production-readiness plan. Each entry lists what changed, why, and what
+tests cover it.
+
+---
+
+## 2026-09-28 — Fraud Scoring (Stripe Radar) + SCA/3D Secure Handling
+
+**Context:** user picked, from the routing-capability audit above,
+"3D Secure/SCA" and "third-party fraud scoring" to build next, scoped via
+`AskUserQuestion`: fraud vendor → **Stripe Radar** (already-integrated,
+zero new vendor onboarding, vs. a standalone vendor needing net-new
+integration); 3DS UX → **frictionless-only** (this gateway is API-only —
+no customer-facing page exists for a shopper to complete an OTP/bank-app
+challenge, so a "challenge required" outcome reports honestly as this
+platform's `'unknown'`, same as every other unresolved async outcome here,
+rather than fabricating a redirect flow with nowhere to send the shopper).
+
+**Verification note:** WebSearch hit its monthly spend limit mid-session
+and was unavailable for this entire pass — unlike every other adapter fact
+in this codebase (each WebSearched against the provider's real docs on a
+named date), the facts below were reasoned from stable, well-established,
+long-unchanged API knowledge instead (Stripe's `requires_action`
+PaymentIntent status and Radar's `outcome.risk_level`/`risk_score` fields
+have been part of Stripe's core API since PaymentIntents/Radar launched).
+Each touched file's class comment flags exactly which claims are
+lower-confidence this pass and worth a spot-check once WebSearch is back,
+rather than silently presenting them at the same confidence as everything
+else.
+
+### Stripe Radar (`packages/providers/src/adapters/payments/stripe.ts`)
+
+- Requests now expand `latest_charge` (`expand[]=latest_charge`) so
+  Radar's risk assessment comes back inline instead of needing a second
+  round-trip.
+- `TransactionEvent` gained `fraudRiskLevel?`/`fraudRiskScore?` (new,
+  optional fields in `packages/schemas`), populated from
+  `latest_charge.outcome.risk_level`/`risk_score` whenever Stripe returns
+  an outcome at all — never a fabricated neutral score when it doesn't.
+- **Acted on, not just logged**: a charge Radar scores `risk_level:
+  'highest'` is downgraded to this platform's `'failed'` status even
+  though Stripe itself authorized it, with Radar's own `seller_message`
+  surfaced as the error — Radar's strongest signal actually blocking the
+  transaction, which is what "integrates fraud scoring into the payment
+  flow" means, not passive reporting after the fact.
+- Fixed a real, separate correctness bug while touching this status logic:
+  Stripe's `requires_action` PaymentIntent status (SCA/3DS authentication
+  still needed) was previously bucketed into `'failed'` — a definite
+  decline — alongside `requires_payment_method`/`canceled`. It's now
+  `'unknown'` (genuinely unresolved, the shopper would need to
+  authenticate some other way this platform can't relay), consistent with
+  how Adyen's and Airwallex's own challenge-required states were already
+  handled. `automatic_payment_methods[allow_redirects]='never'` (already
+  present since this adapter's original build) is what makes
+  `requires_action` — rather than a redirect this platform has nowhere to
+  send the shopper to — the actual outcome Stripe returns when SCA is
+  required.
+
+### SCA/3D Secure documentation (Adyen, Airwallex)
+
+No behavior change to Adyen's or Airwallex's status mapping — both already
+correctly bucketed a challenge-required state into `'unknown'` via their
+existing catch-all branches. What changed is making that fact
+inspectable rather than an accidental side effect of a generic default:
+- `adyen.ts` — added a named `THREE_DS_CHALLENGE_RESULT_CODES` constant
+  (`IdentifyShopper`, `ChallengeShopper`, `RedirectShopper`,
+  `PresentToShopper`) and four new tests asserting each one explicitly
+  maps to `'unknown'`, rather than relying on an implicit catch-all with
+  no named test coverage. Also documents *why* a challenge is rare here in
+  the first place: `shopperInteraction: 'ContAuth'` +
+  `recurringProcessingModel: 'CardOnFile'` (needed anyway, since this
+  adapter only ever charges a previously-tokenized instrument, never a
+  live shopper-present card entry) is the real, standard PSD2 RTS Article
+  13/14 "merchant-initiated transaction" shape acquirers generally exempt
+  from SCA outright.
+- `airwallex.ts` — class comment cross-references the same MIT-exemption
+  reasoning for its own saved-`payment_consent_id`/`customer_id` confirm
+  flow.
+- `checkout.ts` — already documented this correctly from its original
+  build; no change needed.
+
+### Files changed
+
+`packages/schemas/src/index.ts` (new `TransactionEvent` fields),
+`packages/providers/src/adapters/payments/stripe.ts` (+ `.test.ts`, 4 new
+tests + 1 updated), `adyen.ts` (+ `.test.ts`, 4 new tests), `airwallex.ts`
+(docs only), `services/api-gateway/src/app.ts` (stores
+`fraudRiskLevel`/`fraudRiskScore` in the transaction record's existing
+`metadata` jsonb column — no migration needed).
+
+**Not built, still an honest gap:** a real 3DS challenge-completion flow
+(a hosted page + redirect/return route for a shopper to actually enter an
+OTP or approve in their banking app) and any fraud vendor other than
+Stripe Radar. Both were explicitly scoped out by the user's own choices
+above, not silently skipped.
+
+**Tests:** `npm test` — 681 passed (up from 673, +8 new), 12 skipped,
+stable across repeated runs. `npm run type-check`: 0 errors. `npm run
+lint`: 0 errors, 315 warnings (unchanged). `npm run build:all`: clean.
+
+---
+
+## 2026-09-28 — Geographic Smart Routing + Retry Logic on Soft Declines
+
+**Context:** user asked the platform to provide, specifically: smart routing
+by cost/region/success-rate, automatic failover, retry logic on declined
+transactions, unified reporting, and fraud/compliance tools. An audit
+against the real code found three already real (cost/success-rate scoring,
+automatic failover on thrown errors, and unified reporting via
+`/api/observability/metrics`+`/logs`), two gaps closed in this pass, and one
+(fraud/compliance) deliberately not started pending user scoping — see the
+session record for why.
+
+### Gap 1: geographic region was collected but never consulted
+
+Every provider's `countries` list (admin-configured, e.g. PawaPay's
+`['MW','ZM','TZ','UG']`) has existed since the original provider-management
+surface, but `findByCategoryAndCapabilities` filtered on category,
+capability, and currency only — the same "decorative field" class of bug
+this repo has found and fixed before (routing rules, transaction fees).
+Fixed by:
+- `packages/schemas/src/index.ts` — new `PaymentRequest.country?: string`
+  (ISO 3166-1 alpha-2), documented as optional/backward-compatible.
+- `packages/providers/src/registry.ts` — `findByCategoryAndCapabilities`
+  takes an optional `country` param, filtering exactly like the existing
+  currency check (`state.countries.includes(c) || includes('*')`).
+- `packages/routing/src/rules.ts` — `RoutingContext.country` added, so an
+  admin routing rule can match on it (`country == KE`), same pattern as
+  `currency`/`paymentMethod`.
+- `packages/routing/src/index.ts` — `routePayment` threads `country`
+  through to the capability match, the rule-matching context, and the
+  decision-reason text.
+- `services/api-gateway/src/app.ts` — both `POST /v1/api/gateway/payment`
+  and the admin console's request-playground dispatch route now read
+  `country` from the request body and pass it through.
+- `docs/openapi.yaml` — documented on `PaymentCreateRequest`.
+
+### Gap 2: soft declines never triggered failover
+
+The cascade machinery in `routePayment` (built in the 2026-09-25 dynamic-
+routing pass) only ever fired on a **thrown** exception — a network error,
+timeout, or HTTP-level provider error. A real gateway call that completes
+normally and reports the card as declined (`TransactionEvent.status ===
+'failed'`, e.g. Stripe's `card_declined`, Adyen's `Refused`, Braintree's
+`PROCESSOR_DECLINED`) never throws; it resolves. So an ordinary declined
+card silently returned as failed with **no retry through another
+provider/acquirer** — despite this being exactly what "retry logic" /
+"rescue revenue on soft declines" means in a real orchestration platform,
+and despite the cascade loop already existing right there.
+
+Fixed in `packages/routing/src/index.ts`'s `routePayment`: the attempt loop
+now treats a resolved `status:'failed'` the same as a non-timeout thrown
+error — safe to retry via the next best-ranked candidate, because the
+charge is known NOT to have moved money. The existing timeout safety rule
+is unchanged and was not weakened: a resolved `status:'unknown'` (or a
+thrown `ProviderTimeoutError`) still returns immediately without cascading,
+for the same double-charge-risk reason as before. When the cascade
+exhausts on a genuine decline (not an infra failure), the function now
+returns that last declined `TransactionEvent` rather than throwing —
+honestly reporting "every provider tried, all declined" instead of masking
+a real (if unsuccessful) outcome as a routing infrastructure failure.
+
+### Confirmed already real, no code changes needed
+
+- **Automatic failover**: `routePayment`/`routeMessage`'s cascading
+  waterfall (added 2026-09-25) already switches to a backup provider on a
+  thrown non-timeout error.
+- **Unified reporting**: the admin console's Observability tab
+  (`apps/admin-console/src/components/Observability.tsx`) already pulls
+  `paymentSuccess`/`paymentFailure`/`messageSuccess`/`messageFailure`/
+  provider-health/webhook/queue/routing-failure counters and structured
+  logs from `/api/observability/metrics` and `/logs` into one dashboard
+  across every registered provider.
+- **Tokenization** (part of "fraud & compliance"): every card-based adapter
+  already refuses to collect raw card data — `PaymentRequest.paymentToken`
+  is the only instrument accepted, sourced from each provider's own
+  client-side tokenization (Stripe.js, etc.).
+
+### Not started: third-party fraud scoring, PSD2/SCA (3D Secure)
+
+No fraud-scoring vendor integration and no 3D Secure/SCA challenge flow
+exist anywhere in this codebase — several adapters' class comments say so
+explicitly (e.g. Adyen's and Airwallex's "no 3D-Secure/`next_action` relay
+built"). Deliberately not started in this pass: fabricating a fraud score
+or a compliance claim (PSD2/SCA is a real regulatory standard) without a
+real, named, WebSearch-verified vendor integration would be exactly the
+kind of fabrication this repo's provider-adapter discipline exists to
+prevent. Scoping this needs a vendor decision from the user before any
+code is written.
+
+**Files changed:** `packages/schemas/src/index.ts`,
+`packages/providers/src/registry.ts`, `packages/routing/src/rules.ts`,
+`packages/routing/src/index.ts`, `services/api-gateway/src/app.ts`,
+`docs/openapi.yaml`, plus new/updated tests in
+`packages/routing/src/routing.test.ts` and `rules.test.ts`.
+
+**Tests:** `npm test` — 673 passed (up from 667; +6 new tests covering
+soft-decline cascade, the unretried-'unknown' safety rule, cascade
+exhaustion returning the last declined event, country-based capability
+filtering, and a country-matching routing rule), 12 skipped, stable across
+repeated runs. `npm run type-check`: 0 errors. `npm run lint`: 0 errors,
+315 warnings (unchanged). `npm run build:all`: clean.
+
+---
+
+## 2026-09-25 — Three New Real Payment Gateway Integrations: Adyen, Braintree, Checkout.com
+
+**Context:** user asked for the platform's provider roster to grow toward
+parity with a broad orchestration platform (Spreedly was named as the
+comparison). Given the scale of that ask (a real competitor's integration
+count reflects 18+ years of work), scope was narrowed via
+`AskUserQuestion` to "a few more payment gateways" — 2-3 real,
+WebSearch-verified integrations, built the same rigorous way as the six
+that already existed (Stripe, NMI, Flutterwave, PawaPay, PayChangu,
+Airwallex). Explicitly **declined**, separately, to copy any real
+company's actual leadership names, funding history, or copyright notice
+onto this platform's own about-page content — a fabrication/impersonation
+line, not a scope question; see task #44 for the placeholder-content
+alternative offered and accepted instead.
+
+Each of the three below follows the same non-negotiable pattern already
+established for every real adapter in this package: endpoint, auth
+scheme, and request/response shape verified via WebSearch against the
+provider's real, current public documentation (this environment's
+outbound network access to the providers' own domains is restricted, so
+this is "built from real, current documentation," not "certified against
+a live sandbox" — see `docs/IMPLEMENTATION_BASELINE.md` §6 item 1); falls
+back to clearly-labeled simulated processing whenever credentials or a
+`paymentToken` are missing, never a real call with nothing to charge; an
+ambiguous/async real outcome reports this platform's `'unknown'` status,
+never a guessed success or failure.
+
+### Adyen (`packages/providers/src/adapters/payments/adyen.ts`)
+
+Checkout API. Two structural quirks, both documented in the adapter's own
+class comment: no fixed live host (a per-merchant `live_url_prefix`
+secret is required for the live environment specifically — the test host
+is fixed and used whenever no prefix is configured, so this adapter never
+silently calls a fabricated live URL); and `X-API-Key` auth instead of
+every other adapter's `Bearer` scheme. `paymentToken` maps to
+`storedPaymentMethodId`; `shopperReference` is read from
+`payload.metadata.shopperReference`, falling back to `appId`. Refunds
+always report `'unknown'` — Adyen's refund endpoint only ever
+synchronously returns `status: "received"`; the real result arrives async
+via webhook, not built. Native webhook signature verification is
+deliberately not implemented (Adyen's real scheme is a complex per-item
+HMAC over pipe-delimited fields, not a simple raw-body signature — the
+same reasoning already applied to PawaPay's webhook handling).
+
+### Braintree (`packages/providers/src/adapters/payments/braintree.ts`)
+
+GraphQL API — a single `POST /graphql` endpoint (`chargeCreditCard`/
+`refundTransaction` mutations), not a REST resource per operation, the
+one adapter in this package shaped this way. Auth is HTTP Basic
+(`base64(publicKey:privateKey)`) plus a required `Braintree-Version`
+header. **Real, easy-to-miss quirk**: amounts are decimal strings (e.g.
+`"49.99"`), not minor-unit integers like every other adapter here —
+gotten right rather than silently multiplying by 100. `chargeCreditCard`
+captures funds immediately, so `AUTHORIZED` through `SETTLED` are all
+treated as one successful charge's real lifecycle; refunds are scored
+more conservatively — only `SETTLED` is a confirmed refund success,
+`SUBMITTED_FOR_SETTLEMENT`/`SETTLING`/`AUTHORIZED` report `'unknown'`
+rather than a fabricated success, mirroring Stripe's own
+`succeeded`-vs-`pending` refund asymmetry already in this codebase. A
+`{ data, errors }` GraphQL envelope is handled distinctly from HTTP-level
+4xx/5xx — a 200 response can still carry an `errors` array.
+
+### Checkout.com (`packages/providers/src/adapters/payments/checkout.ts`)
+
+Payments API (their current NAS platform). **Structural quirk unique to
+this adapter**: every request — in both sandbox and live — must go to a
+per-merchant subdomain, `https://{prefix}.api(.sandbox).checkout.com`,
+where `prefix` is mechanically derived (first 8 characters of the
+merchant's `client_id`, `cli_` prefix stripped) rather than admin-typed
+like Adyen's live-only prefix; a request to the bare `api.checkout.com`
+host is rejected outright by Checkout.com itself. `paymentToken` is sent
+as `source: { type: 'token', token }`. Refunds are asynchronous by
+Checkout.com's own documentation — a `202` response only confirms the
+refund was *submitted*, not its outcome — so this adapter always reports
+`'unknown'`, never a fabricated success. **Webhook signature verification
+is implemented** (unlike Adyen's, deliberately left unverified there):
+Checkout.com's real `Cko-Signature` scheme is a plain
+`HMAC-SHA256(raw_body, signing_key)` hex digest, structurally identical
+to this platform's own generic webhook check, so it reuses
+`BaseProvider.verifyWebhookSignature()` the same way PayChangu's adapter
+already does.
+
+### Files changed
+
+- `packages/providers/src/adapters/payments/{adyen,braintree,checkout}.ts`
+  (new) + matching `.test.ts` files (15/24/17 tests respectively, 56 new
+  tests total)
+- `packages/providers/src/registry.ts` — three new registrations (payment
+  category), each with real per-adapter secret-field requirements
+- `packages/providers/src/index.ts` — three new exports
+- `apps/admin-console/src/components/ProviderManagement.tsx` —
+  `PROVIDER_SECRET_FIELDS` entries for all three (Adyen: `api_key`,
+  `merchant_account`, `live_url_prefix`; Braintree: `public_key`,
+  `private_key`, `merchant_id`; Checkout.com: `secret_key`, `client_id`,
+  `webhook_signing_key`)
+- `.env.example` — `ADYEN_*`, `BRAINTREE_*`, `CHECKOUT_*` variables
+
+### Test fallout from a real, growing provider pool (not weakened tests)
+
+Adding three legitimate, higher-scoring USD/card candidates to the
+registry shifted several tests that hardcoded exact provider counts or a
+specific cascade winner — the same category of fallout the dynamic-
+routing pass above documented as expected whenever the pool grows:
+- `providerRegistry.test.ts`/`management.test.ts` — provider-count
+  assertions bumped 18 → 21 (payment category 7 → 10) across three
+  passes, one per new adapter
+- `routing.test.ts`'s "all payment providers offline" test — each new
+  provider added to its explicit offline list
+- `dynamic-routing.simulation.test.ts`'s cascading-waterfall test — each
+  new provider added to its `sidelined` array (all three otherwise
+  outrank NMI on weight/cost, breaking that test's fixed 3-candidate
+  determinism assumption)
+
+**Tests:** `npm test` — 667 passed, 12 skipped, stable across repeated
+runs (up from 611 before this pass, +56 net from three adapters' own test
+files plus fallout fixes). `npx tsc --noEmit` / `npm run type-check`: 0
+errors. `npm run lint`: 0 errors, 315 warnings (up slightly from 309,
+same pre-existing categories — `no-explicit-any`/unused-arg patterns
+already present elsewhere in the codebase, not new categories). `npm run
+build:all`: clean.
+
+**Known limitation carried forward, same as every other real adapter in
+this package:** "real HTTP integration, verified via documentation" is
+not the same claim as "tested against a live account" — none of these
+three has been exercised against an actual Adyen/Braintree/Checkout.com
+sandbox, because this environment cannot reach those domains. See
+`docs/IMPLEMENTATION_BASELINE.md` §6 item 1.
+
+---
+
+## 2026-09-25 — Dynamic Routing: Admin Rules Actually Consulted, Success-Rate/Cost Scoring, Cascading Waterfall
+
+**Context:** user asked the routing engine to provide "truly dynamic
+routing" comparable to a real orchestration platform, selecting all three
+of: success-rate/cost-based smart routing, cascading waterfall retries,
+and admin-configurable routing rules.
+
+**A real, previously-undiscovered finding**, surfaced while scoping this:
+`RoutingRule` (`packages/schemas`) already had full CRUD
+(`ProviderRegistry.addRoutingRule`/`updateRoutingRule`/`deleteRoutingRule`),
+a real admin console UI (`ProviderManagement.tsx`'s "Routing Rules"
+section, `IF {match} → {target}`), and passing tests — but
+`RoutingEngine` never called `getRoutingRules()` or consulted this data at
+all. Every rule an admin created was purely decorative, exactly the same
+class of bug as the provider-secrets and inbound-webhook-signature
+findings from earlier passes (see `docs/IMPLEMENTATION_BASELINE.md`).
+Similarly, `ProviderConfig.transactionFeePercent`/`transactionFeeFlat`/
+`messageCost` were real, admin-configured, admin-console-displayed fields
+that `RoutingEngine` never read either — selection was static-weight-only.
+
+### Rule evaluator (`packages/routing/src/rules.ts`, new)
+
+A safe (no `eval()`), fail-closed parser/evaluator for `RoutingRule.match`
+expressions — `field OP value [AND field OP value ...]`, fields
+`currency`/`amount`/`paymentMethod`/`channel`, operators `== != > >= < <=`.
+No `bin`/card-range field exists, deliberately: this gateway never
+collects raw card data (tokenized only), so there is nothing real to match
+a BIN range against — building one would mean fabricating data the
+platform doesn't have. An unparseable expression, an unknown field, or a
+numeric comparator on a string field all fail to match rather than
+throwing or matching everything.
+
+### Scoring (`packages/routing/src/scoring.ts`, new)
+
+`computeProviderScore()` blends the static admin-set `weight` with two
+live signals that already existed but were unused: the provider's rolling
+error rate (`ProviderRegistry.recordTraffic`, fed by every real
+request/response) and its configured cost
+(`transactionFeePercent`/`Flat` for payments, `messageCost` for
+messaging). Success rate is squared in the formula so live health
+dominates the pick well before the circuit breaker would remove a
+provider entirely, not just as a tiebreaker. `weightedRandomSelect()`
+centralizes the weighted-random algorithm `routePayment`/`routeMessage`
+each previously hand-rolled inline (three separate copies).
+
+### RoutingEngine (`packages/routing/src/index.ts`, rewritten)
+
+New selection precedence for both `routePayment` and `routeMessage`: (1)
+an explicit `providerOverride`, (2) — messaging only — active conversation
+continuity, (3) the first enabled admin routing rule whose match holds
+(falls through to normal selection, not a hard failure, if the rule's
+target is offline/invalid), (4) success-rate/cost-scored selection among
+capability-matched candidates. On failure, cascades through every
+remaining score-ranked candidate (not the single fixed fallback hop the
+previous version made) up to `MAX_ROUTING_ATTEMPTS` (default 3) total
+attempts — except a payment timeout, which still stops the cascade
+immediately at any point in the chain and returns `'unknown'`: the
+provider may have already processed the charge, so retrying it through
+another provider risks a real double charge on an outcome that isn't
+actually known to have failed. This safety rule is unchanged from the
+previous version and its existing test coverage
+(`packages/routing/src/routing.test.ts`'s "deliberate: provider timeout"
+suite) still passes without modification. Messaging's cascade has no such
+special case — a message timeout carries none of a duplicate-charge's
+real-money risk, matching the previous version's behavior.
+
+### Test fallout from a real behavior change (not weakened tests)
+
+Several existing simulation tests hardcoded a *specific* provider as the
+outcome of channel-based routing (e.g. "email always goes to the `email`
+provider") — safe when email/whatsapp channel selection was a fixed
+highest-weight pick, no longer safe now that it's genuinely
+weighted-random across every real candidate that declares the capability
+(SMS routing already worked this way before this pass; this pass made
+email/whatsapp consistent with it). Updated each to tolerate every
+provider that actually declares the relevant capability — the same
+pattern already established elsewhere in this codebase — rather than
+asserting one incidental winner. Two resilience tests ("breaks 2 of 7 SMS
+providers, expects total failure") had their premise invalidated by the
+cascade genuinely working now (breaking 2 of 7 real candidates is no
+longer enough to exhaust the pool) — updated to break the full candidate
+set, which is what those tests were actually trying to prove.
+
+### Admin console: real rule-authoring UI
+
+Closed the other half of the original "purely decorative" finding: the
+admin console's "Add Rule" button always POSTed the identical hardcoded
+template (`currency == USD` → self) with no way to edit `match`/`target`
+after creation beyond the enabled toggle. `ProviderManagement.tsx` gained
+a real inline form (match expression input with a grammar hint, target
+provider select, description) for both creating and editing a rule.
+
+### Tests
+
+`packages/routing/src/rules.test.ts` (new, 12 cases) and `scoring.test.ts`
+(new, 10 cases) unit-test the evaluator and scorer directly.
+`packages/simulation/src/dynamic-routing.simulation.test.ts` (new, 5
+cases) drives the real HTTP admin routes and gateway end-to-end: a rule
+override beats scored selection, a disabled/non-matching/target-offline
+rule correctly falls through, and a cascade deterministically walks
+through 2 broken providers (pool shrunk to exactly 3 candidates so the
+result doesn't depend on `MAX_ROUTING_ATTEMPTS`, a module-load-time
+constant a running test can't retroactively change) to the one healthy
+survivor. 611 tests passing (was 584), verified stable across 3 repeated
+full-suite runs given the new randomness. 0 lint errors, clean
+type-check and build.
+
+---
+
+## 2026-09-25 — Verify-Email / Reset-Password Pages, npm-audit Re-investigation
+
+**Context:** same "audit, identify any gaps, and continue to build any
+remaining things" pass as the outbound-webhooks work below. After applying
+that migration to the live database, continued auditing and found one more
+concrete, closable gap plus one previously-deferred item worth a fresh,
+real attempt rather than just re-asserting the old conclusion.
+
+### Customer-facing verify-email / reset-password pages
+
+`docs/IMPLEMENTATION_BASELINE.md` item 15 had flagged, since the real
+transactional-email integration landed (2026-09-14), that
+`PLATFORM_APP_URL` pointed at a page that didn't exist anywhere in the
+repo — the two server-side routes (`POST /v1/api/auth/verify-email`,
+`POST /v1/api/auth/reset-password`) were real and always had been, but
+nothing a user could click through to reach them. Closed by adding
+`/verify-email` and `/reset-password` to `apps/web` (`VerifyEmailPage.tsx`,
+`ResetPasswordPage.tsx`, `AccountLayout.tsx`), routed by
+`window.location.pathname` rather than adding `react-router-dom` — the
+site is 3 independent pages with no navigation between them, so a router
+library would be more machinery than the scope needs (unlike
+`apps/admin-console`, which genuinely has 4 interlinked tabs). Both pages
+call the existing real auth routes directly; no server-side change was
+needed beyond correcting `app.ts`'s doc comment and `.env.example`'s
+description of `PLATFORM_APP_URL`, both of which had described the page as
+not existing. `apps/web/vercel.json` (new) adds the SPA rewrite a direct
+load of either path needs in production — the same rewrite
+`apps/admin-console/vercel.json` already has for its own router. Verified
+in a real headless browser (Playwright, the pre-installed
+`/opt/pw-browsers/chromium`) against the real Vite dev server: missing-
+token, success, and error states for both pages, client-side password
+validation (length, match), and confirmed the existing landing page still
+renders unaffected.
+
+### npm audit `qs`/`express` — re-investigated, conclusion unchanged but now proven
+
+§4 item 11 previously stated no non-breaking fix was available. Rather
+than re-assert that, tried to actually fix it this pass: `express@4.22.2`
+pins `"qs": "~6.15.1"` and the two advisories' fix landed only in
+`qs@6.16.0` (confirmed no patched 6.15.x exists), so express's own
+declared range structurally excludes the fix. Tried a root
+`"overrides": { "qs": "6.16.0" }` — a legitimate, commonly-used pattern for
+exactly this situation — but `npm install` in this environment accepted
+the override in `package.json` without ever regenerating
+`package-lock.json` to match, leaving `node_modules` in a broken
+`invalid`/`ELSPROBLEMS` state regardless of a fresh install or deleting
+the package's own `node_modules/qs`. Making it actually take would require
+a full lockfile regeneration across 585 packages with no CI in this
+environment to catch a regression in an unrelated transitive version — a
+materially larger, less verifiable change than a moderate DoS advisory in
+a deeply nested dependency justifies. Reverted the override attempt
+cleanly (`git status` showed zero diff afterward) rather than leave a
+half-applied fix in the tree. Still open, still requires an express
+major-version bump (or a lockfile regeneration this environment can't
+safely verify) — but that conclusion is now backed by an actual attempt.
+
+**Database migrations:** none (see the outbound-webhooks entry below for
+the one that did land this session).
+
+**Tests:** `npm run type-check` (root + `apps/admin-console` +
+`apps/web`) clean; `npm test`: 584 passed, 12 skipped (unchanged — no test
+package touched by this entry); `npm run build:all` clean.
+
+---
+
+## 2026-09-25 — Outbound Platform Webhooks (register, wire, sign)
+
+**Context:** user asked to "audit, identify any gaps, and continue to build
+any remaining things." The audit's most substantial, already-well-scoped
+open item was `docs/IMPLEMENTATION_BASELINE.md` item 24: outbound webhooks
+were "more built than 'not implemented'" — a real retry-with-backoff
+delivery engine (`packages/events/src/webhook-delivery.ts`'s
+`WebhookDelivery`) existed but was never instantiated, never called, sent
+no signature, and had no table, route, or UI for a developer to register a
+callback URL in the first place. Closed it in full this pass.
+
+### Schema, encryption, dispatch
+
+New `webhook_endpoints` table (`packages/database/src/schema/
+webhook-endpoints.ts`, migration `drizzle/0002_webhook_endpoints.sql` —
+purely additive) scoped by `appId` (the only identifier `TransactionEvent`
+carries — it has no `tenantId`, so fan-out can't key on tenant even though
+the table records one for the registration API's own ownership checks).
+The signing secret is encrypted at rest with the same AES-256-GCM helpers
+`provider_configs` already uses (`packages/database/src/crypto.ts`),
+generated fresh per registration and returned to the caller exactly once —
+`GET` never re-displays it, matching how this platform already treats API
+keys and session tokens.
+
+`WebhookTarget` (`packages/events/src/webhook-delivery.ts`) gained an
+optional `secret`; `processQueue()` now adds `X-Webhook-Signature:
+sha256=<hmac-sha256(secret, body)>` to every delivery attempt when one is
+configured — the exact construction `packages/api-client`'s
+`WebhooksResource.verify()`/`constructEvent()` were already built, unused,
+to check.
+
+`services/api-gateway/src/app.ts` instantiates one `WebhookDelivery`,
+starts its retry loop at module load, and subscribes to the existing
+`EventBus`: every event this gateway emits (payment, refund, messaging,
+and the various admin/system events that reuse the same `TransactionEvent`
+shape) triggers a fire-and-forget `dispatchOutboundWebhooks()` that looks
+up every active, category-matching `webhook_endpoints` row for that
+event's `appId`, decrypts each one's own secret, and enqueues a signed
+delivery. A DB failure or a dead/slow callback URL never blocks or fails
+the request whose event triggered it — mirrors the existing fire-and-forget
+pattern `persistProviderSecrets`/inbound-message enqueueing already use
+elsewhere in this same file.
+
+### API surface
+
+`POST /v1/api/gateway/webhooks` (register — `https://` required outside a
+non-production override; returns the endpoint plus its one-time secret),
+`GET /v1/api/gateway/webhooks` (list the authenticated application's own
+endpoints, secret omitted), `DELETE /v1/api/gateway/webhooks/:id`
+(ownership-scoped — 404s rather than confirming another application's
+endpoint exists). Gated by `webhooks:read`/`webhooks:write` API-key
+scopes, the same opt-in enforcement pattern every other gateway route uses
+(an unscoped key stays unrestricted). `packages/api-client`'s
+`WebhooksResource` gained `register()`/`list()`/`delete()` against these
+real routes.
+
+### Docs
+
+`docs/openapi.yaml`: three new paths, three new schemas
+(`WebhookEndpointCreate`/`WebhookEndpointSummary`/`WebhookEndpointCreated`),
+and the `WebhookEvent` schema's "NOT REACHABLE END-TO-END" warning replaced
+with what it now actually documents. `docs/DEVELOPER_GUIDE.md` §9b rewritten
+from a description of what was missing into registration instructions, the
+real delivery/retry/signature shape, and a verification example. Verified
+every `$ref` in the rewritten YAML resolves (the same small script used to
+verify the 2026-09-17 openapi.yaml pass).
+
+### Tests
+
+`packages/events/src/webhook-delivery.test.ts` (new): signing present only
+when a secret is configured, retry-then-dead-letter behavior. A new
+`webhookEndpointRepository` unit suite (validation runs before any
+DB/encryption call; a real encrypt/decrypt round trip). `packages/api-client`'s
+existing suite gained cases for the three new resource methods. A new
+`packages/simulation/src/outbound-webhooks.simulation.test.ts` (10 cases)
+drives the real HTTP routes end-to-end against the real gateway: a donation
+triggers an actual signed HTTP POST to a mocked callback URL, the signature
+verified byte-for-byte against an independently computed HMAC, plus
+category-filtering, cross-application isolation, and ownership-scoped
+delete/list as negative cases. `packages/simulation/src/db.ts`'s mock
+gained `webhookEndpointRepository`; `packages/simulation/src/harness.ts`
+exposes the gateway's real `WebhookDelivery` instance
+(`gatewayWebhookDelivery`, via a new `getWebhookDeliveryForTests()` export
+from `app.ts`, mirroring the existing `getGatewayQueueForTests()` pattern)
+so tests can force an immediate delivery attempt instead of waiting on the
+real 5-second interval timer.
+
+**Database migrations:** `packages/database/drizzle/0002_webhook_endpoints.sql`
+(new `webhook_endpoints` table + 3 indexes — additive only, no existing
+table altered). Applied to the live database (Neon project
+`orange-water-80452818`) with explicit human confirmation, same standing
+rule as every other live-DB write this session: statements run directly
+(the Neon HTTP driver rejects multi-statement batches, so each `CREATE
+TABLE`/`CREATE INDEX` ran individually, matching how the app's own
+migrator already splits on `--> statement-breakpoint`), then verified
+column-for-column and index-for-index against the migration file, and the
+`drizzle.__drizzle_migrations` bookkeeping row inserted with the migration
+file's real sha256 hash — computed locally and cross-checked against the
+already-applied 0001 migration's hash already in that table (both
+matched), rather than guessed. `drizzle-kit migrate` now correctly sees
+this migration as already applied. Table confirmed empty (0 rows) both
+before and immediately after — no data at risk.
+
+**Deliberately not done in this pass:** a delivery log or manual-replay
+endpoint (if all 5 attempts fail, the only recovery path today is polling
+`GET /v1/api/gateway/transaction/:id`); an admin-console UI for viewing a
+tenant's registered endpoints (the API is fully developer-self-service via
+the gateway routes, same as every other `/v1/api/gateway/*` resource); a
+secret-rotation endpoint (today rotation is delete + re-register).
+
+---
+
+## 2026-09-17 — Real Email Adapter, Payment Refunds, Payment Reconciliation, Gateway Docs Reconciled
+
+**Context:** user asked to "continue to build on other remaining items such
+as payment reconciliation etc," and to "complete building the messaging
+providers and API gateway."
+
+### Real email messaging adapter
+
+`packages/providers/src/adapters/messaging/email.ts` was fully simulated
+despite this platform already having a real transactional email
+integration (`@company/shared`'s `sendTransactionalEmail`, built for
+account verification/password-reset — §4 item 15). Wired `EmailProvider`
+to the same Resend integration for the general-purpose messaging gateway
+(`POST /v1/api/gateway/messaging`), falling back to simulated processing
+when `RESEND_API_KEY` is unset or the request has no recipient/content —
+same pattern every real adapter in this package follows. `SignalHouse` and
+`FutureSMS` were reconfirmed via WebSearch as not real, findable vendors
+(no public API to build a real integration against) and will stay
+simulated — this is a deliberate, re-verified decision, not an oversight.
+New tests: `email.test.ts` (isConfigured, simulated fallback, real send
+path with HTML-escaping, Resend failure handling).
+
+### Real payment refund capability
+
+No refund route existed anywhere in the real gateway before this —
+`docs/openapi.yaml` documented a `Refunds` tag with no implementation
+behind it. Added `BaseProvider.processRefund()` (default: honest
+`status: 'failed'`, never a fabricated result) and real,
+WebSearch-verified refund support for **Stripe** (`POST /v1/refunds`),
+**NMI** (`type=refund` on `transact.php`), and **Flutterwave**
+(`POST /v3/transactions/{id}/refund`, whose real settlement is
+asynchronous — reported as `'unknown'`, not `'success'`). New
+`POST /v1/api/gateway/refund` route in `services/api-gateway/src/app.ts`:
+resolves the transaction by the provider-side id the client already has
+(not this platform's internal database id — `transactionRepository.
+findByProviderTransactionId`), enforces it's currently `'success'` and
+that a partial amount doesn't exceed the original, and on confirmed
+success transitions it to `'refunded'` (an `'unknown'` result is left
+alone for the existing `charge.refunded` webhook handling to resolve
+later). `packages/api-client` gained a matching `payments.refund()`.
+Tests: a `processRefund()` suite per adapter (Stripe/NMI/Flutterwave, and
+PawaPay's inherited default-failure case), a new
+`packages/simulation/src/refund.simulation.test.ts` (full/partial refund,
+over-amount rejection, double-refund rejection, cross-application
+ownership rejection), and an `api-client.test.ts` case.
+
+### Real payment reconciliation (detection, not auto-resolution)
+
+`packages/workers/src/jobs/reconciliation.ts` was, despite its name, a
+system/queue health report generator with no payment-specific logic at
+all — confirmed by reading it directly, matching what
+`IMPLEMENTATION_BASELINE.md` §4 item 10 already suspected. Added
+`transactionRepository.findStaleUnresolved(olderThanMs)`: transactions
+stuck in `pending`/`processing`/`unknown` past a configurable threshold
+(`RECONCILIATION_STALE_THRESHOLD_MS`, default 1 hour). Deliberately
+detection-only, never auto-resolving — this platform has no way to know a
+stuck transaction's real outcome without asking the provider, and
+guessing would be exactly the fabrication the master plan prohibits for a
+real charge. The reconciliation job's report/audit-log entry now includes
+a `payments` section listing every stale transaction; a new on-demand
+`GET /api/dashboard/reconciliation` route lets an operator query the same
+thing without waiting for the next scheduled run. Tests: new
+`packages/workers/src/jobs/reconciliation.test.ts` and
+`packages/simulation/src/reconciliation.simulation.test.ts`.
+
+### `docs/openapi.yaml` and `docs/DEVELOPER_GUIDE.md` reconciled with the real gateway
+
+Both documents had explicitly flagged themselves as unfinished — openapi.yaml's
+top-of-file note said Auth/Billing had been corrected in an earlier pass
+but "Payments/Refunds/Messages/Conversations/Providers sections still need
+the same pass." Rewrote every path, request/response shape, and shared
+component (`Error`, headers, idempotency model, pagination, identifiers,
+amount units) to match `services/api-gateway/src/app.ts` exactly — the
+fictional `/payments`, `/refunds`, `/messages/{id}`, `/conversations/{id}`,
+`/providers/{id}` REST-resource design is gone, replaced by the real
+`/v1/api/gateway/{payment,refund,messaging,transaction/{id},providers}`
+routes (`docs/DEVELOPER_GUIDE.md` sections 1-8, 10-11 got the same
+correction). Along the way, found and documented (not built further) that
+**outbound platform webhooks are more built than "not implemented," but
+still not reachable end-to-end**: `packages/events/src/webhook-delivery.ts`'s
+`WebhookDelivery` is a real, working outbound POST engine (exponential
+backoff, 5 attempts) that is never instantiated or called anywhere, there
+is no registration path (schema/admin-console UI/API route) for a
+developer's callback URL, and it sends no signature despite
+`packages/api-client`'s verification helpers already expecting one — see
+`IMPLEMENTATION_BASELINE.md` §4 item 24 for the full finding and the
+well-scoped remaining work. `packages/api-client` (already an accurate,
+separate rewrite from an earlier pass) needed only the new
+`payments.refund()` method to stay in sync. Verified every `$ref` in the
+rewritten YAML resolves via a small script rather than manual inspection.
+
+### Verification
+
+`npm run type-check`, `npm run lint` (0 errors; warnings 297 vs. the
+prior-pass baseline of 292 — consistent with existing `any`-in-catch-block
+style, no new patterns introduced), `npm test` (564 passed, 12 skipped —
+unrelated), `npm run build:all` all clean.
+
+---
+
+## 2026-09-17 — Provider Secrets Now Survive a Restart (DB Persistence)
+
+**Context:** continuing "complete the remaining production-readiness
+gaps" — the last open item from the provider-secrets pipeline fix
+(`IMPLEMENTATION_BASELINE.md` §4 item 19): a secret added through the
+admin console lived only in `ProviderRegistry`'s in-memory `Map`s and
+reverted to the env-var fallback (or nothing) on every restart.
+
+### What changed
+
+**`packages/providers` stays fully DB-free** — its design constraint,
+not an oversight: `ProviderRegistry`'s constructor is synchronous and it
+is a process-wide singleton shared by every `packages/simulation` test
+file, so it cannot itself await a real DB call. It gained two new,
+still-pure-in-memory methods instead: `exportSecretsForPersistence(id)`
+(the provider's current plaintext secrets, as `{field, label, value}[]`
+— not a new trust boundary, since it's exactly what the caller's own
+prior `addSecret()` calls already supplied) and `hydrateSecrets(id,
+secrets)` (restores them; a no-op if that provider already has secrets
+from this same process, so a fresh `addSecret()` call always wins over
+whatever was loaded from disk).
+
+**`services/api-gateway`**, which already depends on both
+`packages/providers` and `@company/database`, owns the actual
+persistence — the only place this needed to be wired. New
+`packages/database/src/provider-secrets.ts`:
+- `persistProviderSecrets(slug, secrets)` — encrypts the *full* current
+  set as one JSON blob with the existing (previously completely unused)
+  `encryptSecret`/AES-256-GCM helper and upserts it into the existing
+  (also previously unused) `provider_configs` table, keyed by
+  `(providerId, environment)`. `environment` here is the *deployment
+  tier* (`'live'` in production, `'test'` elsewhere) — deliberately not
+  the provider's own admin-toggleable `ManagementState.environment`
+  field, so secrets can't become unreachable if an admin flips that
+  value mid-life.
+- `loadAllProviderSecrets()` — the read side; decrypts every
+  `provider_configs` row for the current tier, skipping (not throwing
+  on) a row that fails to decrypt so one bad row can't block every other
+  provider's secrets from loading.
+- `ensureProviderRow(slug, name, category)` — `provider_configs.
+  provider_id` is a real FK to `providers.id`, and nothing in the
+  codebase had ever seeded that table: confirmed empty on the live DB
+  (`SELECT count(*) FROM providers` → `0`) before writing this. Fixed by
+  adding an atomic `providerRepository.upsertBySlug()` (`ON CONFLICT
+  (slug) DO UPDATE`, verified against the live `providers_slug_unique`
+  constraint) and calling it from the gateway's secrets routes
+  themselves — not only once at startup, since an admin can add a
+  provider's very first secret before a separate startup loop has
+  necessarily reached that provider yet (a real race caught by this
+  pass's own new simulation test failing before the fix, not a
+  hypothetical).
+
+**Wiring in `app.ts`**: `hydrateProviderSecretsFromDb()` runs once,
+fire-and-forget, right after `ProviderRegistry.getInstance()` —
+non-blocking (`app.listen()` must not wait on a DB round trip) and a
+no-op wherever `SECRET_ENCRYPTION_KEY` isn't set (most non-production
+environments), which is expected, not an error: the process.env fallback
+still works exactly as before this existed.
+`persistProviderSecretsAsync(id)` runs the same way after every
+`addSecret()`/`deleteSecret()` on `/api/dashboard/providers/:id/secrets`
+— never blocks or fails the HTTP response, since the in-memory registry
+(what every real adapter call actually reads) is already correct the
+moment those calls return; a persistence failure only affects whether
+that state survives the *next* restart.
+
+No new migration: both `providers` and `provider_configs` already
+existed on the live database (Drizzle schema + an earlier, never-wired
+pass), confirmed by direct query before writing any code against them.
+
+**`packages/simulation/src/db.ts`**'s `installDatabaseMock()` — every
+simulation test that boots the gateway replaces `@company/database`
+wholesale with this in-memory double; without extending it, the moment
+this pass wired real persistence calls into the secrets routes, every
+such test would have hit an unmocked `undefined` the instant an
+`addSecret()` call fired. Added `providerRepository`,
+`providerConfigRepository`, and mirrors of all three
+`provider-secrets.ts` functions, backed by new `dbState.providers`/
+`providerConfigs` arrays, using the *real* `encryptSecret`/
+`decryptSecret` (imported via relative path, same pattern already used
+for `hashPassword` etc. in this file) so a round trip here behaves
+identically to production.
+
+### Tests
+
+- `packages/providers/src/providerRegistry.test.ts`: new coverage for
+  `exportSecretsForPersistence`/`hydrateSecrets`, including the
+  never-clobber guarantee (a secret added this process always beats one
+  loaded from disk) and the unknown-provider no-op case.
+- New `packages/simulation/src/provider-secrets-persistence.simulation.test.ts`:
+  drives the real `POST`/`DELETE /api/dashboard/providers/:id/secrets`
+  routes end-to-end and decrypts what actually landed in the (mocked)
+  `provider_configs` table — proves the stored blob doesn't contain the
+  plaintext value anywhere (i.e. it's genuinely encrypted, not just
+  encoded), that adding a second field re-encrypts the *full* set rather
+  than losing the first, that deleting the only secret persists an empty
+  set rather than leaving a stale one, and that `loadAllProviderSecrets()`
+  decrypts back to exactly what `addSecret()` produced.
+- Full suite: `npm run type-check`, `npm run lint` (0 errors; warnings
+  unchanged at 292 vs. the post-webhook-signature-pass baseline), `npm
+  test` (530 passed, 12 skipped — unrelated), `npm run build:all` all
+  clean. Verified directly against the live Neon database (read-only:
+  table existence, `providers_slug_unique`, `provider_configs` column
+  shapes, and that `providers` was genuinely empty) before writing any
+  code that assumed those facts.
+
+---
+
+## 2026-09-17 — Native Per-Provider Inbound Webhook Signature Verification
+
+**Context:** continuing "complete the remaining production-readiness
+gaps" — the correction note added to `IMPLEMENTATION_BASELINE.md` §4 item
+19 flagged this as a real, open gap: every inbound provider webhook was
+verified against one shared, platform-wide `WEBHOOK_HMAC_SECRET` HMAC,
+never the provider's own real signature scheme, despite an earlier
+(already-corrected) doc claiming otherwise.
+
+### What changed
+
+**`BaseProvider.verifyProviderWebhookSignature(rawBody, headers)`**
+(`packages/providers/src/base.ts`) — new method, default implementation
+returns `null` ("no native scheme configured/available for this
+provider"), distinct from `true`/`false`. Overridden with each provider's
+real scheme, verified via WebSearch against current public documentation
+on 2026-09-17 (this environment's outbound network access to each
+provider's domain is restricted — same constraint noted for the payment
+adapters themselves):
+
+- **Stripe** (`stripe.ts`) — `Stripe-Signature: t=<unix seconds>,v1=<hex
+  hmac>`; signed content `${timestamp}.${rawBody}`, HMAC-SHA256; rejects
+  signatures older than Stripe's documented 300s replay window.
+- **NMI** (`nmi.ts`) — `Webhook-Signature: t=<nonce>,s=<hex hmac>`; `t` is
+  a per-delivery nonce, *not* a timestamp (no replay window applies);
+  signed content `${nonce}.${rawBody}`, HMAC-SHA256.
+- **Flutterwave** (`flutterwave.ts`) — `verif-hash`: **not** a computed
+  HMAC — a static value equal to the dashboard-configured "secret hash",
+  echoed back verbatim; direct constant-time string comparison. One
+  source describes it as SHA-256(secret hash) instead; flagged inline as
+  a genuine, unresolved ambiguity since this environment couldn't reach
+  flutterwave.com to confirm — documented as the first thing to try if
+  live traffic fails this check.
+- **PayChangu** (`paychangu.ts`) — `Signature`: plain HMAC-SHA256 of the
+  raw body, keyed by the dashboard's "web secret key" — identical shape
+  to the platform's own pre-existing generic `verifyWebhookSignature()`
+  helper, just keyed by PayChangu's own secret.
+- **Airwallex** (`airwallex.ts`) — `x-timestamp` + `x-signature`:
+  HMAC-SHA256 of `${timestamp}${rawBody}` (concatenated directly, no
+  separator — differs from Stripe/NMI's `.`-joined scheme).
+
+**PawaPay (`pawapay.ts`) — deliberately not implemented.** Its real scheme
+is RFC-9421 HTTP Message Signatures: asymmetric, keyed by PawaPay's own
+public key (fetched from a dedicated endpoint), with its own
+canonicalization rules for building the signature base. Building this
+without a live PawaPay sandbox to validate against risked shipping a
+wrong implementation of an asymmetric scheme — which would silently
+degrade security while looking done — rather than an honest fallback.
+Documented at length in the adapter's class comment; PawaPay webhooks
+continue to use the generic platform fallback.
+
+**Gateway** (`services/api-gateway/src/app.ts`, `POST
+/v1/api/webhooks/:provider`) — now calls
+`known.verifyProviderWebhookSignature(rawBody, normalizedHeaders)` first.
+A non-`null` result is authoritative: `true` accepts, `false` rejects
+outright with no fallback (a native check must never be weakened by
+falling through to the generic HMAC — that would let a compromised
+`WEBHOOK_HMAC_SECRET` forge webhooks for a provider with its own, separate
+real protection). Only a `null` result (no native scheme
+configured/available) falls back to the pre-existing generic
+`x-webhook-signature` / `WEBHOOK_HMAC_SECRET` check. The chosen
+`verificationMethod` (`'native' | 'platform'`) is logged on rejection and
+threaded into both enqueued jobs.
+
+**Worker-side defense-in-depth interaction (found and fixed while wiring
+this up):** `packages/workers/src/jobs/paymentWebhook.ts` and
+`providerWebhook.ts` each independently re-verify a webhook's signature
+against `WEBHOOK_HMAC_SECRET` before processing — a real safety net
+against a bug in the gateway's enqueue path, not dead code. Left
+unchanged, this would have rejected every natively-verified delivery,
+since a provider's real signature (e.g. Stripe's `t=`/`v1=` HMAC) is not
+the platform's generic HMAC and the job never carried a `signature` value
+in that shape to re-check. Fixed by adding `verificationMethod: 'native' |
+'platform'` to `ProviderWebhookEvent` (`packages/schemas/src/index.ts`),
+populated by the gateway and read by both job processors: the generic
+re-check now runs only for `'platform'`-verified deliveries (and for
+older jobs with no `verificationMethod` at all, treated as `'platform'`
+for back-compatibility) — trusting a `'native'` verification as already
+correctly done at the gateway, since the worker has no way to redo a
+provider-specific check without the full request headers, which aren't
+threaded through the job queue.
+
+Also updated to match: `.env.example` (new `STRIPE_WEBHOOK_SECRET`,
+`NMI_WEBHOOK_SIGNING_KEY`, `FLUTTERWAVE_SECRET_HASH`,
+`PAYCHANGU_WEBHOOK_SECRET`, `AIRWALLEX_WEBHOOK_SECRET` — no PawaPay
+signing var, per the decision above); `PROVIDER_SECRET_FIELDS` in
+`apps/admin-console/src/components/ProviderManagement.tsx` (adds a
+`webhook_secret` field entry for the 5 native-verified providers so an
+operator has somewhere to enter it); `docs/DEVELOPER_GUIDE.md` §9a and
+`docs/providers/ADDING_A_PROVIDER.md` §6 (both previously described
+webhook verification as entirely generic/unimplemented — now explain the
+native-first/fallback behavior and how to add a native check for a new
+adapter).
+
+### Tests
+
+- A `describe('verifyProviderWebhookSignature()', ...)` block added to
+  each of `stripe.test.ts`, `nmi.test.ts`, `flutterwave.test.ts`,
+  `paychangu.test.ts`, `airwallex.test.ts`: null when unconfigured, true
+  for a correctly computed signature, false for a tampered body and for a
+  missing header; Stripe's suite additionally covers the 300s replay
+  window. `pawapay.test.ts` gained one test confirming it inherits
+  `BaseProvider`'s default `null` (no native scheme).
+- New `packages/workers/src/jobs/paymentWebhook.test.ts` and
+  `providerWebhook.test.ts`: prove a `'native'`-verified job with no
+  generic `signature` at all still processes successfully (the bug this
+  pass fixed), a `'platform'`-verified job with a bad signature still
+  fails closed, a valid `'platform'` signature still processes, and (for
+  `paymentWebhook.ts`) a legacy job with no `verificationMethod` still
+  requires a valid generic signature — no accidental unauthenticated
+  bypass for old-shaped jobs.
+- Full suite: `npm run type-check`, `npm run lint` (0 errors; warnings
+  292 vs. a 290 baseline — the +2 is the pre-existing `delete (clean as
+  any).<field>` pattern gaining one more field, matching existing style),
+  `npm test` (521 passed, 12 skipped — unrelated), `npm run build:all`
+  all clean.
+
+---
+
+## 2026-09-17 — Referential Integrity: `events.app_id` Foreign Key
+
+**Context:** continuing the user's ask to "complete the remaining
+production-readiness gaps" — the next item on `IMPLEMENTATION_BASELINE.md`'s
+open-gaps list, §4 item 4.
+
+### What changed
+`events.app_id` was a plain `text` column with no foreign key — nothing
+stopped an orphaned or misspelled app id from being written. It holds the
+application's *slug*, not its UUID id (confirmed by reading
+`authenticateApplication` in `services/api-gateway/src/auth.ts`), so the
+new constraint references `applications.slug`, a unique column, not
+`applications.id`.
+
+A full-repo search for every literal `appId:` value written via
+`eventRepository.create()` turned up two sentinel values already in real
+production use for events with no owning tenant app: `'system'`
+(`provider_webhook` job processing, the reconciliation job) and
+`'webhook'` (a payment webhook whose payload carried no
+`metadata.appId`). Rather than special-case these in application code
+(which would mean the FK "mostly" holds, with silent exceptions), the
+migration seeds them as real `applications` rows first
+(`ON CONFLICT DO NOTHING`, idempotent) before adding the constraint — the
+FK now holds with zero exceptions.
+
+### Verification and live application
+Checked the live database for orphaned `events.app_id` values before
+writing the migration — the `events` table had 0 rows, so nothing needed
+reconciling. Generated via `drizzle-kit generate` against the single-
+baseline history from the 2026-09-15 migration-consolidation pass (see
+that entry) — this is the first real incremental migration since that
+consolidation, and it worked cleanly, confirming the baseline is actually
+usable going forward, not just for a fresh deploy. Applied to the live
+database with explicit human confirmation (same standing rule as every
+other live-DB write this session); `drizzle.__drizzle_migrations` updated
+to record it. Verified immediately after: both sentinel `applications`
+rows exist, the constraint exists in `pg_constraint`, and `applications`
+row count is exactly 6 (4 real + 2 sentinel) as expected. Full test suite
+(492 tests) re-run after the schema change: no regressions — the
+simulation harness's DB mock doesn't enforce FKs (by design, it's a
+behavioral simulation, not a schema-constraint simulation), so this was
+purely a real-Postgres-side change.
+
+**Files changed:**
+- `packages/database/src/schema/events.ts` — `appId` now
+  `.references(() => applications.slug)`
+- `packages/database/drizzle/0001_events_app_id_fk.sql` (new),
+  `drizzle/meta/0001_snapshot.json` (new), `drizzle/meta/_journal.json`
+
+## 2026-09-15 — Provider Onboarding Readiness: Real Secrets Pipeline, isConfigured(), Docs
+
+**Context:** the user asked to "continue building and complete all the
+components and elements so that the platform is ready to add providers" —
+an audit of what that actually requires (beyond "write an adapter class,"
+which already worked) turned up a load-bearing gap: admin-console-managed
+secrets never reached the adapters at all.
+
+### The core finding
+`BaseProvider.setSecrets()` — what populates `this.secrets.<field>`, which
+every real adapter's HTTP calls read before falling back to their raw
+`process.env.*` var — was never called anywhere outside test files. The
+admin console's Secrets UI and `POST /api/dashboard/providers/:id/secrets`
+wrote to `ProviderRegistry`'s own `ManagementState.secrets`, which nothing
+downstream consumed. Entering a real API key through the console did
+nothing. `ProviderRegistry.register()` additionally auto-generated a fake
+random `sk_...` secret for every provider at startup that nothing used
+either — purely decorative today, but would have actively broken every
+adapter's env-var fallback (shadowing it with garbage) the moment secrets
+syncing went live, so it had to go, not just be left alone.
+
+### Fix
+- `ProviderSecretMeta` (`packages/schemas`) gained a required `field`
+  property naming which `this.secrets.<field>` a value populates.
+- `ProviderRegistry.addSecret()`/`deleteSecret()` now rebuild a
+  `{field: value}` record from whatever's currently stored and call the
+  live provider instance's real `setSecrets()` — the adapter's very next
+  request sees the change, no restart. `addSecret()` upserts by field
+  (replacing, not duplicating, on key rotation).
+- The fake auto-generated secret at registration is gone.
+- `BaseProvider.isConfigured()` (new; default `true`) was overridden on
+  all 10 real-HTTP-integration adapters (stripe, nmi, flutterwave,
+  pawapay, paychangu, airwallex, infobip, africastalking, sinch, vibes),
+  each reusing its own already-existing credential-presence check — the
+  same condition each adapter already used to decide simulated-vs-real,
+  not a new judgment call. Exposed via `ProviderManagement.configured` and
+  a "Configured"/"Not Configured" badge in the admin console (provider
+  list + detail drawer). A `'live'`-environment provider that's
+  unconfigured now also gets a `console.warn` at registry startup.
+- Admin console's Add Secret form gained a `field` selector — a dropdown
+  of known field names per provider (`PROVIDER_SECRET_FIELDS` in
+  `ProviderManagement.tsx`, e.g. Airwallex needs `client_id` **and**
+  `api_key`), falling back to free text for a provider not in the map —
+  auto-fills the label when a known field is picked.
+
+### Docs corrected, not just added
+- `docs/adr/ADR-005-provider-adapters.md`'s "Adding a New Provider"
+  section referenced a `packages/config` package that doesn't exist,
+  wrong file paths, and a test-folder convention this repo doesn't use —
+  amended in place with pointers to the new authoritative doc rather than
+  silently rewritten (ADRs record a decision's rationale, which is still
+  valid; the how-to living doc is separate).
+- New `docs/providers/ADDING_A_PROVIDER.md`: the accurate, current,
+  step-by-step process — adapter class → registry → `.env.example` →
+  admin-console field mapping → tests → the webhook-signature caveat
+  below — kept in sync with the code rather than re-litigated per-ADR.
+- `docs/DEVELOPER_GUIDE.md` claimed inbound provider webhooks are
+  authenticated by each provider's own native signature scheme (a real
+  `Stripe-Signature` header, Flutterwave's `verif-hash`, etc.). False:
+  `services/api-gateway/src/app.ts`'s `/v1/api/webhooks/:provider` route
+  verifies every provider's webhook against one shared, platform-wide
+  `WEBHOOK_HMAC_SECRET` HMAC — not any provider's real scheme. Corrected,
+  and flagged as a genuine open gap for going live with a provider that
+  signs its own outbound webhooks (documented, not silently worked
+  around).
+- `docs/IMPLEMENTATION_BASELINE.md`'s "Provider Registry & Routing"
+  section separately claimed the registry was "DB-backed... encrypted
+  secrets, AES-256-GCM" via `packages/database`'s `provider-configs.ts`.
+  Also false — confirmed by a full-repo search that `providerConfigRepository`
+  is exported but never imported anywhere. All provider config/management
+  state/secrets are in-memory only and don't survive a gateway restart —
+  corrected, and left as a documented, not-yet-built gap rather than
+  quietly fixed by inventing real persistence in the same pass.
+- `packages/providers/src/adapters/messaging/sms.ts` — dead code, never
+  registered or exported, the source of a `.env.example` gap an earlier
+  audit flagged — deleted rather than fixed; `example.ts` already serves
+  as the registered, tested "how to build a real provider" template.
+
+### Verification
+10 new `isConfigured()` unit tests (one per real adapter, each proving
+both the env-var path and the `setSecrets()` path). New Playwright
+regression test (`apps/admin-console/tests/provider-secrets.spec.ts`):
+opens a provider's detail view, confirms the "Not Configured" badge,
+confirms the field selector shows the adapter's real known field(s),
+picks one, and asserts the POST body carries `field`+`label`+`value`
+end-to-end through a mocked backend. Full suite: 492 passed (up from 482 —
+10 new tests, existing coverage unchanged), `tsc --noEmit` clean (root +
+admin-console + web), `npm run lint` 0 errors (290 pre-existing warnings,
+unchanged), `npm run build:all` clean, admin-console Playwright suite (7
+tests, including the new one) stable across repeated runs.
+
+**Files changed:**
+- `packages/schemas/src/index.ts` — `ProviderSecretMeta.field`,
+  `ProviderManagement.configured`
+- `packages/providers/src/base.ts` — `isConfigured()` default
+- `packages/providers/src/registry.ts` — fake-secret removal, real
+  `setSecrets()` sync on add/delete, `configured` in management view,
+  startup unconfigured-live-provider warning
+- `packages/providers/src/adapters/{payments,messaging}/*.ts` (10 files)
+  — `isConfigured()` overrides
+- `packages/providers/src/adapters/messaging/sms.ts` — deleted
+- `packages/providers/src/{management,providerRegistry}.test.ts` +
+  10 adapter test files — updated/new tests
+- `services/api-gateway/src/app.ts` — `field` required on the secrets
+  POST route
+- `apps/admin-console/src/types.ts`,
+  `apps/admin-console/src/components/ProviderManagement.tsx` — field
+  selector, Configured badge
+- `apps/admin-console/tests/provider-secrets.spec.ts` (new)
+- `docs/adr/ADR-005-provider-adapters.md`,
+  `docs/providers/ADDING_A_PROVIDER.md` (new),
+  `docs/DEVELOPER_GUIDE.md`, `docs/IMPLEMENTATION_BASELINE.md`
+
+## 2026-09-15 — Gateway Inbound-Webhook Enqueue: Real Job Queue, Not Raw ioredis
+
+**Context:** last item on the user's explicit priority-ordered punch list:
+"the gateway and the ready on the inbound webhook path."
+
+### What changed
+`services/api-gateway/src/app.ts`'s `enqueueInboundMessage()`,
+`enqueuePaymentWebhook()`, and `enqueueProviderWebhook()` used a hand-rolled
+raw `ioredis` client (`getRedisClient()`) that constructed its own ad hoc
+Redis key names and fully no-opped — silently dropping the message,
+including a STOP opt-out request, with **zero** durability — whenever
+`REDIS_URL` wasn't set or wasn't reachable at that exact moment. Replaced
+with `@company/workers`'s own `createStore()`/`JobQueue`/`createKeys()` —
+the exact abstraction `services/worker/src/index.ts` already uses to build
+its own queue. `createStore()` degrades a configured-but-unreachable Redis
+to an ephemeral in-memory store (logging a warning), the same way the rest
+of the platform already behaves in that situation, instead of dropping the
+job outright. A new `getGatewayQueueForTests()` export exposes the gateway's
+own store/keys/config for `packages/simulation`'s test harness only — no
+production code path uses it.
+
+`GET /ready`'s existing `unconfigured` (REDIS_URL unset — a known, accepted
+degraded mode) vs. `unreachable` (REDIS_URL set but the connection is
+actually down — a real failure) distinction for the `queue` dependency
+carries over unchanged, now checking the shared store's own
+`RedisStore`/`isConnected()` state instead of a second ad hoc client.
+Verified live both ways: unset `REDIS_URL` → `{"queue":"unconfigured"}` /
+200; a configured-but-dead `REDIS_URL` → `{"queue":"unreachable"}` / 503.
+
+### A real bug found and fixed along the way
+Making the enqueue path actually work (rather than a no-op) surfaced a
+genuine, previously-undetectable bug: `packages/workers/src/jobs/
+providerWebhook.ts` and `paymentWebhook.ts` both computed their idempotency
+key as `webhook:${eventId}`. The gateway enqueues one `provider_webhook` job
+and one `payment_webhook` job per inbound webhook delivery, and both carry
+the *same* upstream event id (it's one HTTP request) — so whichever job
+type's processor claimed that shared key first made the *other* type fail
+on every retry with a false "Replay detected" error and dead-letter after 5
+attempts. This bug already existed in the pre-fix raw-ioredis code (it built
+the identical shared key), including in any real deployment with `REDIS_URL`
+actually configured — it just could never be observed or tested, because the
+enqueue itself never worked in any environment this session could reach.
+Fixed by namespacing each processor's idempotency key by its own job type
+(`provider_webhook:${eventId}` / `payment_webhook:${eventId}`).
+
+### Simulation test changes
+Two pre-existing "documented gap" tests plus a 7-keyword `it.each` block in
+`packages/simulation/src/messaging-conversation.simulation.test.ts`
+specifically asserted the old no-op behavior (a real HTTP webhook delivery,
+verified, acked 200, then silently dropped). They now assert the real
+end-to-end path instead: `deliverWebhook()` (real HTTP + HMAC) followed by
+`drain()` against a new `gatewayPipeline` worker — attached to the exact
+same store/keys the gateway's own `getGatewayQueueForTests()` returns (see
+`SimRuntime.gatewayStore`/`gatewayKeys` in `harness.ts`), as opposed to the
+isolated `pipeline` worker the file's other tests use with the
+`enqueueInboundMessage`/`enqueueProviderWebhook` bypass helpers (kept
+as-is, still a legitimate faster way to drive worker-side logic directly).
+`CHECK IN` and `WHERE IS MY DRIVER?` now correctly reach `handleKeyword()`
+for real, confirming there's genuinely no case for either yet — flagged as
+a separate, still-open, honestly-labeled gap rather than something invented
+a fix for here.
+
+### Verification
+Full suite: 482 passed (no count change — existing tests rewritten in
+place, not added), `tsc --noEmit` clean (root + admin-console + web),
+`npm run lint` 0 errors, `npm run build:all` clean. `packages/simulation/
+src/messaging-conversation.simulation.test.ts` re-run 2x standalone to
+confirm stability post-fix. Live-verified `/ready`'s unconfigured/
+unreachable split via a standalone script hitting the real Express app with
+and without a (dead) `REDIS_URL` set.
+
+**Files changed:**
+- `services/api-gateway/src/app.ts` — real `JobQueue` via `@company/workers`
+  replacing `getRedisClient()`; `/ready`'s queue check now uses the shared
+  store; new `getGatewayQueueForTests()` export
+- `services/api-gateway/package.json` — `@company/workers` dependency
+- `packages/workers/src/jobs/providerWebhook.ts`,
+  `paymentWebhook.ts` — namespaced idempotency keys (the collision fix)
+- `packages/simulation/src/harness.ts` — `SimRuntime.gatewayStore`/
+  `gatewayKeys`, sourced from the gateway module's new test export
+- `packages/simulation/src/messaging-conversation.simulation.test.ts` —
+  the two "documented gap" tests and the keyword `it.each` block now
+  exercise the real end-to-end path; stale comments elsewhere in the file
+  updated to match
+
+## 2026-09-15 — Admin Console Real Routing (react-router-dom)
+
+**Context:** next item down the user's explicit priority-ordered punch
+list: "the admin console... still in-memory tabs, no real URLs."
+
+### What changed
+`apps/admin-console`'s 4 tabs (Operations, Provider Management, Customers,
+Observability) were a single `useState<Tab>` in `App.tsx` — switching tabs
+never touched the URL, so there was no deep-linking, no bookmarking a
+specific tab, and browser back/forward did nothing (both buttons just sat
+on `/` regardless of which tab was showing).
+
+Added `react-router-dom` (`^7.18.3`) and wrapped `<App />` in
+`<BrowserRouter>` (`main.tsx`). `App.tsx` now derives the active tab from
+`useLocation().pathname` via a small `tabFromPathname()` mapping instead
+of local state, and the tab buttons call `useNavigate()` instead of
+`setTab()`:
+- `/` → Operations Dashboard
+- `/providers` → Provider Management
+- `/customers` → Customers
+- `/observability` → Observability
+
+An unrecognized path falls back to Operations rather than a blank page —
+deliberately simple (no `<Routes>`/`<Route>` table, since all 4 "pages"
+were already conditionally-rendered JSX blocks in one component; only the
+source of truth for *which* block renders changed) rather than a bigger
+restructure the ask didn't call for.
+
+Added `apps/admin-console/vercel.json` with a SPA rewrite
+(`/(.*) → /index.html`). This wasn't needed before (every tab lived at
+`/`), but is now required for the production Vercel deploy: a direct
+load or hard refresh on `/providers` etc. would otherwise 404, since
+Vercel's static file server has no fallback of its own. The Vite dev
+server already does this by default, which is why it wasn't visible
+locally.
+
+### A real regression, found and fixed
+`tests/smoke.spec.ts`'s tab-switching assertions (e.g. click "Provider
+Management" then immediately assert `getByText('Stripe', { exact: true
+})`) started failing intermittently once routing went in — not a test
+bug, a real timing change: with `useState`, clicking a tab button
+re-rendered synchronously within the same click handler; with
+`useNavigate()`, the URL and the re-render it triggers are not
+guaranteed synchronous with the click. For a brief window the previous
+tab's DOM (which also renders "Stripe" — once in the topology graph,
+once in a `<select>` option) can still be attached, so an exact-text
+locator briefly resolves to multiple elements. Playwright's `toBeVisible()`
+retries on "not found," but **not** on a strict-mode multiple-match
+violation — it fails immediately instead of waiting out the render.
+Fixed by adding `page.waitForURL()` after each tab click (confirms the
+route committed) plus a short `page.waitForTimeout(150)` before the one
+assertion that's ambiguous mid-transition — verified stable across 3
+repeated full runs after the fix, not just the first green run.
+
+### Verification
+- `apps/admin-console`'s own `npm run type-check`: clean.
+- `npx playwright test` (6 tests): all pass, stable across 3 runs.
+- Manual live-browser check (real dev server, not just the mocked
+  Playwright suite): direct navigation to `/observability` correctly
+  highlights the Observability tab and renders its content; clicking
+  Customers then using the browser's Back button correctly returns to
+  `/observability`, and Forward correctly returns to `/customers`.
+- Root `npm run type-check`, `npm run lint` (0 errors), `npm test` (482
+  passed, unrelated to this change but re-run to confirm no regression),
+  `npm run build:all`: all clean.
+
+**Files changed:**
+- `apps/admin-console/src/main.tsx` — wrap `<App />` in `<BrowserRouter>`
+- `apps/admin-console/src/App.tsx` — `useState<Tab>` → `useLocation()`/
+  `useNavigate()`, `tabFromPathname()`/`TAB_PATHS` mapping
+- `apps/admin-console/vercel.json` (new) — SPA rewrite for production
+- `apps/admin-console/tests/smoke.spec.ts` — `waitForURL()` after each
+  tab-switching click, plus the settle-time fix described above
+- `apps/admin-console/package.json`, `package-lock.json` —
+  `react-router-dom` dependency
+
+## 2026-09-15 — Client-Side Tokenization, Plan Limit Enforcement, Migration History Consolidation
+
+**Context:** continuing down the user's explicit priority-ordered punch
+list from the previous entry: client-side card tokenization, plan
+usage-limit enforcement, and the Drizzle migration-history divergence.
+
+### Plan usage-limit enforcement
+`plans.messageLimit`/`paymentVolumeLimitCents` were stored but never
+checked. Added `checkPlanLimit()` in the gateway, called before routing
+on both `/v1/api/gateway/payment` and `/v1/api/gateway/messaging`; an
+application with no active subscription or a null-limit plan stays
+unrestricted (nothing to enforce, not a bug). Message counts now come
+from a real `events` table write the messaging route never made before
+(added, mirroring the payment route's existing transaction-record
+pattern); payment volume comes from the existing `transactions` table.
+Both only count/sum `'success'` rows. 7 new simulation tests exercise
+this through the real gateway routes.
+
+### Drizzle migration-history consolidation
+See `packages/database/drizzle/README.md` for the full writeup.
+Short version: the old 13-file migration history had snapshot files only
+through migration 0001 despite SQL files through 0012, which made
+`drizzle-kit generate` produce nonsensical, potentially destructive
+suggestions (confirmed live). Replaced it with a single fresh
+`0000_baseline.sql`, verified column-for-column against the live
+database before committing (not assumed) — the old files are archived,
+not deleted. Two tables in the live DB with no schema file
+(`checkout_sessions`, `webhook_jobs`) are confirmed orphaned and
+deliberately left alone. The live database's own migration-tracking
+table (`drizzle.__drizzle_migrations`) needed a live write to reconcile
+— held for explicit human confirmation first (per this session's
+standing rule), then done once approved: its 14 old rows replaced with
+the single row matching the new baseline's hash. Verified immediately
+after that no application data changed (row counts on `applications`,
+`users`, `transactions`, and the two orphaned tables all identical
+before/after) — only Drizzle's own bookkeeping table was touched.
+
+### Client-side card tokenization (previous entry, cross-referenced here)
+Already covered in its own commit message — added real Stripe.js/
+Elements tokenization to the admin console's Request Playground (which
+was separately found to be entirely non-functional — it called a route
+that never existed) so `PaymentRequest.paymentToken` has a real producer
+for the first time.
+
+### Verification
+Full suite grew from 467 to 482 passing across this entry (7 new
+plan-limit tests), `tsc --noEmit` clean, `npm run lint` 0 errors, clean
+build. The migration consolidation was additionally verified read-only
+against the live Neon database (table counts and column-level diffs on
+4 representative tables) rather than assumed correct from the generated
+SQL alone.
+
+---
+
+## 2026-09-15 — Remaining Real Payment Adapters (PawaPay, PayChangu, Airwallex) + Trembi Investigation
+
+**Context:** direct continuation of 2026-09-14's real-payment-adapter
+work, at the user's "keep going" — closing out the rest of the payment
+provider punch list from that entry's §6.
+
+### What was done
+- **Real PawaPay adapter** (`payments/pawapay.ts`) — v2 Merchant API
+  (`POST /v2/deposits`). Architecturally different from the card
+  adapters: mobile-money needs no pre-tokenized instrument (the customer
+  approves on their own phone), but does need PawaPay's own
+  operator+country provider code, which this platform can't safely
+  derive from a phone number — read from
+  `payload.metadata.pawapayProvider` rather than guessed; without it,
+  falls back to simulated. The synchronous response only ever reports
+  `ACCEPTED` (queued) or `REJECTED` (rejected outright) — `ACCEPTED`
+  maps to this platform's `unknown` outcome, not a fabricated success,
+  since the real result arrives later via callback/status-check (not
+  wired up).
+- **Real PayChangu adapter** (`payments/paychangu.ts`) — Mobile Money API
+  (`POST /mobile-money/payments/initialize`). Same operator-code gating
+  pattern as PawaPay (`payload.metadata.paychanguOperatorRefId`); same
+  "top-level success just means accepted" trap as Flutterwave
+  (`data.status` is the real outcome). One thing flagged as
+  lower-confidence rather than asserted: PayChangu's error envelope
+  shape was inferred from its confirmed success shape, not directly
+  observed.
+- **Real Airwallex adapter** (`payments/airwallex.ts`) — PaymentIntents
+  API, a genuinely more complex 3-call flow: `/authentication/login` for
+  a Bearer token (cached in-memory per Airwallex's own guidance, reused
+  until ~1 minute before its 30-minute expiry), `/payment_intents/create`,
+  then `/payment_intents/{id}/confirm`. Confirms against an
+  already-tokenized instrument like Stripe (`paymentToken` ->
+  `payment_consent_id`), additionally requiring a `customer_id`
+  (`payload.metadata.airwallexCustomerId`). No 3D-Secure/`next_action`
+  relay built — a `REQUIRES_CUSTOMER_ACTION` result reports as `unknown`
+  honestly, but nothing resolves it.
+- **Trembi — investigated, not built.** WebSearch found trembi.com is a
+  sales/marketing automation platform (leads, email/SMS/WhatsApp
+  campaigns) with its own "Messaging API," not a payment gateway — it
+  uses a third party (ElemiTech) for its *own* payment processing.
+  Building a "Trembi payment adapter" would mean fabricating an
+  integration against an API that doesn't exist, which the master plan
+  explicitly prohibits. Documented in
+  `docs/IMPLEMENTATION_BASELINE.md`'s adapter table and gap list so a
+  future pass doesn't retry the same dead end.
+
+With this, all six payment providers named in `.env.example` (Stripe,
+NMI, Flutterwave, PawaPay, PayChangu, Airwallex) now have real HTTP
+integrations — the payment side of "real provider adapters" is closed by
+count, matching the messaging side's four real adapters
+(Infobip/Africa's Talking/Sinch/Vibes). What remains is §4 item 1a
+(client-side card tokenization) — without it, the four card-based
+adapters have no real caller that can ever populate `paymentToken`.
+
+### Verification
+Each adapter has its own test file: PawaPay 8 tests, PayChangu 9,
+Airwallex 10 (27 new tests total) — each covering the simulated
+fallback, the real request shape, every documented status outcome, the
+error envelope, 5xx retry, and offline/maintenance short-circuit.
+Airwallex's suite additionally verifies its 3-call sequence and that a
+second payment reuses the cached access token rather than logging in
+again. Full suite grew from 440 to 467 passing across this entry, always
+green; `tsc --noEmit` clean and `npm run lint` 0 errors after every
+commit.
+
+---
+
+## 2026-09-14 — Real Payment Adapters, Transactional Email, Gateway Crash Fix, Landing Page Redesign
+
+**Context:** user asked to (1) re-check the codebase against the master
+plan for anything not yet fully implemented, (2) get the platform closer
+to production-ready specifically so real payment providers can be
+plugged in, and (3) improve the marketing landing page's visual design
+(text/icons read as too small, wanted a more modern look). Re-reading
+`docs/IMPLEMENTATION_BASELINE.md` §4/§6 against the current repo found
+its single largest standing gap unchanged since 2026-09-08: every
+payment adapter was still fully simulated, with no live-provider code
+path at all (unlike the messaging adapters, several of which were
+already real by this point).
+
+### What was done
+- **Landing page redesign** (`apps/web`) — larger fluid type scale
+  (hero headline `clamp(2.75rem, 6vw, 4.75rem)`, up from a flat 52px),
+  60px gradient-tinted icon boxes (up from 40px flat-tint), real Inter/
+  Lexend font loading (the design tokens referenced 'Inter' but nothing
+  ever loaded it), a dot-grid + radial-glow hero background, hover-lift
+  cards. Found and fixed live: the nav had no responsive handling at all
+  and broke (wordmark and "Admin console" button overlapping) at phone
+  widths — added a breakpoint that hides the secondary nav links and
+  swaps to a short wordmark under 430px, verified with Playwright
+  screenshots at 360/390/768/1440px.
+- **Real Stripe adapter** (`payments/stripe.ts`) — rewritten on the
+  PaymentIntents API. The previous version already called a live Stripe
+  endpoint when credentials were set, but sent a JSON body against an
+  API that requires `application/x-www-form-urlencoded` and hit the
+  deprecated Charges endpoint — every "real" call it ever made would
+  have failed. Added `BaseProvider.toFormBody()`, a shared form-encoding
+  helper.
+- **Real NMI adapter** (`payments/nmi.ts`) — previously fully simulated
+  with no real-HTTP path at all. Rewritten against NMI's Direct Post API
+  (`POST /api/transact.php`), which is form-urlencoded in *both*
+  directions — the response is a query string, not JSON.
+- **Real Flutterwave adapter** (`payments/flutterwave.ts`) — also
+  previously fully simulated. Rewritten against v3's tokenized-charges
+  API. The easy-to-miss trap here: a 200 response with top-level
+  `status: "success"` only means the request was accepted, not that the
+  charge succeeded — the real outcome is `data.status`.
+- **`PaymentRequest.paymentToken`** (new, `@company/schemas`) — this
+  gateway never collected raw card data or a provider token before now,
+  so no payment adapter, real or not, ever had anything to actually
+  charge. All three real adapters above are gated on it being present
+  (a pre-tokenized instrument the caller obtained client-side, e.g. via
+  Stripe.js): without one, they fall back to simulated rather than
+  fabricating a charge against nothing. This is a structural,
+  cross-provider limitation, not fixed by any one adapter — a real
+  end-to-end charge additionally needs a client-side tokenization step
+  this repo doesn't include yet.
+- **Real transactional email** (`packages/shared/src/email.ts`) — closes
+  §4 item 15: verification/password-reset tokens previously had zero
+  delivery path to a real inbox. Sends via Resend's HTTP API directly
+  (matching the no-SDK pattern of every provider adapter), wired into
+  signup, `/resend-verification`, and `/request-password-reset` as a
+  fire-and-forget send that never blocks the request. Honestly flagged,
+  not worked around: this repo has no frontend page yet to land a
+  verify-email/reset-password link on, so the email always also includes
+  the raw token as plain text alongside the link.
+- **Gateway crash fix** (`services/api-gateway/src/app.ts`) — found live
+  while running the app to demonstrate the above, not by static review:
+  opening the admin console's Customers tab crashed the *entire* gateway
+  process, not just that request, because a DB query error in an async
+  route handler with no try/catch became an unhandled promise rejection
+  (Express 4 doesn't forward those to its error middleware on its own).
+  12 of 32 async handlers had this gap. Added an `asyncHandler()`
+  wrapper and applied it to exactly those 12; verified the same request
+  that previously killed the gateway now returns a normal 500 and every
+  other route keeps serving right after.
+
+### Verification
+Every adapter change has its own test file exercising the simulated
+fallback, the real request shape, and each documented outcome/error case
+(Stripe 8 tests, NMI 9, Flutterwave 10, email 7 — 34 new tests total).
+Full suite run repeatedly across the session, always green (grew from
+403 to 440 passing as work progressed), `tsc --noEmit` clean throughout,
+`npm run lint` 0 errors throughout. The landing page and the gateway
+crash fix were both verified live: a real headless-Chromium pass for the
+former, and a real `npm run dev` (gateway + admin console, live Neon
+connection) session for the latter, where the crash was originally
+found and the fix re-verified against the identical failing request.
+
+### Deliberately not done in this pass
+- PawaPay, PayChangu, Airwallex, and Trembi remain simulated/unbuilt —
+  see `docs/IMPLEMENTATION_BASELINE.md` §6 item 11 for the recommended
+  order.
+- No client-side tokenization flow (Stripe.js/Elements or equivalent) was
+  built — without one, `paymentToken` is never actually populated by a
+  real caller yet, so today's real adapters are correct but currently
+  unreachable end-to-end outside a direct API test that supplies a token
+  by hand.
+- Plan usage-limit enforcement, admin console routing, Drizzle migration
+  history divergence, and the gateway's Redis-only inbound-webhook
+  enqueue path are unchanged — see `docs/IMPLEMENTATION_BASELINE.md` §4/§6
+  for the full standing list.
+
+---
+
+## 2026-09-10 — Consolidated a Sibling Session's Parallel Branch
+
+**Context:** two Claude Code Remote sessions had independently been working
+this same repository on two different branches diverged from the same base
+commit — this session's `claude/bis-api-platform-production-r9to5j` (Phases
+A–D above: auth, subscription billing, CRM/support, admin console
+verification) and a sibling session's `claude/bis-api-production-readiness-
+altvu7` (its own production-readiness remediation pass: RBAC/subscription/
+support schema, a marketing landing page, an architecture doc suite, and
+several standalone bug fixes). The user asked to consolidate onto one
+branch. Where both sessions had independently built the same feature
+(subscriptions, support tickets, RBAC) with incompatible schemas, the user
+chose to keep this session's version (already live in Neon, fully tested)
+and drop the sibling's competing design. Everything else — genuinely
+non-overlapping work — was brought in.
+
+### What was ported in
+- **Admin-console auth fix**: `services/api-gateway/src/app.ts`'s
+  `/api/dashboard` routes were gated by `mw.admin` (checks
+  `x-admin-key`/`Authorization` against `PLATFORM_ADMIN_KEY`), but the real
+  admin-console frontend authenticates via `requireAdmin` (checks
+  `x-admin-token` against `ADMIN_API_TOKEN`) — two disconnected auth
+  mechanisms, meaning every `/api/dashboard/*` route (including all of this
+  session's own Phase A–D admin routes) was unreachable through the real
+  login flow. Also found and fixed the same-class bug independently in
+  `apps/admin-console/src/App.tsx`'s `fetchProviders`/`fetchLogs`/
+  `fetchMetrics`/`handleClearLogs`, which never sent the admin token or
+  checked `res.ok` before using an error body as state. Verified with a
+  live (non-mocked) end-to-end pass: real gateway, real browser, real login.
+- **Payment-timeout handling**: `RoutingEngine.routePayment` used to catch
+  a provider timeout the same way as any other failure and immediately
+  retried the identical payment through a second provider — a genuine
+  double-charge risk, since a timeout means the outcome is unknown, not
+  failed. Timeouts now resolve as a distinct `'unknown'` transaction status
+  (HTTP 202) instead of failing over.
+- **`packages/api-client` rewrite**: the official external SDK was built
+  against a `/payments`, `/refunds`, `/messages`, `/conversations/{id}`,
+  `/providers` REST-resource contract that was never implemented
+  server-side — every call it made would 404/400 against the real gateway.
+  Rewritten to match the real `/v1/api/gateway/*` routes, headers, and
+  error envelope; `refunds`/`conversations` (no backing endpoint) removed.
+  Also fixed `/ready` unconditionally reporting `database: 'healthy'`
+  regardless of actual status, and added a 3s timeout so a hung DB
+  connection fails `/ready` fast.
+- **Provider environment isolation + CORS fail-closed**: routing never
+  checked a provider's `environment` field, so a real production payment
+  or message had a non-zero chance of being served by a `'test'`-environment
+  demo adapter that fabricates success without doing anything — added
+  `ProviderRegistry.isLiveEligible()` and wired it into every routing path.
+  CORS also now fails closed in production when `CORS_ORIGINS` is unset,
+  instead of defaulting to `origin: '*'`.
+- **`apps/web`**: a new Vite+React+TS marketing landing page workspace
+  (hero, feature grid, pricing, CTA), wired into the root `type-check`
+  script and picked up by the existing `build:all` workspace glob.
+- **`docs/openapi.yaml`**: fixed the Auth/Billing sections' path keys and
+  prose references from `/auth/*`/`/billing/*` to the real `/api/auth/*`/
+  `/api/billing/*` routes, and added a clear warning that the
+  Payments/Refunds/Messages/Conversations/Providers sections are still
+  aspirational and don't match the implemented gateway.
+
+### Deliberately not ported
+- The sibling session's RBAC (`user_roles` join table), `subscription_
+  plans`/`tenant_subscriptions`, and `support_tickets`/`support_ticket_
+  messages` schema and APIs — this session's own Phase B/C equivalents are
+  live in Neon and fully tested; the sibling's competing design was never
+  applied to any live database. Per explicit user decision.
+- A mobile app the sibling session had itself already reverted, and a
+  redundant `&&`-chained-condition fix that turned out to touch the exact
+  same files this branch's own pre-existing fix already covers (confirmed
+  via diff comparison before skipping).
+
+### Verification
+Full suite run 3x for stability (406/406 passing each time, 0 flakes),
+`tsc --noEmit` (root + admin-console + apps/web), `npm run lint` (0
+errors), `npm run build:all`, and `apps/admin-console`'s own Playwright
+smoke suite (6/6 passing). The admin-console auth fix and the `apps/web`
+landing page were additionally verified with a real (non-mocked) browser.
+
+---
+
+## 2026-09-09 — Admin Console Verification + Permanent Regression Suite (Phase D of 4)
+
+**Context:** final phase of the same 4-phase request as Phases A/B/C
+(below). The user's literal ask for this phase was to "make sure the
+admin console is functioning properly" — a verification request, not a
+request to add routing infrastructure. Scoped accordingly: this phase is
+a thorough regression pass across all 4 tabs (Operations, Provider
+Management, the new Customers tab, Observability) plus turning that
+verification into a permanent, automated check, rather than bolting on
+`react-router` (a real architecture change with genuine regression risk)
+to a console that has zero pre-existing test coverage of any kind.
+
+### What was done
+- **Manual regression pass in a real headless browser** (Chromium via
+  Playwright, launched against the environment's pre-installed browser at
+  `/opt/pw-browsers/chromium`) — booted the Vite dev server standalone,
+  mocked every `/api/dashboard/*` and `/api/observability/*` endpoint the
+  console calls (this environment cannot reach the live database, the
+  same constraint noted throughout this document), and walked all 4 tabs
+  plus tab-switching. **Found and fixed one real bug in the process**
+  (not a pre-existing one — introduced by this session's own first
+  regression-script draft, not by the app): the mock `/api/observability/
+  metrics` response didn't match `Observability.tsx`'s actual
+  `MetricsSnapshot` interface (`counters`/`latency`/`providerHealth`),
+  which crashed the component with "Cannot convert undefined or null to
+  object." Confirms the check is doing real work, not rubber-stamping —
+  a wrong assumption about a response shape surfaces immediately as a
+  crash, exactly like it would with real data.
+- **Turned that manual check into `apps/admin-console/tests/smoke.spec.ts`**
+  (new `@playwright/test` devDependency) — 6 tests, run via
+  `npm run test:e2e` in `apps/admin-console`: each of the 4 tabs renders
+  real (mocked) data with zero console/page errors, the Customers tab's
+  unauthenticated gate renders correctly, and switching through all 4
+  tabs in sequence never throws. `playwright.config.ts` pins
+  `launchOptions.executablePath` to the environment's pre-installed
+  Chromium rather than letting Playwright attempt its own version-matched
+  download, per this session's environment notes.
+- **One real test-harness bug found and fixed while building the suite**:
+  the login helper did `page.goto('/')` then `page.evaluate(...
+  localStorage.setItem...)` then `page.reload()` — the reload cancels the
+  first load's in-flight `fetch()` calls mid-navigation, which surfaces
+  as spurious "Failed to fetch" console errors that look like app bugs
+  but aren't. Fixed by seeding `localStorage` via `page.addInitScript()`
+  before a single navigation instead. Documented in the test file so a
+  future contributor doesn't reintroduce the same race.
+- **Result: no app defects found.** All 4 tabs — including the Phase C
+  Customers tab — render correctly with real backend data, no console
+  errors, no crashes, and tab-switching doesn't corrupt state.
+
+### Deliberately not done in this phase
+- **No router library added.** The console remains 4 in-memory tabs via
+  `useState`, not real URLs — no deep-linking, no browser back/forward
+  between tabs, no page-refresh tab persistence. This was flagged as a
+  known gap in Phases A–C's changelog entries and remains one; adding
+  `react-router` (or similar) is a real architecture change, and doing it
+  under this phase's actual scope ("make sure it's functioning") without
+  dedicated design/testing time would be exactly the kind of
+  under-verified change the master plan warns against. Tracked as a
+  follow-up, not silently dropped.
+
+### Tests
+- `apps/admin-console/tests/smoke.spec.ts` — 6 new Playwright tests,
+  confirmed stable across 3 consecutive runs (no flakiness) once the
+  login-helper race above was fixed.
+- `apps/admin-console`'s own `npm run type-check` — clean (covers the new
+  test/config files too; confirmed the root `tsc --noEmit` still does
+  **not** cover `apps/**`, so this remains the only way to typecheck this
+  app — see Phase C's entry).
+- Full backend suite unaffected by this phase (no backend code changed):
+  399 passed, 12 pre-existing skipped, unchanged from Phase C.
+  `npm run build:all` clean.
+
+**Files changed:** `apps/admin-console/package.json` (new
+`@playwright/test` devDependency, new `test:e2e` script),
+`apps/admin-console/playwright.config.ts` (new),
+`apps/admin-console/tests/smoke.spec.ts` (new), `.gitignore` (Playwright
+artifact directories), `package-lock.json`.
+
+**This closes out the 4-phase request** (customer signup/login,
+subscription billing, developer CRM/support back office, admin console
+verification). Real, load-bearing gaps that remain across all four
+phases, for whoever picks this up next: no transactional email
+integration (Phase A/B — verification/reset tokens have no delivery path
+in production), no plan usage-limit enforcement (Phase B), and no admin
+console routing (Phase D, this entry) — none of these were silently
+dropped; each is called out explicitly in `IMPLEMENTATION_BASELINE.md`
+§4/§6.
+
+## 2026-09-09 — Developer CRM / Support Back Office (Phase C of 4)
+
+**Context:** continuation of the same 4-phase request as Phases A/B
+(below). This is Phase C — a customer list, notes, and support tickets
+for BIS staff, backend + admin console UI. Phase D (admin console
+routing/regression consolidation) is the only phase not started.
+
+### What was built
+- **Schema** (migration `0012_add_crm.sql`, applied directly to the live
+  Neon project, same hand-written/hand-applied method as 0010/0011):
+  `customer_notes` (free-text notes on an application), `support_tickets`
+  (subject/description/status/priority/requester), `ticket_comments`
+  (threaded replies on a ticket). `authorName` is a plain string rather
+  than a user FK — admin auth is still a single shared token
+  (`requireAdmin`), so there's no per-admin identity to reference.
+- **`CrmRegistry`** (`packages/database/src/crm-registry.ts`) — composes
+  `applicationRepository.findAll()` (confirmed already existed — the
+  2026-09-09 audit's finding was that no *route* exposed it, not that the
+  repository layer lacked it) with subscriptions/plans (Phase B) and the
+  new notes/tickets/comments repos into a `listCustomers()`/
+  `getCustomer()` view. **Security fix caught during review, not after**:
+  `getCustomer()` initially spread real `User` rows (which include
+  `passwordHash`) straight into the API response — TypeScript's
+  `UserSummary` interface doesn't strip that field at runtime, only an
+  explicit field whitelist does. Fixed before this was ever exercised
+  over HTTP by building a `toUserSummary()` mapper; a dedicated test
+  (`'never leaks passwordHash through getCustomer'`, at both the unit and
+  HTTP-simulation level) guards the regression.
+- **Gateway routes** (`services/api-gateway/src/app.ts`, new "DEVELOPER
+  CRM / SUPPORT BACK OFFICE" section, all `requireAdmin`-gated — same
+  single shared-secret admin auth as every other `/api/dashboard/*`
+  route): `GET /customers`, `GET /customers/:id`, `POST /customers/:id/
+  notes`, `GET /tickets` (optionally `?status=`), `GET /tickets/:id`,
+  `POST /customers/:id/tickets`, `PATCH /tickets/:id`, `POST /tickets/:id/
+  comments`.
+- **Admin console UI** (`apps/admin-console/src/components/Customers.tsx`,
+  new "Customers" tab in `App.tsx`) — a customer list (plan, subscription
+  status, user count, open ticket count) that drills into a detail view:
+  users, notes with an add-note form, and a support-ticket panel
+  (create, expand to see/add comments, one-click status change).
+  Verified in a real headless browser (Chromium via Playwright), not just
+  typecheck/build: booted the Vite dev server standalone, confirmed the
+  unauthenticated gate renders, then mocked `/api/dashboard/*` responses
+  via request interception (no live DB reachable from this environment —
+  same constraint as every other real-data verification this session) to
+  confirm the populated list, customer detail, and expanded-ticket views
+  render with zero console/page errors. Screenshots retained for this
+  session only, not committed to the repo.
+
+### Tests
+- `packages/database/src/crm-registry.test.ts` — 13 unit tests against
+  in-memory fakes, including the passwordHash-leak regression guard.
+- `packages/simulation/src/crm.simulation.test.ts` — 11 tests booting the
+  real gateway: admin-auth enforcement, full customer/note/ticket/comment
+  CRUD, ticket status → `resolvedAt`, and the same passwordHash-leak check
+  at the HTTP level.
+- Extending `packages/simulation/src/db.ts` was required again (`app.ts`
+  now also constructs a `CrmRegistry` at module load time) — including
+  adding `applicationRepository.findAll()` to the mock, which didn't
+  exist there before, and backfilling a `createdAt` field onto mock
+  application rows (several pre-existing call sites — `seedReachChurch`,
+  the `ApplicationRegistry`/`AuthRegistry` mocks' own app-creation paths —
+  never set one; defaulted lazily in the two read paths that now need it
+  rather than touching every writer).
+- Full suite: 411 total (399 passed, 12 pre-existing skipped) — confirmed
+  3x consecutive runs, 0 failures. Lint (0 errors — including the new
+  `Customers.tsx`, zero findings), `apps/admin-console`'s dedicated
+  `type-check` script (clean — the root `tsc --noEmit` does **not** cover
+  `apps/**/*.tsx`, so this had to be run separately), and
+  `npm run build:all` all clean.
+
+**Files changed:** `packages/database/drizzle/0012_add_crm.sql` (new),
+`packages/database/drizzle/meta/_journal.json`, `packages/database/src/
+schema/{customer-notes,support-tickets,ticket-comments,index}.ts` (3
+new), `packages/database/src/repositories/{customer-notes,support-
+tickets,ticket-comments,index}.ts` (3 new), `packages/database/src/
+crm-registry.ts` (new) + `.test.ts` (new), `packages/database/src/
+repositories/applications.ts` (no change needed — `findAll()` already
+existed), `packages/database/src/index.ts`,
+`services/api-gateway/src/app.ts`, `packages/simulation/src/db.ts`,
+`packages/simulation/src/crm.simulation.test.ts` (new),
+`apps/admin-console/src/components/Customers.tsx` (new),
+`apps/admin-console/src/App.tsx`.
+
+## 2026-09-09 — Subscription Billing: Plans, Stripe Subscriptions (Phase B of 4)
+
+**Context:** continuation of the same 4-phase request as Phase A (below).
+This is Phase B — subscription/billing for the platform's own customers
+(the businesses that hold an application). Phases C (CRM/support back
+office) and D (admin console consolidation) are not started yet.
+
+### What was built
+- **Schema** (migration `0011_add_subscriptions.sql`, applied directly to
+  the live Neon project, same hand-written/hand-applied method as
+  migration 0010 and for the same reason — see that entry): new `plans`
+  table (slug, price, interval, soft usage limits, an optional
+  `stripe_price_id` for when a plan has a live-mode Stripe Price) and
+  `subscriptions` table (one row per application; `stripe_customer_id`/
+  `stripe_subscription_id`, period dates, `cancel_at_period_end`).
+  Seeded with 3 placeholder plans (Starter/Growth/Enterprise) —
+  **placeholder pricing for a real billing mechanism, not a business
+  decision about actual prices**; whoever owns pricing should update these
+  rows before this is used for real billing. Confirmed via `run_sql`
+  before applying that this was a genuinely new, empty pair of tables.
+- **Stripe Billing HTTP client + `SubscriptionRegistry`**
+  (`packages/database/src/subscription-registry.ts`) — a *different*
+  Stripe object graph than `packages/providers/src/adapters/payments/
+  stripe.ts` (which only calls the one-off Charges API): Customers,
+  Subscriptions, cancellation. Facts verified via WebSearch against
+  Stripe's current API reference (2026-09-09), not memory — endpoint
+  paths/params for creating a customer and a subscription, and
+  specifically that `DELETE /v1/subscriptions/{id}` cancels immediately
+  while `POST /v1/subscriptions/{id}` with `cancel_at_period_end: true`
+  schedules cancellation (a real, easy-to-get-backwards distinction).
+  Not verified against a live Stripe account. Same real-HTTP +
+  simulated-fallback philosophy as every provider adapter: without
+  `STRIPE_SECRET_KEY` (or when a plan has no `stripePriceId` yet), it
+  fabricates a `sim_sub_`-prefixed subscription with a real
+  period-end date computed from the plan's interval — never a fabricated
+  "real" Stripe id. No retry/backoff logic (unlike `BaseProvider.
+  http_request`, which the payment adapters get for free) — a deliberate
+  scope cut, not an oversight.
+- **Gateway routes** (`services/api-gateway/src/app.ts`, new
+  "SUBSCRIPTIONS / BILLING" section): `GET /v1/api/billing/plans` (public),
+  `GET /subscription`, `POST /subscribe`, `POST /cancel` (all
+  session-authed via Phase A's `requireSession`), and
+  `POST /webhooks/stripe`.
+- **Real Stripe webhook signature verification** — the billing webhook
+  route verifies the actual `Stripe-Signature` header (`t=<unix>,
+  v1=hex_hmac_sha256(`${t}.${rawBody}`, secret)`, 5-minute tolerance),
+  verified via WebSearch against Stripe's docs, **not** the platform's
+  pre-existing generic `WEBHOOK_HMAC_SECRET` scheme used by
+  `/v1/api/webhooks/:provider` — that scheme only ever checks against this
+  platform's own signing convention and would reject every genuine Stripe
+  delivery, so reusing it here would have shipped a webhook endpoint that
+  cannot actually receive real Stripe events. Required capturing the raw
+  request body (`express.json()`'s `verify` callback, stashed as
+  `req.rawBody`) since Stripe's signature is computed over the exact raw
+  bytes, not a re-serialized `JSON.stringify(req.body)`.
+- `.env.example`: `STRIPE_BILLING_WEBHOOK_SECRET` (reuses the existing
+  `STRIPE_SECRET_KEY`for the API calls themselves).
+- `docs/openapi.yaml`: new `Billing` tag and full path/schema definitions
+  for all 5 routes.
+
+### Tests
+- `packages/database/src/subscription-registry.test.ts` — 15 unit tests
+  against in-memory fakes (plan listing, subscribe/simulated-fallback,
+  unknown application/plan rejection, plan-change updates the same row,
+  immediate vs. scheduled cancellation, `syncFromStripeEvent` for all 3
+  handled event types plus unrecognized-event and unknown-subscription
+  no-ops).
+- `packages/simulation/src/billing.simulation.test.ts` — 12 tests booting
+  the real gateway, including a full HMAC round-trip: signing a payload
+  with `createHmac('sha256', ...)` exactly as Stripe's algorithm specifies
+  and confirming the real route accepts it and rejects a bad one.
+- Extending `packages/simulation/src/db.ts` was required again, same
+  reason as Phase A — `app.ts` now also constructs a `SubscriptionRegistry`
+  at module load time.
+- Full suite: 384 total (372 passed, 12 pre-existing skipped) — confirmed
+  3x consecutive runs, 0 failures. Lint (0 errors), typecheck, and
+  `npm run build:all` all clean.
+
+**Files changed:** `packages/database/drizzle/0011_add_subscriptions.sql`
+(new), `packages/database/drizzle/meta/_journal.json`,
+`packages/database/src/schema/{plans,subscriptions,index}.ts` (2 new),
+`packages/database/src/repositories/{plans,subscriptions,index}.ts` (2
+new), `packages/database/src/subscription-registry.ts` (new) + `.test.ts`
+(new), `packages/database/src/index.ts`, `services/api-gateway/src/app.ts`,
+`packages/simulation/src/db.ts`, `packages/simulation/src/
+billing.simulation.test.ts` (new), `docs/openapi.yaml`, `.env.example`.
+
+**Known gap carried into Phase C/D:** plan limits (`messageLimit`,
+`paymentVolumeLimitCents`) are stored but **not enforced anywhere** — a
+`starter`-plan application can send unlimited messages today. Enforcement
+would need to hook into the routing engine or gateway request path and
+wasn't in scope for standing up the billing mechanism itself.
+
+## 2026-09-09 — Customer Account Auth: Signup/Login (Phase A of 4)
+
+**Context:** user asked for four things in one request — (1) subscription
+setups for customers, (2) signup/login authentication, (3) a full
+developer-facing CRM/support back office, and (4) making sure the admin
+console works. A prior read-only audit confirmed all four were either
+fully absent or (for the admin console) healthy but minimal — see that
+audit's findings folded into §1/§2/§3 of `IMPLEMENTATION_BASELINE.md`
+below. Given the scope, this is being delivered as four sequenced,
+independently-tested phases rather than partial work spread across all
+four; this entry is Phase A. Phases B (subscriptions/billing), C
+(CRM/support back office), and D (admin console consolidation) are not
+started yet.
+
+**What "customer" means here:** the businesses that hold a BIS Platform
+application (Reach Church, HaulPro, Afribook) — i.e. this platform's own
+developer/business customers self-provisioning API access — not the
+end-consumers those businesses message/charge. This reuses the existing
+`users` table (scoped to one `applicationId`), which existed in schema
+only, with zero production usage anywhere in the codebase before this
+change (confirmed by the audit).
+
+### What was built
+- **Schema** (migration `0010_add_user_auth.sql`, applied directly to the
+  live Neon project `orange-water-80452818` — hand-written and
+  hand-applied via `run_sql_transaction`, not `drizzle-kit generate`,
+  because this repo's migration history is already known to have drifted
+  from the schema on disk (see the 2026-09-08 "Drizzle Migration History
+  Has Diverged" entry below) and generating against it produces unsafe
+  interactive rename-vs-new-column guesses):
+  - `users.role_id` (nullable FK → `roles.id`) — connects the previously
+    dead `roles`/`permissions` tables to something real: signup creates an
+    "Owner" role (full-access, `resource: '*', action: '*'`) for the new
+    application and assigns it to the first user.
+  - A new global unique index on `users.email` (signup/login take no
+    application context from the caller — "one signup creates one
+    application" is this platform's self-serve model). Safe to add: the
+    table had 4 pre-existing rows (old manual QA data), all distinct
+    emails, verified via `run_sql` before applying.
+  - New tables `user_sessions` (opaque, hashed, revocable session
+    tokens — same design as `application_api_keys`, not a JWT, so
+    logout/password-reset can invalidate a session immediately) and
+    `user_verification_tokens` (single-use tokens shared by email
+    verification and password reset, distinguished by a `purpose` column).
+- **Crypto** (`packages/database/src/crypto.ts`): `hashPassword`/
+  `verifyPassword` (scrypt, random salt per password — this module already
+  used `scryptSync` for the secret-encryption key, so this is consistent
+  with existing dependencies, no new npm package); `hashToken` (sha256,
+  generalized from the existing `hashApiKey`) plus `generateSessionToken`/
+  `generateVerificationToken` for opaque revocable tokens, same shape as
+  the existing `generateApiKey`.
+- **`AuthRegistry`** (`packages/database/src/auth-registry.ts`) — same
+  dependency-injected registry pattern as `ApplicationRegistry`/
+  `TenantRegistry`: `signup` (creates the application + Owner role + user
+  in one call, via `ApplicationRegistry.createApplication`), `login`
+  (generic "Invalid email or password" for both wrong-password and
+  unknown-email, to avoid account enumeration; lockout after 5 failed
+  attempts for 15 minutes, using the `failedLoginAttempts`/`lockedUntilAt`
+  columns that already existed on `users` but were never wired to
+  anything), `logout`, `verifySession`, `requestPasswordReset`/
+  `resetPassword` (resetting revokes every existing session for the
+  account), `resendEmailVerification`/`verifyEmail`.
+- **Gateway routes** (`services/api-gateway/src/app.ts`, new "CUSTOMER
+  ACCOUNT AUTH" section): `POST /v1/api/auth/signup`, `/login`, `/logout`,
+  `GET /me`, `POST /verify-email`, `/resend-verification`,
+  `/request-password-reset`, `/reset-password`. Distinct from the
+  existing per-application API-key auth (`mw.apiKey`, used by
+  `/v1/api/gateway/*`) and the single shared-secret admin auth
+  (`requireAdmin`, used by `/api/dashboard/*`) — this is a third,
+  person-level auth surface. Rate-limited by the existing
+  `app.use('/v1/api', mw.rateLimit)` (keyed by IP for these routes, since
+  they carry no API key yet).
+- **Known, explicitly-labeled gap:** no transactional email sending was
+  built (would need a real SMTP/SES/Postmark/etc. integration and
+  credentials this session doesn't have). Email verification and password
+  reset tokens are surfaced directly in the API response, but *only
+  outside production* (`NODE_ENV !== 'production'`) — never fabricated as
+  "emailed" when they weren't. In production these endpoints currently
+  have no way to deliver the token to the user; wiring a real email send
+  is required before this phase is production-usable end to end.
+- **`docs/openapi.yaml`**: new `Auth` tag, `sessionAuth` security scheme
+  (distinct from the existing `bearerAuth` API-key scheme), and full path
+  definitions for all 8 routes — intentionally lighter-weight (inline
+  schemas, no per-error-code component refs) than the `Payments`/
+  `Messages` sections, to fit this phase's scope.
+
+### Tests
+- `packages/database/src/auth-registry.test.ts` — 22 unit tests against
+  in-memory fakes (signup validation/conflict, login success/failure/
+  lockout/enumeration-resistance, session verify/logout/expiry, password
+  reset end-to-end including session revocation, email verification
+  including reuse rejection).
+- `packages/simulation/src/auth.simulation.test.ts` — 14 tests that boot
+  the **real gateway** (`services/api-gateway/src/app.ts`, unmodified)
+  against the in-memory Neon double and exercise every route over real
+  HTTP, including confirming a signup-issued API key actually authenticates
+  against `/v1/api/gateway/*`, and that `dbState.users` gets a real row
+  with a non-plaintext password hash.
+- Extending `packages/simulation/src/db.ts` (the shared in-memory Neon
+  double used by ~30 other simulation test files) to support the new
+  repos/`AuthRegistry` was **required, not optional** — `app.ts` now
+  imports `AuthRegistry` and constructs one at module load time, so every
+  existing simulation test that boots the gateway would otherwise crash
+  immediately with "No AuthRegistry export is defined on the mock" (this
+  was caught by actually running the existing suite mid-change, not
+  assumed safe).
+- Full suite: 343 passed, 12 pre-existing skipped (unrelated integration
+  tests needing live DB/network) — confirmed 3x consecutive runs, 0
+  failures. Lint (0 errors), typecheck, and `npm run build:all` all clean.
+- **Not tested in this session**: an actual HTTP request against the real
+  Neon database — this environment's own app process still cannot reach
+  `api.c-2.us-east-2.aws.neon.tech` (403, host not in the network
+  allowlist), the same constraint documented in the 2026-09-08 "Attempted:
+  Real Provider Adapters — Blocked by Network Policy" entry. The migration
+  itself *was* applied to and verified against the real Neon project via
+  the Neon MCP tools, which are unaffected by that restriction.
+
+**Files changed:** `packages/database/drizzle/0010_add_user_auth.sql`
+(new), `packages/database/drizzle/meta/_journal.json`,
+`packages/database/src/schema/{users,user-sessions,user-verification-tokens,index}.ts`,
+`packages/database/src/repositories/{users,user-sessions,user-verification-tokens,roles,index}.ts`,
+`packages/database/src/crypto.ts`, `packages/database/src/auth-registry.ts`
+(new) + `.test.ts` (new), `packages/database/src/index.ts`,
+`services/api-gateway/src/app.ts`, `packages/simulation/src/db.ts`,
+`packages/simulation/src/auth.simulation.test.ts` (new),
+`docs/openapi.yaml`, `.env.example`.
+
+## 2026-09-09 — Real Provider Adapters: Sinch + Vibes
+
+**Phase:** 6 of the master plan (continued). User-requested addition of two
+more messaging providers, given their public documentation URLs
+(`sinch.com/messaging/sms-api/send-sms`, `developer.vibes.com`).
+
+**How the facts were verified:** Same method as the Infobip/Africa's
+Talking entry below — `WebFetch` is blocked for both `sinch.com` and
+`developer.vibes.com` (confirmed `EGRESS_BLOCKED`), so all facts came from
+`WebSearch` result snippets and their source URLs, gathered 2026-09-09.
+Neither adapter has been tested against a live account — no credentials
+were available in this session.
+
+### Sinch (net-new: `packages/providers/src/adapters/messaging/sinch.ts`)
+Confidence level: comparable to Infobip/Africa's Talking — multiple
+corroborating search results for the endpoint, auth, and request/response
+shapes.
+- `POST https://{region}.sms.api.sinch.com/xms/v1/{SINCH_SERVICE_PLAN_ID}/batches`
+  (the "Batches" endpoint of Sinch's SMS API), `Authorization: Bearer
+  {SINCH_API_TOKEN}`. `SINCH_REGION` selects `us` (default) or `eu` — Sinch
+  serves SMS from regional endpoints, not a single global one.
+- Request: `{ from, to: [recipient], body: content }`
+- Success response: `{ id, to, from, body, canceled, created_at,
+  modified_at }` — `canceled: false` only confirms Sinch *accepted* the
+  batch, not delivery; per-recipient delivery status arrives later via a
+  webhook this session did not build, so it is never fabricated here.
+  `canceled: true` is reported as a real failure.
+- Error envelope: `{ code, text }`, parsed into the real error message.
+- Same simulated-fallback pattern as the other real adapters when
+  `SINCH_API_TOKEN`/`SINCH_SERVICE_PLAN_ID` are unset.
+- Registered with `countries: ['*']` (Sinch is a global Tier-1 SMS
+  aggregator, same treatment as Infobip).
+- 7 new contract tests (`sinch.test.ts`): simulated fallback makes no HTTP
+  call; real request shape/URL/region is correct; `canceled: true` is
+  reported as failed, not success; the documented error envelope is
+  parsed; a malformed response (no batch id) fails cleanly; the `eu`
+  region routes to the eu endpoint; `status: offline` short-circuits.
+
+### Vibes (net-new: `packages/providers/src/adapters/messaging/vibes.ts`)
+**Lower confidence than every other real adapter in this platform** — the
+class-level comment in `vibes.ts` documents this in detail and should be
+read before trusting or extending the adapter further. Search snippets for
+Vibes were noticeably thinner than for the other three real providers.
+- CONFIRMED: base URL `https://messageapi.vibesapps.com` (US/Canada SMS);
+  HTTP Basic auth (`base64(email:password)`); `Content-Type: text/xml`
+  required; XML vocabulary `mtMessage`/`submitterMessageId`/`destination`/
+  `source`/`text`.
+- **NOT CONFIRMED, and handled defensively rather than guessed**: the
+  exact submit path (`/MessageApi/mt/messages` is inferred from a
+  documented URL *pattern* plus a sibling GET path, not observed against
+  an actual submit example); the `destination`/`source` `type` attribute
+  (omitted entirely rather than risk a wrong value); the response XML
+  schema for the returned message ID (parsed defensively for a
+  `messageId`/`message_id` attribute or element; returns failure, never a
+  fabricated ID, if nothing plausible is found); the error response
+  format.
+- `packages/providers/src/base.ts`'s shared `http_request()` was extended
+  to pass a pre-serialized string body through as-is (needed for Vibes'
+  XML) instead of always `JSON.stringify`-ing — backward compatible, every
+  existing JSON-object caller is unaffected.
+- Same simulated-fallback pattern when `VIBES_USERNAME`/`VIBES_PASSWORD`
+  are unset.
+- Registered with `countries: ['US', 'CA']` only, matching the *confirmed*
+  scope of the base URL — deliberately not `['*']` given the lower
+  confidence here.
+- 6 new contract tests (`vibes.test.ts`): simulated fallback makes no HTTP
+  call; real XML request/headers/auth are correct; a `message_id` element
+  is parsed as a fallback response shape; a non-2xx response fails; an
+  unparseable response fails cleanly without fabricating a message id;
+  `status: offline` short-circuits.
+
+**Adding a 17th and 18th provider required the same test bookkeeping as
+the Africa's Talking addition** — `providerRegistry.test.ts`/
+`management.test.ts` (16→18 total, 6→8 messaging), and every
+simulation/routing test enumerating "all SMS-capable providers"
+(`routing.test.ts`, `application-certification.simulation.test.ts`,
+`resilience-failure.simulation.test.ts`,
+`messaging-conversation.simulation.test.ts`), including the "all SMS
+providers offline" gap tests that must now take both new providers
+offline too for the assertion to hold. Registration-order-dependent
+failover tests (e.g. signalhouse → infobip) are unaffected — both new
+providers are registered after infobip.
+
+**Database migrations:** none
+
+**API changes:** none (adapter-internal)
+
+**Security changes:** none
+
+**Tests:** full suite 316 (304 passed, 12 pre-existing skipped —
+integration tests requiring live DB/network) — net +13 new (7 Sinch + 6
+Vibes) — confirmed 3x consecutive full-suite runs, 0 failures.
+Lint/typecheck/build clean.
+
+**Known issues carried forward:** Vibes' exact submit path and response
+schema are inferred, not observed — do not treat it as production-ready
+without verifying against a live Vibes sandbox account or the actual
+documentation pages. SignalHouse, FutureSMS, generic SMS, and Email
+adapters remain fully simulated. All payment adapters except Stripe
+(partially real) remain simulated. Neither Sinch nor Vibes has been
+tested against a live account.
+
+---
+
+## 2026-09-08 — Real Provider Adapters: Infobip + Africa's Talking
+
+**Phase:** 6 of the master plan. The single largest previously-open gap:
+every messaging adapter was fully simulated (fabricated message IDs,
+always-success responses, no HTTP call at all).
+
+**How the facts were verified, and what that means for confidence
+level:** `WebFetch` (direct page retrieval) is blocked in this session —
+confirmed via `infobip.com` and, as a control, an unrelated well-known
+domain, both `EGRESS_BLOCKED`. `WebSearch` is *not* blocked and returns
+real, current search-result snippets with source URLs (not training-data
+memory). Several targeted queries per provider established: exact
+endpoint path, auth header format, request body shape, success response
+shape, error envelope shape, and (for Infobip) delivery-status group
+names. Every fact used in the adapters below is traceable to a specific
+search result, not inferred or remembered. **What this is not**: a page
+fetched and read in full, or a live account tested against. Both
+adapters remain unverified against a real Infobip/Africa's Talking
+account — no credentials were available in this session. Treat as "built
+from real, current, but partial documentation," not "certified."
+
+### Infobip (`packages/providers/src/adapters/messaging/infobip.ts` — rewritten)
+- `POST https://{INFOBIP_BASE_URL}/sms/3/messages`,
+  `Authorization: App {INFOBIP_API_KEY}`
+- Request: `{ messages: [{ sender, destinations: [{to}], content: {text} }] }`
+- Success response: `{ bulkId, messages: [{ messageId, status: {groupId,
+  groupName, id, name, description}, to }] }` — only reports platform
+  `status: 'success'` when `groupName !== 'REJECTED'`; a 2xx HTTP response
+  can still carry a per-message rejection, and that's never reported as a
+  fabricated success.
+- Error envelope: `{ requestError: { serviceException: { messageId, text } } }`
+  — parsed into a real error message, not a generic "request failed" string.
+- **Falls back to the pre-existing simulated behavior when
+  `INFOBIP_API_KEY`/`INFOBIP_BASE_URL` aren't configured** — matches the
+  established pattern already in `adapters/payments/stripe.ts` (the only
+  adapter with any prior real-HTTP logic). This is why every existing test
+  continues to pass unmodified: nothing in this environment configures
+  these vars, so behavior is unchanged for all of them.
+- 7 new contract tests (`infobip.test.ts`, `vi.stubGlobal('fetch', ...)`):
+  simulated fallback makes no HTTP call; real request shape (URL, auth
+  header, body) is correct; REJECTED-in-a-200 is reported as failed, not
+  success; the documented error envelope is parsed; a malformed response
+  (no messages array) fails cleanly instead of fabricating a message ID;
+  5xx responses actually retry (via `BaseProvider.http_request`'s existing
+  retry logic) before failing; `status: offline` short-circuits before any
+  HTTP call.
+
+### Africa's Talking (net-new: `packages/providers/src/adapters/messaging/africastalking.ts`)
+Explicitly named as a priority provider in master plan Phase 16. Did not
+exist before this session — no adapter file, no registry entry, no env
+vars.
+- `POST {baseUrl}/version1/messaging` where `baseUrl` is
+  `https://api.africastalking.com` (live) or
+  `https://api.sandbox.africastalking.com` (test) — **driven by the
+  provider's registered `environment` field** (an existing first-class
+  concept in this registry), not a new env var.
+- Headers: `apiKey: {AFRICASTALKING_API_KEY}`, `Accept: application/json`
+- Request: `{ username, to, message, from? }` (JSON — confirmed
+  Africa's Talking accepts JSON as an alternative to its classic
+  form-urlencoded format)
+- Success response: `{ SMSMessageData: { Message, Recipients: [{
+  statusCode, number, status, cost, messageId }] } }` — only reports
+  platform `status: 'success'` when the recipient's `status === 'Success'`
+  exactly; every other status string (`InsufficientBalance`,
+  `InvalidPhoneNumber`, etc.) is a real provider-reported rejection,
+  surfaced as the `error` field verbatim rather than paraphrased or
+  mapped to a guessed enum.
+- Same simulated-fallback pattern as Infobip when credentials are unset.
+- Registered in `packages/providers/src/registry.ts` with the countries
+  Africa's Talking's own documentation confirms it serves for SMS: KE,
+  UG, TZ, RW, MW, NG, ZM, CI, ET, GH, ZA (not guessed, not copied from
+  another provider's list — this repo's own audit history flagged
+  exactly that mistake once already, for SignalHouse/Malawi).
+- `.env.example`: `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`.
+- 7 new contract tests (`africastalking.test.ts`), same coverage shape as
+  Infobip's, plus a dedicated test that `environment: 'test'` routes to
+  the sandbox base URL.
+
+**Adding a 16th provider required updating tests that hard-coded provider
+counts/lists** — not a design change, just consistency bookkeeping:
+`providerRegistry.test.ts`/`management.test.ts` (15→16 total, 5→6
+messaging), and every simulation/routing test that enumerates "all
+SMS-capable providers" for either a `toContain` assertion or an
+offline-toggle loop (`routing.test.ts`,
+`application-certification.simulation.test.ts`,
+`resilience-failure.simulation.test.ts`,
+`messaging-conversation.simulation.test.ts`) — the same class of
+maintenance the `example-msg` flakiness fix earlier this session required,
+now handled proactively instead of discovered via a flaky run. Verified
+provider-selection/failover tests that depend on *registration order*
+(e.g. "signalhouse fails over to infobip") are unaffected, since
+Africa's Talking was inserted after both in `registry.ts` and this
+platform's failover is single-level-by-order, not exhaustive.
+
+**Database migrations:** none
+
+**API changes:** none (adapter-internal; the gateway's public contract is
+unchanged)
+
+**Security changes:** none
+
+**Tests:** `npm test` 284 (net +14 new: 7 Infobip + 7 Africa's Talking) —
+confirmed 3x consecutive full-suite runs, 0 failures. Lint/typecheck/build
+clean.
+
+**Known issues carried forward:** SignalHouse, FutureSMS, generic SMS,
+and Email adapters remain fully simulated (SignalHouse's docs weren't
+usefully indexed by search — confirmed by trying, rather than assumed).
+All payment adapters (Stripe partially real already; NMI, Flutterwave,
+PawaPay, PayChangu, Airwallex) remain simulated. Trembi not attempted —
+net-new provider, no search results attempted yet. Neither new adapter
+has been tested against a live account.
+
+## 2026-09-08 — Neon Database Connected — Corrected Migration-Drift Diagnosis
+
+Per the user's request, connected to the project's existing Neon
+database (`bis-api-platform`, project `orange-water-80452818`, a real,
+actively-used project — not a throwaway) via the Neon MCP connector.
+
+**Important environment finding, for future sessions:** the MCP
+`mcp__Neon__*` tools work in this session, but the application's own
+database driver (`@neondatabase/serverless`, used by `getDb()` /
+`DATABASE_URL`) does **not** — it makes an HTTP call to
+`api.c-2.us-east-2.aws.neon.tech`, which this session's egress proxy
+rejects with `403 Host not in allowlist`. Confirmed by actually running
+`npm run test:integration` with `DATABASE_URL` set: every test failed
+with that exact error, not a test failure. **Practical consequence**:
+`npm run test:integration` / any code path that calls `getDb()` cannot
+be exercised end-to-end in this environment even with a real
+`DATABASE_URL` configured — only the `mcp__Neon__*` tools (which route
+through different infrastructure) can reach this database from here.
+Verification in this entry was done via `mcp__Neon__run_sql`, not by
+running the repository's own test suite against the DB.
+
+**Corrected the earlier migration-drift diagnosis** (see the HIGH entry
+above from earlier this session, and `docs/IMPLEMENTATION_BASELINE.md`
+§4 item 12) by actually inspecting the live schema:
+- `tenants`, `conversations`, and `tenant_application_links` **all
+  already match the current TypeScript schema exactly** in the live
+  database — column-for-column, index-for-index. The earlier entry's
+  claim that `0000_drizzle_init.sql`'s older `tenants` shape represented
+  live risk was wrong; that migration was superseded by something (see
+  next point) long before now, and the live table is correct.
+- `drizzle.__drizzle_migrations` (the live tracking table) has entries
+  for 11 migrations; this repo's `_journal.json` only accounts for 8
+  (0000–0007) plus the 2 added this session (0008–0009, applied directly
+  via SQL, not through this table's normal flow). **Migrations 9–11 in
+  the live tracking table have no corresponding file in this repo at
+  all** — someone applied schema changes directly to this database
+  (almost certainly via `drizzle-kit push`, not `drizzle-kit migrate`)
+  without committing what they ran.
+- Two tables exist in the live database with **no schema file anywhere
+  in the current codebase**: `checkout_sessions` and `webhook_jobs`.
+  Neither is referenced by any current repository or test. Orphaned —
+  either superseded by `transactions`/`outbox_events` or from a different
+  branch/prototype that never merged. Not touched.
+- `tenant_application_links` specifically (the table backing
+  `TenantRegistry.assertTenantAccess`, i.e. the actual gateway
+  tenant-isolation check) was independently double-checked against
+  `packages/database/src/schema/tenant-application-links.ts` — they
+  match exactly. The `&&` bug fixed earlier this session was a pure
+  query-logic bug in the repository layer, not a schema mismatch.
+
+**Empirically proved the `&&` bug's severity against real data** (not
+just JS-semantics reasoning): created two temporary applications, two
+temporary tenants, and links `(tenant1→app1)` and `(tenant2→app2)` only
+— `tenant1` was never linked to `app2`. Ran the OLD buggy query pattern's
+real SQL equivalent (`WHERE application_id = app2` — the tenant_id
+condition `&&`-chaining silently dropped) alongside the fixed pattern
+(`WHERE tenant_id = tenant1 AND application_id = app2`) against the same
+live table: **buggy pattern returned 1 row (would have granted access),
+fixed pattern returned 0 rows (correctly denies it)**. All test data
+deleted immediately after — verified zero leftover rows.
+
+**Applied `0008_add_consent_records.sql` and `0009_add_messaging_profiles.sql`
+to the live database** (via `mcp__Neon__run_sql`, statement-by-statement —
+the Neon HTTP driver rejects multi-statement calls) since `drizzle-kit
+migrate` can't be trusted here (see the drift finding above). Verified
+each new table with a real insert + select round-trip, then deleted the
+smoke-test rows. Did **not** attempt to reconcile
+`drizzle.__drizzle_migrations` for these two migrations — inserting a
+fabricated hash for them risks confusing a future real `drizzle-kit
+migrate` run worse than leaving it alone; the table was already missing
+3 unrelated migrations before this session touched anything.
+
+**Files changed:** none in the repository (database-only investigation
+and additive schema changes, executed directly against Neon via MCP
+tools, not through this repo's migration tooling)
+
+**What remains open:** reconciling `drizzle/meta/*.json` snapshots (or
+abandoning migration-file generation in favor of `drizzle-kit push` as
+the documented deployment method) and identifying/removing or
+documenting `checkout_sessions`/`webhook_jobs` — both still require a
+human decision on approach, not just more investigation.
+
+---
+
+## 2026-09-08 — Attempted: Real Provider Adapters — Blocked by Network Policy
+
+Before starting other work this session, attempted to fetch Infobip's SMS
+API documentation (`infobip.com`) to begin replacing the simulated
+adapter with a real HTTP integration per master plan Phase 6. It failed
+with `EGRESS_BLOCKED`. As a control, fetched an unrelated, well-known
+documentation domain (`developers.google.com`) — same failure — confirming
+this session's outbound network access is restricted to a small
+allowlist (package registries, the Anthropic API) rather than
+Infobip specifically being unreachable.
+
+Writing "real" adapters from training-data memory of these APIs instead
+of verified current documentation would risk exactly the
+fabricated-request/response-contract problem the master plan explicitly
+prohibits ("Do not guess API payloads," "Official developer documentation
+must be treated as the source of truth"), so this was not attempted.
+Pivoted to other work this session that doesn't depend on external
+network access. Real provider adapters remain the single largest gap
+against the master plan's stated non-negotiables — see
+`docs/IMPLEMENTATION_BASELINE.md` §6 item 1 for what's needed to unblock
+it (network access for this session, or the docs/OpenAPI specs supplied
+directly).
+
+**Files changed:** none
+
+## 2026-09-08 — Phase 26: Startup Configuration Validation
+
+**Phase:** 26 of the master plan.
+
+**What it does:** both `services/api-gateway` and `services/worker` now
+validate required configuration before doing anything else and
+`process.exit(1)` with an itemized error list if it's invalid, instead of
+starting up and letting the problem surface request-by-request later.
+Verified end-to-end, not just via unit test: actually ran the gateway
+entrypoint (`ts-node --transpile-only src/index.ts`) with
+`NODE_ENV=production` and no other config set — exited 1, printed all
+four missing-var errors, never attempted to bind the port.
+
+**What's validated:**
+- `DATABASE_URL` — always required (every repository call fails without
+  it, in every environment, not just production).
+- In production only: `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY`,
+  `PLATFORM_ADMIN_KEY` — each of these already fails closed at request
+  time when missing (webhooks rejected, secret encryption broken, admin
+  routes all reject); this phase doesn't change that runtime behavior, it
+  just catches the same problem at boot instead of via a stream of
+  request failures.
+- Deliberately **not** validated: `REDIS_URL`. Both the rate limiter
+  (`services/api-gateway/src/auth.ts`) and the job store
+  (`packages/workers/src/client.ts`) already have a working in-memory
+  fallback when it's unset — a legitimate (if reduced-durability)
+  deployment choice, not a misconfiguration.
+- Deliberately **not** validated: any provider API key (e.g.
+  `SIGNALHOUSE_API_KEY`). Every current provider adapter is simulated and
+  never reads its own API key — validating a key nothing checks would be
+  hollow, matching the master plan's own instruction not to make things
+  "appear production-ready" without substance. This becomes real once
+  real adapters land (currently blocked, see the entry above).
+
+**Files changed:**
+- `packages/shared/src/startup-config.ts` (new) — `validateStartupConfig()`
+  (pure, testable) and `assertStartupConfig()` (validates + exits)
+- `packages/shared/src/startup-config.test.ts` (new) — 8 unit tests
+- `packages/shared/src/index.ts` — exports the above
+- `services/api-gateway/src/index.ts` — calls `assertStartupConfig()`
+  before importing `./app` (so an invalid config never even constructs
+  the Express app). Deliberately **not** added to `app.ts` itself — the
+  simulation test harness imports `app.ts` directly and constructs its
+  own environment; forcing it through this check would break every
+  simulation test that doesn't happen to set all of these vars.
+- `services/worker/src/index.ts` — calls it as the first line of `main()`
+- `services/worker/package.json` — added `@company/shared` (already used
+  by `services/api-gateway`, newly needed here)
+
+**Database migrations:** none
+
+**API changes:** none (process-startup behavior only)
+
+**Security changes:** none beyond making existing fail-closed behavior
+visible earlier
+
+**Tests:** `npm test` 269 → 277 passed (8 new), 0 failed. Lint/typecheck/
+build clean. Also manually verified the real process exit behavior
+(described above), not just the extracted function.
+
+## 2026-09-08 — Phase 40/41: A2P/10DLC Messaging Profiles (Registration CRUD)
+
+**Phase:** 40/41 (A2P/10DLC compliance model) of the master plan.
+
+**Scope of this pass, stated plainly:** this adds the `MessagingProfile`
+registration record from master plan §41 and a CRUD surface for it. It
+does **not** enforce `complianceStatus` against outbound sends (an
+unregistered or rejected sender can still send messages today — nothing
+in `RoutingEngine` checks this table) and does **not** integrate with any
+real carrier/registrar API to verify registration automatically. Building
+those is real, separate follow-up work; this phase is the foundation they
+would build on, not a claim that A2P/10DLC compliance is "done."
+
+**Files changed:**
+- `packages/database/src/schema/messaging-profiles.ts` (new) —
+  `messaging_profiles` table: `(appId, tenantId, country, senderType,
+  sender, provider, campaignId?, brandId?, complianceStatus)`, matching
+  the master plan's `MessagingProfile` interface. `senderType` ∈
+  `{phone, 10dlc, tollfree, shortcode, alphanumeric}`, `complianceStatus`
+  ∈ `{unregistered, pending, approved, rejected, suspended}`. Unique per
+  `(appId, tenantId, sender, provider)`.
+- `packages/database/drizzle/0009_add_messaging_profiles.sql` (new,
+  hand-authored per the migration-drift entry above) + journal entry.
+  Verified with `drizzle-kit check`.
+- `packages/database/src/repositories/messaging-profiles.ts` (new) —
+  `findById`, `findBySender`, `findByApplicationId`, `create` (validates
+  `senderType`/`complianceStatus` before touching the database),
+  `updateComplianceStatus`, `count`.
+- `packages/database/src/repositories/messaging-profiles.test.ts` (new) —
+  5 DB-free unit tests for the validation logic, which runs before
+  `getDb()` is ever called.
+- `services/api-gateway/src/app.ts` — `POST`/`GET
+  /v1/api/gateway/messaging-profiles` (app registers/lists its own
+  senders, scoped under new `messaging-profiles:read`/`:write` API-key
+  scopes) and admin `PATCH /api/dashboard/messaging-profiles/:id` (ops
+  transitions `complianceStatus` after real-world registration/approval —
+  intentionally admin-only, since that's a real-world fact the platform
+  can't self-certify).
+- `packages/simulation/src/db.ts` — real (not stubbed) mock repository,
+  including the same validation as the real one (duplicated intentionally
+  — this mock stands in for the whole `@company/database` module).
+- `packages/simulation/src/messaging-profiles.simulation.test.ts` (new) —
+  6 tests: register + list via HTTP, missing-field and invalid-senderType
+  rejection, tenant/app data isolation, and the admin compliance-status
+  transition workflow (`unregistered` → `pending` → `approved`) exercised
+  directly against the repository.
+
+**Database migrations:** `0009_add_messaging_profiles.sql` (new table)
+
+**API changes:** `GET`/`POST /v1/api/gateway/messaging-profiles`,
+`PATCH /api/dashboard/messaging-profiles/:id`
+
+**Security changes:** none beyond standard API-key scoping + admin gating
+on the new routes
+
+**Tests:** `npm test` 257 → 269 passed (11 net new: 6 simulation + 5 unit),
+0 failed. Lint/typecheck/build clean.
+
+**Known issues carried forward:** no enforcement against
+`complianceStatus` in routing (stated above, not hidden); no registrar
+integration; `PATCH .../messaging-profiles/:id` isn't exercised by an
+automated test via HTTP (no `PLATFORM_ADMIN_KEY` configured in this
+environment — same limitation as every other admin-dashboard route in
+this test suite, not new here) — it's covered indirectly by testing
+`updateComplianceStatus` directly against the (mocked) repository the
+route calls.
+
+## 2026-09-08 — Phase 39: Consent Management (STOP/JOIN Blocks/Restores Outbound Sends)
+
+**Phase:** 39 (STOP/consent management) of the master plan. Closes the gap
+where a STOP keyword was logged and closed the conversation but nothing
+in the outbound send path ever checked it — a recipient who replied STOP
+could still receive further messages.
+
+**Files changed:**
+- `packages/database/src/schema/consent-records.ts` (new) — `consent_records`
+  table: `(appId, tenantId, recipient, channel)` → current `status`
+  (`opted_in`/`opted_out`/`unknown`), `source` (`keyword`/`api`/`import`),
+  `keyword`. Unique per `(recipient, appId, tenantId, channel)` — one
+  current value, not a log (the existing `events` table already records
+  every keyword/API call that changed it).
+- `packages/database/drizzle/0008_add_consent_records.sql` (new,
+  hand-authored — see the migration-drift entry above for why
+  `drizzle-kit generate` couldn't be used directly) +
+  `drizzle/meta/_journal.json` entry. Verified with `drizzle-kit check`.
+- `packages/database/src/repositories/consent-records.ts` (new) —
+  `findByRecipient`, `upsert` (the STOP/JOIN write path), `isOptedOut`
+  (the send-path read), `findByApplicationId`, `count`.
+- `packages/routing/src/keywords.ts` — `handleStop`/`handleJoin` now write
+  a consent record via `consentRecordRepository.upsert`. **Also removed
+  `conversationRepository.close()` from `handleStop`**: closing the
+  conversation broke `ConversationResolver`'s ability to route a
+  *subsequent* JOIN back to the same app (inbound routing only matches
+  *active* conversations — see `packages/routing/src/conversation-resolver.ts`
+  `findActiveByPhone`), which would have made re-subscribing impossible.
+  Consent (compliance) and conversation status (routing/continuity) are
+  now correctly separate concerns; `KeywordContext` gained an optional
+  `channel` field, threaded through from `packages/workers/src/jobs/inboundMessage.ts`.
+- `packages/routing/src/index.ts` — `RoutingEngine.routeMessage` computes
+  `channel` once (previously recomputed inline in three places) and
+  checks `consentRecordRepository.isOptedOut(appId, tenantId, recipient,
+  channel)` before any provider selection; throws the new
+  `ConsentBlockedError` if blocked. **Fails open** (allows the send, logs
+  via `console.error`) if the consent lookup itself errors — consistent
+  with `ConversationManager`'s existing best-effort pattern in this same
+  file, not a new precedent. This is a real, documented tradeoff: a
+  genuinely opted-out recipient could receive one message during a
+  consent-store outage. Hardening to fail-closed is a flagged follow-up,
+  not done here, because it would make all outbound messaging hard-depend
+  on the consent store's availability.
+- `services/api-gateway/src/app.ts` — `POST /v1/api/gateway/messaging`
+  catches `ConsentBlockedError` specifically and returns 403 (not the
+  generic 503 every other routing failure gets), since retrying a
+  consent-blocked send will never succeed. Added
+  `GET /v1/api/consent/:recipient` and `POST /v1/api/consent` (master plan
+  §66's final API contract) — the latter lets an application set consent
+  directly (e.g. importing an existing suppression list) without a
+  keyword round-trip; both scoped under new `consent:read`/`consent:write`
+  API-key scopes.
+- `packages/simulation/src/db.ts` — added a real (stateful, not stubbed)
+  `consentRecordRepository` mock backed by `dbState.consentRecords`, so
+  simulation tests can exercise actual STOP/JOIN → send-blocking behavior,
+  not just that a keyword was logged.
+- `packages/simulation/src/harness.ts` — added `enqueueInboundMessage()`,
+  mirroring the existing `enqueueProviderWebhook()`/`enqueuePaymentWebhook()`
+  pattern: it reaches the worker's `inbound_message` processor directly,
+  bypassing a **separate, pre-existing gap** discovered while testing this
+  (see below).
+- `packages/simulation/src/messaging-conversation.simulation.test.ts` — 3
+  new tests: STOP blocks a subsequent send (403) and is recorded with
+  `source: 'keyword'`; JOIN after STOP restores `opted_in` and sends
+  succeed again; opting out one recipient doesn't block another. Also
+  corrected the framing of two pre-existing "documented gap" tests whose
+  narrative this work made stale (see below) — their assertions were
+  already correct, only their comments/titles were wrong.
+- `packages/routing/package.json` — added `@company/database` as an
+  explicit dependency. `conversation.ts` and `keywords.ts` already
+  imported from it without declaring it (working only via npm workspace
+  hoisting); `index.ts` now imports it too, a good point to fix the
+  manifest.
+
+**Separate pre-existing gap found while writing these tests:** the
+gateway's real inbound-webhook path
+(`services/api-gateway/src/app.ts` `enqueueInboundMessage()`) uses a raw
+`ioredis` client with no fallback; without `REDIS_URL` configured (as in
+this environment) it silently no-ops, so **no inbound message — including
+STOP — ever reaches `handleKeyword()` via the actual webhook route today**.
+This was already independently documented by two pre-existing
+"documented gap" test blocks in this same file (the `it.each(KEYWORDS)`
+block and "the gateway accepts a correctly signed inbound webhook but
+never enqueues it") — not new. The new consent tests reach the worker's
+processor directly via `enqueueInboundMessage()` (the harness helper, not
+the gateway function of the same name) to test consent enforcement
+independent of that gap, the same way existing tests already do for
+`provider_webhook`/`payment_webhook`. Fixing the gateway's inbound
+enqueue path to use the same abstracted, testable queue the rest of the
+system uses (instead of a raw, Redis-required client) is a real,
+separate piece of follow-up work — not done here.
+
+**Database migrations:** `0008_add_consent_records.sql` (new table, no
+data migration)
+
+**API changes:** `GET /v1/api/consent/:recipient?channel=sms`,
+`POST /v1/api/consent`; `POST /v1/api/gateway/messaging` can now return
+403 in addition to its existing 400/401/403(tenant)/503
+
+**Security/compliance changes:** outbound messaging now actually respects
+STOP (previously logged only, never enforced) — closes the specific
+platform gap the master plan's Phase 39 exists to address.
+
+**Tests:** `npm test` 254 → 257 passed (3 net new — some iteration
+happened getting the seed-conversation provider deterministic, see git
+history), 0 failed. Ran the full suite and the messaging-conversation file
+alone 3x consecutively to confirm no flakiness. Lint/typecheck/build
+clean.
+
+**Known issues carried forward:** consent enforcement fails open on a
+lookup error (documented above); no admin-console UI for consent records
+yet (API only); `application.allowedCapabilities` remains unused (same
+note as the API-key scoping phase); the gateway's raw-ioredis inbound
+enqueue gap (documented above) means STOP sent via the real webhook route
+still doesn't work end-to-end in a `REDIS_URL`-less deployment — only
+the underlying keyword-handling and consent-enforcement logic this phase
+adds has been fixed and verified.
+
+## 2026-09-08 — HIGH: Drizzle Migration History Has Diverged From The Actual Schema
+
+**Severity:** High. Found while generating a migration for the new
+`consent_records` table (next entry below) — `drizzle-kit generate`
+unexpectedly prompted interactively asking whether `tenants.country_code`
+was a new column or a rename of `tenants.domain`/`tenants.settings`/
+`tenants.application_id`, which are columns that don't exist in the
+current `packages/database/src/schema/tenants.ts` at all.
+
+**What's actually wrong:**
+1. `packages/database/drizzle/meta/` only has snapshot files for
+   migrations 0000 and 0001 (`0000_snapshot.json`, `0001_snapshot.json`),
+   but `_journal.json` and the SQL files on disk go up to migration 0007.
+   Migrations 0002–0007 were added without regenerating their snapshots —
+   `drizzle-kit generate`'s diffing (which snapshots exist to support) has
+   been comparing against 0001's state ever since, not the schema as it
+   actually stood after each later migration.
+2. Two tables that exist in the TypeScript schema and are actively used by
+   real code have **no migration at all**: `tenant_application_links`
+   (`packages/database/src/schema/tenant-application-links.ts` — this is
+   the table backing `TenantRegistry.assertTenantAccess`, the platform's
+   core tenant-isolation check) and `conversations`
+   (`packages/database/src/schema/conversations.ts` — backs all
+   conversation continuity and inbound message routing). A fresh database
+   built by running `npm run drizzle:migrate` from migration 0000 forward
+   would never create either table.
+3. `0000_drizzle_init.sql`'s `tenants` table (`application_id`, `domain`,
+   `settings` columns, one tenant belongs to one application) is a
+   fundamentally different, older design than the current
+   `tenants.ts` schema (`country_code`, `currency`, `status`, `metadata`,
+   no `application_id` — tenants now relate to applications many-to-many
+   via `tenant_application_links`). That redesign was never captured in a
+   migration either.
+
+**Why this wasn't fixed in this pass:** reconstructing the exact
+`ALTER TABLE`/`CREATE TABLE` sequence that would take a database built
+from the current migration files to the schema real code actually expects
+is a real, standalone task — done wrong it risks producing a migration
+that looks plausible but corrupts or loses data on a database that already
+has the old `tenants` shape applied. That needs to be verified against a
+real (or realistic staging) Postgres instance, which this environment
+doesn't have (`DATABASE_URL` isn't configured here). Attempting it blind
+would be exactly the kind of "looks done, isn't" work the master plan
+warns against — documenting it precisely, rather than guessing, is the
+correct move per that plan's explicit instruction to flag what can't be
+verified rather than claim unearned confidence.
+
+**What was verified safe:** `npx drizzle-kit check` (the command
+`migration-check` in CI runs) still passes — it validates journal/file
+self-consistency, not schema-vs-snapshot drift, so this finding doesn't
+newly break that gate; it was already silently not catching this.
+
+**Recommended next steps for whoever picks this up:** (1) stand up a
+throwaway Postgres instance, `drizzle:push` the *current* schema to it to
+see the target shape, (2) `drizzle:push` migrations 0000-0007 to a second
+instance to see what's actually reachable via versioned migrations today,
+(3) diff the two and hand-write the missing/corrective migrations,
+verifying against real data-preservation semantics for the `tenants`
+redesign specifically. Do not attempt this by re-running
+`drizzle-kit generate` interactively without first fixing the missing
+snapshots, or its rename-vs-new-column guesses can't be trusted.
+
+**Files changed:** none (investigation only, documented here and in
+`docs/IMPLEMENTATION_BASELINE.md`)
+
+## 2026-09-08 — CRITICAL: `&&`-Chained Drizzle Conditions Silently Dropped Filters Across 10 Repository Files
+
+**Severity:** Critical. Found while adding the consent-records repository
+(next entry below) and reading `conversations.ts` as a style reference.
+
+**The defect:** Ten repository files combined multiple Drizzle `eq()`/`gt()`
+conditions with the JavaScript `&&` operator instead of Drizzle's `and()`
+combinator:
+
+```ts
+.where(
+  eq(conversations.phoneNumber, phoneNumber) &&
+    eq(conversations.appId, appId) &&
+    eq(conversations.tenantId, tenantId),
+)
+```
+
+`eq()` returns a truthy `SQL` object. `a && b && c` evaluates left to
+right and returns its *last* truthy operand — so `.where()` received only
+`eq(conversations.tenantId, tenantId)`; the phoneNumber and appId
+conditions were computed (for their side effects, building unused SQL AST
+nodes) and then silently discarded. This is invisible to TypeScript
+(every intermediate value is a structurally valid `SQL` type) and
+invisible to most hand-written tests, because it only produces a wrong
+result when the *dropped* condition would have excluded a row that the
+*kept* condition still matches — exactly the scenario cross-tenant
+isolation tests are supposed to exercise, and in several cases apparently
+didn't (see "Confirmed impact" below).
+
+**Confirmed impact by file:**
+- `tenant-application-links.ts` `findByTenantAndApplication` (used by
+  `isLinked`, which backs `TenantRegistry.assertTenantAccess` — **the
+  actual gateway-level tenant authorization check**) filtered only by
+  `applicationId`. **Any tenant ID would pass authorization as long as
+  *some* tenant was linked to the requested application** — a real
+  cross-tenant authorization bypass in the platform's core isolation
+  primitive. Also affected `unlink`.
+- `users.ts` `findByApplicationAndEmail` filtered only by `email`,
+  ignoring `applicationId` — a login lookup that could authenticate a
+  user against the wrong application's account on an email collision.
+- `transactions.ts` `findByAppAndIdempotencyKey` filtered only by
+  `idempotencyKey`, ignoring `appId`/`tenantId` — idempotency keys could
+  collide across unrelated tenants' payments.
+- `idempotency-records.ts` `findActive` filtered only by the `gt(expiresAt,
+  now)` clause, ignoring `appId`/`tenantId`/`operation`/`idempotencyKey`
+  entirely — the general-purpose idempotency guard used across the
+  worker pipeline was effectively checking "does *any* active
+  idempotency record exist," not "does *this* one."
+- `suppliers.ts` `findByApplicationAndSlug` filtered only by `slug`,
+  ignoring `applicationId`/`tenantId` — cross-tenant supplier lookup.
+- `conversations.ts` `findByPhoneAndApp` filtered only by `tenantId`;
+  `findActiveByPhone` filtered only by `status`; `close` filtered only
+  by `tenantId` — meaning `close()` (invoked by the STOP keyword
+  handler) could close *every* conversation for a tenant, not just the
+  one for the requesting phone/app.
+- `tenants.ts` `findActiveByApplicationId` filtered only by `status`,
+  ignoring `applicationId` — would return active tenants belonging to
+  *other* applications.
+- `application-permissions.ts` `findByApplicationAndResource`,
+  `findByApplicationResourceAction`, and `deleteByApplicationResource`
+  each dropped all but their last condition — the resource/action lookup
+  underlying permission checks could match the wrong application.
+- `provider-configs.ts` `findByProviderAndEnvironment` filtered only by
+  `environment`.
+
+**Fix:** every occurrence rewritten to use `and(cond1, cond2, ...)`. Several
+files (`conversations.ts`, `idempotency-records.ts`,
+`tenant-application-links.ts`, `users.ts`) already had `and` imported and
+unused right next to the bug — a strong signal the intent was always to
+use it.
+
+**Regression guard:** `packages/database/src/where-clause-and.test.ts`
+(new) statically scans every file in `repositories/` for the
+condition-immediately-followed-by-`&&` pattern and fails if it reappears.
+Verified against both the original buggy source (matches) and the fixed
+source (doesn't match) before relying on it. This doesn't require a live
+database, so it runs in every `npm test` invocation, not just the gated
+DB integration suite.
+
+**Files changed:** `packages/database/src/repositories/{conversations,
+idempotency-records,application-permissions,provider-configs,suppliers,
+tenant-application-links,tenants,transactions,users}.ts`,
+`packages/database/src/where-clause-and.test.ts` (new)
+
+**Database migrations:** none (query-logic fix only)
+
+**Tests:** `npm test` 235 → 253 passed (18 new, all from the regression
+guard), 0 failed. **Could not be verified end-to-end against a live
+Postgres database in this environment** (no `DATABASE_URL` configured) —
+`conversations.integration.test.ts` remains the only test that exercises
+these repositories against a real database, and it's gated by
+`describe.skipIf(!hasDb)`. The fix itself is a well-established, correct
+Drizzle pattern (`and()` is Drizzle's own documented condition combinator)
+and was applied identically to every occurrence, but running
+`npm run test:integration` against a real database (as CI's
+`integration-test` job does with `TEST_DATABASE_URL`) is the outstanding
+verification step — flagging this explicitly rather than claiming a
+confidence level this session couldn't actually establish.
+
+**This is exactly the class of defect Phase 0's baseline audit is meant to
+surface** — it was not caught by the extensive prior "P0 audit
+remediation" commits despite several of them specifically claiming to fix
+cross-tenant isolation in `transactions.ts`, `events.ts`, and
+`conversations.ts`. Those fixes were real (the tenant-scoping *arguments*
+were added), but the `&&` bug silently undid them at the query level. Worth
+noting for how future audits verify a fix: a positive-path test with only
+one matching row cannot distinguish a correct multi-condition filter from
+one that silently dropped every condition but the last — the isolation
+tests that would have caught this need *at least two rows differing only
+in the dropped field*, not just "does the happy path still find the
+right row."
+
+## 2026-09-08 — Phase 11: `/ready` Queue Health Check + Two Flaky-Test Fixes
+
+**Phase:** 11 (observability) — closes the last item from
+`PRODUCTION_READINESS_REPORT.md` P2-5 ("`/ready` doesn't check
+dependencies") that was still genuinely open.
+
+**Files changed:**
+- `services/api-gateway/src/app.ts` — `/ready` now pings the Redis
+  connection used for job enqueueing (`getRedisClient()`) when
+  `REDIS_URL` is set, reporting `healthy`/`unreachable`; reports
+  `unconfigured` (not a failure) when Redis isn't configured, since the
+  platform's real fallback in that case is DB-only webhook persistence,
+  not an outage. **Also fixed a real, separate bug found while making this
+  change**: the DB check assigned `checkDatabaseHealth()`'s entire
+  resolved object (`{status, latencyMs, details}`) to a variable and
+  treated any non-throwing result as truthy → always `'healthy'`. That
+  function returns (doesn't throw) `status: 'degraded'` or `'unhealthy'`
+  for a slow-but-connected database, so `/ready` never actually surfaced
+  those states — only a hard connection failure (a thrown exception) did.
+  Now reads `.status` directly.
+- `packages/simulation/src/ready-endpoint.simulation.test.ts` (new) — 3
+  tests: all dependency keys present, queue reports `unconfigured` (200)
+  when `REDIS_URL` is unset, database reports `unhealthy` (503) when the
+  DB is down — the last of which caught the bug above (it failed against
+  the pre-fix code, confirming `/ready` was silently reporting healthy).
+- `packages/simulation/src/security-isolation.simulation.test.ts` — fixed
+  a real flaky test unrelated to this phase's main change, found while
+  re-running the suite to validate it: "tampered HMAC signature is
+  rejected" flipped a webhook signature's first hex nibble to a *fixed*
+  `'a'`, which has a 1-in-16 chance of coincidentally matching the
+  original (non-deterministic per run — the webhook body includes a
+  random event id and current timestamp), producing a byte-identical
+  "tampered" signature that's actually still valid and spuriously passing
+  verification. Now flips to whichever of `'a'`/`'b'` differs from the
+  original.
+- `packages/routing/src/routing.test.ts` — fixed a second flaky test found
+  the same way: the SMS-routing test's expected-provider list omitted
+  `example-msg`, a real SMS-capable, weight-25 candidate in the same
+  weighted-random pool as the three providers it did list — about a
+  1-in-7 chance per run of a spurious failure.
+- `docs/IMPLEMENTATION_BASELINE.md` — marked the `/ready` gap closed,
+  corrected the DB-check claim
+
+**Database migrations:** none
+
+**API changes:** `/ready` response gains a `queue` key in `dependencies`
+(`healthy` / `unreachable` / `unconfigured`); `database` can now report
+`degraded` in addition to `healthy`/`unhealthy`/`unreachable`
+
+**Security changes:** none
+
+**Tests:** `npm test` 232 → 235 passed, 0 failed. Ran the full suite 5x
+consecutively after both flaky-test fixes to confirm elimination (prior to
+the fixes, 2 of 4 consecutive runs failed on one or the other).
+Lint/typecheck/build clean.
+
+**Known issues carried forward:** none new. The `queue` check only
+verifies the Redis connection is reachable, not that the worker process
+is actually consuming from it — a full worker liveness signal (e.g. a
+heartbeat key the worker refreshes) would be a further improvement but is
+out of scope here.
+
+## 2026-09-08 — Phase 3: API-Key Scope Enforcement & Default Expiry
+
+**Phase:** 3 (API Gateway hardening) — closes two items from
+`SECURITY_AUDIT_REPORT.md` (M2, M3) that were still open per
+`docs/IMPLEMENTATION_BASELINE.md`.
+
+**Files changed:**
+- `packages/database/src/registry.ts` — `AuthenticateResult.scopes` now
+  surfaces the matched API key's `scopes` column;
+  `API_KEY_DEFAULT_EXPIRY_DAYS` (default 365, 0 disables) applied to
+  `expiresAt` in `createApplication` and `rotateApplicationKey`
+- `services/api-gateway/src/auth.ts` — `AuthService.authenticate()` parses
+  `scopes` into a string array; `createMiddleware().apiKey` is now a
+  factory `apiKey(requiredScope?: string)` that 403s when the key has
+  scopes configured and the requested capability isn't among them (a key
+  with no scopes stays unrestricted — opt-in scoping, not a breaking
+  change for keys issued before this existed)
+- `services/api-gateway/src/app.ts` — wired `mw.apiKey(scope)` onto all 5
+  gateway routes: `payments:send`, `messaging:send`, `other:send`,
+  `transactions:read`, `providers:read`
+- `packages/database/src/registry.test.ts` — 4 new tests: default expiry
+  set on creation, scopes surfaced on successful auth (both configured and
+  null/unrestricted cases)
+- `.env.example` — documented `API_KEY_DEFAULT_EXPIRY_DAYS`
+- `docs/IMPLEMENTATION_BASELINE.md` — marked both gaps closed
+
+**Database migrations:** none (`scopes` and `expiresAt` columns already
+existed on `application_api_keys`; this phase starts populating/enforcing
+them)
+
+**API changes:** gateway routes now return 403
+(`API key is not authorized for scope "..."`) for a scoped key missing the
+required capability. No change to unscoped keys' behavior.
+
+**Security changes:** closes SECURITY_AUDIT_REPORT.md M2 (no scope
+enforcement) and M3 (no default expiry).
+
+**Tests:** `npm test` 229 → 232 passed (3 net new — one prior "preserves
+scopes on rotation" test already existed and continues to pass), 0 failed;
+lint/typecheck/build clean, including the full `packages/simulation`
+end-to-end suite (proves existing unscoped keys are unaffected).
+
+**Known issues carried forward:** no admin-console UI or dashboard API
+route yet to set a key's `scopes` after creation — the enforcement is live,
+but assigning scopes today means writing the `scopes` column directly
+(e.g. via a migration or direct DB access). `application.allowedCapabilities`
+(a separate, application-level field also in the schema) is still unused —
+left out of this phase to keep scope narrow; only per-key `scopes` is
+enforced.
+
+## 2026-09-08 — Phase 11/21: Provider Circuit Breaker
+
+**Phase:** 21 (circuit breaker) of the master plan, plus the doc correction
+from Phase 0/1 that first identified it as a real (not already-fixed) gap.
+
+**Files changed:**
+- `packages/schemas/src/index.ts` — added `ProviderCircuitState` type
+  (`'closed' | 'open' | 'half_open'`) and `circuitState` /
+  `consecutiveFailures` fields on `ProviderManagement`
+- `packages/providers/src/registry.ts` — per-provider circuit breaker state
+  machine on `ManagementState`; `isCircuitAvailable(id)` and
+  `isProviderAvailable(id)` (status + circuit combined); `recordTraffic()`
+  drives CLOSED→OPEN on threshold, OPEN→HALF_OPEN on cooldown expiry,
+  HALF_OPEN→CLOSED on a successful probe, HALF_OPEN→OPEN (cooldown restart)
+  on a failed probe; `findByCategoryAndCapabilities()` now excludes
+  circuit-open providers; `updateManagement()` and `updateProviderConfig()`
+  reset the circuit when an operator manually sets a provider back online
+- `packages/routing/src/index.ts` — every routing decision point
+  (`routePayment`, `routeMessage` including conversation continuity,
+  `routeOther`, and all manual-override checks) now calls
+  `registry.isProviderAvailable()` instead of reading `config.status`
+  directly, so an open circuit removes a provider from routing without an
+  operator having to flip its status by hand
+- `packages/providers/src/circuitBreaker.test.ts` (new) — 8 tests covering
+  the full state machine, including fake-timer-driven cooldown/half-open
+  transitions
+- `packages/routing/src/routing.test.ts` — 2 new tests proving routing
+  fails over around an open-circuit provider (including when a caller
+  explicitly requests it via `providerOverride`) even though its
+  admin-controlled `status` stays `online`
+- `.env.example` — documented `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default
+  5) and `CIRCUIT_BREAKER_COOLDOWN_MS` (default 30000)
+- `docs/IMPLEMENTATION_BASELINE.md` — marked the circuit-breaker gap closed
+
+**Database migrations:** none (circuit state is in-memory on the registry
+singleton, same durability model as the rest of `ManagementState` — provider
+health/errorRate were already in-memory-only)
+
+**API changes:** `GET` provider management responses now include
+`circuitState` and `consecutiveFailures`; no route signature changes
+
+**Security changes:** none
+
+**Tests:** `npm test` 219 → 229 passed (10 new), 0 failed; lint/typecheck/
+build all clean
+
+**Known issues carried forward:** circuit state resets on process restart
+(consistent with the rest of the registry's in-memory management state —
+persisting it would be a separate, larger change to move provider
+management state into the database, out of scope here). No admin-console UI
+surfaces `circuitState` yet — the field is exposed on the API but not yet
+rendered in `ProviderManagement.tsx`.
+
+## 2026-09-08 — Phase 0/1: Repository Audit & Baseline
+
+**Phase:** 0 (repository audit) and 1 (baseline test pass)
+
+**Files changed:**
+- `docs/IMPLEMENTATION_BASELINE.md` (new) — full architecture/gap audit
+- `docs/BASELINE_TEST_REPORT.md` (new) — baseline pipeline results
+- `packages/events/src/eventBus.test.ts` — fixed stale 100-event history
+  assertion to match the real 1000-event `MAX_HISTORY` cap
+- `packages/simulation/src/donation-system.simulation.test.ts` — fixed
+  timestamp-race in `mark()`/`busEventsAfter()` helpers
+- `packages/simulation/src/resilience-failure.simulation.test.ts` — same fix
+- `packages/simulation/src/messaging-conversation.simulation.test.ts` — same fix
+- `packages/workers/src/load.test.ts` → renamed
+  `packages/workers/src/load.integration.test.ts`, added
+  `describe.skipIf(!hasDb)` guard matching the existing
+  `conversations.integration.test.ts` convention
+- `package-lock.json` — `npm audit fix` (non-breaking): patched the
+  `body-parser` → `qs` DoS advisory path; synced two missing workspace
+  entries (`@company/loadtest`, `@company/simulation`) that `npm install`
+  had not previously recorded
+
+**Database migrations:** none
+
+**API changes:** none
+
+**Security changes:**
+- `qs` (via `body-parser`) DoS advisories (GHSA-x5fp-wj9c-mxmx,
+  GHSA-4mjr-xmp4-gh2g) patched via non-breaking `npm audit fix`. Residual
+  `qs` exposure via `express`'s own dependency requires an express 5.x
+  major-version migration — documented as a tracked gap, not silently
+  ignored (`docs/BASELINE_TEST_REPORT.md` §4).
+
+**Tests:**
+- `npm test`: 3 failed → 0 failed (219 passed, 12 correctly skipped)
+- `npx tsc --noEmit`: 0 errors (no change, already clean)
+- `npm run lint`: 0 errors (no change, already clean)
+- `npm run build:all`: clean (no change, already clean)
+
+**Known issues carried forward (not addressed in this phase):**
+All messaging/payment provider adapters are simulated (no real HTTP calls);
+no Africa's Talking/Trembi adapters exist; gateway rate limiting is
+in-memory-per-instance despite a Redis-backed limiter existing in
+`@company/workers`; `/ready` doesn't check DB/Redis/queue health; no circuit
+breaker; no API-key scope enforcement; no A2P/10DLC compliance model; no
+payment reconciliation/connected-account model. Full list in
+`docs/IMPLEMENTATION_BASELINE.md` §4.
+
+**Explicitly not done in this phase:** any new feature work, any provider
+integration work, any change to `services/api-gateway/src/app.ts` or
+`packages/providers/**` beyond what's listed above. This phase was
+deliberately scoped to "make the existing baseline honest and green," per
+the master plan's Phase 0/1 instructions, before starting further
+implementation phases.

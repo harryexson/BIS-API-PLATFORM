@@ -16,6 +16,7 @@ export interface AuthOptions {
 type AuthedRequest = Request & {
   appId?: string;
   application?: { id: string; slug: string; name: string };
+  scopes?: string[] | null;
 };
 
 function createRateLimiter(opts: { windowMs: number; max: number }) {
@@ -85,7 +86,7 @@ export class AuthService {
   async authenticate(
     raw: string | undefined,
     fallbackAppId?: string,
-  ): Promise<{ ok: boolean; appId?: string; error?: string }> {
+  ): Promise<{ ok: boolean; appId?: string; error?: string; scopes?: string[] | null }> {
     if (raw) {
       if (!this.registry) {
         // P0: Fail closed — never trust client-supplied appId
@@ -96,7 +97,13 @@ export class AuthService {
         if (!res.authenticated || !res.application) {
           return { ok: false, error: res.error || 'Invalid API key' };
         }
-        return { ok: true, appId: res.application.slug };
+        // scopes is null/absent for keys with no configured restrictions —
+        // that means unrestricted, not "no access": every key issued
+        // before scoping existed had no scopes value at all.
+        const scopes = res.scopes
+          ? res.scopes.split(',').map((s) => s.trim()).filter(Boolean)
+          : null;
+        return { ok: true, appId: res.application.slug, scopes };
       } catch {
         // P0: Fail closed — never trust client-supplied appId
         return { ok: false, error: 'Authentication service unavailable' };
@@ -130,17 +137,27 @@ export class AuthService {
 }
 
 export function createMiddleware(auth: AuthService) {
-  const apiKey = async (req: Request, res: Response, next: NextFunction) => {
-    const key = auth.extractKey(req);
-    const result = await auth.authenticate(key, (req as AuthedRequest).body?.appId);
-    if (!result.ok) {
-      return res.status(401).json({ error: result.error || 'Unauthorized' });
-    }
-    const r = req as AuthedRequest;
-    r.appId = result.appId;
-    if (r.body) r.body.appId = result.appId;
-    next();
-  };
+  // requiredScope: the capability this route needs (e.g. 'messaging:send').
+  // A key with no scopes configured (null) is unrestricted — scoping is
+  // opt-in per key, so keys issued before this existed keep working.
+  const apiKey = (requiredScope?: string) =>
+    async (req: Request, res: Response, next: NextFunction) => {
+      const key = auth.extractKey(req);
+      const result = await auth.authenticate(key, (req as AuthedRequest).body?.appId);
+      if (!result.ok) {
+        return res.status(401).json({ error: result.error || 'Unauthorized' });
+      }
+      if (requiredScope && result.scopes && !result.scopes.includes(requiredScope)) {
+        return res.status(403).json({
+          error: `API key is not authorized for scope "${requiredScope}"`,
+        });
+      }
+      const r = req as AuthedRequest;
+      r.appId = result.appId;
+      r.scopes = result.scopes;
+      if (r.body) r.body.appId = result.appId;
+      next();
+    };
 
   const rateLimit = async (req: Request, res: Response, next: NextFunction) => {
     const id = auth.extractKey(req) || req.ip || 'anonymous';

@@ -43,6 +43,92 @@ const HEALTH_COLOR: Record<ProviderHealthStatus, string> = {
   unknown: 'var(--text-muted)',
 };
 
+// The named secret fields each real adapter's HTTP calls actually read
+// (this.secrets.<field> in packages/providers/src/adapters/**) — lets the
+// Add Secret form guide an admin to the right field name instead of a blind
+// free-text box. Providers not listed here are simulation-only and don't
+// need real credentials (their isConfigured() always returns true).
+const PROVIDER_SECRET_FIELDS: Record<string, { field: string; label: string }[]> = {
+  stripe: [
+    { field: 'api_key', label: 'Secret Key' },
+    { field: 'webhook_secret', label: 'Webhook Signing Secret (whsec_...)' },
+  ],
+  nmi: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'gateway_id', label: 'Gateway Hostname (optional, defaults to secure.nmi.com)' },
+    { field: 'webhook_secret', label: 'Webhook Signing Key' },
+  ],
+  flutterwave: [
+    { field: 'api_key', label: 'Secret Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret Hash (from dashboard webhook settings)' },
+  ],
+  pawapay: [{ field: 'api_key', label: 'API Key' }],
+  paychangu: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret (web secret key)' },
+  ],
+  airwallex: [
+    { field: 'client_id', label: 'Client ID' },
+    { field: 'api_key', label: 'API Key' },
+    { field: 'webhook_secret', label: 'Webhook Secret (per notification URL)' },
+  ],
+  adyen: [
+    { field: 'api_key', label: 'API Key (from the Customer Area)' },
+    { field: 'merchant_account', label: 'Merchant Account code' },
+    { field: 'live_url_prefix', label: 'Live URL Prefix (optional — leave unset to call the test API)' },
+  ],
+  braintree: [
+    { field: 'public_key', label: 'Public Key' },
+    { field: 'private_key', label: 'Private Key' },
+    { field: 'merchant_id', label: 'Merchant ID' },
+  ],
+  checkout: [
+    { field: 'secret_key', label: 'Secret Key' },
+    { field: 'client_id', label: 'Client ID (used to derive the per-merchant API subdomain)' },
+    { field: 'webhook_signing_key', label: 'Webhook Signing Key (optional — from the Workflows webhook action)' },
+  ],
+  paypal: [
+    { field: 'client_id', label: 'Client ID' },
+    { field: 'client_secret', label: 'Client Secret' },
+  ],
+  paystack: [
+    { field: 'api_key', label: 'Secret Key' },
+  ],
+  square: [
+    { field: 'access_token', label: 'Access Token' },
+    { field: 'location_id', label: 'Location ID (optional — defaults to the main location)' },
+    { field: 'webhook_signature_key', label: 'Webhook Signature Key (optional)' },
+    { field: 'webhook_notification_url', label: 'Webhook Notification URL (must match the subscription exactly)' },
+  ],
+  infobip: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'base_url', label: 'Base URL (e.g. xxxx.api.infobip.com)' },
+  ],
+  twilio: [
+    { field: 'account_sid', label: 'Account SID' },
+    { field: 'auth_token', label: 'Auth Token' },
+    { field: 'from_number', label: 'From Number (E.164) or Messaging Service SID' },
+  ],
+  whatsapp: [
+    { field: 'access_token', label: 'Access Token (System User token recommended)' },
+    { field: 'phone_number_id', label: 'Phone Number ID' },
+    { field: 'app_secret', label: 'App Secret (optional — for webhook verification)' },
+  ],
+  africastalking: [
+    { field: 'api_key', label: 'API Key' },
+    { field: 'username', label: 'Username' },
+  ],
+  sinch: [
+    { field: 'api_key', label: 'API Token' },
+    { field: 'service_plan_id', label: 'Service Plan ID' },
+  ],
+  vibes: [
+    { field: 'username', label: 'Username' },
+    { field: 'password', label: 'Password' },
+  ],
+  email: [{ field: 'api_key', label: 'Resend API Key (re_...)' }],
+};
+
 function parseList(value: string): string[] {
   return value
     .split(',')
@@ -154,16 +240,27 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
   };
 
   // ---- Routing rule handlers ----
+  const [newRuleMatch, setNewRuleMatch] = useState('');
+  const [newRuleTarget, setNewRuleTarget] = useState('');
+  const [newRuleDescription, setNewRuleDescription] = useState('');
+
   const addRule = async (providerId: string) => {
+    if (!newRuleMatch || !newRuleTarget) {
+      setError('A match expression and a target provider are both required');
+      return;
+    }
     setBusyId(providerId);
     setError(null);
     try {
       await mutate(`/api/dashboard/providers/${providerId}/routing`, 'POST', {
-        match: 'currency == USD',
-        target: providerId,
-        description: 'Custom routing rule',
+        match: newRuleMatch,
+        target: newRuleTarget,
+        description: newRuleDescription || undefined,
         enabled: true,
       });
+      setNewRuleMatch('');
+      setNewRuleTarget('');
+      setNewRuleDescription('');
       await onRefresh();
     } catch (err: any) {
       setError(err.message);
@@ -199,25 +296,29 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
   };
 
   // ---- Secret handlers ----
+  const [newSecretField, setNewSecretField] = useState('');
   const [newSecretLabel, setNewSecretLabel] = useState('');
   const [newSecretValue, setNewSecretValue] = useState('');
 
   const addSecret = async (providerId: string) => {
-    if (!newSecretLabel || !newSecretValue) {
-      setError('Secret label and value are required');
+    if (!newSecretField || !newSecretLabel || !newSecretValue) {
+      setError('Field, label, and value are all required');
       return;
     }
     setBusyId(providerId);
     setError(null);
     try {
       await mutate(`/api/dashboard/providers/${providerId}/secrets`, 'POST', {
+        field: newSecretField,
         label: newSecretLabel,
         value: newSecretValue,
       });
+      setNewSecretField('');
       setNewSecretLabel('');
       setNewSecretValue('');
       const data = await mutate(`/api/dashboard/providers/${providerId}/secrets`, 'GET');
       setSecrets(data);
+      await onRefresh();
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -260,10 +361,19 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
         onDeleteRule={(rule) => deleteRule(selected.id, rule.id)}
         onAddSecret={() => addSecret(selected.id)}
         onDeleteSecret={(secretId) => deleteSecret(selected.id, secretId)}
+        newSecretField={newSecretField}
+        setNewSecretField={setNewSecretField}
         newSecretLabel={newSecretLabel}
         setNewSecretLabel={setNewSecretLabel}
         newSecretValue={newSecretValue}
         setNewSecretValue={setNewSecretValue}
+        allProviders={providers.map((p) => ({ id: p.id, name: p.name }))}
+        newRuleMatch={newRuleMatch}
+        setNewRuleMatch={setNewRuleMatch}
+        newRuleTarget={newRuleTarget}
+        setNewRuleTarget={setNewRuleTarget}
+        newRuleDescription={newRuleDescription}
+        setNewRuleDescription={setNewRuleDescription}
       />
     );
   }
@@ -315,6 +425,7 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
               <Th>Currencies</Th>
               <Th>Capabilities</Th>
               <Th>Priority</Th>
+              <Th>Configured</Th>
               <Th>Health</Th>
               <Th>Last Success</Th>
               <Th>Err Rate</Th>
@@ -335,6 +446,7 @@ export const ProviderManagement: React.FC<ProviderManagementProps> = ({
                 <Td>{chips(p.currencies, 'var(--accent-yellow)')}</Td>
                 <Td>{chips(p.capabilities, 'var(--accent-purple)')}</Td>
                 <Td><span style={{ fontWeight: '700' }}>{p.priority}</span></Td>
+                <Td><ConfiguredBadge configured={p.configured} providerId={p.id} /></Td>
                 <Td>
                   <span style={{ color: HEALTH_COLOR[p.health || 'unknown'], fontWeight: '600', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                     <HeartPulse className="w-3.5 h-3.5" />
@@ -384,10 +496,19 @@ interface DetailProps {
   onDeleteRule: (rule: RoutingRule) => void;
   onAddSecret: () => void;
   onDeleteSecret: (secretId: string) => void;
+  newSecretField: string;
+  setNewSecretField: (v: string) => void;
   newSecretLabel: string;
   setNewSecretLabel: (v: string) => void;
   newSecretValue: string;
   setNewSecretValue: (v: string) => void;
+  allProviders: { id: string; name: string }[];
+  newRuleMatch: string;
+  setNewRuleMatch: (v: string) => void;
+  newRuleTarget: string;
+  setNewRuleTarget: (v: string) => void;
+  newRuleDescription: string;
+  setNewRuleDescription: (v: string) => void;
 }
 
 const ProviderDetail: React.FC<DetailProps> = (props) => {
@@ -408,11 +529,22 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
     onDeleteRule,
     onAddSecret,
     onDeleteSecret,
+    newSecretField,
+    setNewSecretField,
     newSecretLabel,
     setNewSecretLabel,
     newSecretValue,
     setNewSecretValue,
+    allProviders,
+    newRuleMatch,
+    setNewRuleMatch,
+    newRuleTarget,
+    setNewRuleTarget,
+    newRuleDescription,
+    setNewRuleDescription,
   } = props;
+
+  const knownFields = PROVIDER_SECRET_FIELDS[provider.id];
 
   const [localCountries, setLocalCountries] = useState(provider.countries.join(', '));
   const [localCurrencies, setLocalCurrencies] = useState(provider.currencies.join(', '));
@@ -517,6 +649,11 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
           <StatusBadge status={provider.status} />
         </Field>
 
+        {/* Configured */}
+        <Field label="Credentials" icon={<KeyRound className="w-4 h-4" />}>
+          <ConfiguredBadge configured={provider.configured} providerId={provider.id} />
+        </Field>
+
         {/* Error rate */}
         <Field label="Error Rate" icon={<AlertTriangle className="w-4 h-4" />}>
           <span style={{ color: (provider.errorRate || 0) >= 20 ? 'var(--accent-red)' : 'var(--accent-green)', fontWeight: 700 }}>
@@ -552,38 +689,68 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
         </Field>
       </div>
 
-      {/* Routing rules */}
-      <Section title="Routing Rules" icon={<Route className="w-4 h-4" />} onAdd={isAdmin ? onAddRule : undefined} addDisabled={disabled} addLabel="Add Rule">
+      {/* Routing rules — actually consulted by RoutingEngine (packages/
+          routing/src/rules.ts): the first enabled rule whose match
+          expression holds overrides success-rate/cost-based selection for
+          that request. Stored under whichever provider's page created it,
+          but target can be any provider id — "IF <match> route to
+          <target>" is a general rule, not scoped to this provider. */}
+      <Section title="Routing Rules" icon={<Route className="w-4 h-4" />}>
         {provider.routingRules.length === 0 ? (
           <Empty text="No custom routing rules configured." />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {provider.routingRules.map((rule) => (
-              <div key={rule.id} style={ruleRowStyle}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: '12px' }}>
-                    IF {rule.match} → {rule.target}
-                  </div>
-                  {rule.description && <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{rule.description}</div>}
-                </div>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--text-secondary)' }}>
-                  <input
-                    type="checkbox"
-                    checked={rule.enabled}
-                    disabled={disabled}
-                    onChange={(e) => onUpdateRule(rule, { enabled: e.target.checked })}
-                  />
-                  enabled
-                </label>
-                {isAdmin && (
-                  <button onClick={() => onDeleteRule(rule)} disabled={disabled} style={iconButtonStyle('var(--accent-red)')} title="Delete rule">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
+              <RuleRow
+                key={rule.id}
+                rule={rule}
+                allProviders={allProviders}
+                disabled={disabled}
+                isAdmin={isAdmin}
+                onSave={(updates) => onUpdateRule(rule, updates)}
+                onToggleEnabled={(enabled) => onUpdateRule(rule, { enabled })}
+                onDelete={() => onDeleteRule(rule)}
+              />
             ))}
           </div>
         )}
+
+        {isAdmin && (
+          <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+            <input
+              placeholder="Match expression (e.g. currency == MWK)"
+              value={newRuleMatch}
+              disabled={disabled}
+              onChange={(e) => setNewRuleMatch(e.target.value)}
+              style={{ ...inputStyle, minWidth: '220px' }}
+            />
+            <select aria-label="New rule target provider" value={newRuleTarget} disabled={disabled} onChange={(e) => setNewRuleTarget(e.target.value)} style={selectStyle}>
+              <option value="">Target provider…</option>
+              {allProviders.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+            <input
+              aria-label="New rule description"
+              placeholder="Description (optional)"
+              value={newRuleDescription}
+              disabled={disabled}
+              onChange={(e) => setNewRuleDescription(e.target.value)}
+              style={inputStyle}
+            />
+            <button onClick={onAddRule} disabled={disabled} style={actionButtonStyle('var(--accent-green)')}>
+              <Plus className="w-4 h-4" /> Add Rule
+            </button>
+          </div>
+        )}
+        <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '8px' }}>
+          Match syntax: <code>field OP value</code>, optionally joined with{' '}
+          <code>AND</code> — e.g. <code>currency == MWK AND amount &gt; 50</code>.
+          Fields: <code>currency</code>, <code>amount</code>, <code>paymentMethod</code>{' '}
+          (payments), <code>channel</code> (messaging: sms/whatsapp/email). Operators:{' '}
+          <code>== != &gt; &gt;= &lt; &lt;=</code>. The first enabled rule that matches wins;
+          a rule whose target is offline falls through to normal routing rather than failing the request.
+        </div>
       </Section>
 
       {/* Secrets */}
@@ -614,6 +781,32 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
 
           {isAdmin && (
             <div style={{ display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' }}>
+              {knownFields ? (
+                <select
+                  value={newSecretField}
+                  disabled={disabled}
+                  onChange={(e) => {
+                    const field = e.target.value;
+                    setNewSecretField(field);
+                    const known = knownFields.find((f) => f.field === field);
+                    if (known && !newSecretLabel) setNewSecretLabel(known.label);
+                  }}
+                  style={selectStyle}
+                >
+                  <option value="">Field…</option>
+                  {knownFields.map((f) => (
+                    <option key={f.field} value={f.field}>{f.field} — {f.label}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  placeholder="Field (e.g. api_key)"
+                  value={newSecretField}
+                  disabled={disabled}
+                  onChange={(e) => setNewSecretField(e.target.value)}
+                  style={inputStyle}
+                />
+              )}
               <input
                 placeholder="Label (e.g. Live API Key)"
                 value={newSecretLabel}
@@ -635,13 +828,87 @@ const ProviderDetail: React.FC<DetailProps> = (props) => {
             </div>
           )}
           <div style={{ fontSize: '10px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-            <Shield className="w-3 h-3" /> Secret values are masked and never exposed to the client.
+            <Shield className="w-3 h-3" /> Secret values are masked and never exposed to the client. Adding or replacing
+            a field here takes effect immediately — the adapter reads it on its very next request, no restart required.
           </div>
         </div>
       </Section>
     </div>
   );
 };
+
+function RuleRow({
+  rule,
+  allProviders,
+  disabled,
+  isAdmin,
+  onSave,
+  onToggleEnabled,
+  onDelete,
+}: {
+  rule: RoutingRule;
+  allProviders: { id: string; name: string }[];
+  disabled: boolean;
+  isAdmin: boolean;
+  onSave: (updates: Partial<RoutingRule>) => void;
+  onToggleEnabled: (enabled: boolean) => void;
+  onDelete: () => void;
+}) {
+  const [match, setMatch] = useState(rule.match);
+  const [target, setTarget] = useState(rule.target);
+  const [description, setDescription] = useState(rule.description ?? '');
+  const dirty = match !== rule.match || target !== rule.target || description !== (rule.description ?? '');
+
+  return (
+    <div style={{ ...ruleRowStyle, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', flex: 1, alignItems: 'center' }}>
+        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>IF</span>
+        <input
+          aria-label="Rule match expression"
+          value={match}
+          disabled={disabled}
+          onChange={(e) => setMatch(e.target.value)}
+          style={{ ...inputStyle, minWidth: '180px' }}
+        />
+        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>→</span>
+        <select aria-label="Rule target provider" value={target} disabled={disabled} onChange={(e) => setTarget(e.target.value)} style={selectStyle}>
+          {allProviders.map((p) => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+        <input
+          aria-label="Rule description"
+          placeholder="Description (optional)"
+          value={description}
+          disabled={disabled}
+          onChange={(e) => setDescription(e.target.value)}
+          style={inputStyle}
+        />
+        {isAdmin && dirty && (
+          <SaveButton
+            onClick={() => onSave({ match, target, description: description || undefined })}
+            disabled={disabled}
+            label="Save"
+          />
+        )}
+      </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--text-secondary)' }}>
+        <input
+          type="checkbox"
+          checked={rule.enabled}
+          disabled={disabled}
+          onChange={(e) => onToggleEnabled(e.target.checked)}
+        />
+        enabled
+      </label>
+      {isAdmin && (
+        <button onClick={onDelete} disabled={disabled} style={iconButtonStyle('var(--accent-red)')} title="Delete rule">
+          <Trash2 className="w-4 h-4" />
+        </button>
+      )}
+    </div>
+  );
+}
 
 // ----------------------------------------------------
 // Small UI helpers
@@ -691,6 +958,27 @@ function EnvBadge({ environment }: { environment: ProviderEnvironment }) {
 function StatusBadge({ status }: { status: string }) {
   const color = status === 'online' ? 'var(--accent-green)' : status === 'offline' ? 'var(--accent-red)' : 'var(--accent-yellow)';
   return <span style={{ fontSize: '11px', color, fontWeight: 700, textTransform: 'capitalize' }}>{status}</span>;
+}
+
+// Whether the adapter has real credentials to make a live API call with —
+// distinct from Health, which only reflects past traffic (and a provider
+// that's never been called stays "unknown" forever). A simulation-only
+// provider (no real HTTP integration — configured is always true for those)
+// shows nothing here rather than a misleading "Configured" badge.
+function ConfiguredBadge({ configured, providerId }: { configured?: boolean; providerId: string }) {
+  const hasRealIntegration = providerId in PROVIDER_SECRET_FIELDS;
+  if (!hasRealIntegration) {
+    return <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>— (simulated)</span>;
+  }
+  return configured ? (
+    <span style={{ fontSize: '11px', color: 'var(--accent-green)', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+      <CheckCircle2 className="w-3.5 h-3.5" /> Configured
+    </span>
+  ) : (
+    <span style={{ fontSize: '11px', color: 'var(--accent-red)', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '4px' }} title="No real credentials — every request falls back to simulated processing">
+      <XCircle className="w-3.5 h-3.5" /> Not Configured
+    </span>
+  );
 }
 
 function Field({ label, icon, children }: { label: string; icon: React.ReactNode; children: React.ReactNode }) {

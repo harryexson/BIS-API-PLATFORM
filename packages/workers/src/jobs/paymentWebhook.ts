@@ -16,18 +16,23 @@ function verifySignature(secret: string, rawBody: string, signature: string): bo
 export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
   return async (job, ctx: WorkerContext) => {
     const payload = job.payload as Partial<ProviderWebhookEvent>;
-    const { provider, rawBody, signature, providerEventId } = payload;
+    const { provider, rawBody, signature, providerEventId, verificationMethod } = payload;
     const appId = payload.applicationId || 'webhook';
 
     if (!provider) {
       throw new Error('payment_webhook requires provider');
     }
 
-    // P0: Idempotency check using provider event ID
+    // P0: Idempotency check using provider event ID. Namespaced by job type
+    // (see the matching fix in jobs/providerWebhook.ts) — the gateway
+    // enqueues a payment_webhook AND a provider_webhook job for the same
+    // inbound delivery, both carrying the same upstream event id, so a
+    // shared `webhook:${eventId}` key made whichever job type claimed it
+    // first falsely dead-letter the other as a replay.
     const eventId = providerEventId || job.payload.id;
     if (eventId && ctx?.store) {
       const seen = await ctx.store.setNx(
-        deps.keys.idempotency(`webhook:${eventId}`),
+        deps.keys.idempotency(`payment_webhook:${eventId}`),
         '1',
         deps.config.idempotencyTtlMs,
       );
@@ -36,27 +41,40 @@ export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
       }
     }
 
-    const secret = process.env.WEBHOOK_HMAC_SECRET;
-    if (secret) {
-      if (!signature || !rawBody) {
-        throw new Error('payment_webhook signature required');
+    // P0: The gateway already cryptographically verified this webhook
+    // before enqueueing it — natively, with the provider's own scheme
+    // (see BaseProvider.verifyProviderWebhookSignature), or with the
+    // generic platform HMAC. A 'native' check has no generic `signature`
+    // to redo here (each provider's real scheme uses its own header(s)
+    // and algorithm, not this one), so it is trusted as-is; re-deriving it
+    // would need the provider's secret and headers passed through the
+    // queue, which this job does not carry. Only the 'platform' path — the
+    // fallback used when no native scheme is configured — is re-verified
+    // below, as defense in depth against a bug in the enqueue path.
+    if (verificationMethod !== 'native') {
+      const secret = process.env.WEBHOOK_HMAC_SECRET;
+      if (secret) {
+        if (!signature || !rawBody) {
+          throw new Error('payment_webhook signature required');
+        }
+        if (!verifySignature(secret, rawBody, signature)) {
+          throw new Error('payment_webhook signature verification failed');
+        }
+      } else {
+        // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
+        // Processing unverified webhooks is a security vulnerability.
+        console.error(
+          '[payment_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
+        );
+        throw new Error('payment_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
       }
-      if (!verifySignature(secret, rawBody, signature)) {
-        throw new Error('payment_webhook signature verification failed');
-      }
-    } else {
-      // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
-      // Processing unverified webhooks is a security vulnerability.
-      console.error(
-        '[payment_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
-      );
-      throw new Error('payment_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
     // Build clean event record (strip raw webhook data)
     const clean = { ...job.payload };
     delete (clean as any).rawBody;
     delete (clean as any).signature;
+    delete (clean as any).verificationMethod;
 
     // P0 FIX: Normalize webhook type → eventType.
     // Stripe webhooks use `type` (e.g., "charge.succeeded") but the

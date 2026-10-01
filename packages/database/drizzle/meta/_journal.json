@@ -5,85 +5,29 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1786939961945,
-      "tag": "0000_drizzle_init",
+      "when": 1789440725222,
+      "tag": "0000_baseline",
       "breakpoints": true
     },
     {
       "idx": 1,
       "version": "7",
-      "when": 1786941627291,
-      "tag": "0001_add_application_registry",
+      "when": 1789505410008,
+      "tag": "0001_events_app_id_fk",
       "breakpoints": true
     },
     {
       "idx": 2,
       "version": "7",
-      "when": 1786942000000,
-      "tag": "0002_add_events",
+      "when": 1790315995550,
+      "tag": "0002_webhook_endpoints",
       "breakpoints": true
     },
     {
       "idx": 3,
       "version": "7",
-      "when": 1786943000000,
-      "tag": "0003_add_outbox",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "7",
-      "when": 1786944000000,
-      "tag": "0004_add_transactions",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "7",
-      "when": 1786945000000,
-      "tag": "0005_add_idempotency_records",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "7",
-      "when": 1786946000000,
-      "tag": "0006_add_events_idempotency",
-      "breakpoints": true
-    },
-    {
-      "idx": 7,
-      "version": "7",
-      "when": 1786947000000,
-      "tag": "0007_add_suppliers",
-      "breakpoints": true
-    },
-    {
-      "idx": 8,
-      "version": "7",
-      "when": 1788458066000,
-      "tag": "0008_reconcile_schema_drift",
-      "breakpoints": true
-    },
-    {
-      "idx": 9,
-      "version": "7",
-      "when": 1788480000000,
-      "tag": "0009_add_webhook_jobs",
-      "breakpoints": true
-    },
-    {
-      "idx": 10,
-      "version": "7",
-      "when": 1788500000000,
-      "tag": "0010_add_checkout_sessions",
-      "breakpoints": true
-    },
-    {
-      "idx": 11,
-      "version": "7",
-      "when": 1788520000000,
-      "tag": "0011_add_rbac_billing_support",
+      "when": 1790863280936,
+      "tag": "0003_remerged_baseline",
       "breakpoints": true
     }
   ]

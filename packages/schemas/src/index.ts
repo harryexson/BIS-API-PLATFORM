@@ -27,6 +27,12 @@ export type TransactionStatus =
 export type ProviderEnvironment = 'test' | 'live';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 
+// Circuit breaker state for a provider, tracked independently of the
+// admin-controlled `status` field. CLOSED = normal routing eligibility;
+// OPEN = temporarily excluded from routing after repeated failures;
+// HALF_OPEN = a single recovery probe is in flight.
+export type ProviderCircuitState = 'closed' | 'open' | 'half_open';
+
 export interface RoutingRule {
   id: string;
   match: string; // human readable match expression, e.g. "currency == MWK"
@@ -38,6 +44,14 @@ export interface RoutingRule {
 // Secret metadata only. The plaintext secret value is NEVER exposed to clients.
 export interface ProviderSecretMeta {
   id: string;
+  // The named field on BaseProvider.secrets this value populates (e.g.
+  // 'api_key', 'client_id', 'username', 'password', 'gateway_id',
+  // 'service_plan_id', 'base_url') — this is what actually makes a secret
+  // entered through the admin console reach the adapter's real HTTP calls
+  // (via ProviderRegistry syncing it into BaseProvider.setSecrets()), not
+  // just display metadata. Each adapter's own `this.secrets.<field>` reads
+  // document which field names it expects.
+  field: string;
   label: string; // e.g. "Live API Key"
   masked: string; // masked representation, e.g. "sk_live_••••••••••1234"
   lastUpdated?: string; // ISO timestamp
@@ -83,6 +97,27 @@ export interface TransactionEvent {
   payload: any;
   response: any;
   error?: string;
+  // Third-party fraud-scoring signal, when the selected provider returns
+  // one (currently only Stripe Radar — see stripe.ts's class comment).
+  // Absent for a provider/response that carries no fraud signal at all —
+  // never a fabricated neutral score standing in for "unknown".
+  fraudRiskLevel?: string;
+  fraudRiskScore?: number;
+}
+
+// Result of BaseProvider.processRefund() — a real refund attempt against a
+// previously successful payment, distinct from TransactionEvent (which
+// describes the original charge). 'unknown' mirrors TransactionStatus's own
+// meaning here: a refund provider accepted asynchronously (e.g. Stripe's
+// 'pending'/'requires_action') is genuinely unresolved, not a confirmed
+// success or failure.
+export interface RefundResult {
+  status: TransactionStatus;
+  refundId?: string;
+  amount: number;
+  currency: string;
+  response?: any;
+  error?: string;
 }
 
 export interface ProviderManagement extends ProviderConfig {
@@ -95,6 +130,15 @@ export interface ProviderManagement extends ProviderConfig {
   lastSuccessfulRequest: string | null;
   errorRate: number;
   routingRules: RoutingRule[];
+  circuitState: ProviderCircuitState;
+  consecutiveFailures: number;
+  // Whether this adapter currently has real credentials to make a live API
+  // call with (BaseProvider.isConfigured()) — distinct from `health`, which
+  // is a rolling reflection of past traffic outcomes and stays "unknown"
+  // forever for a provider that has never been called. A 'live'-environment
+  // provider with configured: false will silently fall back to simulated
+  // processing on every real request until this is fixed.
+  configured: boolean;
 }
 
 export interface HealthCheckSummary {
@@ -123,7 +167,21 @@ export interface PaymentRequest {
   currency: string;
   paymentMethod: string;
   phoneNumber?: string;
+  // ISO 3166-1 alpha-2 country code (e.g. 'US', 'KE') the transaction is
+  // associated with — the caller's or cardholder's country, not the
+  // merchant's. Optional: when present, routing filters candidates to
+  // providers whose configured `countries` list includes it (or '*');
+  // when absent, routing is unchanged from before this field existed.
+  country?: string;
   metadata?: Record<string, unknown>;
+  // A pre-tokenized payment instrument reference the selected provider's
+  // own API understands (e.g. a Stripe PaymentMethod id created client-side
+  // via Stripe.js/Elements — this gateway never touches raw card data, so
+  // it cannot create that token itself). Optional and provider-specific:
+  // a real-HTTP adapter that needs one to actually move money (Stripe,
+  // NMI) falls back to simulated processing when it's absent, rather than
+  // fabricating a charge with no instrument to charge.
+  paymentToken?: string;
 }
 
 export interface PaymentResponse {
@@ -176,6 +234,14 @@ export interface ProviderCapabilityMatch {
   countries: string[];
   weight: number;
   status: ProviderStatus;
+  // Live rolling error rate (0-100, see ProviderRegistry.recordTraffic) and
+  // configured cost fields — carried through so RoutingEngine's scoring
+  // (packages/routing/src/scoring.ts) can weigh a candidate by real success
+  // rate and cost, not just its static admin-set weight.
+  errorRate: number;
+  transactionFeePercent?: number;
+  transactionFeeFlat?: number;
+  messageCost?: number;
 }
 
 // Transaction status tracking
@@ -226,5 +292,6 @@ export interface ProviderWebhookEvent {
 
   // Webhook verification
   rawBody?: string;               // Raw webhook body for HMAC verification
-  signature?: string;             // Webhook signature for verification
+  signature?: string;             // Generic platform HMAC signature (x-webhook-signature); absent when verificationMethod is 'native'
+  verificationMethod?: 'native' | 'platform'; // How the gateway verified this webhook before enqueueing it — see BaseProvider.verifyProviderWebhookSignature
 }

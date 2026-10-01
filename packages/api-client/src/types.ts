@@ -14,6 +14,7 @@ export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 export type PaymentMethod = 'card' | 'mobile_money' | 'bank_transfer' | 'wallet';
+
 // 'unknown' is a real, distinct outcome (a payment provider timeout, for
 // example) — never treat it as a synonym for 'failed'. See
 // RoutingEngine.routePayment / @company/schemas for the full rationale.
@@ -31,6 +32,16 @@ export interface MessageCreate {
   recipient: string;
   content: string;
   providerOverride?: string;
+}
+
+// POST /v1/api/gateway/refund
+export interface RefundCreate {
+  // The `id` from the original payment's TransactionEvent — this
+  // platform's internal database id is never exposed to callers.
+  transactionId: string;
+  // Omit for a full refund. Major currency unit, same as PaymentCreate.amount.
+  amount?: number;
+  reason?: string;
 }
 
 // Mirrors TransactionEvent from services/api-gateway — the shape every
@@ -78,6 +89,10 @@ export interface ProviderCapabilityMatch {
   countries: string[];
   weight: number;
   status: ProviderStatus;
+  errorRate: number;
+  transactionFeePercent?: number;
+  transactionFeeFlat?: number;
+  messageCost?: number;
 }
 
 export interface ProviderManagement {
@@ -146,3 +161,26 @@ export interface RequestOptions {
 // with a `type`/`created_at`/`data` shape, so this is just TransactionEvent
 // again rather than a distinct WebhookEvent type.
 export type WebhookEvent = TransactionEvent;
+
+// POST /v1/api/gateway/webhooks
+export interface WebhookEndpointCreate {
+  url: string;
+  // TransactionEvent.category values to receive, or omit/['*'] for every
+  // category. Matches the gateway's own validation
+  // (packages/database/src/repositories/webhook-endpoints.ts).
+  events?: Array<'payment' | 'messaging' | 'other' | '*'>;
+}
+
+export interface WebhookEndpointSummary {
+  id: string;
+  url: string;
+  events: string[];
+  active: boolean;
+  createdAt: string;
+}
+
+// The signing secret is present only on the create response — it's
+// generated once, encrypted at rest server-side, and never re-displayed.
+export interface WebhookEndpointCreated extends WebhookEndpointSummary {
+  secret: string;
+}

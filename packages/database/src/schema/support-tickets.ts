@@ -1,25 +1,21 @@
 import { pgTable, uuid, text, timestamp, index } from 'drizzle-orm/pg-core';
+import { applications } from './applications';
 
-/**
- * Thin in-house support ticket record. This is intentionally minimal — the
- * long-term plan is to integrate an existing helpdesk (Zendesk/Intercom/
- * HubSpot); `externalProvider`/`externalRef` are nullable sync fields for
- * that integration. Until a provider is connected, this table is the only
- * record of a ticket.
- */
 export const supportTickets = pgTable(
   'support_tickets',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    appId: text('app_id').notNull(),
-    tenantId: text('tenant_id').notNull().default('default'),
-    requesterEmail: text('requester_email').notNull(),
+    applicationId: uuid('application_id')
+      .notNull()
+      .references(() => applications.id, { onDelete: 'cascade' }),
     subject: text('subject').notNull(),
-    status: text('status').notNull().default('open'),
-    priority: text('priority').notNull().default('normal'),
-    externalProvider: text('external_provider'),
-    externalRef: text('external_ref'),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    description: text('description').notNull(),
+    status: text('status').notNull().default('open'), // open | in_progress | resolved | closed
+    priority: text('priority').notNull().default('normal'), // low | normal | high | urgent
+    requesterEmail: text('requester_email'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true })
       .notNull()
       .defaultNow()
@@ -27,8 +23,7 @@ export const supportTickets = pgTable(
     resolvedAt: timestamp('resolved_at', { withTimezone: true }),
   },
   (t) => [
-    index('idx_support_tickets_app_id').on(t.appId),
-    index('idx_support_tickets_tenant_id').on(t.tenantId),
+    index('idx_support_tickets_application_id').on(t.applicationId),
     index('idx_support_tickets_status').on(t.status),
   ],
 );

@@ -21,6 +21,12 @@ dist/
 dist-ssr/
 *.local
 
+# Playwright test artifacts (apps/admin-console)
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
 # Stale JS files from tsc in source directories
 packages/*/src/**/*.js
 services/*/src/**/*.js

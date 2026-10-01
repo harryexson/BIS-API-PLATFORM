@@ -105,6 +105,73 @@ describe('CompanyApiClient', () => {
     expect(fetchMock.mock.calls[1][0]).toBe('https://api.company.com/v1/api/gateway/transaction/tx_2');
   });
 
+  it('payments.refund posts to /v1/api/gateway/refund without an idempotency header', async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      jsonResponse({
+        id: 're_1', timestamp: 'now', appId: 'a', category: 'payment', providerId: 'stripe',
+        status: 'success', amount: 20, currency: 'USD', latency: 5, cost: 0,
+        decisionReason: 'customer_requested', payload: {}, response: {},
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1', fetchImpl: fetchMock as any });
+
+    const event = await client.payments.refund(
+      { transactionId: 'pi_abc123', amount: 20, reason: 'customer_requested' },
+      { correlationId: 'corr-9' },
+    );
+
+    expect(event.id).toBe('re_1');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://api.company.com/v1/api/gateway/refund');
+    expect(init.method).toBe('POST');
+    expect(init.headers['x-idempotency-key']).toBeUndefined();
+    expect(init.headers['x-correlation-id']).toBe('corr-9');
+    expect(JSON.parse(init.body)).toEqual({ transactionId: 'pi_abc123', amount: 20, reason: 'customer_requested' });
+  });
+
+  it('webhooks.register posts to /v1/api/gateway/webhooks and returns the one-time secret', async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      jsonResponse({
+        id: 'wh_1', url: 'https://example.com/hook', events: ['*'], active: true,
+        createdAt: 'now', secret: 'whsec_abc123',
+      }, 201),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1', fetchImpl: fetchMock as any });
+
+    const endpoint = await client.webhooks.register({ url: 'https://example.com/hook' });
+
+    expect(endpoint.secret).toBe('whsec_abc123');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://api.company.com/v1/api/gateway/webhooks');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body)).toEqual({ url: 'https://example.com/hook' });
+  });
+
+  it('webhooks.list hits GET /v1/api/gateway/webhooks and unwraps the endpoints array', async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      jsonResponse({ endpoints: [{ id: 'wh_1', url: 'https://example.com/hook', events: ['*'], active: true, createdAt: 'now' }], count: 1 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1', fetchImpl: fetchMock as any });
+
+    const endpoints = await client.webhooks.list();
+    expect(endpoints).toHaveLength(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.company.com/v1/api/gateway/webhooks');
+  });
+
+  it('webhooks.delete hits DELETE /v1/api/gateway/webhooks/:id', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Response(null, { status: 204, headers: { 'X-Request-Id': 'req_test' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1', fetchImpl: fetchMock as any });
+
+    await client.webhooks.delete('wh_1');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://api.company.com/v1/api/gateway/webhooks/wh_1');
+    expect(init.method).toBe('DELETE');
+  });
+
   it('webhooks.verify accepts a valid signature and rejects a bad one', async () => {
     const client = new CompanyApiClient({ apiKey: 'k', tenantId: 'ten_1' });
     const secret = 'whsec_test';
