@@ -12,7 +12,8 @@ export type JobType =
   | 'inbound_message'
   | 'outbox_poller'
   | 'receipt_pipeline'
-  | 'keyword_response_delivery';
+  | 'keyword_response_delivery'
+  | 'webhook_job_poller';
 
 export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'dead';
 
@@ -66,6 +67,10 @@ export interface WorkerConfig {
   retryProcessingIntervalMs: number;
   retry: RetryConfig;
   rateLimit: RateLimitConfig;
+  /** Max combined ready+delayed jobs allowed per job type before enqueue()
+   * rejects with QueueBackpressureError instead of accepting more work the
+   * system has no near-term capacity to process. */
+  maxQueueDepth: number;
 }
 
 export interface WorkerContext {
@@ -101,6 +106,7 @@ export function createWorkerConfig(): WorkerConfig {
       windowMs: num(process.env.RATE_LIMIT_WINDOW_MS, 60_000),
       maxRequests: num(process.env.RATE_LIMIT_MAX_REQUESTS, 100),
     },
+    maxQueueDepth: num(process.env.QUEUE_MAX_DEPTH, 10_000),
   };
 }
 

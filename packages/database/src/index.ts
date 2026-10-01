@@ -16,6 +16,8 @@ export {
   decryptSecret,
   hashApiKey,
   generateApiKey,
+  hashPassword,
+  verifyPassword,
   type EncryptedPayload,
 } from './crypto';
 

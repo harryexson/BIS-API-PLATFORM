@@ -10,10 +10,17 @@ import {
   TenantRegistry,
   tenantRepository,
   tenantApplicationLinkRepository,
+  applicationRepository,
   eventRepository,
   transactionRepository,
+  webhookJobRepository,
+  userRepository,
+  apiKeyRepository,
+  checkoutSessionRepository,
+  hashPassword,
+  verifyPassword,
+  generateApiKey,
   checkDatabaseHealth,
-  applicationRepository,
   roleRepository,
   permissionRepository,
   userRoleRepository,
@@ -29,6 +36,10 @@ import {
   getContext,
   setContextField,
 } from '@company/observability';
+import { PlatformIdempotencyService } from '@company/shared';
+import { signPortalToken, verifyPortalToken, PortalTokenPayload } from './jwt';
+
+const platformIdempotency = new PlatformIdempotencyService();
 
 const app = express();
 
@@ -190,7 +201,6 @@ function observeFailure(category: 'payment' | 'messaging' | 'other', providerId:
 }
 
 const auth = new AuthService({
-  adminKey: process.env.PLATFORM_ADMIN_KEY,
   rateLimit: {
     windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
     max: Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
@@ -241,8 +251,22 @@ async function resolveTenantContext(req: Request, res: Response, next: NextFunct
   }
 
   try {
+    // authed.appId is the application's slug (used consistently as the
+    // human-readable app identifier across transactions/conversations/events),
+    // but tenant_application_links.application_id is a UUID FK to
+    // applications.id. Resolve slug -> UUID before checking the link,
+    // otherwise this always fails against a real database.
+    const application = await applicationRepository.findBySlug(authed.appId);
+    if (!application) {
+      logger.warn('tenant access denied: application not found', {
+        operation: 'tenant-resolution',
+        errorCode: 'APPLICATION_NOT_FOUND',
+        status: 'failed',
+      });
+      return res.status(403).json({ error: 'Access denied: tenant not linked to this application' });
+    }
     const tenantRegistry = new TenantRegistry(tenantRepository, tenantApplicationLinkRepository);
-    await tenantRegistry.assertTenantAccess(authed.appId, tenantId);
+    await tenantRegistry.assertTenantAccess(application.id, tenantId);
     next();
   } catch {
     logger.warn('tenant access denied', {
@@ -271,7 +295,10 @@ if (!ADMIN_API_TOKEN && isProduction) {
 }
 
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  const token = req.header('x-admin-token');
+  // EventSource (used for /api/dashboard/stream) can't set custom headers, so
+  // that one route needs a query-param fallback — the standard pattern for
+  // authenticating SSE connections in browsers.
+  const token = req.header('x-admin-token') || (req.query.token as string | undefined);
   if (!ADMIN_API_TOKEN) {
     // P0: Never bypass admin auth — require token in ALL environments
     return res.status(503).json({ error: 'Admin access not configured' });
@@ -279,6 +306,37 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
   if (!token || token !== ADMIN_API_TOKEN) {
     return res.status(403).json({ error: 'Forbidden: administrator authorization required' });
   }
+  return next();
+}
+
+// ----------------------------------------------------
+// DEVELOPER PORTAL AUTHORIZATION
+// ----------------------------------------------------
+// Per-user JWT session auth for the developer portal (apps/developer-portal),
+// distinct from the API-key auth used by server-to-server traffic routes and
+// the shared-passcode admin auth above. In production PORTAL_JWT_SECRET must
+// be explicitly set — falls back to a random per-process secret otherwise
+// (fine for local dev; existing sessions just don't survive a restart).
+const PORTAL_JWT_SECRET = process.env.PORTAL_JWT_SECRET || randomUUID() + randomUUID();
+if (!process.env.PORTAL_JWT_SECRET && isProduction) {
+  logger.error('PORTAL_JWT_SECRET is not set in production — portal sessions will not survive a restart', {
+    operation: 'startup',
+    errorCode: 'MISSING_PORTAL_SECRET',
+    status: 'failed',
+  });
+}
+
+function requirePortalAuth(req: Request, res: Response, next: NextFunction) {
+  const header = req.header('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : undefined;
+  if (!token) {
+    return res.status(401).json({ error: 'Missing bearer token' });
+  }
+  const payload = verifyPortalToken(token, PORTAL_JWT_SECRET);
+  if (!payload) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+  (req as Request & { portalUser?: PortalTokenPayload }).portalUser = payload;
   return next();
 }
 
@@ -358,20 +416,43 @@ app.get('/ready', async (req: Request, res: Response) => {
 app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const { amount, currency, paymentMethod, providerOverride, phoneNumber } = req.body;
-  // P1: Accept idempotency key from header — prevents duplicate charges on retries
-  const idempotencyKey = req.header('x-idempotency-key');
-  
+  const tenantId = req.header('x-tenant-id') || 'default';
+  // Canonical header per docs/openapi.yaml is `Idempotency-Key`; `idempotency_key`
+  // in the body is the documented fallback. (The previous `x-idempotency-key`
+  // header name never matched what docs/SDK/clients actually send, so this
+  // safeguard was silently inert.)
+  const idempotencyKey: string | undefined = req.header('idempotency-key') || req.body.idempotency_key;
+
   if (!appId) {
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
   }
 
-  // P1: Idempotency check — if we've seen this key recently, return the cached result
+  // Fingerprint the mutating fields so a replayed key with a *different*
+  // payload is rejected instead of silently returning the wrong cached charge.
+  const requestFingerprint = JSON.stringify({ amount, currency, paymentMethod, providerOverride, phoneNumber });
+  let idempotencyRecordId: string | undefined;
+
   if (idempotencyKey) {
-    const existing = paymentIdempotencyCache.get(idempotencyKey);
-    if (existing) {
-      metrics.increment('paymentIdempotentHits');
-      return res.json(existing);
+    const claim = await platformIdempotency.checkAndClaim(appId, tenantId, 'payment', idempotencyKey);
+    if (!claim.claimed) {
+      if (claim.existingResult) {
+        if (claim.existingResult.requestFingerprint !== requestFingerprint) {
+          return res.status(409).json({
+            error: {
+              code: 'idempotency_conflict',
+              message: 'Idempotency-Key already used with a different payload',
+              resource: claim.existingResult.event,
+            },
+          });
+        }
+        metrics.increment('paymentIdempotentHits');
+        return res.json(claim.existingResult.event);
+      }
+      return res.status(409).json({
+        error: { code: 'idempotency_in_progress', message: 'A request with this Idempotency-Key is already being processed' },
+      });
     }
+    idempotencyRecordId = claim.recordId;
   }
 
   try {
@@ -388,10 +469,15 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     try {
       await transactionRepository.create({
         appId,
-        tenantId: req.header('x-tenant-id') || 'default',
+        tenantId,
         providerId: event.providerId,
         providerTransactionId: event.id,
-        status: event.status === 'success' ? 'success' : event.status === 'failed' ? 'failed' : 'pending',
+        // routePayment only ever resolves to 'success' | 'failed' | 'unknown' — all three
+        // are valid persisted transaction states (see VALID_STATUSES in the transaction
+        // repository); mapping 'unknown' to 'pending' here would misrepresent an ambiguous
+        // provider timeout as an ordinary not-yet-attempted payment, which the DB-level
+        // state machine's own retry rules treat very differently.
+        status: event.status,
         amount: String(event.amount),
         currency: event.currency || 'USD',
         paymentMethod: paymentMethod || null,
@@ -405,9 +491,8 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     eventBus.emit(event);
     observe(event);
 
-    // P1: Cache the result for idempotency (5 minute TTL)
-    if (idempotencyKey) {
-      paymentIdempotencyCache.set(idempotencyKey, event);
+    if (idempotencyRecordId) {
+      await platformIdempotency.complete(idempotencyRecordId, { requestFingerprint, event }).catch(() => undefined);
     }
 
     // 202: outcome is genuinely unresolved (provider timeout) — distinct
@@ -437,6 +522,9 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, async (req:
     eventBus.emit(errorEvent);
     observeFailure('payment', errorEvent.providerId, 'ROUTING_FAILED');
     observe(errorEvent);
+    if (idempotencyRecordId) {
+      await platformIdempotency.fail(idempotencyRecordId, errorEvent.error).catch(() => undefined);
+    }
     return res.status(503).json({ error: 'Payment routing failed', id: errorEvent.id });
   }
 });
@@ -559,6 +647,408 @@ app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req
   return res.json(statusResponse);
 });
 
+// POST /refunds — refund a previously captured payment. See docs/openapi.yaml.
+app.post('/refunds', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { payment_id: paymentId, amount, currency, reason, metadata } = req.body;
+  const idempotencyKey: string | undefined = req.header('idempotency-key') || req.body.idempotency_key;
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing parameter: appId is required' });
+  }
+  if (!paymentId) {
+    return res.status(400).json({ error: { code: 'invalid_request', message: 'Missing required field: payment_id' } });
+  }
+
+  const requestFingerprint = JSON.stringify({ paymentId, amount, currency, reason });
+  let idempotencyRecordId: string | undefined;
+
+  if (idempotencyKey) {
+    const claim = await platformIdempotency.checkAndClaim(appId, tenantId, 'refund', idempotencyKey);
+    if (!claim.claimed) {
+      if (claim.existingResult) {
+        if (claim.existingResult.requestFingerprint !== requestFingerprint) {
+          return res.status(409).json({
+            error: {
+              code: 'idempotency_conflict',
+              message: 'Idempotency-Key already used with a different payload',
+              resource: claim.existingResult.refund,
+            },
+          });
+        }
+        return res.status(201).json(claim.existingResult.refund);
+      }
+      return res.status(409).json({
+        error: { code: 'idempotency_in_progress', message: 'A request with this Idempotency-Key is already being processed' },
+      });
+    }
+    idempotencyRecordId = claim.recordId;
+  }
+
+  // Ownership: only the application that made the original payment may refund it.
+  const original = eventBus
+    .getHistory()
+    .find((e: TransactionEvent) => e.id === paymentId && e.appId === appId && e.category === 'payment');
+
+  if (!original) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'payment not found').catch(() => undefined);
+    return res.status(404).json({ error: { code: 'not_found', message: `Payment '${paymentId}' not found` } });
+  }
+  if (original.status !== 'success') {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'payment not refundable').catch(() => undefined);
+    return res.status(422).json({
+      error: { code: 'invalid_operation', message: `Payment '${paymentId}' does not have a successful capture to refund` },
+    });
+  }
+  if (amount != null && original.amount != null && Number(amount) > Number(original.amount)) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'refund exceeds captured amount').catch(() => undefined);
+    return res.status(422).json({
+      error: { code: 'invalid_operation', message: 'Refund amount exceeds remaining captured amount' },
+    });
+  }
+
+  const provider = registry.getProvider(original.providerId);
+  if (!provider) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, 'provider unavailable').catch(() => undefined);
+    return res.status(503).json({ error: { code: 'provider_unavailable', message: `Provider '${original.providerId}' is unavailable` } });
+  }
+
+  try {
+    const refundEvent = await provider.refund(
+      appId,
+      { originalTransactionId: paymentId, amount, currency: currency || original.currency, reason, metadata },
+      'refund_requested',
+    );
+
+    eventBus.emit(refundEvent);
+    observe(refundEvent);
+
+    const refund = {
+      id: refundEvent.id,
+      object: 'refund' as const,
+      payment_id: paymentId,
+      status: refundEvent.status === 'success' ? 'success' : refundEvent.status === 'failed' ? 'failed' : 'pending',
+      amount: amount ?? original.amount,
+      currency: currency || original.currency,
+      reason,
+      provider_refund_id: refundEvent.response?.id,
+      created_at: refundEvent.timestamp,
+    };
+
+    if (idempotencyRecordId) {
+      await platformIdempotency.complete(idempotencyRecordId, { requestFingerprint, refund }).catch(() => undefined);
+    }
+
+    return res.status(201).json(refund);
+  } catch (err: any) {
+    if (idempotencyRecordId) await platformIdempotency.fail(idempotencyRecordId, err.message).catch(() => undefined);
+    observeFailure('payment', original.providerId, 'REFUND_FAILED');
+    return res.status(503).json({ error: { code: 'refund_failed', message: 'Refund failed' } });
+  }
+});
+
+// ----------------------------------------------------
+// DEVELOPER PORTAL — self-service account, API keys, transaction history.
+// Consumed by apps/developer-portal. Session auth (Bearer JWT), not the
+// server-to-server API-key auth the traffic routes above use.
+// ----------------------------------------------------
+
+function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 60) || 'app';
+}
+
+app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
+  const { companyName, email, password } = req.body;
+  if (!companyName || !email || !password) {
+    return res.status(400).json({ error: 'companyName, email, and password are required' });
+  }
+  if (String(password).length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+
+  try {
+    const baseSlug = slugify(companyName);
+    let slug = baseSlug;
+    let suffix = 1;
+    while (await applicationRepository.findBySlug(slug)) {
+      slug = `${baseSlug}-${++suffix}`;
+    }
+
+    const application = await applicationRepository.create({
+      name: companyName,
+      slug,
+      environment: 'development',
+    });
+
+    const existingUser = await userRepository.findByApplicationAndEmail(application.id, email);
+    if (existingUser) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+
+    const user = await userRepository.create({
+      applicationId: application.id,
+      email,
+      passwordHash: hashPassword(password),
+    });
+
+    const apiKey = generateApiKey();
+    await apiKeyRepository.create({
+      applicationId: application.id,
+      keyHash: apiKey.hash,
+      prefix: apiKey.prefix,
+      environment: 'test',
+    });
+
+    // A new signup is useless without a tenant to send traffic under —
+    // resolveTenantContext rejects every /v1/api/gateway/* request until one
+    // exists and is linked. Provision a default one so the account is usable
+    // immediately; additional tenants can still be created later.
+    const defaultTenant = await tenantRepository.create({
+      name: 'Default',
+      slug: `${slug}-default`,
+    });
+    await tenantApplicationLinkRepository.link(defaultTenant.id, application.id);
+
+    const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
+
+    return res.status(201).json({
+      token,
+      application: { id: application.id, name: application.name, slug: application.slug },
+      apiKey: { prefix: apiKey.prefix, raw: apiKey.raw },
+      tenant: { id: defaultTenant.id, name: defaultTenant.name, slug: defaultTenant.slug },
+    });
+  } catch (err: any) {
+    logger.error('portal signup failed', {
+      operation: 'portal-signup',
+      errorCode: 'SIGNUP_FAILED',
+      status: 'failed',
+      errorMessage: err?.message,
+      stack: err?.stack,
+    });
+    return res.status(500).json({ error: 'Signup failed' });
+  }
+});
+
+app.post('/v1/portal/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
+
+  const candidates = await userRepository.findByEmail(email);
+  for (const user of candidates) {
+    if (user.passwordHash && verifyPassword(password, user.passwordHash)) {
+      const application = await applicationRepository.findById(user.applicationId);
+      if (!application) continue;
+      const token = signPortalToken({ userId: user.id, applicationId: application.id, email: user.email }, PORTAL_JWT_SECRET);
+      return res.json({
+        token,
+        application: { id: application.id, name: application.name, slug: application.slug },
+      });
+    }
+  }
+
+  return res.status(401).json({ error: 'Invalid email or password' });
+});
+
+app.get('/v1/portal/me', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const application = await applicationRepository.findById(portalUser.applicationId);
+  if (!application) {
+    return res.status(404).json({ error: 'Application not found' });
+  }
+  return res.json({
+    user: { id: portalUser.userId, email: portalUser.email },
+    application: { id: application.id, name: application.name, slug: application.slug, environment: application.environment },
+  });
+});
+
+app.get('/v1/portal/tenants', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const tenants = await tenantRepository.findActiveByApplicationId(portalUser.applicationId);
+  return res.json({
+    tenants: tenants.map((t) => ({ id: t.id, name: t.name, slug: t.slug })),
+  });
+});
+
+app.get('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const keys = await apiKeyRepository.findByApplicationId(portalUser.applicationId);
+  return res.json({
+    apiKeys: keys.map((k) => ({
+      id: k.id,
+      prefix: k.prefix,
+      environment: k.environment,
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt,
+      revokedAt: k.revokedAt,
+    })),
+  });
+});
+
+app.post('/v1/portal/api-keys', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const environment = req.body?.environment === 'live' ? 'live' : 'test';
+  const apiKey = generateApiKey();
+  const created = await apiKeyRepository.create({
+    applicationId: portalUser.applicationId,
+    keyHash: apiKey.hash,
+    prefix: apiKey.prefix,
+    environment,
+  });
+  // The raw key is only ever shown here, once, at creation time.
+  return res.status(201).json({ id: created.id, prefix: apiKey.prefix, raw: apiKey.raw, environment });
+});
+
+app.delete('/v1/portal/api-keys/:id', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const key = await apiKeyRepository.findById(req.params.id);
+  if (!key || key.applicationId !== portalUser.applicationId) {
+    return res.status(404).json({ error: 'API key not found' });
+  }
+  await apiKeyRepository.revoke(req.params.id);
+  return res.status(204).send();
+});
+
+app.get('/v1/portal/transactions', requirePortalAuth, async (req: Request, res: Response) => {
+  const portalUser = (req as Request & { portalUser?: PortalTokenPayload }).portalUser!;
+  const application = await applicationRepository.findById(portalUser.applicationId);
+  if (!application) {
+    return res.status(404).json({ error: 'Application not found' });
+  }
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const transactions = await transactionRepository.findByAppId(application.slug, limit);
+  return res.json({ transactions });
+});
+
+// ----------------------------------------------------
+// HOSTED CHECKOUT SESSIONS
+// A business creates a session server-side with its real API key; the
+// customer's browser (apps/checkout) only ever sees the opaque public token
+// below, never the API key. See packages/database/src/schema/checkout-sessions.ts.
+// ----------------------------------------------------
+
+const CHECKOUT_SESSION_TTL_MS = 30 * 60_000; // 30 minutes
+const CHECKOUT_BASE_URL = process.env.CHECKOUT_BASE_URL || 'http://localhost:5174';
+
+app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  const tenantId = req.header('x-tenant-id') || 'default';
+  const { amount, currency, successUrl, cancelUrl, metadata } = req.body;
+
+  if (!appId) {
+    return res.status(400).json({ error: 'Missing parameter: appId is required' });
+  }
+  if (!amount || !currency) {
+    return res.status(400).json({ error: 'amount and currency are required' });
+  }
+
+  const token = randomUUID().replace(/-/g, '');
+  const session = await checkoutSessionRepository.create({
+    token,
+    appId,
+    tenantId,
+    amount: String(amount),
+    currency,
+    successUrl: successUrl || null,
+    cancelUrl: cancelUrl || null,
+    metadata: metadata ? JSON.stringify(metadata) : null,
+    expiresAt: new Date(Date.now() + CHECKOUT_SESSION_TTL_MS),
+  });
+
+  return res.status(201).json({
+    id: session.id,
+    token: session.token,
+    checkoutUrl: `${CHECKOUT_BASE_URL}/?session=${session.token}`,
+    expiresAt: session.expiresAt,
+  });
+});
+
+// Public — no API key. The session token is itself the capability: it's
+// single-use, expiring, and scoped to exactly the amount/currency/app it
+// was created for, so the browser never needs the application's secret key.
+app.get('/v1/checkout/sessions/:token', async (req: Request, res: Response) => {
+  await checkoutSessionRepository.markExpiredIfPast(req.params.token);
+  const session = await checkoutSessionRepository.findByToken(req.params.token);
+  if (!session) {
+    return res.status(404).json({ error: 'Checkout session not found' });
+  }
+  const application = await applicationRepository.findBySlug(session.appId);
+  return res.json({
+    id: session.id,
+    status: session.status,
+    amount: Number(session.amount),
+    currency: session.currency,
+    applicationName: application?.name || session.appId,
+  });
+});
+
+app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response) => {
+  await checkoutSessionRepository.markExpiredIfPast(req.params.token);
+  const session = await checkoutSessionRepository.findByToken(req.params.token);
+  if (!session) {
+    return res.status(404).json({ error: 'Checkout session not found' });
+  }
+  if (session.status !== 'pending') {
+    return res.status(409).json({ error: `Checkout session is already ${session.status}` });
+  }
+
+  const { paymentMethod, phoneNumber } = req.body;
+
+  try {
+    const event = await routingEngine.routePayment(session.appId, {
+      amount: Number(session.amount),
+      currency: session.currency,
+      paymentMethod: paymentMethod || 'card',
+      phoneNumber,
+    });
+
+    // Single-use: only the first payment attempt against this session can
+    // mark it completed, so a retried/duplicated pay request can't charge twice.
+    const completed = await checkoutSessionRepository.markCompleted(session.token, event.id);
+    if (!completed) {
+      return res.status(409).json({ error: 'Checkout session was already completed' });
+    }
+
+    try {
+      await transactionRepository.create({
+        appId: session.appId,
+        tenantId: session.tenantId,
+        providerId: event.providerId,
+        providerTransactionId: event.id,
+        // routePayment only ever resolves to 'success' | 'failed' | 'unknown' — all three
+        // are valid persisted transaction states (see VALID_STATUSES in the transaction
+        // repository); mapping 'unknown' to 'pending' here would misrepresent an ambiguous
+        // provider timeout as an ordinary not-yet-attempted payment, which the DB-level
+        // state machine's own retry rules treat very differently.
+        status: event.status,
+        amount: String(event.amount),
+        currency: event.currency || session.currency,
+        paymentMethod: paymentMethod || null,
+      });
+    } catch (txErr) {
+      console.error('[checkout] Failed to create transaction record', txErr);
+    }
+
+    eventBus.emit(event);
+    observe(event);
+
+    return res.json({
+      status: event.status,
+      id: event.id,
+      successUrl: session.successUrl,
+    });
+  } catch (err: any) {
+    return res.status(503).json({ error: 'Payment failed', cancelUrl: session.cancelUrl });
+  }
+});
+
 // ----------------------------------------------------
 // PROVIDER CAPABILITY QUERY API
 // ----------------------------------------------------
@@ -582,19 +1072,6 @@ app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Requ
   const views = registry.getAllManagementViews();
   return res.json({ providers: views, count: views.length });
 });
-
-// P1: Payment idempotency cache — prevents duplicate charges on retry.
-// Maps idempotencyKey → TransactionEvent result (5 min TTL).
-const paymentIdempotencyCache = new Map<string, any>();
-const PAYMENT_IDEMPOTENCY_TTL_MS = 5 * 60_000;
-
-setInterval(() => {
-  const cutoff = Date.now() - PAYMENT_IDEMPOTENCY_TTL_MS;
-  for (const [key, event] of paymentIdempotencyCache) {
-    const eventTime = new Date(event.timestamp).getTime();
-    if (eventTime < cutoff) paymentIdempotencyCache.delete(key);
-  }
-}, 60_000);
 
 // P0-5: Inbound provider webhooks with HMAC signature verification.
 // The signature is validated against WEBHOOK_HMAC_SECRET before processing.
@@ -781,7 +1258,16 @@ function getRedisClient(): any {
 
 async function enqueueInboundMessage(providerId: string, payload: any): Promise<void> {
   const client = getRedisClient();
-  if (!client) return; // No Redis — inbound message persisted to DB only
+  if (!client) {
+    // No Redis — gateway and worker are separate processes with no shared
+    // memory, so write a durable row the worker's webhook_job_poller will
+    // pick up and bridge into its own live queue. See
+    // packages/database/src/schema/webhook-jobs.ts.
+    await webhookJobRepository
+      .create({ jobType: 'inbound_message', payload: { providerId, payload } })
+      .catch((err) => console.error('[webhook] Failed to enqueue inbound_message to DB fallback', err));
+    return;
+  }
 
   const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
   const jobId = `job_${randomUUID()}`;
@@ -816,21 +1302,28 @@ async function enqueuePaymentWebhook(input: {
   providerEventId?: string;
   applicationId?: string;
 }): Promise<void> {
+  const jobPayload = {
+    provider: input.providerId,
+    rawBody: input.rawBody,
+    signature: input.signature,
+    providerEventId: input.providerEventId,
+    applicationId: input.applicationId || 'webhook',
+  };
+
   const client = getRedisClient();
-  if (!client) return;
+  if (!client) {
+    await webhookJobRepository
+      .create({ jobType: 'payment_webhook', payload: jobPayload })
+      .catch((err) => console.error('[webhook] Failed to enqueue payment_webhook to DB fallback', err));
+    return;
+  }
 
   const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
   const jobId = `job_${randomUUID()}`;
   const job = {
     id: jobId,
     type: 'payment_webhook',
-    payload: {
-      provider: input.providerId,
-      rawBody: input.rawBody,
-      signature: input.signature,
-      providerEventId: input.providerEventId,
-      applicationId: input.applicationId || 'webhook',
-    },
+    payload: jobPayload,
     attempts: 0,
     maxAttempts: 5,
     status: 'pending',
@@ -856,21 +1349,28 @@ async function enqueueProviderWebhook(input: {
   providerEventId?: string;
   status?: string;
 }): Promise<void> {
+  const jobPayload = {
+    providerId: input.providerId,
+    rawBody: input.rawBody,
+    signature: input.signature,
+    eventId: input.providerEventId,
+    status: input.status,
+  };
+
   const client = getRedisClient();
-  if (!client) return;
+  if (!client) {
+    await webhookJobRepository
+      .create({ jobType: 'provider_webhook', payload: jobPayload })
+      .catch((err) => console.error('[webhook] Failed to enqueue provider_webhook to DB fallback', err));
+    return;
+  }
 
   const queuePrefix = process.env.WORKER_QUEUE_PREFIX || 'bis';
   const jobId = `job_${randomUUID()}`;
   const job = {
     id: jobId,
     type: 'provider_webhook',
-    payload: {
-      providerId: input.providerId,
-      rawBody: input.rawBody,
-      signature: input.signature,
-      eventId: input.providerEventId,
-      status: input.status,
-    },
+    payload: jobPayload,
     attempts: 0,
     maxAttempts: 5,
     status: 'pending',
@@ -902,6 +1402,14 @@ async function enqueueProviderWebhook(input: {
 // against; standardizing on it here makes the console usable again without
 // weakening the gate — the route was never reachable without matching
 // PLATFORM_ADMIN_KEY, now it requires the token the UI actually sends.
+//
+// This also brings GET /providers under the gate. A parallel branch left it
+// unauthenticated on the theory that only mutating routes need protection,
+// but ProviderManagement views include routing rules, error rates, and other
+// operational internals with no legitimate public consumer — the
+// admin-console itself always sends the admin token for this call (see
+// fetchProviders in App.tsx), so gating it costs nothing and closes an
+// unnecessary information-disclosure surface.
 app.use('/api/dashboard', requireAdmin);
 
 app.get('/api/dashboard/providers', (req: Request, res: Response) => {

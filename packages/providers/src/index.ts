@@ -7,12 +7,16 @@ export { FlutterwaveProvider } from './adapters/payments/flutterwave';
 export { PawaPayProvider } from './adapters/payments/pawapay';
 export { PayChanguProvider } from './adapters/payments/paychangu';
 export { AirwallexProvider } from './adapters/payments/airwallex';
+export { AuthorizeNetProvider } from './adapters/payments/authorizenet';
+export { CheckoutComProvider } from './adapters/payments/checkout';
+export { PaystackProvider } from './adapters/payments/paystack';
 export { ExamplePaymentProvider } from './adapters/payments/example';
 
 export { SignalHouseProvider } from './adapters/messaging/signalhouse';
 export { InfobipProvider } from './adapters/messaging/infobip';
 export { FutureSMSProvider } from './adapters/messaging/futuresms';
 export { EmailProvider } from './adapters/messaging/email';
+export { TwilioProvider } from './adapters/messaging/twilio';
 export { ExampleMessagingProvider } from './adapters/messaging/example';
 
 export { MapsProvider } from './adapters/other/maps';

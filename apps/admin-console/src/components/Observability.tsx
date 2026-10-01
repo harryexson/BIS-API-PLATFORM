@@ -187,7 +187,7 @@ export const Observability: React.FC = () => {
                 <tr><Td colSpan={8}><span style={{ color: 'var(--text-muted)' }}>No logs captured yet</span></Td></tr>
               ) : (
                 logs.slice(0, 100).map((l, i) => (
-                  <tr key={i} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                  <tr key={i} style={{ borderBottom: '1px solid rgba(16, 16, 18,0.04)' }}>
                     <Td>{new Date(l.timestamp).toLocaleTimeString()}</Td>
                     <Td>
                       <span style={{ color: l.level === 'error' ? 'var(--accent-red)' : l.level === 'warn' ? 'var(--accent-yellow)' : 'var(--text-secondary)', fontWeight: 600, textTransform: 'uppercase' }}>
@@ -218,7 +218,7 @@ export const Observability: React.FC = () => {
 
 function LatencyStat({ label, value }: { label: string; value: number }) {
   return (
-    <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)', borderRadius: '8px', padding: '8px 10px' }}>
+    <div style={{ background: 'rgba(16, 16, 18,0.02)', border: '1px solid rgba(16, 16, 18,0.04)', borderRadius: '8px', padding: '8px 10px' }}>
       <div style={{ fontSize: '10px', color: 'var(--text-secondary)' }}>{label}</div>
       <div style={{ fontSize: '15px', fontWeight: 700 }}>{typeof value === 'number' ? Math.round(value) : value}</div>
     </div>
@@ -234,8 +234,8 @@ function Td({ children, style, colSpan }: { children?: React.ReactNode; style?: 
 
 function counterCardStyle(color: string): React.CSSProperties {
   return {
-    background: 'rgba(255,255,255,0.02)',
-    border: '1px solid rgba(255,255,255,0.04)',
+    background: 'rgba(16, 16, 18,0.02)',
+    border: '1px solid rgba(16, 16, 18,0.04)',
     borderRadius: '8px',
     padding: '10px 14px',
     minWidth: '130px',

@@ -21,3 +21,5 @@ export { subscriptionPlanRepository } from './subscription-plans';
 export { tenantSubscriptionRepository } from './tenant-subscriptions';
 export { supportTicketRepository } from './support-tickets';
 export { supportTicketMessageRepository } from './support-ticket-messages';
+export { webhookJobRepository } from './webhook-jobs';
+export { checkoutSessionRepository } from './checkout-sessions';

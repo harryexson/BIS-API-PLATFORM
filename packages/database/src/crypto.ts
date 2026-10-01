@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync, createHash } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync, createHash, timingSafeEqual } from 'crypto';
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;
@@ -83,4 +83,26 @@ export function generateApiKey(): {
   const hash = hashApiKey(raw);
   const prefix = generateApiKeyPrefix() + '_' + raw.substring(0, 8);
   return { raw, hash, prefix };
+}
+
+const PASSWORD_SCRYPT_COST = 16384;
+const PASSWORD_KEY_LENGTH = 64;
+
+/**
+ * Hashes a password with scrypt and a random per-password salt, stored as
+ * "salt:hash" hex so verification needs no separate lookup.
+ */
+export function hashPassword(password: string): string {
+  const salt = randomBytes(16);
+  const hash = scryptSync(password, salt, PASSWORD_KEY_LENGTH, { cost: PASSWORD_SCRYPT_COST });
+  return `${salt.toString('hex')}:${hash.toString('hex')}`;
+}
+
+export function verifyPassword(password: string, stored: string): boolean {
+  const [saltHex, hashHex] = stored.split(':');
+  if (!saltHex || !hashHex) return false;
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(hashHex, 'hex');
+  const actual = scryptSync(password, salt, expected.length, { cost: PASSWORD_SCRYPT_COST });
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }

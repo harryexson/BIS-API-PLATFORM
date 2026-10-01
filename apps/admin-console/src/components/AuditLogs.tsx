@@ -11,28 +11,28 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
   
   const getAppBadgeStyle = (appId: string) => {
     const colors: Record<string, string> = {
-      reachchurch: 'rgba(168, 85, 247, 0.1), #c084fc',
-      afribook: 'rgba(234, 179, 8, 0.1), #facc15',
-      haulpro: 'rgba(249, 115, 22, 0.1), #fb923c',
-      stayscape: 'rgba(59, 130, 246, 0.1), #60a5fa',
-      eventhub: 'rgba(236, 72, 153, 0.1), #f472b6',
-      ridely: 'rgba(16, 185, 129, 0.1), #34d399',
-      food: 'rgba(239, 68, 68, 0.1), #f87171',
-      futureapps: 'rgba(6, 182, 212, 0.1), #22d3ee'
+      reachchurch: 'rgba(124, 58, 237, 0.08), #7c3aed',
+      afribook: 'rgba(202, 138, 4, 0.08), #ca8a04',
+      haulpro: 'rgba(194, 65, 12, 0.08), #c2410c',
+      stayscape: 'rgba(37, 99, 235, 0.08), #2563eb',
+      eventhub: 'rgba(219, 39, 119, 0.08), #db2777',
+      ridely: 'rgba(22, 163, 74, 0.08), #16a34a',
+      food: 'rgba(220, 38, 38, 0.08), #dc2626',
+      futureapps: 'rgba(8, 145, 178, 0.08), #0891b2'
     };
 
-    const val = colors[appId.toLowerCase()] || 'rgba(255,255,255,0.06), #e5e7eb';
+    const val = colors[appId.toLowerCase()] || 'rgba(16, 16, 18, 0.06), #71717a';
     const [bg, text] = val.split(', ');
     return { backgroundColor: bg, color: text };
   };
 
   const getCategoryBadgeStyle = (cat: string) => {
     const colors: Record<string, string> = {
-      payment: 'rgba(59, 130, 246, 0.1), #60a5fa',
-      messaging: 'rgba(6, 182, 212, 0.1), #22d3ee',
-      other: 'rgba(168, 85, 247, 0.1), #c084fc'
+      payment: 'rgba(37, 99, 235, 0.08), #2563eb',
+      messaging: 'rgba(8, 145, 178, 0.08), #0891b2',
+      other: 'rgba(124, 58, 237, 0.08), #7c3aed'
     };
-    const val = colors[cat] || 'rgba(255,255,255,0.06), #e5e7eb';
+    const val = colors[cat] || 'rgba(16, 16, 18, 0.06), #71717a';
     const [bg, text] = val.split(', ');
     return { backgroundColor: bg, color: text };
   };
@@ -79,7 +79,7 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
         ) : (
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px', textAlign: 'left' }}>
             <thead>
-              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', color: 'var(--text-secondary)', fontWeight: '600' }}>
+              <tr style={{ borderBottom: '1px solid rgba(16, 16, 18,0.06)', color: 'var(--text-secondary)', fontWeight: '600' }}>
                 <th style={{ padding: '10px 8px' }}>Timestamp</th>
                 <th style={{ padding: '10px 8px' }}>Application</th>
                 <th style={{ padding: '10px 8px' }}>Service</th>
@@ -96,14 +96,18 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
                 // unresolved rather than risk a double charge — it is not a
                 // failure, and must not be styled or labeled as one.
                 const isUnknown = log.status === 'unknown';
+                const isFailed = log.status === 'failed';
+                // Everything else ('pending', 'processing', 'refunded', 'cancelled')
+                // is a non-terminal or post-resolution state — neutral styling,
+                // no implied pass/fail, labeled with the raw status.
                 const timeStr = new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
                 return (
                   <tr
                     key={log.id}
                     style={{
-                      borderBottom: '1px solid rgba(255,255,255,0.03)',
-                      background: isSuccess ? 'transparent' : isUnknown ? 'rgba(245, 158, 11, 0.02)' : 'rgba(239, 68, 68, 0.02)'
+                      borderBottom: '1px solid rgba(16, 16, 18,0.03)',
+                      background: isSuccess ? 'transparent' : isFailed ? 'rgba(239, 68, 68, 0.02)' : 'rgba(245, 158, 11, 0.02)'
                     }}
                   >
                     <td style={{ padding: '10px 8px', color: 'var(--text-muted)' }}>{timeStr}</td>
@@ -155,12 +159,12 @@ export const AuditLogs: React.FC<AuditLogsProps> = ({ logs, onClearLogs }) => {
                           display: 'inline-flex',
                           alignItems: 'center',
                           gap: '3px',
-                          background: isSuccess ? 'rgba(16, 185, 129, 0.1)' : isUnknown ? 'rgba(245, 158, 11, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-                          color: isSuccess ? 'var(--accent-green)' : isUnknown ? 'var(--accent-yellow)' : 'var(--accent-red)'
+                          background: isSuccess ? 'rgba(16, 185, 129, 0.1)' : isFailed ? 'rgba(239, 68, 68, 0.1)' : 'rgba(245, 158, 11, 0.1)',
+                          color: isSuccess ? 'var(--accent-green)' : isFailed ? 'var(--accent-red)' : 'var(--accent-yellow)'
                         }}
                       >
-                        {isUnknown ? <HelpCircle className="w-3 h-3" /> : !isSuccess && <AlertCircle className="w-3 h-3" />}
-                        {isSuccess ? 'SUCCESS' : isUnknown ? 'UNKNOWN' : 'FAILED'}
+                        {isUnknown ? <HelpCircle className="w-3 h-3" /> : isFailed && <AlertCircle className="w-3 h-3" />}
+                        {isSuccess ? 'SUCCESS' : isFailed ? 'FAILED' : log.status.toUpperCase()}
                       </span>
                     </td>
                   </tr>

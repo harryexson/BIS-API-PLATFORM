@@ -35,6 +35,7 @@ import {
   type WorkerHandle,
 } from './harness';
 import { MemoryStore, createKeys, type KVStore, type Keys } from '@company/workers';
+import { PROVIDER_TIMEOUT_MS } from '@company/routing';
 
 console.warn(
   `\n[simulation] REACH CHURCH donation platform — end-to-end simulation + deliberate failure tests\n`,
@@ -253,22 +254,44 @@ describe('deliberate: provider timeout', () => {
     expect(String(donation.body.decisionReason)).toContain('Dynamic Failover');
   });
 
-  it('documents the gap when a provider hangs forever: gateway has no per-request timeout', async () => {
-    patchStripeProcessRequest(() => new Promise(() => undefined));
-    const controller = new AbortController();
-    const pending = runtime.request('POST', '/v1/api/gateway/payment', {
-      headers: {
-        'content-type': 'application/json',
-        authorization: 'Bearer bap_test_reachchurch_0001',
-        'x-tenant-id': TENANT_ID,
-      },
-      body: JSON.stringify({ amount: 50, currency: 'USD', paymentMethod: 'card', providerOverride: 'stripe' }),
-      signal: controller.signal,
-    });
-    await expect(withTimeout(pending, 1200, 'gateway response to hanging provider')).rejects.toThrow('timed out');
-    controller.abort();
-    console.warn('[gap] no request-level timeout around provider calls: hangs tie up gateway + DB-free HTTP connections');
-  });
+  it(
+    'a hung provider is timed out and reported as an unknown outcome, never failed over (FIXED)',
+    async () => {
+      patchStripeProcessRequest(() => new Promise(() => undefined));
+      const pending = runtime.request('POST', '/v1/api/gateway/payment', {
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer bap_test_reachchurch_0001',
+          'x-tenant-id': TENANT_ID,
+        },
+        body: JSON.stringify({ amount: 50, currency: 'USD', paymentMethod: 'card', providerOverride: 'stripe' }),
+      });
+
+      // packages/routing/src/index.ts wraps every provider call in
+      // withProviderTimeout() (PROVIDER_TIMEOUT_MS, 30s default) — this was
+      // never actually being exercised by a 1200ms local race, which can't
+      // distinguish "hung" from "just slow so far". See the equivalent fix
+      // in resilience-failure's R6 test.
+      //
+      // On timeout the gateway must NOT fail over to a second provider: the
+      // first provider may have actually received and completed the charge
+      // before the response was lost, so retrying the same payment through
+      // a different provider here would risk a real double charge on money
+      // whose status we don't actually know. Instead it reports 'unknown'
+      // (202) against the ORIGINAL provider, leaving reconciliation (via
+      // webhook or a status check) to resolve it — see routePayment's catch
+      // block in packages/routing/src/index.ts.
+      const res = await withTimeout(pending, PROVIDER_TIMEOUT_MS + 5000, 'gateway response to hanging provider');
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.status).toBe('unknown');
+      expect(body.providerId).toBe('stripe');
+      console.warn(
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was reported 'unknown' against '${body.providerId}' instead of being failed over`,
+      );
+    },
+    PROVIDER_TIMEOUT_MS + 15_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -382,7 +405,15 @@ describe('deliberate: webhook racing ahead of the client response', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: ambiguous provider response', () => {
-  it('a provider returning a non-terminal status is treated as "success" (documented gap: no pending state)', async () => {
+  // TransactionStatus now includes 'pending' (see @company/schemas and
+  // PaystackProvider, whose real /transaction/initialize call correctly
+  // returns it — that endpoint only confirms the checkout session was
+  // created, not that money changed hands). What's demonstrated below is a
+  // narrower, remaining concern: the platform has no way to detect an
+  // adapter that mislabels a non-terminal charge as 'success' rather than
+  // reporting 'pending' honestly — it can only trust what processRequest()
+  // returns.
+  it('the platform trusts whatever status an adapter reports, even if it mislabels a non-terminal charge as success', async () => {
     patchStripeProcessRequest(async (appId, payload, decisionReason) => {
       await sleep(5);
       return {
@@ -543,13 +574,37 @@ describe('deliberate: worker restart', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: refund', () => {
-  it('no server refund endpoint exists (client resource only) — the charge can only be refunded in the provider panel', async () => {
-    const res = await runtime.request('POST', '/refunds', {
-      headers: { 'content-type': 'application/json', authorization: 'Bearer bap_test_reachchurch_0001' },
-      body: JSON.stringify({ amount: 50, charge: 'ch_xyz' }),
-    });
+  const AUTH = { authorization: 'Bearer bap_test_reachchurch_0001', 'x-tenant-id': TENANT_ID };
+
+  it('POST /refunds refunds a previously captured payment (FIXED)', async () => {
+    const donation = await createDonation(runtime, { amount: 50, currency: 'USD' }, AUTH);
+    expect(donation.status).toBe(200);
+    const paymentId = donation.body.id;
+
+    const res = await runtime.post('/refunds', { payment_id: paymentId, reason: 'customer_requested' }, AUTH);
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.object).toBe('refund');
+    expect(body.payment_id).toBe(paymentId);
+    expect(body.status).toBe('success');
+    expect(body.amount).toBe(50);
+    console.warn('[FIXED] POST /refunds now refunds a captured payment via BaseProvider.refund() (real Stripe API when configured, simulated otherwise)');
+  });
+
+  it('POST /refunds rejects a refund amount exceeding the captured amount', async () => {
+    const donation = await createDonation(runtime, { amount: 20, currency: 'USD' }, AUTH);
+    expect(donation.status).toBe(200);
+    const paymentId = donation.body.id;
+
+    const res = await runtime.post('/refunds', { payment_id: paymentId, amount: 5000 }, AUTH);
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error.code).toBe('invalid_operation');
+  });
+
+  it('POST /refunds 404s for a payment the caller does not own', async () => {
+    const res = await runtime.post('/refunds', { payment_id: 'ch_does_not_exist' }, AUTH);
     expect(res.status).toBe(404);
-    console.warn('[gap] POST /refunds has no gateway route; BaseProvider has no refund(); the api-client RefundsResource is unimplemented server-side');
   });
 
   it('the webhook pipeline handles a charge.refunded event end-to-end and notifies the donor', async () => {

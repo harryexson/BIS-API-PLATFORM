@@ -17,12 +17,16 @@ import { FlutterwaveProvider } from './adapters/payments/flutterwave';
 import { PawaPayProvider } from './adapters/payments/pawapay';
 import { PayChanguProvider } from './adapters/payments/paychangu';
 import { AirwallexProvider } from './adapters/payments/airwallex';
+import { AuthorizeNetProvider } from './adapters/payments/authorizenet';
+import { CheckoutComProvider } from './adapters/payments/checkout';
+import { PaystackProvider } from './adapters/payments/paystack';
 import { ExamplePaymentProvider } from './adapters/payments/example';
 
 import { SignalHouseProvider } from './adapters/messaging/signalhouse';
 import { InfobipProvider } from './adapters/messaging/infobip';
 import { FutureSMSProvider } from './adapters/messaging/futuresms';
 import { EmailProvider } from './adapters/messaging/email';
+import { TwilioProvider } from './adapters/messaging/twilio';
 import { ExampleMessagingProvider } from './adapters/messaging/example';
 
 import { MapsProvider } from './adapters/other/maps';
@@ -138,6 +142,42 @@ export class ProviderRegistry {
       transactionFeeFlat: 0.0
     }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'HKD', 'SGD'], capabilities: ['card', 'bank_transfer'] });
 
+    this.register(new AuthorizeNetProvider({
+      id: 'authorizenet',
+      name: 'Authorize.Net',
+      category: 'payment',
+      status: 'online',
+      weight: 40,
+      latencyMin: 150,
+      latencyMax: 210,
+      transactionFeePercent: 2.9,
+      transactionFeeFlat: 0.30
+    }), { environment: 'live', countries: ['US', 'CA'], currencies: ['USD', 'CAD'], capabilities: ['card'] });
+
+    this.register(new CheckoutComProvider({
+      id: 'checkout',
+      name: 'Checkout.com',
+      category: 'payment',
+      status: 'online',
+      weight: 45,
+      latencyMin: 130,
+      latencyMax: 190,
+      transactionFeePercent: 2.6,
+      transactionFeeFlat: 0.25
+    }), { environment: 'live', countries: ['*'], currencies: ['USD', 'EUR', 'GBP', 'AED'], capabilities: ['card'] });
+
+    this.register(new PaystackProvider({
+      id: 'paystack',
+      name: 'Paystack',
+      category: 'payment',
+      status: 'online',
+      weight: 50,
+      latencyMin: 190,
+      latencyMax: 250,
+      transactionFeePercent: 1.5,
+      transactionFeeFlat: 0.0
+    }), { environment: 'live', countries: ['NG', 'GH', 'ZA', 'KE'], currencies: ['NGN', 'GHS', 'ZAR', 'KES', 'USD'], capabilities: ['card', 'bank_transfer', 'mobile_money'] });
+
     this.register(new SignalHouseProvider({
       id: 'signalhouse',
       name: 'SignalHouse',
@@ -170,6 +210,17 @@ export class ProviderRegistry {
       latencyMax: 250,
       messageCost: 0.002
     }), { environment: 'live', countries: ['MW', 'ZM'], currencies: ['MWK', 'ZMW'], capabilities: ['sms'] });
+
+    this.register(new TwilioProvider({
+      id: 'twilio',
+      name: 'Twilio',
+      category: 'messaging',
+      status: 'online',
+      weight: 50,
+      latencyMin: 100,
+      latencyMax: 160,
+      messageCost: 0.0075
+    }), { environment: 'live', countries: ['*'], currencies: ['USD'], capabilities: ['sms', 'whatsapp'] });
 
     this.register(new EmailProvider({
       id: 'email',

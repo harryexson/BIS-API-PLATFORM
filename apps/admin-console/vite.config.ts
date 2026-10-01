@@ -12,6 +12,13 @@ export default defineConfig({
         changeOrigin: true,
         secure: false,
       },
+      // The Request Playground calls the real /v1/api/gateway/* traffic
+      // routes directly (see RequestPlayground.tsx) — those need proxying too.
+      '/v1': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+        secure: false,
+      },
     },
   },
 });

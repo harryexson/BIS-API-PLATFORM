@@ -99,8 +99,8 @@ export const LoginGate: React.FC<{ onClose?: () => void }> = ({ onClose }) => {
             cursor: 'pointer',
             fontWeight: '600',
             fontSize: '14px',
-            color: '#04121a',
-            background: 'linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-purple) 100%)',
+            color: '#ffffff',
+            background: 'var(--accent-cyan)',
             opacity: loading || !passcode ? 0.6 : 1,
           }}
         >

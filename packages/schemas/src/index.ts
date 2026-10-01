@@ -1,12 +1,28 @@
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
-// 'unknown' is a legitimate, distinct outcome — not a synonym for 'failed'.
-// A payment provider timeout means the request's outcome is genuinely
-// unknown (it may have been charged); routing must never silently convert
-// that into 'failed' (risks a false "declined" being retried into a real
-// double charge) or 'success' (risks confirming a charge that never
-// happened). See RoutingEngine.routePayment's timeout handling.
-export type TransactionStatus = 'success' | 'failed' | 'unknown';
+// The full persisted transaction lifecycle (see VALID_STATUSES/VALID_TRANSITIONS
+// in packages/database/src/repositories/transactions.ts): 'pending' (created,
+// not yet resolved), 'processing' (provider acknowledged, awaiting outcome),
+// 'success'/'failed' (resolved), 'refunded'/'cancelled' (post-resolution),
+// and 'unknown'.
+//
+// 'unknown' is a legitimate, distinct outcome — not a synonym for 'failed' or
+// 'pending'. A payment provider timeout means the request's outcome is
+// genuinely unknown (it may have been charged); routing must never silently
+// convert that into 'failed' (risks a false "declined" being retried into a
+// real double charge), 'success' (risks confirming a charge that never
+// happened), or 'pending' (implies a normal not-yet-attempted state, which
+// understates that this needs reconciliation and must never be auto-retried
+// like an ordinary pending payment). See RoutingEngine.routePayment's timeout
+// handling and the 'unknown' row of VALID_TRANSITIONS.
+export type TransactionStatus =
+  | 'pending'
+  | 'processing'
+  | 'success'
+  | 'failed'
+  | 'refunded'
+  | 'cancelled'
+  | 'unknown';
 
 export type ProviderEnvironment = 'test' | 'live';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
@@ -130,6 +146,14 @@ export interface MessageResponse {
   status: string;
   channel: string;
   [key: string]: unknown;
+}
+
+export interface RefundRequest {
+  originalTransactionId: string;
+  amount?: number;
+  currency?: string;
+  reason?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface OtherRequest {

@@ -35,6 +35,17 @@ export const userRepository = {
     return rows[0];
   },
 
+  /**
+   * Global email lookup across applications — users.email is only unique
+   * per-application (idx_users_application_email), so the same email can
+   * exist under multiple applications. Login doesn't know the applicationId
+   * up front, so it checks each match's password rather than assuming one.
+   */
+  async findByEmail(email: string): Promise<User[]> {
+    const db = getDb();
+    return db.select().from(users).where(eq(users.email, email));
+  },
+
   async findByApplicationId(applicationId: string): Promise<User[]> {
     const db = getDb();
     return db

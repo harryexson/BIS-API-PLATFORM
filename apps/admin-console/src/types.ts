@@ -1,8 +1,18 @@
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
-// 'unknown' = a payment provider timeout the routing engine deliberately
-// left unresolved rather than risk a double charge — not a display bug.
-export type TransactionStatus = 'success' | 'failed' | 'unknown';
+// Mirrors @company/schemas' TransactionStatus — the full persisted transaction
+// lifecycle. 'unknown' = a payment provider timeout the routing engine
+// deliberately left unresolved rather than risk a double charge — not a
+// display bug, and distinct from 'pending' (which implies a normal
+// not-yet-attempted state).
+export type TransactionStatus =
+  | 'pending'
+  | 'processing'
+  | 'success'
+  | 'failed'
+  | 'refunded'
+  | 'cancelled'
+  | 'unknown';
 export type ProviderEnvironment = 'test' | 'live';
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
 

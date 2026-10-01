@@ -10,7 +10,6 @@ import {
 } from 'rate-limiter-flexible';
 
 export interface AuthOptions {
-  adminKey?: string;
   rateLimit?: { windowMs: number; max: number };
 }
 
@@ -111,19 +110,6 @@ export class AuthService {
     return { ok: false, error: 'API key required' };
   }
 
-  checkAdmin(req: Request): boolean {
-    const configured = !!this.opts.adminKey;
-    const header =
-      (req.headers['x-admin-key'] as string) ||
-      (req.headers['authorization'] as string) ||
-      '';
-    if (configured) {
-      return header === this.opts.adminKey;
-    }
-    // P0: Never bypass admin auth — always reject when no key configured
-    return false;
-  }
-
   // P2-4: Redis-backed rate limiting with in-memory fallback
   async rateAllowed(key: string): Promise<boolean> {
     try {
@@ -156,13 +142,6 @@ export function createMiddleware(auth: AuthService) {
     next();
   };
 
-  const admin = (req: Request, res: Response, next: NextFunction) => {
-    if (!auth.checkAdmin(req)) {
-      return res.status(403).json({ error: 'Admin key required' });
-    }
-    next();
-  };
-
   const rateLimit = async (req: Request, res: Response, next: NextFunction) => {
     const id = auth.extractKey(req) || req.ip || 'anonymous';
     if (!(await auth.rateAllowed(id))) {
@@ -171,5 +150,5 @@ export function createMiddleware(auth: AuthService) {
     next();
   };
 
-  return { apiKey, admin, rateLimit };
+  return { apiKey, rateLimit };
 }

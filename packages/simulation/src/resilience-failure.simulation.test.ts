@@ -31,6 +31,8 @@ import {
   type SimRuntime,
   type WorkerHandle,
 } from './harness';
+import { PROVIDER_TIMEOUT_MS } from '@company/routing';
+import { QueueBackpressureError } from '@company/workers';
 
 console.warn('\n[audit] AUDIT 5 — Resilience, Load & Failure Engineering\n');
 
@@ -45,7 +47,7 @@ const AUTH = {
   'x-tenant-id': TENANT_ID,
 };
 
-const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'stripe', 'nmi', 'email'];
+const ALL_PROVIDERS = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'stripe', 'nmi', 'email'];
 
 let runtime: SimRuntime;
 let pipeline: WorkerHandle;
@@ -199,7 +201,7 @@ describe('R3 — primary SMS provider offline: failover works (OK)', () => {
 
 describe('R4 — all SMS providers offline: silent channel change (GAP)', () => {
   it('an SMS is silently routed over email when no SMS provider is available', async () => {
-    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg'];
+    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
       const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);
@@ -266,29 +268,48 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
 // R6) Stripe timeout / hang — no server-side timeout (DEFECT)
 // ---------------------------------------------------------------------------
 
-describe('R6 — provider hang: no gateway request timeout (DEFECT)', () => {
-  it('a hung provider stalls the gateway request indefinitely', async () => {
-    const stripe = runtime.registry.getProvider('stripe') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const orig = stripe.processRequest.bind(stripe);
-    stripe.processRequest = async () => new Promise(() => {}); // never resolves
-    patches.push(() => {
-      stripe.processRequest = orig;
-    });
+describe('R6 — provider hang: gateway request timeout + unknown outcome (FIXED)', () => {
+  it(
+    'a hung provider is timed out after PROVIDER_TIMEOUT_MS and reported unknown, never failed over',
+    async () => {
+      const stripe = runtime.registry.getProvider('stripe') as unknown as {
+        processRequest: (...a: any[]) => Promise<any>;
+      };
+      const orig = stripe.processRequest.bind(stripe);
+      stripe.processRequest = async () => new Promise(() => {}); // never resolves
+      patches.push(() => {
+        stripe.processRequest = orig;
+      });
 
-    const result = await Promise.race([
-      createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then(() => 'done'),
-      sleep(1500).then(() => 'hung'),
-    ]);
+      // packages/routing/src/index.ts already wraps every provider call in
+      // withProviderTimeout(), which was never actually being exercised by
+      // this test — 1500ms is far shorter than the real PROVIDER_TIMEOUT_MS
+      // (30s default), so it always looked "hung" without ever reaching the
+      // real timeout. Race against the real value instead of an arbitrary
+      // short window that can't distinguish "hung" from "just slow so far".
+      //
+      // The timed-out request must NOT fail over to a second provider: Stripe
+      // may have actually received and completed the charge before the
+      // response was lost, so retrying through a different provider here
+      // would risk a real double charge on money whose status we don't
+      // actually know. routePayment's catch block reports 'unknown' (202)
+      // against the ORIGINAL provider instead, leaving reconciliation (via
+      // webhook or a status check) to resolve it.
+      const result = await Promise.race([
+        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, status: r.status, body: r.body })),
+        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, status: undefined as number | undefined, body: undefined as any })),
+      ]);
 
-    // DEFECT: no request timeout around provider call. A hung provider stalls
-    // the gateway request indefinitely. Documenting current behavior.
-    expect(result).toBe('hung');
-    console.warn(
-      '[DEFECT] no request timeout around provider call: a hung provider stalls the gateway request indefinitely',
-    );
-  });
+      expect(result.done).toBe(true);
+      expect(result.status).toBe(202);
+      expect(result.body.status).toBe('unknown');
+      expect(result.body.providerId).toBe('stripe');
+      console.warn(
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was reported 'unknown' against '${result.body.providerId}' instead of stalling indefinitely or failing over`,
+      );
+    },
+    PROVIDER_TIMEOUT_MS + 15_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -449,38 +470,53 @@ describe('R9 — webhook DB write failed: now triggers retry/dead-letter (FIXED)
 // R10) 5,000 messages — no producer backpressure, rate-limit storms (GAP)
 // ---------------------------------------------------------------------------
 
-describe('R10 — mass enqueue: no backpressure, rate-limit storm (GAP)', () => {
+describe('R10 — mass enqueue: producer backpressure (FIXED)', () => {
   it(
-    'exceeding the rate limit turns into a retry/dead-letter storm',
+    'JobQueue.enqueue() rejects once a job type is at capacity, instead of converting overflow into a retry/dead-letter storm',
     async () => {
+      const MAX_DEPTH = 200;
       const w = await runtime.makeWorker({
         config: {
           ...DEFAULT_WORKER_CONFIG,
           rateLimit: { windowMs: 60_000, maxRequests: 100 },
+          maxQueueDepth: MAX_DEPTH,
         },
       });
 
-    const LOAD = 5000;
-    for (let i = 0; i < LOAD; i++) {
-      await w.queue.enqueue('message_delivery', {
-        appId: APP_SLUG,
-        recipient: DONOR_EMAIL,
-        content: `m${i}`,
-      });
-    }
+      // Stop the worker from draining the queue mid-test so the depth cap is
+      // actually exercised — otherwise jobs complete/fail fast enough that
+      // enqueue() rarely observes the queue at capacity.
+      await w.manager.stop();
 
-    await drain(w, ['message_delivery'], { timeoutMs: 120_000 });
-    const c = await counts(w, 'message_delivery');
+      const LOAD = 5000;
+      let accepted = 0;
+      let rejected = 0;
+      for (let i = 0; i < LOAD; i++) {
+        try {
+          await w.queue.enqueue('message_delivery', {
+            appId: APP_SLUG,
+            recipient: DONOR_EMAIL,
+            content: `m${i}`,
+          });
+          accepted++;
+        } catch (err) {
+          expect(err).toBeInstanceOf(QueueBackpressureError);
+          rejected++;
+        }
+      }
 
-    // EXPECTED-SAFE: the system should apply backpressure instead of converting
-    // overflow into a retry/dead-letter storm. Here dead letters pile up.
-    expect(c.dead).toBeGreaterThan(0);
-    console.warn(
-      `[GAP] no producer backpressure; exceeding the rate limit turns into a retry/dead-letter storm (count(dead)=${c.dead})`,
-    );
-    await w.manager.stop().catch(() => {});
+      // FIXED: the queue caps at maxQueueDepth instead of silently absorbing
+      // all 5000 — the producer (an HTTP route handler, a webhook enqueuer)
+      // gets an immediate, actionable rejection instead of every job being
+      // accepted only to fail downstream once the rate limit is hit.
+      expect(accepted).toBe(MAX_DEPTH);
+      expect(rejected).toBe(LOAD - MAX_DEPTH);
+      expect(await counts(w, 'message_delivery')).toMatchObject({ ready: MAX_DEPTH, delayed: 0 });
+      console.warn(
+        `[FIXED] enqueue() rejected ${rejected}/${LOAD} jobs once "message_delivery" reached maxQueueDepth=${MAX_DEPTH}`,
+      );
     },
-    180_000,
+    60_000,
   );
 });
 

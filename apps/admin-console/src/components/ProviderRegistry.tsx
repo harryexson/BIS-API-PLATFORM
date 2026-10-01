@@ -61,8 +61,8 @@ export const ProviderRegistry: React.FC<ProviderRegistryProps> = ({ providers, o
                     <div 
                       key={provider.id} 
                       style={{
-                        background: 'rgba(255, 255, 255, 0.02)',
-                        border: '1px solid rgba(255, 255, 255, 0.04)',
+                        background: 'rgba(16, 16, 18, 0.02)',
+                        border: '1px solid rgba(16, 16, 18, 0.04)',
                         borderRadius: '8px',
                         padding: '12px 16px',
                         display: 'flex',
@@ -74,7 +74,7 @@ export const ProviderRegistry: React.FC<ProviderRegistryProps> = ({ providers, o
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                           <span style={{ fontWeight: '600', fontSize: '14px' }}>{provider.name}</span>
-                          <span style={{ fontSize: '10px', background: 'rgba(255, 255, 255, 0.08)', padding: '2px 6px', borderRadius: '4px', color: 'var(--text-secondary)' }}>
+                          <span style={{ fontSize: '10px', background: 'rgba(16, 16, 18, 0.08)', padding: '2px 6px', borderRadius: '4px', color: 'var(--text-secondary)' }}>
                             {provider.id}
                           </span>
                           {isUpdating && <RefreshCw className="w-3 h-3 animate-spin text-cyan-400" style={{ color: 'var(--accent-cyan)' }} />}
@@ -151,7 +151,7 @@ export const ProviderRegistry: React.FC<ProviderRegistryProps> = ({ providers, o
                       </div>
 
                       {/* Fee information */}
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: 'var(--text-muted)', borderTop: '1px solid rgba(255, 255, 255, 0.02)', paddingTop: '6px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: 'var(--text-muted)', borderTop: '1px solid rgba(16, 16, 18, 0.02)', paddingTop: '6px' }}>
                         {provider.category === 'payment' && (
                           <span>
                             Base Fee: {provider.transactionFeePercent}% 

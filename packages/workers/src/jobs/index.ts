@@ -12,6 +12,7 @@ import { createInboundMessageProcessor } from './inboundMessage';
 import { createOutboxPollerProcessor } from './outboxPoller';
 import { createReceiptPipelineProcessor } from './receiptPipeline';
 import { createKeywordResponseDeliveryProcessor } from './keywordResponseDelivery';
+import { createWebhookJobPollerProcessor } from './webhookJobPoller';
 
 export { JobDeps, NeonWriteError } from './deps';
 export { createMessageDeliveryProcessor } from './messageDelivery';
@@ -25,6 +26,7 @@ export { createInboundMessageProcessor } from './inboundMessage';
 export { createOutboxPollerProcessor } from './outboxPoller';
 export { createReceiptPipelineProcessor } from './receiptPipeline';
 export { createKeywordResponseDeliveryProcessor } from './keywordResponseDelivery';
+export { createWebhookJobPollerProcessor } from './webhookJobPoller';
 
 export function registerAllProcessors(
   manager: WorkerManager,
@@ -46,5 +48,7 @@ export function registerAllProcessors(
   manager.register('receipt_pipeline', createReceiptPipelineProcessor(deps));
   // P0: Register keyword response delivery — sends STOP/HELP/YES responses back to users
   manager.register('keyword_response_delivery', createKeywordResponseDeliveryProcessor(deps));
+  // Bridges gateway-enqueued webhook jobs from Postgres when Redis isn't configured
+  manager.register('webhook_job_poller', createWebhookJobPollerProcessor(deps, queue));
   return manager;
 }

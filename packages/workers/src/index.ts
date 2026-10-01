@@ -5,6 +5,6 @@ export { computeBackoff } from './backoff';
 export { DistributedLock } from './lock';
 export { RateLimiter, type RateLimitResult } from './rateLimit';
 export { IdempotencyStore, type IdempotencyRecord } from './idempotency';
-export { JobQueue } from './queue';
+export { JobQueue, QueueBackpressureError } from './queue';
 export { WorkerManager } from './worker';
 export * from './jobs';

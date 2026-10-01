@@ -47,13 +47,19 @@ export const App: React.FC = () => {
       });
       if (!res.ok) return;
       const data = await res.json();
-      setProviders(data);
+      if (Array.isArray(data)) setProviders(data);
     } catch (err) {
       console.error('Failed to fetch provider registry configs:', err);
     }
   };
 
+  // /api/dashboard/logs and /metrics require admin auth — without a token
+  // these 403 with an error object, not an array/metrics shape, which used
+  // to crash AuditLogs's logs.map() and take down the whole app with no
+  // error boundary. Gate on isAdmin and attach the token like every other
+  // admin-console component already does (see Observability.tsx).
   const fetchLogs = async () => {
+    if (!isAdmin) return;
     try {
       const res = await fetch('/api/dashboard/logs', {
         headers: token ? { 'x-admin-token': token } : undefined,
@@ -63,20 +69,21 @@ export const App: React.FC = () => {
       // it to the error body, which crashed every child that expects an array.
       if (!res.ok) return;
       const data = await res.json();
-      setLogs(data);
+      if (res.ok && Array.isArray(data)) setLogs(data);
     } catch (err) {
       console.error('Failed to fetch transaction logs:', err);
     }
   };
 
   const fetchMetrics = async () => {
+    if (!isAdmin) return;
     try {
       const res = await fetch('/api/dashboard/metrics', {
         headers: token ? { 'x-admin-token': token } : undefined,
       });
       if (!res.ok) return;
       const data = await res.json();
-      setMetrics(data);
+      if (res.ok) setMetrics(data);
     } catch (err) {
       console.error('Failed to fetch metrics:', err);
     }
@@ -108,17 +115,28 @@ export const App: React.FC = () => {
     }
   };
 
-  // Triggers request dispatch from the dashboard client to mock real app traffic
-  const handleDispatchRequest = async (category: 'payment' | 'messaging' | 'other', payload: any) => {
+  // Triggers request dispatch from the dashboard client to mock real app traffic.
+  // The gateway requires a real application API key + tenant ID (mw.apiKey +
+  // resolveTenantContext) — get both from the Developer Portal's API Keys tab.
+  const handleDispatchRequest = async (
+    category: 'payment' | 'messaging' | 'other',
+    payload: any,
+    auth: { apiKey: string; tenantId: string },
+  ) => {
     setPlaygroundLoading(true);
     setPlaygroundResponse(null);
 
-    const endpoint = `/api/gateway/${category === 'payment' ? 'payment' : category === 'messaging' ? 'messaging' : 'other'}`;
+    const endpoint = `/v1/api/gateway/${category}`;
 
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${auth.apiKey}`,
+          'x-tenant-id': auth.tenantId,
+          'Idempotency-Key': crypto.randomUUID(),
+        },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
@@ -134,7 +152,10 @@ export const App: React.FC = () => {
   // Clears active logs
   const handleClearLogs = async () => {
     try {
-      const res = await fetch('/api/dashboard/logs/clear', { method: 'POST' });
+      const res = await fetch('/api/dashboard/logs/clear', {
+        method: 'POST',
+        headers: { 'x-admin-token': token || '' },
+      });
       if (res.ok) {
         setLogs([]);
         setMetrics(INITIAL_METRICS);
@@ -156,13 +177,11 @@ export const App: React.FC = () => {
     fetchLogs();
     fetchMetrics();
 
-    // NOTE: the browser EventSource API cannot attach the x-admin-token
-    // header this endpoint requires, so this stream will not connect even
-    // when logged in. Left in place (it fails safely to "disconnected"
-    // rather than crashing) pending a token-carrying transport — e.g. a
-    // short-lived signed stream ticket issued over the authenticated
-    // fetch API, or switching to a fetch-based ReadableStream.
-    const eventSource = new EventSource('/api/dashboard/stream');
+    // Only requires admin, and EventSource can't set custom headers, so the
+    // token travels via query string instead (see requireAdmin's fallback
+    // in services/api-gateway/src/app.ts — the standard pattern for
+    // authenticating SSE connections from a browser).
+    const eventSource = new EventSource(`/api/dashboard/stream?token=${encodeURIComponent(token || '')}`);
 
     eventSource.onopen = () => setSseConnected(true);
     eventSource.onerror = () => setSseConnected(false);
@@ -186,8 +205,7 @@ export const App: React.FC = () => {
     return () => {
       eventSource.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin]);
+  }, [isAdmin, token]);
 
   return (
     <div className="main-layout">
@@ -197,7 +215,7 @@ export const App: React.FC = () => {
           justifyContent: 'space-between',
           alignItems: 'center',
           marginBottom: '32px',
-          borderBottom: '1px solid rgba(255, 255, 255, 0.05)',
+          borderBottom: '1px solid rgba(16, 16, 18, 0.05)',
           paddingBottom: '20px',
           flexWrap: 'wrap',
           gap: '12px',
@@ -208,19 +226,18 @@ export const App: React.FC = () => {
             style={{
               width: '44px',
               height: '44px',
-              borderRadius: '12px',
-              background: 'linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-purple) 100%)',
+              borderRadius: '8px',
+              background: 'var(--accent-cyan)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              boxShadow: '0 0 20px rgba(6, 182, 212, 0.3)',
             }}
           >
-            <Network className="w-6 h-6 text-white" />
+            <Network className="w-6 h-6 text-white" style={{ color: '#ffffff' }} />
           </div>
           <div>
-            <h1 style={{ margin: 0, fontSize: '22px', fontWeight: 800, letterSpacing: '-0.5px' }}>
-              BIS API GATEWAY PLATFORM
+            <h1 style={{ margin: 0, fontFamily: 'var(--font-display)', fontSize: '20px', fontWeight: 600, letterSpacing: '-0.01em' }}>
+              BIS API Gateway Platform
             </h1>
             <span style={{ fontSize: '12px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
               <Layers className="w-3.5 h-3.5 text-cyan-400" />
@@ -235,8 +252,8 @@ export const App: React.FC = () => {
               display: 'flex',
               alignItems: 'center',
               gap: '6px',
-              background: 'rgba(255, 255, 255, 0.02)',
-              border: '1px solid rgba(255, 255, 255, 0.05)',
+              background: 'rgba(16, 16, 18, 0.02)',
+              border: '1px solid rgba(16, 16, 18, 0.05)',
               padding: '6px 12px',
               borderRadius: '20px',
               fontSize: '12px',
@@ -371,7 +388,7 @@ function adminPill(needsLogin: boolean): React.CSSProperties {
     display: 'inline-flex',
     alignItems: 'center',
     gap: '6px',
-    background: needsLogin ? 'rgba(255,255,255,0.04)' : 'rgba(16,185,129,0.12)',
+    background: needsLogin ? 'rgba(16, 16, 18, 0.04)' : 'rgba(22, 163, 74, 0.1)',
     border: `1px solid ${needsLogin ? 'var(--glass-border)' : 'var(--accent-green)'}`,
     color: needsLogin ? 'var(--text-primary)' : 'var(--accent-green)',
     padding: '6px 12px',
@@ -396,7 +413,7 @@ function TabButton({ active, onClick, icon, label }: { active: boolean; onClick:
         fontWeight: 600,
         cursor: 'pointer',
         border: active ? '1px solid var(--accent-cyan)' : '1px solid var(--glass-border)',
-        background: active ? 'rgba(6,182,212,0.12)' : 'var(--bg-tertiary)',
+        background: active ? 'rgba(255, 90, 31, 0.1)' : 'var(--bg-tertiary)',
         color: active ? 'var(--accent-cyan)' : 'var(--text-secondary)',
       }}
     >
