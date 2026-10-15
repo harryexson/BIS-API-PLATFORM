@@ -206,14 +206,21 @@ export class SquareProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.isConfigured() || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.isConfigured() ? [] : ['SQUARE_ACCESS_TOKEN'],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // Body `idempotency_key` — Square's CreatePayment caps it at 45 chars,
+    // so the deterministic identity is the compact form
+    // bis_<payment_transaction_id without dashes>_<8-char digest of the
+    // client key> (still a pure function of both; gap register E7).
+    const idempotencyKey = this.paymentIdempotencyIdentity(payload, { maxLength: 45 });
+
     try {
-      const customerId = String((payload.metadata as any)?.squareCustomerId || appId);
-      const idempotencyKey = (payload as any).idempotencyKey
-        ? `bis_${appId}_${(payload as any).idempotencyKey}`
-        : `bis_${appId}_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      const customerId = String(payload.metadata?.squareCustomerId || appId);
 
       const res = await this.http_request({
         method: 'POST',

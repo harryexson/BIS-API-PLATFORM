@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { StripeProvider } from './stripe';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'stripe',
@@ -199,7 +204,7 @@ describe('StripeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new StripeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -215,7 +220,7 @@ describe('StripeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new StripeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -236,7 +241,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
         'test',
       );
 
@@ -280,7 +285,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_declined' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_declined' },
         'test',
       );
 
@@ -304,7 +309,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_authenticationRequired' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_authenticationRequired' },
         'test',
       );
 
@@ -324,7 +329,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_ach_debit' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_ach_debit' },
         'test',
       );
 
@@ -344,7 +349,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
         'test',
       );
 
@@ -365,7 +370,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
         'test',
       );
 
@@ -394,7 +399,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
         'test',
       );
 
@@ -424,7 +429,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
         'test',
       );
 
@@ -448,7 +453,7 @@ describe('StripeProvider', () => {
       const provider = new StripeProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' },
         'test',
       );
 
@@ -464,7 +469,7 @@ describe('StripeProvider', () => {
 
       const provider = new StripeProvider(makeConfig({ status: 'offline' }));
       await expect(
-        provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' }, 'test'),
+        provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'pm_card_visa' }, 'test'),
       ).rejects.toThrow(/OFFLINE/);
       expect(fetchSpy).not.toHaveBeenCalled();
     });

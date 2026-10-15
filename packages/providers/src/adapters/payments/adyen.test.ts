@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { AdyenProvider } from './adyen';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'adyen',
@@ -63,7 +68,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
 
       const [url] = fetchSpy.mock.calls[0];
       expect(url).toBe('https://checkout-test.adyen.com/v71/payments');
@@ -81,7 +86,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
 
       const [url] = fetchSpy.mock.calls[0];
       expect(url).toBe('https://reachchurch1234-checkout-live.adyenpayments.com/checkout/v71/payments');
@@ -96,7 +101,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -110,7 +115,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -127,7 +132,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      const event = await provider.processRequest('app1', {
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID,
         amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_method_1',
         metadata: { shopperReference: 'donor_42' },
       }, 'test');
@@ -154,7 +159,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      await provider.processRequest('reach-church', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+      await provider.processRequest('reach-church', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
 
       const [, opts] = fetchSpy.mock.calls[0];
       const body = JSON.parse(opts.body);
@@ -170,7 +175,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
       expect(event.status).toBe('failed');
       expect(event.error).toBe('Insufficient funds');
     });
@@ -184,7 +189,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
       expect(event.status).toBe('unknown');
     });
 
@@ -199,7 +204,7 @@ describe('AdyenProvider', () => {
         vi.stubGlobal('fetch', fetchSpy);
 
         const provider = new AdyenProvider(makeConfig());
-        const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+        const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
         expect(event.status).toBe('unknown');
       },
     );
@@ -213,7 +218,7 @@ describe('AdyenProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AdyenProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_1' }, 'test');
       expect(event.status).toBe('failed');
       expect(event.error).toBe('Not allowed');
     });

@@ -198,14 +198,20 @@ export class PayPalProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.isConfigured() || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.isConfigured() ? [] : ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET'],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // `PayPal-Request-Id` (PayPal's idempotency header; 108-char cap):
+    // deterministic bis_<payment_transaction_id>_<client key | 'default'>
+    // instead of the old random fallback (gap register E7).
+    const requestId = this.paymentIdempotencyIdentity(payload, { maxLength: 108 });
+
     try {
       const token = await this.getAccessToken();
-      const requestId = (payload as any).idempotencyKey
-        ? `bis_${appId}_${(payload as any).idempotencyKey}`
-        : `bis_${appId}_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
       const res = await this.http_request({
         method: 'POST',

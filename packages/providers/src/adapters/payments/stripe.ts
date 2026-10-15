@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { BaseProvider } from '../../base';
+import { BaseProvider, type PaymentStatusQuery, type PaymentStatusQueryResult, type ProviderReportedPaymentStatus } from '../../base';
 import { ProviderConfig, TransactionEvent, PaymentRequest, RefundRequest } from '@company/schemas';
 
 /**
@@ -139,6 +139,105 @@ export class StripeProvider extends BaseProvider {
   }
 
   /**
+   * Read-only reconciliation query (Phase 6, gap register D4). Two GET
+   * endpoints of Stripe's public API, neither of which can create, confirm
+   * or capture anything:
+   *
+   *  - provider id known (`pi_...`): GET /v1/payment_intents/:id — retrieve.
+   *  - provider id never received (router timeout): GET
+   *    /v1/payment_intents/search?query=metadata['bisPaymentTransactionId']:'<id>'
+   *    — every real PaymentIntent this adapter creates carries
+   *    metadata[bisPaymentTransactionId] (see processRequest). Stripe's own
+   *    search documentation (docs.stripe.com/search, checked via Stripe's
+   *    documentation search on 2026-10-14) says search is NOT read-after-write
+   *    consistent (normally searchable within ~1 minute, longer during an
+   *    outage) and is unavailable to businesses in India, so an empty result
+   *    is reported as `not_found` — never as "not charged".
+   *
+   * The PaymentIntent status mapping matches processRequest's:
+   * succeeded→success, canceled→cancelled, requires_payment_method→failed
+   * (the confirm attempt was declined), processing→pending,
+   * requires_action→requires_action; requires_confirmation/requires_capture
+   * (not states this adapter's confirm=true, automatic-capture flow should
+   * leave a PaymentIntent in) are reported as still 'pending' — unresolved —
+   * rather than guessed.
+   *
+   * NOT verified against a live Stripe account or sandbox from this
+   * environment (no credentials/network path): the request shapes are from
+   * Stripe's public API reference only.
+   */
+  public supportsPaymentStatusQuery(): boolean {
+    return Boolean(this.apiKey);
+  }
+
+  public async queryPaymentStatus(query: PaymentStatusQuery): Promise<PaymentStatusQueryResult> {
+    if (!this.apiKey) {
+      // Never answered from simulation: with no key there is nothing real to ask.
+      return { kind: 'unsupported', reason: 'STRIPE_SECRET_KEY not configured — no real status query possible' };
+    }
+    const headers = { Authorization: `Bearer ${this.apiKey}` };
+    const ptx = query.providerTransactionId;
+
+    if (ptx && /^pi_[A-Za-z0-9_]+$/.test(ptx)) {
+      const res = await this.http_request({
+        method: 'GET',
+        url: `${this.baseUrl}/payment_intents/${encodeURIComponent(ptx)}`,
+        headers,
+        timeoutMs: 15_000,
+        maxAttempts: 2,
+      });
+      if (res.status === 404) return { kind: 'not_found', detail: `Stripe has no PaymentIntent ${ptx}` };
+      if (res.status >= 400) throw new Error(res.body?.error?.message || `Stripe API error: HTTP ${res.status}`);
+      const intent = res.body;
+      const claimed = intent?.metadata?.bisPaymentTransactionId;
+      if (claimed && claimed !== query.paymentTransactionId) {
+        throw new Error(`Stripe PaymentIntent ${ptx} belongs to platform transaction ${claimed}, not ${query.paymentTransactionId}`);
+      }
+      return this.intentToStatusResult(intent);
+    }
+
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(query.paymentTransactionId)) {
+      return { kind: 'unsupported', reason: 'no PaymentIntent id and no searchable platform transaction id' };
+    }
+    const q = `metadata['bisPaymentTransactionId']:'${query.paymentTransactionId}'`;
+    const res = await this.http_request({
+      method: 'GET',
+      url: `${this.baseUrl}/payment_intents/search?query=${encodeURIComponent(q)}&limit=10`,
+      headers,
+      timeoutMs: 15_000,
+      maxAttempts: 2,
+    });
+    if (res.status >= 400) throw new Error(res.body?.error?.message || `Stripe API error: HTTP ${res.status}`);
+    const found: any[] = Array.isArray(res.body?.data) ? res.body.data : [];
+    if (found.length === 0) {
+      return {
+        kind: 'not_found',
+        detail: 'Stripe search returned no PaymentIntent for this platform transaction (search is eventually consistent — not proof that nothing was charged)',
+      };
+    }
+    if (found.length > 1) return { kind: 'multiple', providerTransactionIds: found.map((i) => String(i.id)) };
+    return this.intentToStatusResult(found[0]);
+  }
+
+  private intentToStatusResult(intent: any): PaymentStatusQueryResult {
+    const providerStatus = String(intent?.status ?? '');
+    const status: ProviderReportedPaymentStatus =
+      providerStatus === 'succeeded' ? 'success'
+        : providerStatus === 'canceled' ? 'cancelled'
+          : providerStatus === 'requires_payment_method' ? 'failed'
+            : providerStatus === 'requires_action' ? 'requires_action'
+              : 'pending';
+    return {
+      kind: 'found',
+      status,
+      providerTransactionId: String(intent.id),
+      providerStatus,
+      ...(typeof intent?.amount === 'number' ? { amount: intent.amount / 100 } : {}),
+      ...(typeof intent?.currency === 'string' ? { currency: intent.currency.toUpperCase() } : {}),
+    };
+  }
+
+  /**
    * Refunds a PaymentIntent via POST /v1/refunds — verified against
    * Stripe's current API reference via WebSearch, 2026-09-17:
    * `payment_intent` (this adapter's own TransactionEvent.id from the
@@ -239,13 +338,23 @@ export class StripeProvider extends BaseProvider {
     // either way there is nothing a real API call could do here that
     // wouldn't be fabricated. Fall back to simulated mode.
     if (!this.apiKey || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['STRIPE_SECRET_KEY'],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // Deterministic, per-payment Idempotency-Key (Stripe header, max 255
+    // chars): bis_<payment_transaction_id>_<client key | 'default'>. Built
+    // before the try so a missing paymentTransactionId throws (no request
+    // is sent) instead of being reported as a provider decline. Replaces
+    // the old minute-bucketed `pi_<app>_<amount>_<currency>_<minute>`
+    // fallback, which collapsed two legitimate same-amount charges inside
+    // one minute into one (gap register C11/E7).
+    const idempotencyKey = this.paymentIdempotencyIdentity(payload, { maxLength: 255 });
+
     try {
-      const idempotencyKey = (payload as any).idempotencyKey
-        ? `bis_${appId}_${(payload as any).idempotencyKey}`
-        : `pi_${appId}_${amount}_${currency}_${Math.floor(Date.now() / 60_000)}`;
 
       const body = this.toFormBody({
         amount: Math.round(amount * 100), // Stripe amounts are in the smallest currency unit
@@ -260,6 +369,7 @@ export class StripeProvider extends BaseProvider {
         'automatic_payment_methods[allow_redirects]': 'never',
         'metadata[appId]': appId,
         'metadata[decisionReason]': decisionReason,
+        'metadata[bisPaymentTransactionId]': payload.paymentTransactionId,
         // Brings Radar's risk assessment back inline on the Charge this
         // confirm call creates, instead of a second round-trip to fetch it.
         'expand[0]': 'latest_charge',

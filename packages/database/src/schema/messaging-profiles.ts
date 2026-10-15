@@ -31,6 +31,10 @@ export const messagingProfiles = pgTable(
     senderType: text('sender_type').notNull(), // 'phone' | '10dlc' | 'tollfree' | 'shortcode' | 'alphanumeric'
     sender: text('sender').notNull(), // the actual number/code/alphanumeric ID
     provider: text('provider').notNull(), // provider id this sender is registered with
+    // Phase 8: optional supplier/business the sender is dedicated to (e.g.
+    // one STAYSCAPE hotel with its own number). NULL = the sender serves the
+    // whole tenant. Only ever set from the gateway's VERIFIED supplier scope.
+    supplierId: text('supplier_id'),
     campaignId: text('campaign_id'), // e.g. US 10DLC campaign ID
     brandId: text('brand_id'), // e.g. US 10DLC brand ID
     complianceStatus: text('compliance_status').notNull().default('unregistered'), // 'unregistered' | 'pending' | 'approved' | 'rejected' | 'suspended'
@@ -47,6 +51,9 @@ export const messagingProfiles = pgTable(
     index('idx_messaging_profiles_tenant').on(t.tenantId),
     index('idx_messaging_profiles_country').on(t.country),
     index('idx_messaging_profiles_compliance_status').on(t.complianceStatus),
+    // Phase 8: inbound resolution looks profiles up by the DESTINATION
+    // number an inbound message arrived on (provider → number → owners).
+    index('idx_messaging_profiles_sender_provider').on(t.sender, t.provider),
     uniqueIndex('idx_messaging_profiles_app_tenant_sender_provider').on(
       t.appId,
       t.tenantId,

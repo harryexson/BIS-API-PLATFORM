@@ -204,8 +204,24 @@ export class NMIProvider extends BaseProvider {
     // either way there is nothing a real API call could do here that
     // wouldn't be fabricated. Fall back to simulated mode.
     if (!this.apiKey || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['NMI_API_KEY'],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
+
+    // Deterministic per-payment `orderid`: bis_<payment_transaction_id>_<client
+    // key | 'default'> (previously `<appId>_<unix seconds>`, gap register E7).
+    //
+    // PROVIDER LIMITATION: no idempotency-key parameter for transact.php
+    // could be verified in NMI's Direct Post documentation from this
+    // environment. NMI's own protection is processor-side duplicate
+    // checking (`dup_seconds`), which keys on the transaction's details;
+    // `orderid` is a merchant reference that makes a retried payment
+    // identifiable/reconcilable, not a guaranteed dedupe key. 64 chars is a
+    // conservative cap (identities that would exceed it are digested).
+    const orderid = this.paymentIdempotencyIdentity(payload, { maxLength: 64 });
 
     try {
       const body = this.toFormBody({
@@ -214,7 +230,7 @@ export class NMIProvider extends BaseProvider {
         amount: amount.toFixed(2),
         currency,
         payment_token: paymentToken,
-        orderid: `${appId}_${Math.floor(Date.now() / 1000)}`,
+        orderid,
       });
 
       const res = await this.http_request({

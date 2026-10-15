@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { BaseProvider } from '../../base';
+import { BaseProvider, identityToUuid } from '../../base';
 import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schemas';
 
 /**
@@ -82,11 +82,22 @@ export class PawaPayProvider extends BaseProvider {
     // make without guessing at something PawaPay itself says must come
     // from its Active Configuration lookup. Fall back to simulated mode.
     if (!this.apiKey || !provider) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['PAWAPAY_API_KEY'],
+        missingInputs: provider ? [] : ['metadata.pawapayProvider'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // PawaPay's `depositId` IS its idempotency key (a repeat returns
+    // DUPLICATE_IGNORED) and must be a UUID, so it is a UUID derived
+    // deterministically from bis_<payment_transaction_id>_<client key |
+    // 'default'> (BaseProvider.identityToUuid). Previously: the raw client
+    // key (not even guaranteed to be a UUID, and unscoped by app/tenant) or
+    // a random UUID (gap register E7).
+    const depositId = identityToUuid(this.paymentIdempotencyIdentity(payload));
+
     try {
-      const depositId = (payload as any).idempotencyKey || randomUUID();
 
       const res = await this.http_request({
         method: 'POST',

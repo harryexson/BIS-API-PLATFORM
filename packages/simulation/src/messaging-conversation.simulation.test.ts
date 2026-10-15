@@ -308,7 +308,12 @@ describe('Delivery Event -> Platform Webhook (worker durable path)', () => {
     expect(busEventsAfter(token).some((e: any) => e.decisionReason === 'provider_webhook_processed')).toBe(true);
     expect(runtime.registry.getProvider('futuresms')?.config.status).toBe('offline');
 
-    // Replay with the same event id is rejected at the idempotency guard.
+    // Replay with the same event id is recognised from the DURABLE consumer
+    // record (webhook_event_consumers: ('futuresms', eventId) /
+    // provider_webhook = processed) and completes as a no-op without
+    // re-applying anything. Phase 4: this used to assert a dead-lettered job
+    // with "Replay detected" from a setNx marker that was written before
+    // processing and never cleared (gap register B5).
     const job2 = await enqueueProviderWebhook(pipeline.queue, {
       providerId: 'futuresms',
       rawBody,
@@ -316,13 +321,21 @@ describe('Delivery Event -> Platform Webhook (worker durable path)', () => {
       id: eventId,
       status: 'online',
     });
-    await waitFor(async () => (await pipeline.queue.getJob(job2.id))?.status === 'dead', {
-      label: 'provider_webhook replay dead-lettered',
+    await waitFor(async () => (await pipeline.queue.getJob(job2.id))?.status === 'completed', {
+      label: 'provider_webhook replay completed as a no-op',
     });
     const job2State = await pipeline.queue.getJob(job2.id);
-    expect(job2State?.status).toBe('dead');
-    expect(job2State?.lastError).toContain('Replay detected');
+    expect(job2State?.status).toBe('completed');
+    expect(job2State?.lastError).toBeUndefined();
+    expect(dbState.events.filter((r) => r.category === 'provider_webhook').length).toBe(rowsBefore + 1);
     expect(runtime.registry.getProvider('futuresms')?.config.status).toBe('offline');
+    const durable = dbState.webhookEvents.filter((e) => e.providerId === 'futuresms' && e.providerEventId === eventId);
+    expect(durable).toHaveLength(1);
+    const consumer = dbState.webhookEventConsumers.find(
+      (c) => c.webhookEventId === durable[0].id && c.consumer === 'provider_webhook',
+    );
+    expect(consumer?.status).toBe('processed');
+    expect(consumer?.attempts).toBe(1);
 
     runtime.registry.updateManagement('futuresms', { status: 'online' });
     void job1;

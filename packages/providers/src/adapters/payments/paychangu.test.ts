@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { PayChanguProvider } from './paychangu';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'paychangu',
@@ -90,7 +95,7 @@ describe('PayChanguProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayChanguProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 5000, currency: 'MWK', paymentMethod: 'mobile_money', phoneNumber: '265990000000' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 5000, currency: 'MWK', paymentMethod: 'mobile_money', phoneNumber: '265990000000' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -105,7 +110,7 @@ describe('PayChanguProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayChanguProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 5000, currency: 'MWK', paymentMethod: 'mobile_money', phoneNumber: '265990000000' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 5000, currency: 'MWK', paymentMethod: 'mobile_money', phoneNumber: '265990000000' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -114,6 +119,7 @@ describe('PayChanguProvider', () => {
 
   describe('with an API key and an operator reference id (real HTTP path)', () => {
     const validPayload = {
+  paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID,
       amount: 5000,
       currency: 'MWK',
       paymentMethod: 'mobile_money',

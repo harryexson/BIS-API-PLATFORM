@@ -36,6 +36,14 @@ const HISTORY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
  *
  * When Redis is unavailable, falls back to in-memory only (single-process mode).
  */
+/** emitOrThrow(): the cross-process publish did not happen. */
+export class EventBusPublishError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EventBusPublishError';
+  }
+}
+
 export class EventBus {
   private static instance: EventBus;
   private listeners: Set<EventListener> = new Set();
@@ -164,6 +172,59 @@ export class EventBus {
     }
 
     // Always emit to local listeners
+    this.listeners.forEach((listener) => {
+      try {
+        listener(event);
+      } catch (err) {
+        metrics.increment('queueFailures');
+        console.error('Error executing event listener:', err);
+      }
+    });
+  }
+
+  /**
+   * Phase 5 (transactional outbox): like emit(), but a failed cross-process
+   * publish is REPORTED (thrown) instead of swallowed, so the caller — the
+   * outbox poller — leaves the outbox row un-completed and retries it,
+   * rather than marking it delivered while Redis was down (silent loss).
+   *
+   * - Redis configured (REDIS_URL): the PUBLISH must succeed, otherwise this
+   *   throws EventBusPublishError and local listeners are NOT invoked (so a
+   *   retry does not hand them the same event twice). The capped history
+   *   list is best-effort, as in emit().
+   * - Redis not configured: single-process mode; local delivery is the
+   *   only delivery there is, exactly as emit().
+   *
+   * Delivery is at least once: a publish that reached Redis but whose reply
+   * was lost is retried. Consumers de-duplicate on `event.id`, which the
+   * outbox poller sets to the outbox row id (stable across retries/replays).
+   */
+  public async emitOrThrow(event: TransactionEvent): Promise<void> {
+    if (this.redisClient) {
+      if (!this.redisReady) {
+        metrics.increment('eventsEmitFailed');
+        throw new EventBusPublishError('Redis event channel not connected');
+      }
+      try {
+        await this.redisClient.publish(EVENT_CHANNEL, JSON.stringify(event));
+      } catch (err) {
+        metrics.increment('eventsEmitFailed');
+        throw new EventBusPublishError(`Redis publish failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      metrics.increment('eventsEmittedRedis');
+      try {
+        await this.redisClient.lpush(HISTORY_KEY, JSON.stringify(event));
+        await this.redisClient.ltrim(HISTORY_KEY, 0, MAX_HISTORY - 1);
+        await this.redisClient.expire(HISTORY_KEY, Math.floor(HISTORY_TTL_MS / 1000));
+      } catch {
+        // History is a convenience cache, not the delivery.
+      }
+    }
+
+    this.history.unshift(event);
+    if (this.history.length > this.maxHistory) {
+      this.history.pop();
+    }
     this.listeners.forEach((listener) => {
       try {
         listener(event);

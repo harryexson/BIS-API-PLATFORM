@@ -8,6 +8,7 @@ import {
   jsonb,
   index,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { applications } from './applications';
 
 // P0: appId here is the application's slug (e.g. 'reach-church'), not its
@@ -49,6 +50,11 @@ export const events = pgTable(
     index('idx_events_category').on(t.category),
     index('idx_events_provider_id').on(t.providerId),
     index('idx_events_created_at').on(t.createdAt),
+    // Phase 4 (migration 0014): webhook consumers write their events row
+    // with a deterministic idempotency_key and an INSERT ... WHERE NOT
+    // EXISTS guard, so a retried webhook job cannot record its event twice.
+    // Partial: most events rows have no key.
+    index('idx_events_idempotency_key').on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
   ],
 );
 

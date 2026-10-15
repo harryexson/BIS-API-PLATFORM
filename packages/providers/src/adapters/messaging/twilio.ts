@@ -30,6 +30,10 @@ export class TwilioProvider extends BaseProvider {
     return this.secrets.auth_token || process.env.TWILIO_AUTH_TOKEN || '';
   }
 
+  public getSenderAddress(): string | undefined {
+    return this.fromNumber || undefined;
+  }
+
   private get fromNumber(): string {
     return this.secrets.from_number || process.env.TWILIO_FROM_NUMBER || '';
   }

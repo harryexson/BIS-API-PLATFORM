@@ -10,6 +10,9 @@ export interface KeywordContext {
   // the consent record. Defaults to 'sms' when the caller doesn't know it
   // (channel-specific consent still resolves correctly for the common case).
   channel?: string;
+  // Phase 8: the supplier/business the message was attributed to, when
+  // the conversation is supplier-scoped (recorded on keyword events).
+  supplierId?: string | null;
 }
 
 export interface KeywordResult {
@@ -30,6 +33,25 @@ export interface KeywordResult {
  * YES/NO — Confirmation responses (for opt-in flows, surveys, etc.)
  * PRAY — Triggers a prayer request flow
  */
+/**
+ * Phase 8: which keyword (if any) a message is, WITHOUT acting on it. The
+ * inbound worker uses this to label a quarantined (ambiguous) message — a
+ * held STOP in particular — while handleKeyword(), which records consent
+ * and events against a tenant, is only ever called once the owner is known.
+ */
+export type KeywordClass = 'STOP' | 'HELP' | 'YES' | 'NO' | 'PRAY' | 'JOIN';
+
+export function classifyKeyword(content: string): KeywordClass | null {
+  const normalized = (content ?? '').trim().toUpperCase();
+  if (isStopKeyword(normalized)) return 'STOP';
+  if (isHelpKeyword(normalized)) return 'HELP';
+  if (normalized === 'YES' || normalized === 'Y') return 'YES';
+  if (normalized === 'NO' || normalized === 'N') return 'NO';
+  if (normalized === 'PRAY' || normalized === 'PRAYER') return 'PRAY';
+  if (isJoinKeyword(normalized)) return 'JOIN';
+  return null;
+}
+
 export async function handleKeyword(ctx: KeywordContext): Promise<KeywordResult> {
   const normalized = ctx.content.trim().toUpperCase();
 
@@ -81,7 +103,11 @@ function isJoinKeyword(text: string): boolean {
 }
 
 async function handleStop(ctx: KeywordContext): Promise<KeywordResult> {
-  try {
+  // Gap register A5 (Phase 8): the consent write is NOT best-effort. It used
+  // to sit inside the catch-all below, so a failed write was swallowed and
+  // the customer was still told "You have been unsubscribed" while sends
+  // continued. It now throws, failing the inbound job so it is retried.
+  {
     // Record durable consent state — this is what the outbound send path
     // checks before dispatching (RoutingEngine.routeMessage). Deliberately
     // does NOT close the conversation: inbound routing
@@ -99,8 +125,10 @@ async function handleStop(ctx: KeywordContext): Promise<KeywordResult> {
       source: 'keyword',
       keyword: 'STOP',
     });
+  }
 
-    // Log the opt-out event
+  try {
+    // Log the opt-out event (audit trail; best-effort)
     await eventRepository.create({
       appId: ctx.appId,
       category: 'inbound',
@@ -113,6 +141,7 @@ async function handleStop(ctx: KeywordContext): Promise<KeywordResult> {
         keyword: 'STOP',
         action: 'opt_out',
         tenantId: ctx.tenantId,
+        ...(ctx.supplierId ? { supplierId: ctx.supplierId } : {}),
       },
     });
   } catch {
@@ -140,6 +169,7 @@ async function handleHelp(ctx: KeywordContext): Promise<KeywordResult> {
         content: ctx.content,
         keyword: 'HELP',
         tenantId: ctx.tenantId,
+        ...(ctx.supplierId ? { supplierId: ctx.supplierId } : {}),
       },
     });
   } catch {
@@ -169,6 +199,7 @@ async function handleConfirmation(ctx: KeywordContext, confirmed: boolean): Prom
         action: 'confirmation',
         confirmed,
         tenantId: ctx.tenantId,
+        ...(ctx.supplierId ? { supplierId: ctx.supplierId } : {}),
       },
     });
   } catch {
@@ -198,6 +229,7 @@ async function handlePrayer(ctx: KeywordContext): Promise<KeywordResult> {
         keyword: 'PRAY',
         action: 'prayer_request',
         tenantId: ctx.tenantId,
+        ...(ctx.supplierId ? { supplierId: ctx.supplierId } : {}),
       },
     });
   } catch {
@@ -213,7 +245,9 @@ async function handlePrayer(ctx: KeywordContext): Promise<KeywordResult> {
 }
 
 async function handleJoin(ctx: KeywordContext): Promise<KeywordResult> {
-  try {
+  // Not best-effort either (see handleStop): a lost opt-in would leave the
+  // customer blocked after being told they were re-subscribed.
+  {
     await consentRecordRepository.upsert({
       appId: ctx.appId,
       tenantId: ctx.tenantId,
@@ -223,8 +257,10 @@ async function handleJoin(ctx: KeywordContext): Promise<KeywordResult> {
       source: 'keyword',
       keyword: 'JOIN',
     });
+  }
 
-    // Log the opt-in event
+  try {
+    // Log the opt-in event (audit trail; best-effort)
     await eventRepository.create({
       appId: ctx.appId,
       category: 'inbound',
@@ -237,6 +273,7 @@ async function handleJoin(ctx: KeywordContext): Promise<KeywordResult> {
         keyword: 'JOIN',
         action: 'opt_in',
         tenantId: ctx.tenantId,
+        ...(ctx.supplierId ? { supplierId: ctx.supplierId } : {}),
       },
     });
   } catch {

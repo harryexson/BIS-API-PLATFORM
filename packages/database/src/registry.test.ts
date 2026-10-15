@@ -298,6 +298,33 @@ describe('ApplicationRegistry', () => {
       expect(resultB.application?.id).toBe(appB.application.id);
 
       expect(resultA.application?.id).not.toBe(resultB.application?.id);
+
+      // Phase 7 (gap register F13): the assertions above only show that each
+      // key authenticates ITS OWN application — they never present A's
+      // credentials while trying to reach B. The registry has no "target
+      // application" input at all (the key alone decides the application —
+      // the gateway then overwrites any body appId with it, and the
+      // cross-application/cross-tenant HTTP cases are proven in
+      // packages/simulation/src/tenant-isolation.scenarios.ts), so the
+      // attempts that CAN be made at this layer are made here:
+      //   - A's key, however many times presented, never resolves to B;
+      const again = await registry.authenticateApplication(appA.apiKey.raw);
+      expect(again.application?.id).toBe(appA.application.id);
+      //   - a key forged by grafting B's key prefix onto A's secret part,
+      //     or by tampering with one character of B's key, is rejected;
+      const graftedPrefix = appB.apiKey.prefix + appA.apiKey.raw.slice(appB.apiKey.prefix.length);
+      expect(graftedPrefix).not.toBe(appB.apiKey.raw);
+      expect((await registry.authenticateApplication(graftedPrefix)).authenticated).toBe(false);
+      const last = appB.apiKey.raw.slice(-1);
+      const tamperedB = appB.apiKey.raw.slice(0, -1) + (last === 'a' ? 'b' : 'a');
+      expect((await registry.authenticateApplication(tamperedB)).authenticated).toBe(false);
+      //   - revoking B's key does not affect A, and A's key still only ever
+      //     yields A (no fallback to "some other active application").
+      await registry.revokeApplicationKey(appB.apiKey.id);
+      expect((await registry.authenticateApplication(appB.apiKey.raw)).authenticated).toBe(false);
+      const afterRevoke = await registry.authenticateApplication(appA.apiKey.raw);
+      expect(afterRevoke.authenticated).toBe(true);
+      expect(afterRevoke.application?.id).toBe(appA.application.id);
     });
 
     it('empty key → rejected', async () => {

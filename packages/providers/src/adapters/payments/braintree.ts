@@ -103,7 +103,11 @@ export class BraintreeProvider extends BaseProvider {
     return 'Basic ' + Buffer.from(`${this.publicKey}:${this.privateKey}`).toString('base64');
   }
 
-  private async graphql(query: string, variables: Record<string, unknown>): Promise<{ data: any; errors?: any[] }> {
+  private async graphql(
+    query: string,
+    variables: Record<string, unknown>,
+    maxAttempts = 2,
+  ): Promise<{ data: any; errors?: any[] }> {
     const res = await this.http_request({
       method: 'POST',
       url: this.baseUrl,
@@ -113,7 +117,7 @@ export class BraintreeProvider extends BaseProvider {
       },
       body: { query, variables },
       timeoutMs: 30_000,
-      maxAttempts: 2,
+      maxAttempts,
     });
     if (res.status >= 400 && !res.body?.errors) {
       throw new Error(`Braintree API error: HTTP ${res.status}`);
@@ -190,13 +194,37 @@ export class BraintreeProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.isConfigured() || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: [
+          ...(this.publicKey ? [] : ['BRAINTREE_PUBLIC_KEY']),
+          ...(this.privateKey ? [] : ['BRAINTREE_PRIVATE_KEY']),
+          ...(this.merchantId ? [] : ['BRAINTREE_MERCHANT_ID']),
+        ],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // Deterministic per-payment identity, sent as TransactionInput.orderId
+    // (a documented merchant order reference, max 255 chars) so every
+    // Braintree transaction is traceable to exactly one platform payment.
+    //
+    // PROVIDER LIMITATION (documented, not papered over): Braintree's real
+    // idempotency feature ("At-Most-Once Processing", a merchant-supplied
+    // request key honoured for 30 days, GraphQL-only) could not have its
+    // exact request placement verified from this environment, so it is NOT
+    // sent — a guessed field would fail schema validation on every charge.
+    // `orderId` is a reference, not a dedupe key. Because the charge is
+    // therefore not idempotent at the provider, it is sent with
+    // maxAttempts: 1 — no blind HTTP-level retry that could charge twice.
+    const orderId = this.paymentIdempotencyIdentity(payload, { maxLength: 255 });
+
     try {
-      const result = await this.graphql(CHARGE_MUTATION, {
-        input: { paymentMethodId: paymentToken, transaction: { amount: amount.toFixed(2) } },
-      });
+      const result = await this.graphql(
+        CHARGE_MUTATION,
+        { input: { paymentMethodId: paymentToken, transaction: { amount: amount.toFixed(2), orderId } } },
+        1,
+      );
 
       const latency = Date.now() - startTime;
 

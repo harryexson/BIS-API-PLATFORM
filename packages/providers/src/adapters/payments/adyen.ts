@@ -216,21 +216,31 @@ export class AdyenProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.apiKey || !this.merchantAccount || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: [
+          ...(this.apiKey ? [] : ['ADYEN_API_KEY']),
+          ...(this.merchantAccount ? [] : ['ADYEN_MERCHANT_ACCOUNT']),
+        ],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // One deterministic identity for both the `Idempotency-Key` header
+    // (Adyen's documented maximum: 64 chars) and the body `reference` —
+    // previously `reference` was ALWAYS `bis_<appId>_<Date.now()>`, even
+    // when a client key was supplied (gap register E7).
+    const reference = this.paymentIdempotencyIdentity(payload, { maxLength: 64 });
+
     try {
-      const shopperReference = String((payload.metadata as any)?.shopperReference || appId);
-      const reference = `bis_${appId}_${Date.now()}`;
+      const shopperReference = String(payload.metadata?.shopperReference || appId);
 
       const res = await this.http_request({
         method: 'POST',
         url: `${this.baseUrl}/payments`,
         headers: {
           'X-API-Key': this.apiKey,
-          'Idempotency-Key': (payload as any).idempotencyKey
-            ? `bis_${appId}_${(payload as any).idempotencyKey}`
-            : reference,
+          'Idempotency-Key': reference,
         },
         body: {
           merchantAccount: this.merchantAccount,
@@ -338,7 +348,9 @@ export class AdyenProvider extends BaseProvider {
       pspReference: txId,
       resultCode: 'Authorised',
       amount: { value: Math.round(amount * 100), currency: currency.toUpperCase() },
-      merchantReference: `bis_${appId}_${Date.now()}`,
+      merchantReference: payload.paymentTransactionId
+        ? this.paymentIdempotencyIdentity(payload, { maxLength: 64 })
+        : 'bis_simulated',
     };
 
     return {

@@ -92,13 +92,18 @@ export class PayChanguProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.apiKey || !operatorRefId) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['PAYCHANGU_API_KEY'],
+        missingInputs: operatorRefId ? [] : ['metadata.paychanguOperatorRefId'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // Merchant-supplied `charge_id`: deterministic bis_<payment_transaction_id>_
+    // <client key | 'default'> instead of the old random fallback (E7).
+    const chargeId = this.paymentIdempotencyIdentity(payload, { maxLength: 64 });
+
     try {
-      const chargeId = (payload as any).idempotencyKey
-        ? `bis_${appId}_${(payload as any).idempotencyKey}`
-        : `bis_${appId}_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
       const res = await this.http_request({
         method: 'POST',

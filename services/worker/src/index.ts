@@ -93,6 +93,19 @@ async function main(): Promise<void> {
     config.pollIntervalMs,
   );
 
+  // Phase 4: sweep webhook_events for webhooks that were durably persisted
+  // but never reached a consumer (gateway enqueue failed, gateway crashed
+  // between persist and enqueue, or a gateway that fell back to an
+  // in-memory store). Rows are leased with FOR UPDATE SKIP LOCKED, so every
+  // worker replica can run this safely.
+  queue
+    .enqueue('webhook_event_recovery', {})
+    .catch((e) => console.error('[scheduler] webhook_event_recovery enqueue failed', e));
+  const webhookRecoveryTimer = setInterval(
+    () => queue.enqueue('webhook_event_recovery', {}).catch(() => undefined),
+    config.webhookRecoveryIntervalMs ?? 30_000,
+  );
+
   // P1: Periodically rescue stuck processing jobs
   const reaperTimer = setInterval(async () => {
     const rescued = await queue.rescueStuckJobs();
@@ -149,6 +162,7 @@ async function main(): Promise<void> {
     clearInterval(reaperTimer);
     clearInterval(outboxTimer);
     clearInterval(webhookJobPollerTimer);
+    clearInterval(webhookRecoveryTimer);
     healthServer.close();
 
     // Drain: wait for in-flight jobs to complete (max 30s)

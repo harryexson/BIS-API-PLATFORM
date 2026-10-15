@@ -69,6 +69,21 @@ export interface TransactionEvent {
   id: string;
   timestamp: string;
   appId: string;
+  // Phase 7 (gap register C4/C16): the tenant this event belongs to — the
+  // tenant the originating request AUTHENTICATED as (x-tenant-id verified
+  // against tenant_application_links by the gateway), or, for an event the
+  // platform derives itself (a provider webhook, the outbox), the tenant of
+  // the platform's own authoritative row (transactions.tenant_id /
+  // conversations.tenant_id). Never taken from a request body or from a
+  // provider payload's self-declared metadata. Outbound webhook dispatch is
+  // scoped by (appId, tenantId): an event WITHOUT a tenantId is delivered to
+  // no tenant's endpoint at all (fail closed) rather than to every tenant
+  // of the application, which is what happened before this field existed.
+  tenantId?: string;
+  // Phase 7 (F3.8): the supplier this event was produced for, when the
+  // request carried an x-supplier-id the gateway verified through the full
+  // Application → Tenant → Supplier ownership chain. Absent otherwise.
+  supplierId?: string;
   category: ProviderCategory;
   providerId: string;
   status: TransactionStatus;
@@ -87,6 +102,9 @@ export interface TransactionEvent {
   // never a fabricated neutral score standing in for "unknown".
   fraudRiskLevel?: string;
   fraudRiskScore?: number;
+  // Payments only: the platform's own transactions.id this event belongs to
+  // (see PaymentRequest.paymentTransactionId), when the caller allocated one.
+  paymentTransactionId?: string;
 }
 
 // Request to BaseProvider.refund() — refunds a previously successful
@@ -163,8 +181,36 @@ export interface PaymentRequest {
   // it cannot create that token itself). Optional and provider-specific:
   // a real-HTTP adapter that needs one to actually move money (Stripe,
   // NMI) falls back to simulated processing when it's absent, rather than
-  // fabricating a charge with no instrument to charge.
+  // fabricating a charge with no instrument to charge — outside production
+  // only; in production that fallback throws instead (see BaseProvider's
+  // refuseSimulatedFallbackInProduction).
   paymentToken?: string;
+  // The client's own Idempotency-Key for this payment, exactly as received
+  // by the gateway (header `Idempotency-Key`, or body `idempotency_key`).
+  // Absent when the client sent none.
+  idempotencyKey?: string;
+  // The platform's own `transactions.id` for this payment — allocated by
+  // the gateway (row created in status 'processing') BEFORE any provider is
+  // called, so it is stable across adapter-internal HTTP retries, router
+  // failover between providers, and a client retry of a definitively failed
+  // attempt under the same Idempotency-Key. Every payment adapter derives
+  // its provider-facing idempotency identity from this plus
+  // `idempotencyKey` via BaseProvider's buildIdempotencyIdentity()
+  // (`bis_<paymentTransactionId>_<idempotency identity>`), never from
+  // Date.now()/random values. A real (non-simulated) provider call refuses
+  // to proceed without it.
+  paymentTransactionId?: string;
+}
+
+/**
+ * What RoutingEngine.routePayment accepts: a PaymentRequest whose
+ * currency/paymentMethod may be omitted (routing applies its documented
+ * defaults, 'USD'/'card'), plus an optional explicit provider override.
+ */
+export interface PaymentRoutingRequest extends Omit<PaymentRequest, 'currency' | 'paymentMethod'> {
+  currency?: string;
+  paymentMethod?: string;
+  providerOverride?: string;
 }
 
 export interface PaymentResponse {

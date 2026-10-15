@@ -131,13 +131,29 @@ export class AirwallexProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.clientId || !this.apiKey || !paymentToken || !customerId) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: [
+          ...(this.clientId ? [] : ['AIRWALLEX_CLIENT_ID']),
+          ...(this.apiKey ? [] : ['AIRWALLEX_API_KEY']),
+        ],
+        missingInputs: [...(paymentToken ? [] : ['paymentToken']), ...(customerId ? [] : ['metadata.airwallexCustomerId'])],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // Airwallex dedupes on `request_id` (max 64 chars). Both calls get
+    // deterministic ids derived from bis_<payment_transaction_id>_<client
+    // key | 'default'>; create and confirm are different operations, so the
+    // confirm id carries a 'confirm' suffix. `merchant_order_id` is the
+    // create identity. Previously: the raw client key or a random UUID for
+    // create, and an always-random UUID for confirm (gap register E7) — a
+    // retried confirm could never be deduplicated.
+    const requestId = this.paymentIdempotencyIdentity(payload, { maxLength: 64 });
+    const confirmRequestId = this.paymentIdempotencyIdentity(payload, { maxLength: 64, suffix: 'confirm' });
+    const orderId = requestId;
+
     try {
       const token = await this.getAccessToken();
-      const requestId = (payload as any).idempotencyKey || randomUUID();
-      const orderId = `bis_${appId}_${requestId}`.slice(0, 64);
 
       const createRes = await this.http_request({
         method: 'POST',
@@ -165,7 +181,7 @@ export class AirwallexProvider extends BaseProvider {
         url: `${this.baseUrl}/api/v1/pa/payment_intents/${intentId}/confirm`,
         headers: { Authorization: `Bearer ${token}` },
         body: {
-          request_id: randomUUID(),
+          request_id: confirmRequestId,
           customer_id: customerId,
           payment_consent_id: paymentToken,
         },

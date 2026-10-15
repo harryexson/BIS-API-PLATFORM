@@ -3,6 +3,11 @@ import { createHmac } from 'crypto';
 import { SquareProvider } from './square';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'square',
@@ -58,7 +63,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig({ environment: 'test' }));
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
 
       expect(fetchSpy.mock.calls[0][0]).toBe('https://connect.squareupsandbox.com/v2/payments');
     });
@@ -69,7 +74,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig({ environment: 'live' }));
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
 
       expect(fetchSpy.mock.calls[0][0]).toBe('https://connect.squareup.com/v2/payments');
     });
@@ -82,7 +87,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -95,7 +100,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -111,7 +116,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      const event = await provider.processRequest('app1', {
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID,
         amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_visa',
         metadata: { squareCustomerId: 'cust_42' },
       }, 'test');
@@ -136,7 +141,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      await provider.processRequest('reach-church', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
+      await provider.processRequest('reach-church', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
 
       const [, opts] = fetchSpy.mock.calls[0];
       const body = JSON.parse(opts.body);
@@ -150,7 +155,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
 
       const [, opts] = fetchSpy.mock.calls[0];
       const body = JSON.parse(opts.body);
@@ -163,7 +168,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_declined' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_declined' }, 'test');
       expect(event.status).toBe('failed');
     });
 
@@ -173,7 +178,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_1' }, 'test');
       expect(event.status).toBe('unknown');
     });
 
@@ -185,7 +190,7 @@ describe('SquareProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new SquareProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_bad' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'cnon_bad' }, 'test');
       expect(event.status).toBe('failed');
       expect(event.error).toContain('INSUFFICIENT_FUNDS');
     });

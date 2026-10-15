@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { AirwallexProvider } from './airwallex';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'airwallex',
@@ -21,6 +26,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 const validPayload = {
+  paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID,
   amount: 100,
   currency: 'USD',
   paymentMethod: 'card',
@@ -119,7 +125,7 @@ describe('AirwallexProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new AirwallexProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 100, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 100, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -137,7 +143,7 @@ describe('AirwallexProvider', () => {
       const provider = new AirwallexProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 100, currency: 'USD', paymentMethod: 'card', metadata: { airwallexCustomerId: 'cus_xyz789' } },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 100, currency: 'USD', paymentMethod: 'card', metadata: { airwallexCustomerId: 'cus_xyz789' } },
         'test',
       );
 
@@ -154,7 +160,7 @@ describe('AirwallexProvider', () => {
       const provider = new AirwallexProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 100, currency: 'USD', paymentMethod: 'card', paymentToken: 'consent_abc123' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 100, currency: 'USD', paymentMethod: 'card', paymentToken: 'consent_abc123' },
         'test',
       );
 

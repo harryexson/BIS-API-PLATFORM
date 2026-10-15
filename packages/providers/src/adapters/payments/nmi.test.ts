@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { NMIProvider } from './nmi';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'nmi',
@@ -152,7 +157,7 @@ describe('NMIProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new NMIProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -167,7 +172,7 @@ describe('NMIProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new NMIProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -186,7 +191,7 @@ describe('NMIProvider', () => {
       const provider = new NMIProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
         'test',
       );
 
@@ -218,7 +223,7 @@ describe('NMIProvider', () => {
       const provider = new NMIProvider(makeConfig());
       await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
         'test',
       );
 
@@ -236,7 +241,7 @@ describe('NMIProvider', () => {
       const provider = new NMIProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_declined' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_declined' },
         'test',
       );
 
@@ -255,7 +260,7 @@ describe('NMIProvider', () => {
       const provider = new NMIProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_bad' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_bad' },
         'test',
       );
 
@@ -271,7 +276,7 @@ describe('NMIProvider', () => {
       const provider = new NMIProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
         'test',
       );
 
@@ -287,7 +292,7 @@ describe('NMIProvider', () => {
       const provider = new NMIProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' },
         'test',
       );
 
@@ -302,7 +307,7 @@ describe('NMIProvider', () => {
 
       const provider = new NMIProvider(makeConfig({ status: 'offline' }));
       await expect(
-        provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' }, 'test'),
+        provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_abc123' }, 'test'),
       ).rejects.toThrow(/OFFLINE/);
       expect(fetchSpy).not.toHaveBeenCalled();
     });

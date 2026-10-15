@@ -208,14 +208,21 @@ describe('complete donation flow (Reach Church -> ... -> Giving Receipt)', () =>
 // ---------------------------------------------------------------------------
 
 describe('deliberate: duplicate requests', () => {
-  it('payment submission has no server-side idempotency — two identical POSTs charge twice (documented gap)', async () => {
+  // This test used to assert the double charge itself as the expected outcome
+  // (`expect(first.body.id).not.toBe(second.body.id)`) — gap register F9.
+  // The Idempotency-Key is now enforced (idempotency_records claim +
+  // request_hash, migration 0013), so it asserts the fixed behaviour: the
+  // second identical request replays the first charge instead of making a
+  // new one.
+  it('payment submission is idempotent — two identical POSTs with the same Idempotency-Key charge once', async () => {
+    const txBefore = dbState.transactions.filter((t) => t.idempotencyKey === 'donate:storefront:001').length;
     const first = await createDonation(runtime, { amount: 25, idempotencyKey: 'donate:storefront:001' });
     const second = await createDonation(runtime, { amount: 25, idempotencyKey: 'donate:storefront:001' });
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    expect(first.body.id).not.toBe(second.body.id);
-    // The platform ignores idempotency-key at the gateway layer → the gap we want surfaced.
-    console.warn('[gap] POST /v1/api/gateway/payment ignores Idempotency-Key: duplicate requests => duplicate charges');
+    expect(second.body.id).toBe(first.body.id);
+    expect(dbState.transactions.filter((t) => t.idempotencyKey === 'donate:storefront:001').length - txBefore).toBe(1);
+    console.warn('[fixed] POST /v1/api/gateway/payment honours Idempotency-Key: duplicate request => cached result, one charge');
   });
 
   it('but the worker de-duplicates a replayed webhook for the same charge', async () => {
@@ -250,11 +257,26 @@ describe('deliberate: duplicate requests', () => {
     expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
     expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
 
-    // The replay was rejected at the idempotency guard and dead-lettered.
+    // Phase 4 (gap register B5): the replay is recognised from the DURABLE
+    // consumer record — webhook_event_consumers says ('stripe', txId) /
+    // payment_webhook is already `processed` — and completes as a no-op.
+    // This test used to assert the job was dead-lettered with "Replay
+    // detected": that came from a Redis/memory setNx marker written BEFORE
+    // processing and never cleared, the same marker that permanently locked
+    // out legitimate retries after any transient failure. A genuine replay
+    // is not an error, so it no longer pollutes the dead-letter queue (which
+    // retry_processing would otherwise re-drive).
     const finalJob = await pipeline.queue.getJob(job2.id);
-    expect(finalJob?.status).toBe('dead');
-    expect(finalJob?.lastError).toContain('Replay detected');
+    expect(finalJob?.status).toBe('completed');
+    expect(finalJob?.lastError).toBeUndefined();
     expect(job1.id).not.toBe(job2.id);
+    const durable = dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === txId);
+    expect(durable).toHaveLength(1);
+    const consumer = dbState.webhookEventConsumers.find(
+      (c) => c.webhookEventId === durable[0].id && c.consumer === 'payment_webhook',
+    );
+    expect(consumer?.status).toBe('processed');
+    expect(consumer?.attempts).toBe(1);
   });
 });
 
@@ -316,7 +338,7 @@ describe('deliberate: provider timeout', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: webhook arriving twice', () => {
-  it('only honours the first, and the second is dropped at the worker idempotency guard', async () => {
+  it('only honours the first, and the second is recognised as a replay from the durable webhook record', async () => {
     const donation = await createDonation(runtime);
     const txId = donation.body.id;
     const rowsBefore = dbState.events.filter((r) => r.category === 'payment_webhook').length;
@@ -344,8 +366,13 @@ describe('deliberate: webhook arriving twice', () => {
 
     expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
     expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
+    // Phase 4: the second job is a genuine replay of an already-`processed`
+    // durable consumer record, so it completes as a no-op (previously:
+    // dead-lettered by the never-cleared setNx marker — see above).
     const job2State = await pipeline.queue.getJob(job2.id);
-    expect(job2State?.status).toBe('dead');
+    expect(job2State?.status).toBe('completed');
+    expect(job2State?.lastError).toBeUndefined();
+    expect(dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === txId)).toHaveLength(1);
     void job1;
   });
 });
@@ -678,6 +705,11 @@ describe('deliberate: reconciliation', () => {
     expect(typeof report.neon).toBe('object');
     expect(typeof report.redis.deadLetters).toBe('object');
     expect(report.generatedAt).toBeTruthy();
+    // Phase 6: the job now also reconciles PAYMENTS (the transactions table)
+    // — read-only provider status checks where an adapter has one, otherwise
+    // escalation to the operator list — and never re-charges.
+    expect(report.payments).toMatchObject({ chargeAttempts: 0 });
+    expect(typeof report.payments.examined).toBe('number');
 
     const reconciles = busEventsAfter(token);
     expect(reconciles.some((e: any) => e.decisionReason === 'reconciliation_completed')).toBe(true);
@@ -686,6 +718,7 @@ describe('deliberate: reconciliation', () => {
   it('is resilient when the database is down, but cannot detect drift (documented)', async () => {
     dbState.failEventWrites = true;
     dbState.failAuditWrites = true;
+    dbState.failTransactionWrites = true;
     try {
       const auditsBefore = dbState.auditLogs.length;
       const token = mark();
@@ -697,12 +730,20 @@ describe('deliberate: reconciliation', () => {
       expect(dbState.auditLogs.length).toBe(auditsBefore);
       const reconciles = busEventsAfter(token);
       expect(reconciles.some((e: any) => e.decisionReason === 'reconciliation_completed')).toBe(true);
+      // Phase 6: payment reconciliation now exists (provider status check
+      // where an adapter supports one — Stripe only — else escalation for
+      // human review; see packages/workers/src/jobs/paymentReconciliation.ts),
+      // but it needs the database too: with Neon down it reports the error
+      // and changes nothing — it never guesses an outcome or re-charges.
+      const report = reconciles.find((e: any) => e.decisionReason === 'reconciliation_completed') as any;
+      expect(report.payload.payments.error).toMatch(/simulated transactions read failure/);
       console.warn(
-        '[gap] reconciliation cannot act as a durable audit while Neon is down, and it never reconciles against provider-reported transactions',
+        '[gap] reconciliation cannot act as a durable audit while Neon is down (payments are left untouched until it is back); provider-side status checks exist for Stripe only',
       );
     } finally {
       dbState.failEventWrites = false;
       dbState.failAuditWrites = false;
+      dbState.failTransactionWrites = false;
     }
   });
 });

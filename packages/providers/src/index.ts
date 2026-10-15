@@ -1,4 +1,17 @@
-export { BaseProvider } from './base';
+export {
+  BaseProvider,
+  buildIdempotencyIdentity,
+  identityToUuid,
+  isSimulatedFallbackAllowed,
+  SimulatedFallbackBlockedError,
+  ProviderNotConfiguredError,
+  MissingPaymentInputError,
+  MissingPaymentTransactionIdError,
+  type IdempotencyIdentityOptions,
+  type PaymentStatusQuery,
+  type PaymentStatusQueryResult,
+  type ProviderReportedPaymentStatus,
+} from './base';
 export { ProviderRegistry, type PersistableProviderSecret } from './registry';
 
 export { StripeProvider } from './adapters/payments/stripe';

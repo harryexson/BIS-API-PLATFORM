@@ -1,14 +1,26 @@
 import { randomUUID } from 'node:crypto';
-import { ProviderConfig, TransactionEvent } from '@company/schemas';
+import { ProviderConfig, TransactionEvent, PaymentRequest, PaymentRoutingRequest } from '@company/schemas';
 import { ProviderRegistry, BaseProvider } from '@company/providers';
-import { consentRecordRepository } from '@company/database';
-import { ConversationManager, ConversationContext } from './conversation';
+import {
+  consentRecordRepository,
+  messagingProfileRepository,
+  senderOptOutRepository,
+  normalizeMessagingAddress,
+} from '@company/database';
+import { ConversationManager, ConversationContext, type ConversationSenderInfo } from './conversation';
 import { findMatchingRule, type RoutingContext } from './rules';
 import { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
 
 export { ConversationManager, type ConversationContext } from './conversation';
-export { ConversationResolver, type ConversationResolution } from './conversation-resolver';
-export { handleKeyword, type KeywordContext, type KeywordResult } from './keywords';
+export {
+  ConversationResolver,
+  type ConversationResolution,
+  type ConversationResolveInput,
+  type ConversationResolverDeps,
+  type ConversationOwner,
+  type ResolvedConversation,
+} from './conversation-resolver';
+export { handleKeyword, classifyKeyword, type KeywordClass, type KeywordContext, type KeywordResult } from './keywords';
 export { evaluateRule, findMatchingRule, type RoutingContext } from './rules';
 export { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
 
@@ -99,6 +111,38 @@ async function withProviderTimeout<T>(
   ]);
 }
 
+/** Phase 8: the sender-level STOP lookup failed — the send is aborted, never cascaded. */
+class SenderConsentLookupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SenderConsentLookupError';
+  }
+}
+
+/**
+ * Phase 8: ISO country for an E.164 number, ONLY for calling codes that map
+ * to exactly one country (NANP '+1' is shared by US/CA/... and is left
+ * undetermined). Used solely as a tie-breaker between an owner's own
+ * per-country sender registrations — never for anything tenant-related.
+ */
+const SINGLE_COUNTRY_CALLING_CODES: Record<string, string> = {
+  '265': 'MW', '260': 'ZM', '263': 'ZW', '258': 'MZ', '255': 'TZ', '254': 'KE', '256': 'UG',
+  '250': 'RW', '257': 'BI', '251': 'ET', '27': 'ZA', '234': 'NG', '233': 'GH', '221': 'SN',
+  '225': 'CI', '237': 'CM', '243': 'CD', '244': 'AO', '267': 'BW', '264': 'NA', '266': 'LS',
+  '268': 'SZ', '44': 'GB', '353': 'IE', '61': 'AU', '64': 'NZ', '91': 'IN', '49': 'DE', '33': 'FR',
+};
+
+export function countryForE164(raw: string): string | undefined {
+  const n = normalizeMessagingAddress(raw);
+  if (!n.startsWith('+')) return undefined;
+  const digits = n.slice(1);
+  for (const len of [3, 2]) {
+    const code = digits.slice(0, len);
+    if (SINGLE_COUNTRY_CALLING_CODES[code]) return SINGLE_COUNTRY_CALLING_CODES[code];
+  }
+  return undefined;
+}
+
 export class RoutingEngine {
   private registry: ProviderRegistry;
   private conversationManager: ConversationManager;
@@ -130,8 +174,25 @@ export class RoutingEngine {
   // provider may have already processed the charge, so retrying it
   // through another provider risks a real double charge on an outcome
   // that isn't actually known to have failed.
-  public async routePayment(appId: string, payload: any): Promise<TransactionEvent> {
-    const { currency = 'USD', paymentMethod = 'card', providerOverride, country } = payload;
+  //
+  // Every field of the request — including paymentToken, country, metadata,
+  // idempotencyKey and the platform's paymentTransactionId — is forwarded
+  // unchanged to whichever adapter(s) are tried (gap register C1/E1/C11).
+  // The SAME paymentTransactionId goes to every provider in a failover
+  // cascade: each provider's idempotency namespace is its own, and the
+  // platform transaction row being attempted is one and the same.
+  public async routePayment(appId: string, request: PaymentRoutingRequest): Promise<TransactionEvent> {
+    const event = await this.routePaymentAttempts(appId, request);
+    return request.paymentTransactionId && !event.paymentTransactionId
+      ? { ...event, paymentTransactionId: request.paymentTransactionId }
+      : event;
+  }
+
+  private async routePaymentAttempts(appId: string, request: PaymentRoutingRequest): Promise<TransactionEvent> {
+    // Adapters apply their own currency/paymentMethod defaults; the cast
+    // reflects that PaymentRequest's required fields may be defaulted.
+    const payload = request as PaymentRequest & { providerOverride?: string };
+    const { currency = 'USD', paymentMethod = 'card', providerOverride, country } = request;
     const amount = Number(payload.amount);
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
@@ -223,8 +284,18 @@ export class RoutingEngine {
         event = await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
       } catch (err: any) {
         if (err instanceof ProviderTimeoutError) {
+          // Phase 6 (gap register D4): the provider's own id was never
+          // received, so there is none to report. The event's id is the
+          // platform's own pre-allocated, stable payment transaction id —
+          // NOT a throwaway randomUUID() (which used to be stored as the
+          // row's provider_transaction_id, where no later provider webhook
+          // or status check could ever match it). The gateway stores
+          // provider_transaction_id = NULL for this case (see
+          // paymentOutcomeFromEvent in @company/database) and the row in the
+          // distinct 'unknown' status. Only a caller that allocated no row
+          // gets a clearly-labelled placeholder.
           return {
-            id: randomUUID(),
+            id: request.paymentTransactionId || `unknown_${randomUUID()}`,
             timestamp: new Date().toISOString(),
             appId,
             category: 'payment',
@@ -276,6 +347,9 @@ export class RoutingEngine {
   // score-based pick must never silently switch providers mid-conversation.
   public async routeMessage(appId: string, payload: any): Promise<TransactionEvent> {
     const { recipient = '', content = '', providerOverride, tenantId = 'default' } = payload;
+    // Phase 8: the gateway's VERIFIED supplier scope (never a body field —
+    // resolveTenantContext strips those). Part of the conversation owner key.
+    const supplierId: string | null = typeof payload.supplierId === 'string' && payload.supplierId ? payload.supplierId : null;
     let selectedProvider: BaseProvider | null = null;
     let reason = '';
 
@@ -307,7 +381,7 @@ export class RoutingEngine {
     }
 
     // P0 FIX: Check conversation history — now includes tenantId for isolation
-    const conversationCtx: ConversationContext = { phoneNumber: recipient, appId, tenantId };
+    const conversationCtx: ConversationContext = { phoneNumber: recipient, appId, tenantId, supplierId };
     const conversation = await this.conversationManager.resolve(conversationCtx);
 
     if (conversation && !providerOverride) {
@@ -394,12 +468,35 @@ export class RoutingEngine {
     for (let attempt = 1; ; attempt++) {
       attemptedIds.add(currentProvider.config.id);
       try {
+        // Phase 8: which business number this provider will send FROM, and
+        // whether the recipient has opted out of that NUMBER (a STOP on a
+        // shared number — see sender_opt_outs). Fails CLOSED: a lookup
+        // error aborts the whole send (no cascade to another provider),
+        // never a send past a possible STOP.
+        const sender = await this.senderFor(appId, tenantId, supplierId, currentProvider, recipient);
+        let senderOptedOut = false;
+        if (sender.businessNumber && recipient) {
+          try {
+            senderOptedOut = await senderOptOutRepository.isOptedOut(sender.businessNumber, recipient, channel);
+          } catch (lookupErr: any) {
+            throw new SenderConsentLookupError(`sender-level consent lookup failed for ${sender.businessNumber}: ${lookupErr?.message}`);
+          }
+        }
+        if (senderOptedOut) {
+          // A STOP is not a provider failure: never cascade AROUND it to
+          // another provider/number automatically. (A caller that genuinely
+          // owns a different number may still send from it explicitly via
+          // providerOverride.)
+          throw new ConsentBlockedError(recipient, channel);
+        }
         // P1: Wrap provider call with timeout to prevent hung requests
         const event = await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
-        // P2-8: Record conversation after successful delivery
-        await this.conversationManager.record(conversationCtx, currentProvider.config.id, channel);
+        // P2-8: Record conversation after successful delivery — on the
+        // business number it was sent from (Phase 8).
+        await this.conversationManager.record(conversationCtx, currentProvider.config.id, channel, sender);
         return event;
       } catch (err: any) {
+        if (err instanceof ConsentBlockedError || err instanceof SenderConsentLookupError) throw err;
         const next = fallbackOrder.find(c => !attemptedIds.has(c.id))
           ?? (DEFAULT_FALLBACK_POLICY.allowAlternateProvider ? activeMsg.find(p => !attemptedIds.has(p.id)) : undefined);
         if (!next || attempt >= MAX_ROUTING_ATTEMPTS) {
@@ -410,6 +507,62 @@ export class RoutingEngine {
         currentProvider = nextProvider;
       }
     }
+  }
+
+  /**
+   * Phase 8: the business number an outbound send through `provider` goes
+   * FROM, for recording on the conversation and for the sender-level STOP
+   * check.
+   *
+   *  1. The adapter's own account-level sender (TWILIO_FROM_NUMBER etc.) is
+   *     the truth when known — it is the number the provider actually uses
+   *     (and, on a shared number, the same for every tenant). The owner's
+   *     messaging profile for that sender, if any, is linked.
+   *  2. Otherwise, the owner's registration for this provider: a profile
+   *     dedicated to the sending supplier first, then a tenant-level one —
+   *     used only when exactly one matches (several registrations, e.g. one
+   *     per country, with no way to tell which the adapter will use, means
+   *     the number is honestly left unrecorded rather than guessed).
+   */
+  private async senderFor(
+    appId: string,
+    tenantId: string,
+    supplierId: string | null,
+    provider: BaseProvider,
+    recipient: string = '',
+  ): Promise<ConversationSenderInfo> {
+    const providerId = provider.config.id;
+    const adapterSender = typeof provider.getSenderAddress === 'function' ? provider.getSenderAddress() : undefined;
+    let profiles: Awaited<ReturnType<typeof messagingProfileRepository.findSendersForOwner>> = [];
+    try {
+      profiles = await messagingProfileRepository.findSendersForOwner(appId, tenantId, providerId);
+    } catch (err: any) {
+      // Same fail-open stance as the tenant-level consent lookup above (gap
+      // register A7, still open): without the registry the number is only
+      // known from the adapter itself. The sender-level STOP check below
+      // still fails CLOSED whenever a number IS known.
+      console.error(`[routing] messaging-profile lookup failed for ${appId}/${tenantId} via ${providerId}: ${err?.message}`);
+    }
+    const usable = profiles.filter((p) => !p.supplierId || p.supplierId === supplierId);
+    if (adapterSender) {
+      const normalized = normalizeMessagingAddress(adapterSender);
+      const match = usable.find((p) => p.sender === normalized && p.supplierId === supplierId)
+        ?? usable.find((p) => p.sender === normalized);
+      return { businessNumber: normalized, messagingProfileId: match?.id ?? null, country: match?.country ?? null };
+    }
+    const supplierSpecific = supplierId ? usable.filter((p) => p.supplierId === supplierId) : [];
+    let pool = supplierSpecific.length > 0 ? supplierSpecific : usable.filter((p) => !p.supplierId);
+    if (pool.length > 1) {
+      // One local number per country is the platform's model: prefer the
+      // registration in the recipient's own country, when the number's
+      // calling code identifies it unambiguously.
+      const country = countryForE164(recipient);
+      if (country) pool = pool.filter((p) => p.country.toUpperCase() === country);
+    }
+    if (pool.length === 1) {
+      return { businessNumber: pool[0].sender, messagingProfileId: pool[0].id, country: pool[0].country };
+    }
+    return { businessNumber: null };
   }
 
   // Routes other API requests (Maps, Identity, AI)

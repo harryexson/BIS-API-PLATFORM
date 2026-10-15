@@ -142,6 +142,12 @@ export async function createSimulation(
     process.env[key] = value;
   }
   process.env.WEBHOOK_HMAC_SECRET = WEBHOOK_SECRET;
+  // With gap-register B1 fixed, the gateway's createStore() really connects
+  // to Redis whenever one answers at REDIS_URL (default redis://localhost:6379)
+  // instead of always falling back to memory. Give this process its own key
+  // namespace so a developer's local Redis can never leak queued jobs
+  // between test runs.
+  if (!process.env.WORKER_QUEUE_PREFIX) process.env.WORKER_QUEUE_PREFIX = `bis-sim-${randomUUID().slice(0, 8)}`;
   if (!process.env.RATE_LIMIT_MAX_REQUESTS) process.env.RATE_LIMIT_MAX_REQUESTS = '100000';
 
   // Always re-import (cheap: Node's module cache makes this a no-op after

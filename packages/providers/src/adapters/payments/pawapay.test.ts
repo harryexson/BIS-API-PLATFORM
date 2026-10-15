@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { PawaPayProvider } from './pawapay';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'pawapay',
@@ -64,7 +69,7 @@ describe('PawaPayProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PawaPayProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 100, currency: 'KES', paymentMethod: 'mobile_money', phoneNumber: '254700000000' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 100, currency: 'KES', paymentMethod: 'mobile_money', phoneNumber: '254700000000' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -79,7 +84,7 @@ describe('PawaPayProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PawaPayProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 100, currency: 'KES', paymentMethod: 'mobile_money', phoneNumber: '254700000000' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 100, currency: 'KES', paymentMethod: 'mobile_money', phoneNumber: '254700000000' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -88,6 +93,7 @@ describe('PawaPayProvider', () => {
 
   describe('with an API key and a provider code (real HTTP path)', () => {
     const validPayload = {
+  paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID,
       amount: 100,
       currency: 'ZMW',
       paymentMethod: 'mobile_money',

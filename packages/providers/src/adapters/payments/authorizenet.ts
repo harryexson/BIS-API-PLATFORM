@@ -8,6 +8,24 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * Uses the Authorize.Net JSON API (https://api.authorize.net/xml/v1/request.api)
  * with createTransactionRequest / authCaptureTransaction.
  *
+ * The instrument is the caller's Accept.js payment nonce (`paymentToken`,
+ * sent as `payment.opaqueData` with dataDescriptor
+ * COMMON.ACCEPT.INAPP.PAYMENT). Previously a hardcoded sandbox test card
+ * (4111...) was charged regardless of the request (gap register E8); with
+ * no `paymentToken` this adapter now falls back to simulated processing
+ * outside production and refuses (throws) in production.
+ *
+ * Idempotency: Authorize.Net has no idempotency-key mechanism. Its
+ * duplicate-transaction filter (`duplicateWindow`, default 2 minutes)
+ * rejects a second request with the same card, amount and invoice number
+ * inside the window — so `order.invoiceNumber` (max 20 chars) is set to a
+ * deterministic digest of bis_<payment_transaction_id>_<client key> (a
+ * retry of the SAME payment is caught as a duplicate; two different
+ * payments never share an invoice number), and `refId` (echo-only, max 20)
+ * carries the same value instead of the old `bis_<Date.now()>` (E7). This
+ * is a duplicate-window filter, not true idempotency — documented provider
+ * limitation.
+ *
  * Environment variables:
  *   AUTHORIZENET_LOGIN_ID    — API Login ID
  *   AUTHORIZENET_TRANSACTION_KEY — Transaction Key
@@ -26,6 +44,11 @@ export class AuthorizeNetProvider extends BaseProvider {
     return this.secrets.transaction_key || process.env.AUTHORIZENET_TRANSACTION_KEY || '';
   }
 
+  // Previously inherited BaseProvider's unconditional `true` (gap register E2).
+  public isConfigured(): boolean {
+    return Boolean(this.loginId && this.transactionKey);
+  }
+
   private get baseUrl(): string {
     const sandbox = process.env.AUTHORIZENET_SANDBOX !== 'false';
     return sandbox
@@ -36,12 +59,23 @@ export class AuthorizeNetProvider extends BaseProvider {
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 
-    const { amount = 10, currency = 'USD' } = payload;
+    const { amount = 10, currency = 'USD', paymentToken } = payload;
     const startTime = Date.now();
 
-    if (!this.loginId || !this.transactionKey) {
+    if (!this.loginId || !this.transactionKey || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: [
+          ...(this.loginId ? [] : ['AUTHORIZENET_LOGIN_ID']),
+          ...(this.transactionKey ? [] : ['AUTHORIZENET_TRANSACTION_KEY']),
+        ],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
+
+    // 20 chars is both refId's and invoiceNumber's documented maximum, so
+    // this is always the digest form: bis_<16 hex of sha256(txid, key)>.
+    const reference = this.paymentIdempotencyIdentity(payload, { maxLength: 20 });
 
     try {
       const requestBody = {
@@ -50,19 +84,22 @@ export class AuthorizeNetProvider extends BaseProvider {
             name: this.loginId,
             transactionKey: this.transactionKey,
           },
-          refId: `bis_${Date.now()}`,
+          refId: reference,
           transactionRequest: {
             transactionType: 'authCaptureTransaction',
             amount: amount.toFixed(2),
             currencyCode: currency.toUpperCase(),
-            // No real card data is collected upstream of this adapter yet —
-            // the sandbox test card lets this exercise the real API end-to-end.
+            // Accept.js nonce — this gateway never handles raw card data.
+            // Element order matters to Authorize.Net's schema-backed JSON
+            // API: payment precedes order.
             payment: {
-              creditCard: {
-                cardNumber: '4111111111111111',
-                expirationDate: '2030-12',
-                cardCode: '900',
+              opaqueData: {
+                dataDescriptor: 'COMMON.ACCEPT.INAPP.PAYMENT',
+                dataValue: paymentToken,
               },
+            },
+            order: {
+              invoiceNumber: reference,
             },
           },
         },

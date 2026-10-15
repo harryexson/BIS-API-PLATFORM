@@ -13,20 +13,42 @@ import { createOutboxPollerProcessor } from './outboxPoller';
 import { createReceiptPipelineProcessor } from './receiptPipeline';
 import { createKeywordResponseDeliveryProcessor } from './keywordResponseDelivery';
 import { createWebhookJobPollerProcessor } from './webhookJobPoller';
+import { createWebhookEventRecoveryProcessor } from './webhookEventRecovery';
 
 export { JobDeps, NeonWriteError } from './deps';
 export { createMessageDeliveryProcessor } from './messageDelivery';
-export { createPaymentWebhookProcessor } from './paymentWebhook';
+export { createPaymentWebhookProcessor, paymentWebhookTransactionTarget } from './paymentWebhook';
 export { createProviderWebhookProcessor } from './providerWebhook';
 export { createProviderHealthProcessor } from './providerHealth';
 export { createEventProcessingProcessor } from './eventProcessing';
 export { createRetryProcessingProcessor } from './retryProcessing';
 export { createReconciliationProcessor } from './reconciliation';
+export {
+  runPaymentReconciliationOnce,
+  resolvePaymentReconciliationConfig,
+  DEFAULT_PAYMENT_RECONCILIATION_CONFIG,
+  type PaymentReconciliationConfig,
+  type PaymentReconciliationReport,
+  type PaymentReconciliationStore,
+  type ReconciliationRow,
+} from './paymentReconciliation';
 export { createInboundMessageProcessor } from './inboundMessage';
-export { createOutboxPollerProcessor } from './outboxPoller';
+export {
+  createOutboxPollerProcessor,
+  runOutboxPollOnce,
+  eventBusOutboxDispatcher,
+  outboxRowToTransactionEvent,
+  resolveOutboxConsumerConfig,
+  DEFAULT_OUTBOX_CONSUMER_CONFIG,
+  type OutboxStore,
+  type OutboxDispatcher,
+  type OutboxConsumerConfig,
+  type OutboxPollResult,
+} from './outboxPoller';
 export { createReceiptPipelineProcessor } from './receiptPipeline';
 export { createKeywordResponseDeliveryProcessor } from './keywordResponseDelivery';
 export { createWebhookJobPollerProcessor } from './webhookJobPoller';
+export { createWebhookEventRecoveryProcessor } from './webhookEventRecovery';
 
 export function registerAllProcessors(
   manager: WorkerManager,
@@ -50,5 +72,7 @@ export function registerAllProcessors(
   manager.register('keyword_response_delivery', createKeywordResponseDeliveryProcessor(deps));
   // Bridges gateway-enqueued webhook jobs from Postgres when Redis isn't configured
   manager.register('webhook_job_poller', createWebhookJobPollerProcessor(deps, queue));
+  // Phase 4: re-enqueues durably persisted webhooks that never reached a consumer
+  manager.register('webhook_event_recovery', createWebhookEventRecoveryProcessor(deps, queue));
   return manager;
 }

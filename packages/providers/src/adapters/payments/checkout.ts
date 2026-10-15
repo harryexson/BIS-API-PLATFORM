@@ -6,8 +6,19 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * Checkout.com payment provider adapter.
  *
  * Uses the Checkout.com Payments API (https://api.checkout.com/payments),
- * charging against a tokenized test source since no real card-collection
- * flow sits upstream of this adapter yet.
+ * charging the caller's tokenized card (`paymentToken`, a Checkout.com
+ * `tok_...` from Frames/Flow) as `source: { type: 'token' }`. Previously
+ * this charged a hardcoded `tok_test` regardless of the request (the
+ * gateway never forwarded a token at all — gap register C1/E8); with no
+ * `paymentToken` it now falls back to simulated processing outside
+ * production and refuses (throws) in production, same as Stripe.
+ *
+ * Idempotency: `Cko-Idempotency-Key` header and the body `reference` both
+ * carry the deterministic identity bis_<payment_transaction_id>_<client
+ * key | 'default'> (see BaseProvider.buildIdempotencyIdentity) — previously
+ * both were `bis_<appId>_<Date.now()>`, which never deduplicated anything
+ * (gap register E7). Capped at 80 chars (Checkout.com's documented
+ * `reference` limit; the header uses the same value).
  *
  * Environment variables:
  *   CHECKOUT_SECRET_KEY — sk_sbox_... (sandbox) or sk_... (live)
@@ -23,18 +34,28 @@ export class CheckoutComProvider extends BaseProvider {
     return this.secrets.api_key || process.env.CHECKOUT_SECRET_KEY || '';
   }
 
+  // Previously inherited BaseProvider's unconditional `true` (gap register E2).
+  public isConfigured(): boolean {
+    return Boolean(this.apiKey);
+  }
+
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 
-    const { amount = 10, currency = 'USD' } = payload;
+    const { amount = 10, currency = 'USD', paymentToken } = payload;
     const startTime = Date.now();
 
-    if (!this.apiKey) {
+    if (!this.apiKey || !paymentToken) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['CHECKOUT_SECRET_KEY'],
+        missingInputs: paymentToken ? [] : ['paymentToken'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    const idempotencyKey = this.paymentIdempotencyIdentity(payload, { maxLength: 80 });
+
     try {
-      const idempotencyKey = `bis_${appId}_${Date.now()}`;
       const res = await this.http_request({
         method: 'POST',
         url: `${this.baseUrl}/payments`,
@@ -43,12 +64,11 @@ export class CheckoutComProvider extends BaseProvider {
           'Cko-Idempotency-Key': idempotencyKey,
         },
         body: {
-          // Checkout.com's sandbox test token for a Visa test card.
-          source: { type: 'token', token: 'tok_test' },
+          source: { type: 'token', token: paymentToken },
           amount: Math.round(amount * 100),
           currency: currency.toUpperCase(),
           capture: true,
-          reference: `bis_${appId}_${Date.now()}`,
+          reference: idempotencyKey,
           metadata: { appId, decisionReason },
         },
         timeoutMs: 30_000,

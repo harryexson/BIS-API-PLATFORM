@@ -191,13 +191,20 @@ export class FlutterwaveProvider extends BaseProvider {
     // required field for this flow) — any of those means there is no
     // valid real charge to attempt. Fall back to simulated mode.
     if (!this.apiKey || !paymentToken || !email) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['FLUTTERWAVE_SECRET_KEY'],
+        missingInputs: [...(paymentToken ? [] : ['paymentToken']), ...(email ? [] : ['metadata.email'])],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    // `tx_ref` is Flutterwave's merchant-unique transaction reference (its
+    // duplicate-charge guard): deterministic bis_<payment_transaction_id>_
+    // <client key | 'default'> instead of the old random-UUID fallback
+    // (gap register E7). 100 chars is a conservative cap.
+    const txRef = this.paymentIdempotencyIdentity(payload, { maxLength: 100 });
+
     try {
-      const txRef = (payload as any).idempotencyKey
-        ? `bis_${appId}_${(payload as any).idempotencyKey}`
-        : `flw_${appId}_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
       const res = await this.http_request({
         method: 'POST',

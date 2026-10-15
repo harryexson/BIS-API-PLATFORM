@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { FlutterwaveProvider } from './flutterwave';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'flutterwave',
@@ -138,7 +143,7 @@ describe('FlutterwaveProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new FlutterwaveProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 1000, currency: 'NGN', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 1000, currency: 'NGN', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -155,7 +160,7 @@ describe('FlutterwaveProvider', () => {
       const provider = new FlutterwaveProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 1000, currency: 'NGN', paymentMethod: 'card', metadata: { email: 'buyer@example.com' } },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 1000, currency: 'NGN', paymentMethod: 'card', metadata: { email: 'buyer@example.com' } },
         'test',
       );
 
@@ -171,7 +176,7 @@ describe('FlutterwaveProvider', () => {
       const provider = new FlutterwaveProvider(makeConfig());
       const event = await provider.processRequest(
         'app1',
-        { amount: 1000, currency: 'NGN', paymentMethod: 'card', paymentToken: 'flw-t1nf-abc' },
+        { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 1000, currency: 'NGN', paymentMethod: 'card', paymentToken: 'flw-t1nf-abc' },
         'test',
       );
 
@@ -182,6 +187,7 @@ describe('FlutterwaveProvider', () => {
 
   describe('with an API key, token, and email (real HTTP path)', () => {
     const validPayload = {
+  paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID,
       amount: 1000,
       currency: 'NGN',
       paymentMethod: 'card',

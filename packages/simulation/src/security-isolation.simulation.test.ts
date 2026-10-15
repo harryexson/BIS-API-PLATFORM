@@ -78,6 +78,42 @@ describe('A) IDOR — cross-application transaction read', () => {
 });
 
 // ---------------------------------------------------------------------------
+// A2) IDOR — SAME application, different tenant (Phase 7, gap register C4)
+// ---------------------------------------------------------------------------
+// Case A above only ever crossed APPLICATIONS (a HaulPro key against a Reach
+// Church payment), which the appId check has always caught. The realistic
+// multi-tenant model is many tenants under ONE application — and until
+// Phase 7 the status/refund routes checked appId only, so a second tenant of
+// the same application could read and refund the first tenant's payment.
+// No test in the repository had ever seeded a second tenant linked to the
+// same application (gap register F14 item 6). The full adversarial matrix
+// lives in tenant-isolation.scenarios.ts; this pins the core case here too.
+describe('A2) IDOR — same application, different tenant (FIXED, Phase 7)', () => {
+  const SECOND_TENANT = 'ten_reach_second_site';
+  const SECOND_AUTH = { authorization: 'Bearer ' + API_KEY, 'x-tenant-id': SECOND_TENANT };
+
+  beforeAll(() => {
+    dbState.tenants.push({ id: SECOND_TENANT, slug: 'reach-second-site', name: 'Reach Church — Second Site', status: 'active', countryCode: 'US', currency: 'USD' });
+    dbState.tenantLinks.push({ tenantId: SECOND_TENANT, applicationId: `app_${APP_SLUG}`, status: 'active' });
+  });
+
+  it("a second tenant of the SAME application cannot read or refund the first tenant's payment", async () => {
+    const donation = await createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH);
+    expect(donation.status).toBe(200);
+    const txId = donation.body.id;
+
+    // Same API key, a different (validly linked) tenant: the tenant link
+    // check passes — the resource ownership check must still refuse.
+    expect((await runtime.get('/v1/api/gateway/transaction/' + txId, SECOND_AUTH)).status).toBe(404);
+    expect((await runtime.post('/refunds', { payment_id: txId, tenantId: TENANT_ID }, SECOND_AUTH)).status).toBe(404);
+
+    // The owning tenant still can.
+    expect((await runtime.get('/v1/api/gateway/transaction/' + txId, AUTH)).status).toBe(200);
+    console.warn('[FIXED] same-application cross-tenant IDOR: a second tenant can no longer read/refund the first tenant\'s payment');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // B) IDOR via unauthenticated sim bypass
 // ---------------------------------------------------------------------------
 describe('B) IDOR via unauthenticated non-prod auth bypass', () => {
@@ -126,15 +162,28 @@ describe('D) Tenant verification is mandatory (FIXED)', () => {
 // ---------------------------------------------------------------------------
 // E) Webhook replay at gateway (FIXED)
 // ---------------------------------------------------------------------------
-describe('E) Webhook replay rejected at gateway (FIXED)', () => {
-  it('duplicate webhook deliveries are rejected with 409 at the gateway', async () => {
+describe('E) Webhook replay recognised at gateway from the durable DB record (FIXED)', () => {
+  it('a duplicate delivery is acknowledged (200, duplicate) without a second durable row or re-enqueue', async () => {
+    // Phase 4 (gap register B8/C5/D7): dedup used to be a per-process
+    // in-memory Map answering 409 — lost on restart, keyed without the
+    // provider, and written BEFORE the enqueue it claimed to protect. The
+    // duplicate is now detected by Postgres's unique (provider_id,
+    // provider_event_id) index via the gateway's atomic claim, and is
+    // acknowledged 200 (it WAS durably recorded and enqueued the first
+    // time) so the provider stops retrying, instead of a 409.
     const body = buildStripeWebhook('chg_replay1');
     const first = await deliverWebhook(runtime, 'stripe', body);
     expect(first.status).toBe(200);
+    expect(first.json.duplicate).toBeUndefined();
     const second = await deliverWebhook(runtime, 'stripe', body);
-    // FIXED: gateway-level deduplication rejects replayed webhooks.
-    expect(second.status).toBe(409);
-    console.warn('[FIXED] webhook replay: gateway now rejects duplicate deliveries with 409');
+    expect(second.status).toBe(200);
+    expect(second.json.duplicate).toBe(true);
+    expect(second.json.webhookEventId).toBe(first.json.webhookEventId);
+    const rows = dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === body.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].enqueuedAt).not.toBeNull();
+    expect([...rows[0].enqueuedJobs].sort()).toEqual(['inbound_message', 'payment_webhook', 'provider_webhook']);
+    console.warn('[FIXED] webhook replay: recognised from the durable webhook_events row, acknowledged without re-enqueue');
   });
 });
 
@@ -146,7 +195,11 @@ describe('F) Forged webhook signature rejected (control)', () => {
     const body = buildStripeWebhook('chg_forged1');
     const rawBody = JSON.stringify(body);
     const correct = signWebhook(rawBody);
-    const tampered = 'a' + correct.slice(1); // flip first nibble; still valid-length hex
+    // Change the first nibble; still valid-length hex. (Was `'a' + correct.slice(1)`,
+    // which left the signature UNCHANGED whenever it already began with 'a' —
+    // a 1-in-16 flake where the "forged" request was correctly accepted.)
+    const tampered = (correct[0] === 'a' ? 'b' : 'a') + correct.slice(1);
+    expect(tampered).not.toBe(correct);
     const res = await runtime.postText('/v1/api/webhooks/stripe', rawBody, {
       'x-webhook-signature': tampered,
     });
@@ -327,12 +380,15 @@ describe('O) Duplicate payment submission (VULN) vs webhook replay protection (F
     const delivery = await deliverWebhook(runtime, 'stripe', body1);
     expect(delivery.status).toBe(200);
 
-    // Same event ID sent again — gateway rejects with 409
+    // Same event ID sent again — recognised as a duplicate by the durable
+    // (provider_id, provider_event_id) unique index and acknowledged 200
+    // without re-enqueueing (Phase 4; previously an in-memory 409).
     const body2 = buildStripeWebhook(txId1, { id: eventId });
     const delivery2 = await deliverWebhook(runtime, 'stripe', body2);
-    // Gateway-level deduplication returns 409 for duplicate webhook
-    expect(delivery2.status).toBe(409);
-    console.warn('[FIXED] webhook replay is protected at gateway level (409 for duplicates)');
+    expect(delivery2.status).toBe(200);
+    expect(delivery2.json.duplicate).toBe(true);
+    expect(dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === eventId)).toHaveLength(1);
+    console.warn('[FIXED] webhook replay is protected at gateway level (durable DB-enforced duplicate detection)');
 
     // VULN: duplicate POST /payment submissions are NOT idempotent.
     // Current state: each submission creates a new txId (no idempotency key enforcement).

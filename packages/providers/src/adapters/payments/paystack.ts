@@ -11,6 +11,19 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * "success" once the transaction is initialized — final settlement status
  * arrives via the charge.success webhook, same as Stripe's async webhook path.
  *
+ * The customer's email (required by Paystack's initialize call) comes from
+ * `payload.metadata.email`. Previously a fabricated `<appId>@bis-platform
+ * .invalid` address was sent (gap register E8); without a real email this
+ * adapter now falls back to simulated processing outside production and
+ * refuses (throws) in production.
+ *
+ * Idempotency/reference: Paystack's `reference` must be unique per
+ * transaction and only allows `-`, `.`, `=` and alphanumerics (no `_`), so
+ * the deterministic identity is built with '-' separators:
+ * bis-<payment_transaction_id>-<client key | 'default'> (client keys with
+ * other characters are digested). Previously `bis_<appId>_<Date.now()>` —
+ * banned, and not even valid for Paystack's own character set (E7).
+ *
  * Environment variables:
  *   PAYSTACK_SECRET_KEY — sk_test_... or sk_live_...
  */
@@ -25,24 +38,39 @@ export class PaystackProvider extends BaseProvider {
     return this.secrets.api_key || process.env.PAYSTACK_SECRET_KEY || '';
   }
 
+  // Previously inherited BaseProvider's unconditional `true` (gap register E2).
+  public isConfigured(): boolean {
+    return Boolean(this.apiKey);
+  }
+
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 
     const { amount = 10, currency = 'NGN' } = payload;
+    const email = typeof payload.metadata?.email === 'string' && payload.metadata.email ? payload.metadata.email : undefined;
     const startTime = Date.now();
 
-    if (!this.apiKey) {
+    if (!this.apiKey || !email) {
+      this.refuseSimulatedFallbackInProduction({
+        missingCredentials: this.apiKey ? [] : ['PAYSTACK_SECRET_KEY'],
+        missingInputs: email ? [] : ['metadata.email'],
+      });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 
+    const reference = this.paymentIdempotencyIdentity(payload, {
+      maxLength: 100,
+      separator: '-',
+      allowedChars: /^[A-Za-z0-9.=-]+$/,
+    });
+
     try {
-      const reference = `bis_${appId}_${Date.now()}`;
       const res = await this.http_request({
         method: 'POST',
         url: `${this.baseUrl}/transaction/initialize`,
         headers: { Authorization: `Bearer ${this.apiKey}` },
         body: {
-          email: `${appId}@bis-platform.invalid`,
+          email,
           amount: Math.round(amount * 100), // kobo
           currency: currency.toUpperCase(),
           reference,

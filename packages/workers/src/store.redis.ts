@@ -25,6 +25,7 @@ export class RedisStore implements KVStore {
   private channels = new Map<string, Set<(m: string) => void>>();
   private connected = false;
   private reconnectAttempts = 0;
+  private initialConnect: Promise<{ ok: true } | { ok: false; err: unknown }>;
 
   constructor(url: string) {
     const baseOpts: RedisOptions = {
@@ -53,8 +54,11 @@ export class RedisStore implements KVStore {
       this.channels.get(channel)?.forEach((h) => h(message));
     });
 
-    // Track connection state
-    this.client.on('connect', () => {
+    // Track connection state. 'ready' (not 'connect') is the event that
+    // means commands can actually be sent: with enableReadyCheck the socket
+    // is open at 'connect' but ioredis still runs its INFO check first, and
+    // isConnected() below requires status === 'ready' anyway.
+    this.client.on('ready', () => {
       this.connected = true;
       this.reconnectAttempts = 0;
     });
@@ -63,14 +67,54 @@ export class RedisStore implements KVStore {
       this.connected = false;
       this.reconnectAttempts++;
     });
+    // Without a listener ioredis prints "[ioredis] Unhandled error event"
+    // for every failed reconnect of the subscriber connection.
+    this.subClient.on('error', () => undefined);
 
     this.client.on('close', () => {
       this.connected = false;
     });
 
-    // Connect lazily
-    this.client.connect().catch(() => undefined);
-    this.subClient.connect().catch(() => undefined);
+    // B1 FIX: start connecting immediately, but KEEP the promise so
+    // callers (createStore) can actually wait for the outcome. Previously
+    // this was `this.client.connect().catch(() => undefined)` — fire and
+    // forget — and createStore() probed the connection synchronously right
+    // after construction, before the TCP handshake could possibly have
+    // completed, so it fell back to MemoryStore on every single call even
+    // with Redis up. The rejection is observed here (so it is never an
+    // unhandled rejection) and re-surfaced through waitUntilReady().
+    const connecting = Promise.all([this.client.connect(), this.subClient.connect()]).then(() => undefined);
+    this.initialConnect = connecting.then(
+      () => ({ ok: true as const }),
+      (err: unknown) => ({ ok: false as const, err }),
+    );
+  }
+
+  /**
+   * Resolves once BOTH connections (commands + pub/sub) are ready; rejects if
+   * the initial connection attempt failed or did not finish within
+   * `timeoutMs`. ioredis keeps reconnecting in the background after a
+   * failed first attempt — callers that give up on this store should
+   * quit() it to stop that.
+   */
+  async waitUntilReady(timeoutMs: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<{ ok: false; err: unknown }>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ ok: false, err: new Error(`Redis connection not ready within ${timeoutMs}ms (status: ${this.client.status})`) }),
+        timeoutMs,
+      );
+    });
+    try {
+      const outcome = await Promise.race([this.initialConnect, timeout]);
+      if (!outcome.ok) throw outcome.err instanceof Error ? outcome.err : new Error(String(outcome.err));
+      // 'ready' handler may not have run yet if connect() resolved in the
+      // same tick; the status check is authoritative.
+      if (this.client.status === 'ready') this.connected = true;
+      this.assertConnected();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -102,8 +146,13 @@ export class RedisStore implements KVStore {
 
   async quit(): Promise<void> {
     this.connected = false;
-    await this.client.quit().catch(() => undefined);
-    await this.subClient.quit().catch(() => undefined);
+    // quit() needs a live connection to send QUIT; on a store that never
+    // connected (or is mid-reconnect) it can hang/reject, so fall back to a
+    // hard disconnect, which also stops the background reconnect loop.
+    for (const c of [this.client, this.subClient]) {
+      if (c.status === 'ready') await c.quit().catch(() => c.disconnect());
+      else c.disconnect();
+    }
   }
 
   async set(key: string, value: string, ttlMs?: number): Promise<void> {

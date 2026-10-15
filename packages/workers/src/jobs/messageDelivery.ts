@@ -16,12 +16,15 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
     }
 
     // P0 FIX: Pass tenantId to routing engine for conversation isolation
-    const event = await deps.routing.routeMessage(appId, {
+    const routed = await deps.routing.routeMessage(appId, {
       recipient,
       content,
       providerOverride,
       tenantId: tenantId || 'default',
     });
+    // Phase 7: carry the job's tenant onto the event (it scopes outbound
+    // webhook dispatch); an untenanted job's event reaches no tenant.
+    const event = tenantId ? { ...routed, tenantId } : routed;
 
     try {
       await eventRepository.create({

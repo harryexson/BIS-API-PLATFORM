@@ -18,12 +18,12 @@ import {
  * (the delivery engine existed and worked before this table did; nothing
  * supplied it a target).
  *
- * Scoped by appId only for dispatch purposes — TransactionEvent itself
- * carries no tenantId, so a listener can't filter by tenant. tenantId is
- * still recorded (default 'default', matching every other per-tenant table
- * in this schema) so the registering application/tenant pair is known for
- * ownership checks on the registration API itself, even though delivery
- * fan-out can only key on appId.
+ * Scoped by (appId, tenantId) for EVERYTHING — registration, listing,
+ * deletion and delivery fan-out (Phase 7, gap register C4/F3.2). Before
+ * Phase 7 TransactionEvent carried no tenantId, so delivery keyed on appId
+ * alone and every tenant of an application received every other tenant's
+ * events; TransactionEvent.tenantId now exists and the gateway dispatches an
+ * event only to the endpoints of the event's own (appId, tenantId).
  */
 export const webhookEndpoints = pgTable(
   'webhook_endpoints',

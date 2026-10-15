@@ -1,7 +1,13 @@
 import { JobProcessor, JobType } from '../types';
 import { JobDeps } from './deps';
 import { JobQueue } from '../queue';
-import { eventRepository, auditLogRepository } from '@company/database';
+import { eventRepository, auditLogRepository, transactionRepository } from '@company/database';
+import {
+  resolvePaymentReconciliationConfig,
+  runPaymentReconciliationOnce,
+  type PaymentReconciliationReport,
+  type PaymentReconciliationStore,
+} from './paymentReconciliation';
 
 const ALL_TYPES: JobType[] = [
   'message_delivery',
@@ -35,11 +41,28 @@ export function createReconciliationProcessor(
         deadLetters[type] = await queue.deadCount(type);
       }
 
+      // Phase 6 (gap register D4 / PHASE3-02): reconcile payments whose
+      // outcome is unknown or stuck. Read-only provider status checks where
+      // an adapter supports one, otherwise escalation to the operator list —
+      // NEVER a charge retry (see paymentReconciliation.ts).
+      let payments: PaymentReconciliationReport | { error: string };
+      try {
+        payments = await runPaymentReconciliationOnce(
+          deps,
+          deps.paymentReconciliation ?? (transactionRepository as unknown as PaymentReconciliationStore),
+          resolvePaymentReconciliationConfig(deps.config.paymentReconciliation),
+        );
+      } catch (err) {
+        console.error('[reconciliation] payment reconciliation failed', err);
+        payments = { error: err instanceof Error ? err.message : String(err) };
+      }
+
       const report = {
         generatedAt: new Date().toISOString(),
         neon: { totalEvents, eventsByCategory },
         redis: { deadLetters },
-        note: 'Neon is the source of truth for durable state; Redis holds ephemeral queue/locks.',
+        payments,
+        note: 'Neon is the source of truth for durable state; Redis holds ephemeral queue/locks. Payments with an unknown outcome are checked read-only with the provider where an adapter supports it, otherwise escalated to requires_reconciliation (GET /api/dashboard/payments/reconciliation) — never re-charged.',
       };
 
       try {

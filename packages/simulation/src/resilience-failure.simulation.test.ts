@@ -305,8 +305,8 @@ describe('R6 — provider hang: gateway request timeout, ambiguous outcome not r
       // real timeout. Race against the real value instead of an arbitrary
       // short window that can't distinguish "hung" from "just slow so far".
       const result = await Promise.race([
-        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, status: r.status, providerId: r.body.providerId as string | undefined, eventStatus: r.body.status as string | undefined })),
-        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, status: undefined as number | undefined, providerId: undefined as string | undefined, eventStatus: undefined as string | undefined })),
+        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, status: r.status, providerId: r.body.providerId as string | undefined, eventStatus: r.body.status as string | undefined, id: r.body.id as string | undefined, paymentTransactionId: r.body.paymentTransactionId as string | undefined })),
+        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, status: undefined as number | undefined, providerId: undefined as string | undefined, eventStatus: undefined as string | undefined, id: undefined as string | undefined, paymentTransactionId: undefined as string | undefined })),
       ]);
 
       expect(result.done).toBe(true);
@@ -323,6 +323,14 @@ describe('R6 — provider hang: gateway request timeout, ambiguous outcome not r
       expect(result.status).toBe(202);
       expect(result.eventStatus).toBe('unknown');
       expect(result.providerId).toBe('stripe');
+      // Phase 6 (D4): identified by the platform's own pre-allocated payment
+      // transaction id, stored in the distinct 'unknown' status with no
+      // (random) provider id — so the provider's later webhook, the
+      // reconciliation job, or an operator can resolve it.
+      expect(result.id).toBe(result.paymentTransactionId);
+      const row = dbState.transactions.find((t) => t.id === result.paymentTransactionId)!;
+      expect(row.status).toBe('unknown');
+      expect(row.providerTransactionId).toBeNull();
       console.warn(
         `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was returned as an ambiguous 'unknown' (202) rather than stalling indefinitely or risking a double charge via blind failover`,
       );
@@ -375,13 +383,19 @@ describe('R7 — success then connection drop (GAP)', () => {
 // R8) Worker crash during payment processing — retry + idempotency (OK)
 // ---------------------------------------------------------------------------
 
-describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () => {
-  it('idempotency (setNx) prevents a duplicate payment record even after a crash+retry', async () => {
-    // The payment_webhook processor claims the idempotency key (setNx) BEFORE
-    // doing the durable write and the downstream emit. If the worker crashes
-    // after claiming the key, any retry/replay with the same webhook id sees the
-    // key already set and is blocked by the guard — so a second durable record
-    // can never be created (no double charge).
+describe('R8 — worker crash mid-emit: durable consumer state bounds duplicates AND the retry completes (FIXED)', () => {
+  it('a crash after the durable write is retried to completion with exactly one payment record; a later replay is a no-op', async () => {
+    // Phase 4 (gap register B5). This test used to assert the OPPOSITE: that
+    // after the emit crash the job went `dead` and every retry/replay failed
+    // with "Replay detected" — i.e. that the webhook was permanently lost
+    // (the receipt/emit never happened) because the processor set a
+    // Redis/memory setNx marker BEFORE doing the work and never cleared it.
+    // Now:
+    //   - the consumer claim lives in webhook_event_consumers; the crash
+    //     records the attempt as `failed`, and the retry cleanly re-claims it;
+    //   - the events/outbox write is at-most-once per durable event
+    //     (persistEffectsOnce), so the retry does NOT write a second record;
+    //   - the retry's emit succeeds, so the webhook is actually processed.
     const original = runtime.bus.emit.bind(runtime.bus);
     let first = true;
     (runtime.bus as any).emit = async (e: any) => {
@@ -402,7 +416,8 @@ describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () 
       return { rawBody: raw, signature: signWebhook(raw) };
     };
 
-    // First processing: setNx ok, durable row written, downstream emit crashes.
+    // First processing: durable row written, downstream emit crashes, the
+    // job is retried and completes.
     const e1 = envelope();
     const job1 = await enqueuePaymentWebhook(pipeline.queue, {
       appId: APP_SLUG,
@@ -411,19 +426,22 @@ describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () 
       signature: e1.signature,
       id: 'chg_crash1',
     });
-    // The emit crash causes the job to fail. On retry, idempotency blocks it → dead.
     await waitFor(
-      async () => {
-        const j = await pipeline.queue.getJob(job1.id);
-        return j?.status === 'dead';
-      },
-      { label: 'R8 first job dead after crash+idempotency block', timeoutMs: 30_000 },
+      async () => (await pipeline.queue.getJob(job1.id))?.status === 'completed',
+      { label: 'R8 first job completed after crash + clean retry', timeoutMs: 15_000 },
     );
-    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(
-      rowsBefore + 1,
+    const job1State = await pipeline.queue.getJob(job1.id);
+    expect(job1State?.attempts).toBe(1); // one failed attempt recorded, then success
+    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
+    const durable = dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === 'chg_crash1');
+    expect(durable).toHaveLength(1);
+    const consumer = dbState.webhookEventConsumers.find(
+      (c) => c.webhookEventId === durable[0].id && c.consumer === 'payment_webhook',
     );
+    expect(consumer?.status).toBe('processed');
+    expect(consumer?.attempts).toBe(2);
 
-    // Simulate the post-crash retry: the same webhook id is replayed.
+    // A later replay of the same webhook id is a genuine replay: no-op.
     const e2 = envelope();
     const job2 = await enqueuePaymentWebhook(pipeline.queue, {
       appId: APP_SLUG,
@@ -433,19 +451,15 @@ describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () 
       id: 'chg_crash1',
     });
     await waitFor(
-      async () => (await pipeline.queue.getJob(job2.id))?.status === 'dead',
-      { label: 'R8 replay dead' },
+      async () => (await pipeline.queue.getJob(job2.id))?.status === 'completed',
+      { label: 'R8 replay completed as a no-op' },
     );
-
     const finalJob = await pipeline.queue.getJob(job2.id);
-    expect(finalJob?.status).toBe('dead');
-    expect(finalJob?.lastError).toContain('Replay detected');
-    // Still exactly one row — the replay was blocked, no duplicate payment.
-    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(
-      rowsBefore + 1,
-    );
+    expect(finalJob?.lastError).toBeUndefined();
+    // Still exactly one row — no duplicate payment record.
+    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
     console.warn(
-      '[OK] idempotency (setNx) prevents a duplicate payment record even when a worker crashes mid-emit and retries',
+      '[FIXED] crash mid-emit: retry re-claims the durable consumer record and completes; exactly one payment record; replay is a no-op',
     );
   }, 30_000);
 });

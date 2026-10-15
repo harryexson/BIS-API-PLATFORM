@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { PayPalProvider } from './paypal';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'paypal',
@@ -69,7 +74,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig({ environment: 'test' }));
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
 
       expect(fetchSpy.mock.calls[0][0]).toBe('https://api-m.sandbox.paypal.com/v1/oauth2/token');
       expect(fetchSpy.mock.calls[1][0]).toBe('https://api-m.sandbox.paypal.com/v2/checkout/orders');
@@ -87,7 +92,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig({ environment: 'live' }));
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
 
       expect(fetchSpy.mock.calls[0][0]).toBe('https://api-m.paypal.com/v1/oauth2/token');
       expect(fetchSpy.mock.calls[1][0]).toBe('https://api-m.paypal.com/v2/checkout/orders');
@@ -102,7 +107,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -116,7 +121,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -136,7 +141,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_abc' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_abc' }, 'test');
 
       const [tokenUrl, tokenOpts] = fetchSpy.mock.calls[0];
       expect(tokenUrl).toBe('https://api-m.sandbox.paypal.com/v1/oauth2/token');
@@ -172,8 +177,8 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
 
       // 1 token call + 2 order calls = 3, not 4 (no second token call).
       expect(fetchSpy).toHaveBeenCalledTimes(3);
@@ -188,7 +193,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
       expect(event.status).toBe('failed');
     });
 
@@ -201,7 +206,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
       expect(event.status).toBe('unknown');
     });
 
@@ -214,7 +219,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_bad' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_bad' }, 'test');
       expect(event.status).toBe('failed');
       expect(event.error).toContain('does not exist');
     });
@@ -228,7 +233,7 @@ describe('PayPalProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new PayPalProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'wallet', paymentToken: 'vault_1' }, 'test');
       expect(event.status).toBe('failed');
       expect(event.error).toContain('Client Authentication failed');
     });

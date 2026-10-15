@@ -71,6 +71,10 @@ export class VonageProvider extends BaseProvider {
     return this.secrets.api_secret || process.env.VONAGE_API_SECRET || '';
   }
 
+  public getSenderAddress(): string | undefined {
+    return this.fromNumber || undefined;
+  }
+
   private get fromNumber(): string {
     return this.secrets.from_number || process.env.VONAGE_FROM_NUMBER || '';
   }

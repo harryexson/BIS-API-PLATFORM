@@ -1,5 +1,177 @@
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, OtherRequest, RefundRequest } from '@company/schemas';
+
+// ---------------------------------------------------------------------------
+// Production kill-switch for simulated provider fallbacks (gap register E2).
+// ---------------------------------------------------------------------------
+
+/**
+ * Base class for "this adapter would have fabricated a simulated result,
+ * but simulation is forbidden here" errors. Thrown — never returned as a
+ * fake success — so the router treats it as a definite non-charge (nothing
+ * was sent to any provider) and the gateway never reports money as moved.
+ */
+export class SimulatedFallbackBlockedError extends Error {
+  readonly code: string;
+  readonly providerId: string;
+  readonly missing: string[];
+
+  constructor(code: string, providerId: string, missing: string[], message: string) {
+    super(message);
+    this.name = new.target.name;
+    this.code = code;
+    this.providerId = providerId;
+    this.missing = missing;
+  }
+}
+
+/** The adapter has no real credentials (or no real integration at all). */
+export class ProviderNotConfiguredError extends SimulatedFallbackBlockedError {
+  constructor(providerId: string, missing: string[], detail?: string) {
+    super(
+      'provider_not_configured',
+      providerId,
+      missing,
+      `Provider '${providerId}' is not configured for real processing` +
+        (missing.length ? ` (missing: ${missing.join(', ')})` : '') +
+        (detail ? ` — ${detail}` : '') +
+        '. Simulated fallback is disabled when NODE_ENV=production.',
+    );
+  }
+}
+
+/** The adapter is configured, but the request lacks an input a real call needs (e.g. paymentToken). */
+export class MissingPaymentInputError extends SimulatedFallbackBlockedError {
+  constructor(providerId: string, missing: string[]) {
+    super(
+      'missing_payment_input',
+      providerId,
+      missing,
+      `Provider '${providerId}' cannot make a real call: request is missing ${missing.join(', ')}. ` +
+        'Simulated fallback is disabled when NODE_ENV=production.',
+    );
+  }
+}
+
+/** A real money-moving call was attempted without the platform's own transaction id. */
+export class MissingPaymentTransactionIdError extends Error {
+  readonly code = 'missing_payment_transaction_id';
+  constructor() {
+    super(
+      'paymentTransactionId is required to build a deterministic provider idempotency identity ' +
+        '(bis_<payment_transaction_id>_<idempotency_identity>); refusing to call the provider without one.',
+    );
+    this.name = 'MissingPaymentTransactionIdError';
+  }
+}
+
+/** Simulated fallbacks are allowed everywhere except NODE_ENV=production (read at call time). */
+export function isSimulatedFallbackAllowed(): boolean {
+  return process.env.NODE_ENV !== 'production';
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic provider idempotency identity (gap register E7 / C11).
+// ---------------------------------------------------------------------------
+
+export interface IdempotencyIdentityOptions {
+  /** The provider's documented maximum length for the field. Default 255. */
+  maxLength?: number;
+  /**
+   * Characters the provider accepts in the field. Default: ASCII letters,
+   * digits, '_' and '-'. A client key containing anything else is replaced
+   * by a SHA-256 digest of itself (still deterministic).
+   */
+  allowedChars?: RegExp;
+  /** Separator between the parts. Default '_' (Paystack, which forbids '_', uses '-'). */
+  separator?: string;
+  /**
+   * Distinguishes several provider calls made for ONE payment (e.g.
+   * Airwallex create-intent vs confirm-intent need different request ids).
+   * Becomes part of the idempotency-identity segment.
+   */
+  suffix?: string;
+}
+
+const DEFAULT_ALLOWED = /^[A-Za-z0-9_-]+$/;
+const sha256Hex = (input: string) => createHash('sha256').update(input, 'utf8').digest('hex');
+
+/**
+ * Builds the provider-facing idempotency identity for one payment:
+ *
+ *     bis_<payment_transaction_id>_<idempotency_identity>
+ *
+ * where `<idempotency_identity>` is the client's own Idempotency-Key (or
+ * the literal `default` when the client sent none — each keyless request
+ * still gets a fresh payment_transaction_id, so the result stays unique per
+ * payment), optionally followed by `suffix`.
+ *
+ * It is a PURE function of (paymentTransactionId, clientKey, options): no
+ * Date.now(), no Math.random(), no randomUUID(). The same payment retried —
+ * adapter-internal HTTP retry, router failover, or a client retry that
+ * reuses the same transaction row — always yields the same identity, and
+ * two different payments (different transaction ids) never share one.
+ *
+ * Fitting provider constraints, deterministically, in this order:
+ *  1. A client key with characters the provider rejects is replaced by
+ *     `h` + SHA-256(hex) of itself.
+ *  2. If the result exceeds `maxLength`, the transaction id is written
+ *     without dashes (lossless for a UUID) and the identity segment is
+ *     replaced by a SHA-256 digest truncated to the remaining budget
+ *     (at least 8 hex chars).
+ *  3. If even that cannot fit (very short fields such as Authorize.Net's
+ *     20-char refId), the whole thing becomes `bis_` + SHA-256 of
+ *     (transaction id, identity), truncated to fit (at least 12 hex chars).
+ */
+export function buildIdempotencyIdentity(
+  paymentTransactionId: string | undefined | null,
+  clientKey?: string | null,
+  options: IdempotencyIdentityOptions = {},
+): string {
+  if (typeof paymentTransactionId !== 'string' || paymentTransactionId.trim() === '') {
+    throw new MissingPaymentTransactionIdError();
+  }
+  const maxLength = options.maxLength ?? 255;
+  const allowed = options.allowedChars ?? DEFAULT_ALLOWED;
+  const sep = options.separator ?? '_';
+  const prefix = 'bis';
+
+  const keyPart = typeof clientKey === 'string' && clientKey !== '' ? clientKey : 'default';
+  const rawIdentity = options.suffix ? `${keyPart}${sep}${options.suffix}` : keyPart;
+  const identity = allowed.test(rawIdentity) ? rawIdentity : `h${sha256Hex(rawIdentity).slice(0, 32)}`;
+  const txPart = allowed.test(paymentTransactionId) ? paymentTransactionId : `t${sha256Hex(paymentTransactionId).slice(0, 32)}`;
+
+  const full = [prefix, txPart, identity].join(sep);
+  if (full.length <= maxLength) return full;
+
+  const compactTx = txPart.replace(/-/g, '');
+  const budget = maxLength - (prefix.length + compactTx.length + 2 * sep.length);
+  if (budget >= 8) {
+    const digestIdentity = `h${sha256Hex(rawIdentity)}`.slice(0, Math.min(budget, 65));
+    return [prefix, compactTx, digestIdentity].join(sep);
+  }
+
+  const digestBudget = maxLength - (prefix.length + sep.length);
+  if (digestBudget >= 12) {
+    return `${prefix}${sep}${sha256Hex(`${paymentTransactionId}\u0000${rawIdentity}`).slice(0, Math.min(digestBudget, 64))}`;
+  }
+  throw new Error(`buildIdempotencyIdentity: maxLength ${maxLength} is too small for a collision-resistant identity`);
+}
+
+/**
+ * For providers whose idempotency field must itself be a UUID (PawaPay's
+ * `depositId`): a UUID-formatted value derived deterministically from the
+ * identity string (first 16 bytes of its SHA-256), with the version nibble
+ * set to 4 and the RFC 4122 variant bits set so strict UUIDv4 validators
+ * accept it. Same input → same UUID; no randomness.
+ */
+export function identityToUuid(identity: string): string {
+  const bytes = createHash('sha256').update(identity, 'utf8').digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Buffer.from(bytes).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
 export interface HttpRequestOptions {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
@@ -20,6 +192,38 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const RETRY_BASE_MS = 500;
 
+// ---------------------------------------------------------------------------
+// Read-only payment status query (Phase 6 — gap register D4 reconciliation).
+// ---------------------------------------------------------------------------
+
+export interface PaymentStatusQuery {
+  /** The platform's own transactions.id (sent to the provider as metadata/reference). */
+  paymentTransactionId: string;
+  /** The provider's own id for the payment, when one was ever received. */
+  providerTransactionId: string | null;
+}
+
+/** What a provider reports about a payment, mapped onto the platform's state machine. */
+export type ProviderReportedPaymentStatus = 'success' | 'failed' | 'cancelled' | 'pending' | 'requires_action';
+
+export type PaymentStatusQueryResult =
+  /** The adapter has no real, read-only way to ask the provider. */
+  | { kind: 'unsupported'; reason: string }
+  /** The provider has no record (yet) — NOT evidence of "not charged" (e.g. search-index lag). */
+  | { kind: 'not_found'; detail: string }
+  /** More than one provider-side payment claims this platform transaction — needs a human. */
+  | { kind: 'multiple'; providerTransactionIds: string[] }
+  | {
+      kind: 'found';
+      status: ProviderReportedPaymentStatus;
+      providerTransactionId: string;
+      /** The provider's own raw status string, for the audit trail. */
+      providerStatus: string;
+      /** Major units, as reported by the provider (for an amount cross-check). */
+      amount?: number;
+      currency?: string;
+    };
+
 export abstract class BaseProvider {
   public config: ProviderConfig;
   private _secrets: Record<string, string> = {};
@@ -34,6 +238,46 @@ export abstract class BaseProvider {
 
   public setSecrets(secrets: Record<string, string>): void {
     this._secrets = secrets;
+  }
+
+  /**
+   * Production kill-switch (gap register E2). Every adapter calls this
+   * immediately before it would return a simulated/fabricated result.
+   * Outside production it is a no-op (dev/test keep simulating without real
+   * credentials). With NODE_ENV=production it THROWS instead:
+   *   - ProviderNotConfiguredError when `missingCredentials` is non-empty
+   *     (or `simulationOnly` is set — an adapter with no real integration);
+   *   - MissingPaymentInputError when only request inputs are missing
+   *     (e.g. no paymentToken to charge).
+   * NODE_ENV is read at call time, not import time.
+   */
+  protected refuseSimulatedFallbackInProduction(opts: {
+    missingCredentials?: string[];
+    missingInputs?: string[];
+    simulationOnly?: boolean;
+    detail?: string;
+  }): void {
+    if (isSimulatedFallbackAllowed()) return;
+    const creds = opts.missingCredentials ?? [];
+    const inputs = opts.missingInputs ?? [];
+    if (opts.simulationOnly) {
+      throw new ProviderNotConfiguredError(this.config.id, creds, opts.detail ?? 'adapter has no real provider integration (simulation only)');
+    }
+    if (creds.length > 0) {
+      throw new ProviderNotConfiguredError(this.config.id, creds, opts.detail);
+    }
+    throw new MissingPaymentInputError(this.config.id, inputs.length ? inputs : ['required input']);
+  }
+
+  /**
+   * Deterministic provider idempotency identity for a payment payload —
+   * `bis_<payment_transaction_id>_<idempotency_identity>`, see
+   * buildIdempotencyIdentity(). Throws MissingPaymentTransactionIdError when
+   * the payload carries no paymentTransactionId: a real provider call must
+   * never be made with a non-deterministic identity.
+   */
+  protected paymentIdempotencyIdentity(payload: PaymentRequest, options?: IdempotencyIdentityOptions): string {
+    return buildIdempotencyIdentity(payload.paymentTransactionId, payload.idempotencyKey, options);
   }
 
   /**
@@ -207,6 +451,13 @@ export abstract class BaseProvider {
    */
   async refund(appId: string, payload: RefundRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
+    // This default IS the simulated path (no provider call at all), so it is
+    // subject to the same production kill-switch as simulated charges.
+    this.refuseSimulatedFallbackInProduction({
+      missingCredentials: this.isConfigured() ? [] : ['credentials'],
+      simulationOnly: this.isConfigured(),
+      detail: 'this adapter has no real refund API call for its current configuration; the default refund() would fabricate a success',
+    });
     const latency = await this.simulateLatency();
     const refundId = 're_' + randomUUID().replace(/-/g, '').slice(0, 24);
 
@@ -283,6 +534,39 @@ export abstract class BaseProvider {
   // check — see registry.ts's getManagementView() for where this surfaces.
   public isConfigured(): boolean {
     return true;
+  }
+
+  /**
+   * Phase 8 (shared phone numbers): the account-level sender identity — the
+   * number / short code / sender ID — this adapter actually sends FROM,
+   * when it is known. The routing layer records it on the conversation as
+   * its business number, so a reply arriving on that number can be
+   * attributed. undefined = not known (the conversation's number then comes
+   * from the owner's messaging profile, or stays unrecorded).
+   */
+  public getSenderAddress(): string | undefined {
+    return this.secrets.from_number || undefined;
+  }
+
+  /**
+   * Whether this adapter can ask its provider, READ-ONLY, what happened to a
+   * payment (used by the reconciliation job for 'unknown'/stuck payments).
+   * Default false: as of Phase 6 only Stripe implements one. An adapter must
+   * never "answer" this from simulation — no real query, no answer.
+   */
+  public supportsPaymentStatusQuery(): boolean {
+    return false;
+  }
+
+  /**
+   * Read-only provider status query. MUST NOT create, confirm, capture or
+   * otherwise re-send anything that could move money — reconciliation of an
+   * ambiguous payment never retries the charge. Default: unsupported.
+   * Throws on transport/provider errors (the caller treats that as
+   * inconclusive).
+   */
+  public async queryPaymentStatus(_query: PaymentStatusQuery): Promise<PaymentStatusQueryResult> {
+    return { kind: 'unsupported', reason: `'${this.config.id}' adapter has no read-only payment status query` };
   }
 
   // Checks status, throwing error if not online

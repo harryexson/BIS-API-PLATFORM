@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { BraintreeProvider } from './braintree';
 import { ProviderConfig } from '@company/schemas';
 
+// Phase 3: a real (non-simulated) provider call now requires the platform's
+// own payment transaction id — the provider idempotency identity is derived
+// from it (bis_<payment_transaction_id>_<key>) — so every payload carries one.
+const TEST_PAYMENT_TRANSACTION_ID = '5b0c8a2e-3f4d-4c1a-9e6b-7a8d9c0e1f23';
+
 function makeConfig(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
   return {
     id: 'braintree',
@@ -72,7 +77,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig({ environment: 'test' }));
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'fake-valid-nonce' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'fake-valid-nonce' }, 'test');
 
       const [url] = fetchSpy.mock.calls[0];
       expect(url).toBe('https://payments.sandbox.braintree-api.com/graphql');
@@ -88,7 +93,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig({ environment: 'live' }));
-      await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'real-nonce' }, 'test');
+      await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'real-nonce' }, 'test');
 
       const [url] = fetchSpy.mock.calls[0];
       expect(url).toBe('https://payments.braintree-api.com/graphql');
@@ -104,7 +109,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -119,7 +124,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card' }, 'test');
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(event.status).toBe('success');
@@ -137,7 +142,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'fake-valid-nonce' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'fake-valid-nonce' }, 'test');
 
       const [, opts] = fetchSpy.mock.calls[0];
       expect(opts.headers.Authorization).toBe('Basic ' + Buffer.from('pub_1:priv_1').toString('base64'));
@@ -164,7 +169,7 @@ describe('BraintreeProvider', () => {
         vi.stubGlobal('fetch', fetchSpy);
 
         const provider = new BraintreeProvider(makeConfig());
-        const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
+        const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
         expect(event.status).toBe('success');
       },
     );
@@ -181,7 +186,7 @@ describe('BraintreeProvider', () => {
         vi.stubGlobal('fetch', fetchSpy);
 
         const provider = new BraintreeProvider(makeConfig());
-        const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
+        const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
         expect(event.status).toBe('failed');
         expect(event.error).toContain(status);
       },
@@ -197,7 +202,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
       expect(event.status).toBe('unknown');
     });
 
@@ -211,7 +216,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
       expect(event.status).toBe('failed');
       expect(event.error).toBe('Payment method nonce is required.');
     });
@@ -224,7 +229,7 @@ describe('BraintreeProvider', () => {
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new BraintreeProvider(makeConfig());
-      const event = await provider.processRequest('app1', { amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
+      const event = await provider.processRequest('app1', { paymentTransactionId: TEST_PAYMENT_TRANSACTION_ID, amount: 10, currency: 'USD', paymentMethod: 'card', paymentToken: 'tok_1' }, 'test');
       expect(event.status).toBe('failed');
     });
   });
