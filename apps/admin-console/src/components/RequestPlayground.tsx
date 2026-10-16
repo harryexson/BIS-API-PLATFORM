@@ -28,6 +28,11 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
   // Messaging States
   const [recipient, setRecipient] = useState('info@reachchurch.org');
   const [content, setContent] = useState('Your verification code for ReachChurch EventHub is 8291.');
+  // Phase 10: the explicit channel ('' = let the gateway apply its legacy
+  // content-inferred default) and the per-message opt-in channel switch.
+  const [channel, setChannel] = useState<'' | 'sms' | 'whatsapp' | 'email'>('');
+  const [allowChannelSwitch, setAllowChannelSwitch] = useState(false);
+  const [fallbackEmail, setFallbackEmail] = useState('');
   
   // Other States
   const [serviceType, setServiceType] = useState('ai');
@@ -75,7 +80,16 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
       payload = {
         ...payload,
         recipient,
-        content
+        content,
+        ...(channel ? { channel } : {}),
+        ...(allowChannelSwitch
+          ? {
+              channelPolicy: {
+                allowChannelSwitch: true,
+                ...(fallbackEmail ? { fallbackRecipients: { email: fallbackEmail } } : {}),
+              },
+            }
+          : {}),
       };
     } else {
       payload = {
@@ -356,6 +370,59 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
                 />
               </div>
               <div>
+                <label style={{ display: 'block', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>Channel</label>
+                <select
+                  value={channel}
+                  onChange={(e) => setChannel(e.target.value as '' | 'sms' | 'whatsapp' | 'email')}
+                  style={{
+                    width: '100%',
+                    background: 'var(--bg-tertiary)',
+                    border: '1px solid var(--glass-border)',
+                    color: 'var(--text-primary)',
+                    padding: '6px 8px',
+                    borderRadius: '6px',
+                    fontSize: '12px',
+                    outline: 'none'
+                  }}
+                >
+                  <option value="">Not specified (gateway infers a default from the content)</option>
+                  <option value="sms">SMS</option>
+                  <option value="whatsapp">WhatsApp</option>
+                  <option value="email">Email</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'flex', alignItems: 'center', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={allowChannelSwitch}
+                    onChange={(e) => setAllowChannelSwitch(e.target.checked)}
+                    style={{ marginRight: '6px' }}
+                  />
+                  Allow a different channel if this one is unavailable (off = fail instead)
+                </label>
+                {allowChannelSwitch && (
+                  <input
+                    type="text"
+                    value={fallbackEmail}
+                    onChange={(e) => setFallbackEmail(e.target.value)}
+                    placeholder="Fallback email address (needed to fall back from SMS/WhatsApp to email)"
+                    style={{
+                      width: '100%',
+                      marginTop: '6px',
+                      background: 'var(--bg-tertiary)',
+                      border: '1px solid var(--glass-border)',
+                      color: 'var(--text-primary)',
+                      padding: '6px 10px',
+                      borderRadius: '6px',
+                      fontSize: '12px',
+                      outline: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                )}
+              </div>
+              <div>
                 <label style={{ display: 'block', fontSize: '10px', color: 'var(--text-secondary)', marginBottom: '3px' }}>Message Body</label>
                 <textarea
                   value={content}
@@ -543,11 +610,22 @@ export const RequestPlayground: React.FC<RequestPlaygroundProps> = ({ providers,
               {loading ? (
                 <span style={{ animation: 'pulse-text 1.5s infinite' }}>Orchestration engine evaluating rules...</span>
               ) : lastEvent ? (
-                lastEvent.decisionReason || 'Automatic match completed successfully.'
+                lastEvent.decisionReason || lastEvent.detail || 'Automatic match completed successfully.'
               ) : (
                 <span style={{ color: 'var(--text-muted)' }}>No decision made yet. Select parameters and send request.</span>
               )}
             </p>
+            {lastEvent?.requestedChannel && (
+              <div style={{ marginTop: '6px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.4' }}>
+                <div>
+                  Channel requested: <strong>{lastEvent.requestedChannel}</strong> ({lastEvent.requestedChannelSource === 'explicit' ? 'explicit' : 'inferred default'})
+                  {' · '}selected: <strong>{lastEvent.selectedChannel ?? 'none (not sent)'}</strong>
+                </div>
+                {lastEvent.fallbackReason && (
+                  <div style={{ color: 'var(--accent-red)', marginTop: '2px' }}>Channel fallback: {lastEvent.fallbackReason}</div>
+                )}
+              </div>
+            )}
             {lastEvent?.error && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginTop: '6px', fontSize: '10px', color: 'var(--accent-red)' }}>
                 <AlertTriangle className="w-3.5 h-3.5" />

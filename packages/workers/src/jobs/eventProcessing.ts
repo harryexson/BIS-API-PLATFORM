@@ -17,6 +17,10 @@ export function toEventRecord(payload: any, category: string): EventRecord {
     payload: payload.payload ?? payload,
     response: payload.response ?? null,
     error: payload.error ?? null,
+    // Phase 10: a messaging event's channel decision (migration 0019).
+    requestedChannel: typeof payload.requestedChannel === 'string' ? payload.requestedChannel : null,
+    selectedChannel: typeof payload.selectedChannel === 'string' ? payload.selectedChannel : null,
+    fallbackReason: typeof payload.fallbackReason === 'string' ? payload.fallbackReason : null,
     createdAt: payload.timestamp ? new Date(payload.timestamp) : new Date(),
   } as EventRecord;
 }

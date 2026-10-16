@@ -10,6 +10,21 @@ import { pgTable, uuid, text, timestamp, jsonb, uniqueIndex } from 'drizzle-orm/
  *
  * Provider-specific idempotency (e.g., Stripe's Idempotency-Key header)
  * is an additional internal layer on top of this.
+ *
+ * `request_hash` (migration 0013) is a SHA-256 fingerprint of the mutating
+ * request fields, stored at CLAIM time. It is deliberately NOT part of the
+ * unique index: the unique index must stay on
+ * (app_id, tenant_id, operation, idempotency_key) so that two different
+ * request bodies under the same key can never both win a claim. Instead the
+ * claim path (`idempotencyRecordRepository.claim`, a single atomic
+ * INSERT ... ON CONFLICT DO UPDATE ... WHERE statement) compares the stored
+ * hash to the incoming one and the caller rejects a mismatch with 409
+ * `idempotency_conflict`.
+ *
+ * NOT NULL DEFAULT '' so the column can be added to a live table without a
+ * rewrite/backfill. '' means "legacy row claimed before request hashes
+ * existed — hash unknown"; every row claimed by the current code stores a
+ * non-empty 64-char hex digest. Legacy rows age out within one TTL window.
  */
 export const idempotencyRecords = pgTable(
   'idempotency_records',
@@ -19,6 +34,7 @@ export const idempotencyRecords = pgTable(
     tenantId: text('tenant_id').notNull().default('default'),
     operation: text('operation').notNull(),
     idempotencyKey: text('idempotency_key').notNull(),
+    requestHash: text('request_hash').notNull().default(''),
     status: text('status').notNull().default('pending'),
     result: jsonb('result'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

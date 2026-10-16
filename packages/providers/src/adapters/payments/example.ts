@@ -19,8 +19,12 @@ export class ExamplePaymentProvider extends BaseProvider {
   }
 
   async processRequest(appId: string, payload: PaymentRequest, decisionReason: string): Promise<TransactionEvent> {
-    const latency = await this.simulateLatency();
     this.verifyAvailability();
+    // Pure simulation — never allowed to fabricate a "success" in production
+    // (it is also registered environment:'test', which isLiveEligible()
+    // already excludes there; this is the adapter-level backstop).
+    this.refuseSimulatedFallbackInProduction({ simulationOnly: true });
+    const latency = await this.simulateLatency();
 
     const { amount = 10, currency = 'USD', paymentMethod = 'card' } = payload;
     const txId = 'ex_pay_' + randomUUID().replace(/-/g, '').slice(0, 16);

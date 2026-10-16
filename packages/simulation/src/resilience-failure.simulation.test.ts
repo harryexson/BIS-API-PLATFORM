@@ -36,6 +36,14 @@ import { QueueBackpressureError } from '@company/workers';
 
 console.warn('\n[audit] AUDIT 5 — Resilience, Load & Failure Engineering\n');
 
+// Every SMS-capable provider currently registered — see the identical list
+// (and rationale) in messaging-conversation.simulation.test.ts. A hard
+// "all providers exhausted" test must break every one of these, not just
+// one or two: packages/routing/src/scoring.ts's cascade ranks and tries
+// every remaining online candidate, not a single fixed fallback hop, so
+// proving genuine exhaustion means genuinely exhausting the pool.
+const SMS_CAPABLE = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'vonage'];
+
 // Avoid a crashing rejection when the failing-store worker loop dies (R2).
 let unhandledRejections = 0;
 process.on('unhandledRejection', () => {
@@ -196,20 +204,35 @@ describe('R3 — primary SMS provider offline: failover works (OK)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R4) All SMS providers offline — silent channel change (GAP)
+// R4) All SMS providers offline — NO silent channel change (FIXED, Phase 10)
 // ---------------------------------------------------------------------------
 
-describe('R4 — all SMS providers offline: silent channel change (GAP)', () => {
-  it('an SMS is silently routed over email when no SMS provider is available', async () => {
-    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio'];
+describe('R4 — all SMS providers offline: no silent channel change (FIXED, Phase 10)', () => {
+  it('an SMS fails with a specific channel_unavailable reason instead of being silently routed over email', async () => {
+    // Phase 10 (gap register A9): this test used to assert the defect
+    // (`res.status === 200 && providerId === 'email'` for an SMS). It now
+    // asserts the corrected, observable behaviour for both an inferred-sms
+    // caller (no channel field) and an explicit channel:'sms' caller.
+    const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'whatsapp', 'vonage', 'africastalking', 'sinch', 'vibes'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
-      const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);
-      expect(res.status).toBe(200);
-      expect(res.body.providerId).toBe('email');
-      console.warn(
-        '[GAP] when all SMS providers are offline, an SMS is silently routed over email (channel changed without alert)',
-      );
+      for (const body of [
+        { recipient: '+15550003333', content: 'x' },
+        { recipient: '+15550003333', content: 'x', channel: 'sms' },
+      ]) {
+        const res = await sendMessage(runtime, body, AUTH);
+        expect(res.status).toBe(503);
+        expect(res.body.providerId).toBeUndefined();
+        expect(res.body).toMatchObject({
+          code: 'channel_unavailable',
+          requestedChannel: 'sms',
+          requestedChannelSource: body.channel ? 'explicit' : 'inferred',
+          selectedChannel: null,
+          fallbackReason: null,
+        });
+        expect(String(res.body.detail)).toContain('allowChannelSwitch');
+      }
+      console.warn('[FIXED] when all SMS providers are offline, an SMS fails loudly (channel_unavailable) instead of silently going out as email');
     } finally {
       for (const p of sms) runtime.registry.updateManagement(p, { status: 'online' });
     }
@@ -221,7 +244,7 @@ describe('R4 — all SMS providers offline: silent channel change (GAP)', () => 
 // ---------------------------------------------------------------------------
 
 describe('R5 — single provider failover then hard 503 (OK)', () => {
-  it('fails over on one provider error and returns 503 when all fail', async () => {
+  it('fails over on one provider error and returns 503 once every SMS-capable provider is broken', async () => {
     const infobip = runtime.registry.getProvider('infobip') as unknown as {
       processRequest: (...a: any[]) => Promise<any>;
     };
@@ -233,7 +256,9 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
       infobip.processRequest = origInfo;
     });
 
-    // signalhouse is online by default -> single failover target.
+    // Several other SMS providers are still online -> failover succeeds to
+    // some other real SMS-capable provider (the specific winner is scored,
+    // not a fixed "first in list" pick).
     const first = await sendMessage(
       runtime,
       { recipient: DONOR_PHONE, content: 'x', providerOverride: 'infobip' },
@@ -241,18 +266,25 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
     );
     expect(first.status).toBe(200);
     expect(first.body.providerId).not.toBe('infobip');
+    expect(SMS_CAPABLE).toContain(first.body.providerId);
 
-    // Now also break signalhouse -> nothing left -> 503.
-    const signalhouse = runtime.registry.getProvider('signalhouse') as unknown as {
-      processRequest: (...a: any[]) => Promise<any>;
-    };
-    const origSig = signalhouse.processRequest.bind(signalhouse);
-    signalhouse.processRequest = async () => {
-      throw new Error('down');
-    };
-    patches.push(() => {
-      signalhouse.processRequest = origSig;
-    });
+    // Now break every remaining SMS-capable provider — the routing engine
+    // cascades through every remaining ranked candidate (not a single fixed
+    // fallback hop), so proving genuine exhaustion means genuinely
+    // exhausting the pool, not just breaking one more.
+    for (const id of SMS_CAPABLE) {
+      if (id === 'infobip') continue;
+      const provider = runtime.registry.getProvider(id) as unknown as {
+        processRequest: (...a: any[]) => Promise<any>;
+      };
+      const original = provider.processRequest.bind(provider);
+      provider.processRequest = async () => {
+        throw new Error('down');
+      };
+      patches.push(() => {
+        provider.processRequest = original;
+      });
+    }
 
     const second = await sendMessage(
       runtime,
@@ -260,7 +292,7 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
       AUTH,
     );
     expect(second.status).toBe(503);
-    console.warn('[OK] single-provider failover and hard-failure 503 both work');
+    console.warn('[OK] single-provider failover and hard-failure 503 (once the whole SMS pool is exhausted) both work');
   });
 });
 
@@ -268,9 +300,9 @@ describe('R5 — single provider failover then hard 503 (OK)', () => {
 // R6) Stripe timeout / hang — no server-side timeout (DEFECT)
 // ---------------------------------------------------------------------------
 
-describe('R6 — provider hang: gateway request timeout + failover (FIXED)', () => {
+describe('R6 — provider hang: gateway request timeout, ambiguous outcome not retried (FIXED)', () => {
   it(
-    'a hung provider is timed out after PROVIDER_TIMEOUT_MS and the request fails over to a healthy provider',
+    'a hung PAYMENT provider is timed out after PROVIDER_TIMEOUT_MS and returned as an ambiguous 202, never retried via another provider',
     async () => {
       const stripe = runtime.registry.getProvider('stripe') as unknown as {
         processRequest: (...a: any[]) => Promise<any>;
@@ -288,14 +320,34 @@ describe('R6 — provider hang: gateway request timeout + failover (FIXED)', () 
       // real timeout. Race against the real value instead of an arbitrary
       // short window that can't distinguish "hung" from "just slow so far".
       const result = await Promise.race([
-        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, providerId: r.body.providerId as string | undefined })),
-        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, providerId: undefined as string | undefined })),
+        createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH).then((r) => ({ done: true, status: r.status, providerId: r.body.providerId as string | undefined, eventStatus: r.body.status as string | undefined, id: r.body.id as string | undefined, paymentTransactionId: r.body.paymentTransactionId as string | undefined })),
+        sleep(PROVIDER_TIMEOUT_MS + 5000).then(() => ({ done: false, status: undefined as number | undefined, providerId: undefined as string | undefined, eventStatus: undefined as string | undefined, id: undefined as string | undefined, paymentTransactionId: undefined as string | undefined })),
       ]);
 
       expect(result.done).toBe(true);
-      expect(result.providerId).not.toBe('stripe');
+      // A PAYMENT timeout is genuinely ambiguous — the charge may have
+      // reached Stripe and succeeded before the response was lost, so
+      // packages/routing/src/index.ts's routePayment() deliberately does
+      // NOT cascade to another provider on a timeout (unlike a soft
+      // decline or thrown error, which do cascade) — retrying here risks
+      // a real double charge. It returns the timed-out provider's own id
+      // with status 'unknown' (202) instead, leaving reconciliation via
+      // webhook/status-check as the only safe next step. See the
+      // ProviderTimeoutError branch in routePayment for the full
+      // reasoning.
+      expect(result.status).toBe(202);
+      expect(result.eventStatus).toBe('unknown');
+      expect(result.providerId).toBe('stripe');
+      // Phase 6 (D4): identified by the platform's own pre-allocated payment
+      // transaction id, stored in the distinct 'unknown' status with no
+      // (random) provider id — so the provider's later webhook, the
+      // reconciliation job, or an operator can resolve it.
+      expect(result.id).toBe(result.paymentTransactionId);
+      const row = dbState.transactions.find((t) => t.id === result.paymentTransactionId)!;
+      expect(row.status).toBe('unknown');
+      expect(row.providerTransactionId).toBeNull();
       console.warn(
-        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and failed over to '${result.providerId}' instead of stalling indefinitely`,
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was returned as an ambiguous 'unknown' (202) rather than stalling indefinitely or risking a double charge via blind failover`,
       );
     },
     PROVIDER_TIMEOUT_MS + 15_000,
@@ -303,42 +355,53 @@ describe('R6 — provider hang: gateway request timeout + failover (FIXED)', () 
 });
 
 // ---------------------------------------------------------------------------
-// R7) Provider returns success but connection drops (GAP / OK)
+// R7) Provider returns success but connection drops (FIXED, Phase 11-12)
 // ---------------------------------------------------------------------------
 
-describe('R7 — success then connection drop (GAP)', () => {
-  it('a "success then drop" is treated as failure (no silent double charge)', async () => {
+describe('R7 — success then connection drop: ambiguous, never failed over (FIXED, Phase 11-12)', () => {
+  it('a "success then drop" is reported as unknown (202) on the original provider, and NO other provider is charged', async () => {
+    // Phase 11-12 (gap register A10/E4/PHASE3-01): this test used to assert
+    // `res.status === 503 || res.body.providerId !== 'stripe'` and call that
+    // "safe" — but `providerId !== 'stripe'` IS the double charge: Stripe
+    // processed the charge (the connection dropped AFTER its success), and
+    // the router then charged a second provider for the same payment. It now
+    // asserts the outcome is the ambiguous 'unknown' on Stripe, stored as
+    // 'unknown' with no fabricated provider id (reconcilable), with zero
+    // calls to any other payment provider.
     const stripe = runtime.registry.getProvider('stripe') as unknown as {
       processRequest: (...a: any[]) => Promise<any>;
     };
     const orig = stripe.processRequest.bind(stripe);
-    stripe.processRequest = async (appId: string, payload: any, decisionReason: string) => {
-      const evt = {
-        id: 'chg_ok1',
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: 'stripe',
-        status: 'success',
-        latency: 10,
-        cost: 0,
-        decisionReason: 'approved',
-        payload,
-        response: null,
-      };
+    stripe.processRequest = async () => {
       // Simulate the connection dropping after the provider returned success.
       throw new Error('ECONNRESET after success');
     };
     patches.push(() => {
       stripe.processRequest = orig;
     });
+    const otherCalls: string[] = [];
+    for (const cfg of runtime.registry.getAllConfigs()) {
+      if (cfg.category !== 'payment' || cfg.id === 'stripe') continue;
+      const p = runtime.registry.getProvider(cfg.id) as unknown as { processRequest: (...a: any[]) => Promise<any> };
+      const original = p.processRequest;
+      p.processRequest = async (...a: any[]) => {
+        otherCalls.push(cfg.id);
+        return original.apply(p, a);
+      };
+      patches.push(() => {
+        p.processRequest = original;
+      });
+    }
 
     const res = await createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH);
-    // Safe: treated as failure (failover/503), never a silent double charge.
-    expect(res.status === 503 || res.body.providerId !== 'stripe').toBe(true);
-    console.warn(
-      '[GAP] a "success then drop" is treated as failure (safe vs double-charge) but there is no at-least-once retry guarantee',
-    );
+    expect(res.status).toBe(202);
+    expect(res.body.status).toBe('unknown');
+    expect(res.body.providerId).toBe('stripe');
+    expect(otherCalls).toEqual([]);
+    const row = dbState.transactions.find((t) => t.id === res.body.paymentTransactionId)!;
+    expect(row.status).toBe('unknown');
+    expect(row.providerTransactionId).toBeNull();
+    console.warn('[FIXED] a "success then drop" is an ambiguous unknown (reconciled), never failed over to a second provider');
   });
 });
 
@@ -346,13 +409,19 @@ describe('R7 — success then connection drop (GAP)', () => {
 // R8) Worker crash during payment processing — retry + idempotency (OK)
 // ---------------------------------------------------------------------------
 
-describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () => {
-  it('idempotency (setNx) prevents a duplicate payment record even after a crash+retry', async () => {
-    // The payment_webhook processor claims the idempotency key (setNx) BEFORE
-    // doing the durable write and the downstream emit. If the worker crashes
-    // after claiming the key, any retry/replay with the same webhook id sees the
-    // key already set and is blocked by the guard — so a second durable record
-    // can never be created (no double charge).
+describe('R8 — worker crash mid-emit: durable consumer state bounds duplicates AND the retry completes (FIXED)', () => {
+  it('a crash after the durable write is retried to completion with exactly one payment record; a later replay is a no-op', async () => {
+    // Phase 4 (gap register B5). This test used to assert the OPPOSITE: that
+    // after the emit crash the job went `dead` and every retry/replay failed
+    // with "Replay detected" — i.e. that the webhook was permanently lost
+    // (the receipt/emit never happened) because the processor set a
+    // Redis/memory setNx marker BEFORE doing the work and never cleared it.
+    // Now:
+    //   - the consumer claim lives in webhook_event_consumers; the crash
+    //     records the attempt as `failed`, and the retry cleanly re-claims it;
+    //   - the events/outbox write is at-most-once per durable event
+    //     (persistEffectsOnce), so the retry does NOT write a second record;
+    //   - the retry's emit succeeds, so the webhook is actually processed.
     const original = runtime.bus.emit.bind(runtime.bus);
     let first = true;
     (runtime.bus as any).emit = async (e: any) => {
@@ -373,7 +442,8 @@ describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () 
       return { rawBody: raw, signature: signWebhook(raw) };
     };
 
-    // First processing: setNx ok, durable row written, downstream emit crashes.
+    // First processing: durable row written, downstream emit crashes, the
+    // job is retried and completes.
     const e1 = envelope();
     const job1 = await enqueuePaymentWebhook(pipeline.queue, {
       appId: APP_SLUG,
@@ -382,19 +452,22 @@ describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () 
       signature: e1.signature,
       id: 'chg_crash1',
     });
-    // The emit crash causes the job to fail. On retry, idempotency blocks it → dead.
     await waitFor(
-      async () => {
-        const j = await pipeline.queue.getJob(job1.id);
-        return j?.status === 'dead';
-      },
-      { label: 'R8 first job dead after crash+idempotency block', timeoutMs: 30_000 },
+      async () => (await pipeline.queue.getJob(job1.id))?.status === 'completed',
+      { label: 'R8 first job completed after crash + clean retry', timeoutMs: 15_000 },
     );
-    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(
-      rowsBefore + 1,
+    const job1State = await pipeline.queue.getJob(job1.id);
+    expect(job1State?.attempts).toBe(1); // one failed attempt recorded, then success
+    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
+    const durable = dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === 'chg_crash1');
+    expect(durable).toHaveLength(1);
+    const consumer = dbState.webhookEventConsumers.find(
+      (c) => c.webhookEventId === durable[0].id && c.consumer === 'payment_webhook',
     );
+    expect(consumer?.status).toBe('processed');
+    expect(consumer?.attempts).toBe(2);
 
-    // Simulate the post-crash retry: the same webhook id is replayed.
+    // A later replay of the same webhook id is a genuine replay: no-op.
     const e2 = envelope();
     const job2 = await enqueuePaymentWebhook(pipeline.queue, {
       appId: APP_SLUG,
@@ -404,19 +477,15 @@ describe('R8 — worker crash mid-emit: idempotency bounds duplicates (OK)', () 
       id: 'chg_crash1',
     });
     await waitFor(
-      async () => (await pipeline.queue.getJob(job2.id))?.status === 'dead',
-      { label: 'R8 replay dead' },
+      async () => (await pipeline.queue.getJob(job2.id))?.status === 'completed',
+      { label: 'R8 replay completed as a no-op' },
     );
-
     const finalJob = await pipeline.queue.getJob(job2.id);
-    expect(finalJob?.status).toBe('dead');
-    expect(finalJob?.lastError).toContain('Replay detected');
-    // Still exactly one row — the replay was blocked, no duplicate payment.
-    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(
-      rowsBefore + 1,
-    );
+    expect(finalJob?.lastError).toBeUndefined();
+    // Still exactly one row — no duplicate payment record.
+    expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
     console.warn(
-      '[OK] idempotency (setNx) prevents a duplicate payment record even when a worker crashes mid-emit and retries',
+      '[FIXED] crash mid-emit: retry re-claims the durable consumer record and completes; exactly one payment record; replay is a no-op',
     );
   }, 30_000);
 });

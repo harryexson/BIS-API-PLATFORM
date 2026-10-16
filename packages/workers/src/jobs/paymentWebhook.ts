@@ -1,8 +1,9 @@
 import { createHmac, timingSafeEqual } from 'crypto';
-import { JobProcessor, WorkerContext } from '../types';
+import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
-import { eventRepository, outboxEventRepository, transactionRepository, runInTransaction } from '@company/database';
+import { transactionStatusesAllowedInto, webhookEventRepository } from '@company/database';
 import { ProviderWebhookEvent } from '@company/schemas';
+import { runDurableWebhookConsumer, type WebhookEventStore } from '../webhookEvents';
 
 function verifySignature(secret: string, rawBody: string, signature: string): boolean {
   const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
@@ -13,27 +14,62 @@ function verifySignature(secret: string, rawBody: string, signature: string): bo
   return timingSafeEqual(a, b);
 }
 
+/**
+ * The transactions-row change a (Stripe-shaped) payment webhook implies.
+ *
+ * Phase 6 (D4/D11):
+ *  - The row is matched on the provider id the PLATFORM stored, which for
+ *    Stripe is the PaymentIntent id (pi_...). A `charge.*` event's
+ *    data.object is a Charge (ch_...) whose `payment_intent` field carries
+ *    that id, so it is preferred over data.object.id.
+ *  - `metadata.bisPaymentTransactionId` (set by the Stripe adapter on every
+ *    real PaymentIntent) is passed through so an ambiguous row whose provider
+ *    id was never received (router timeout) can still be matched — see
+ *    webhookEventRepository.persistEffectsOnce.
+ *  - `charge.refunded` with `refunded: false` (Stripe sets `refunded` only
+ *    once the charge is FULLY refunded) is a partial refund.
+ *  - PaymentIntent lifecycle events map onto the state machine too.
+ * Whether the change is actually applied is decided by Postgres against the
+ * row's current status (VALID_TRANSITIONS), never here.
+ */
+export function paymentWebhookTransactionTarget(
+  eventType: string | undefined,
+  object: any,
+  providerEventId?: string,
+): { providerTransactionId: string | undefined; toStatus: string | null; paymentTransactionId: string | null } {
+  const piRef = typeof object?.payment_intent === 'string' ? object.payment_intent : undefined;
+  const providerTransactionId = piRef || object?.id || providerEventId;
+  const toStatus =
+    eventType === 'charge.succeeded' || eventType === 'payment_intent.succeeded' ? 'success'
+    : eventType === 'charge.failed' || eventType === 'payment_intent.payment_failed' ? 'failed'
+    : eventType === 'charge.refunded' ? (object?.refunded === false ? 'partially_refunded' : 'refunded')
+    : eventType === 'charge.pending' || eventType === 'payment_intent.processing' ? 'pending'
+    : eventType === 'payment_intent.requires_action' ? 'requires_action'
+    : eventType === 'payment_intent.canceled' ? 'cancelled'
+    : null;
+  const bis = object?.metadata?.bisPaymentTransactionId;
+  return {
+    providerTransactionId: providerTransactionId ? String(providerTransactionId) : undefined,
+    toStatus,
+    paymentTransactionId: typeof bis === 'string' && bis ? bis : null,
+  };
+}
+
 export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
-  return async (job, ctx: WorkerContext) => {
-    const payload = job.payload as Partial<ProviderWebhookEvent>;
+  return async (job) => {
+    const payload = job.payload as Partial<ProviderWebhookEvent> & { webhookEventId?: string; tenantId?: string; type?: string };
     const { provider, rawBody, signature, providerEventId } = payload;
-    const appId = payload.applicationId || 'webhook';
 
     if (!provider) {
       throw new Error('payment_webhook requires provider');
     }
 
-    // P0: Idempotency check using provider event ID
+    // Phase 4 (gap register B5): durable identity is (provider, providerEventId).
+    // A job without one cannot be de-duplicated, so it is rejected rather
+    // than processed blindly.
     const eventId = providerEventId || job.payload.id;
-    if (eventId && ctx?.store) {
-      const seen = await ctx.store.setNx(
-        deps.keys.idempotency(`webhook:${eventId}`),
-        '1',
-        deps.config.idempotencyTtlMs,
-      );
-      if (!seen) {
-        throw new Error('Replay detected: payment webhook already processed');
-      }
+    if (!eventId) {
+      throw new Error('payment_webhook requires providerEventId (durable webhook identity)');
     }
 
     const secret = process.env.WEBHOOK_HMAC_SECRET;
@@ -53,91 +89,157 @@ export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
       throw new Error('payment_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
-    // Build clean event record (strip raw webhook data)
-    const clean = { ...job.payload };
-    delete (clean as any).rawBody;
-    delete (clean as any).signature;
+    // B5 FIX: the old code set a Redis/memory `setNx` replay marker HERE,
+    // before doing any work, and never cleared it — so the first transient
+    // failure (DB error, lock contention) turned every retry into a
+    // permanent "Replay detected" and the webhook was lost. Completion state
+    // now lives in Postgres (webhook_event_consumers): a failed attempt is
+    // recorded as `failed` and cleanly re-claimed by the retry; only a
+    // consumer row already `processed` is a genuine replay, which completes
+    // as a no-op instead of dead-lettering.
+    const store = deps.webhookEvents ?? webhookEventRepository;
+    await runDurableWebhookConsumer(
+      store,
+      'payment_webhook',
+      {
+        webhookEventId: payload.webhookEventId,
+        providerId: provider,
+        providerEventId: String(eventId),
+        fallbackRow: () => {
+          let body: unknown = {};
+          try {
+            body = rawBody ? JSON.parse(rawBody) : {};
+          } catch {
+            body = {};
+          }
+          return {
+            appId: payload.applicationId ?? null,
+            tenantId: payload.tenantId ?? null,
+            eventType: payload.type ?? payload.eventType ?? null,
+            payload: body,
+            rawBody: rawBody ?? '',
+            signature: signature ?? null,
+          };
+        },
+      },
+      (event) => processPaymentWebhook(job, deps, store, event.id, provider, String(eventId)),
+      { leaseMs: deps.config.webhookConsumerLeaseMs },
+    );
+  };
+}
 
-    // P0 FIX: Normalize webhook type → eventType.
-    // Stripe webhooks use `type` (e.g., "charge.succeeded") but the
-    // ProviderWebhookEvent schema defines `eventType`. The receipt pipeline
-    // consumes `eventType`, so we must propagate it correctly.
-    if (clean.type && !clean.eventType) {
-      clean.eventType = clean.type;
-    }
+async function processPaymentWebhook(
+  job: Parameters<JobProcessor>[0],
+  deps: JobDeps,
+  store: WebhookEventStore,
+  webhookEventId: string,
+  provider: string,
+  eventId: string,
+): Promise<void> {
+  const payload = job.payload as Partial<ProviderWebhookEvent> & { tenantId?: string };
+  const { providerEventId } = payload;
+  const appId = payload.applicationId || 'webhook';
+  // Phase 7 (gap register C4): the tenant comes from the durable
+  // webhook_events row, which the gateway attributed from the platform's own
+  // transactions row (never from the provider payload's metadata — GW-1.1).
+  // Absent when the webhook could not be attributed; such an event is then
+  // never dispatched to any tenant's outbound webhook endpoint.
+  const tenantId = typeof payload.tenantId === 'string' && payload.tenantId ? payload.tenantId : undefined;
 
-    // P0: Write event + outbox atomically in a transaction.
-    // This closes the gap between "event persisted" and "event emitted".
-    try {
-      await runInTransaction(async (tx) => {
-        // Write event record
-        await eventRepository.create({
+  // Build clean event record (strip raw webhook data)
+  const clean = { ...job.payload };
+  delete (clean as any).rawBody;
+  delete (clean as any).signature;
+
+  // P0 FIX: Normalize webhook type → eventType.
+  // Stripe webhooks use `type` (e.g., "charge.succeeded") but the
+  // ProviderWebhookEvent schema defines `eventType`. The receipt pipeline
+  // consumes `eventType`, so we must propagate it correctly.
+  if (clean.type && !clean.eventType) {
+    clean.eventType = clean.type;
+  }
+
+  // The business-state change this webhook implies (transaction status).
+  const target = paymentWebhookTransactionTarget(clean.eventType, clean.data?.object, providerEventId);
+  const providerTxId = target.providerTransactionId;
+  const newStatus = target.toStatus;
+
+  // Event row + outbox row + transaction status change, written atomically
+  // (ONE SQL statement — no db.transaction(), which neon-http cannot run:
+  // gap register D1) and AT MOST ONCE per durable webhook event, so a retry
+  // after a later failure (e.g. the emit below) does not record this
+  // webhook — or re-apply its state change — twice.
+  //
+  // Phase 5: the transaction status update used to run here as a SEPARATE,
+  // best-effort statement after the events/outbox write, with its errors
+  // swallowed — a DB failure there lost the state change silently while the
+  // outbox still announced the event. It is now part of the same statement,
+  // and its transition guard (VALID_TRANSITIONS) is evaluated by Postgres on
+  // the row's current status.
+  let persisted: { inserted: boolean; transactionUpdated: boolean };
+  try {
+    persisted = await store.persistEffectsOnce({
+      idempotencyKey: `webhook:${webhookEventId}:payment_webhook`,
+      event: {
+        appId,
+        tenantId: tenantId ?? null,
+        category: 'payment_webhook',
+        providerId: provider,
+        status: payload.status || 'success',
+        decisionReason: 'payment_webhook_received',
+        payload: clean,
+        response: clean.data ?? null,
+      },
+      outbox: {
+        appId,
+        eventType: 'payment_webhook_received',
+        payload: {
+          id: eventId,
+          timestamp: payload.timestamp || new Date().toISOString(),
           appId,
-          category: 'payment_webhook',
+          ...(tenantId ? { tenantId } : {}),
+          category: 'payment',
           providerId: provider,
           status: payload.status || 'success',
           decisionReason: 'payment_webhook_received',
           payload: clean,
           response: clean.data ?? null,
-        });
-
-        // Write outbox event (atomic with event write)
-        await outboxEventRepository.create({
-          appId,
-          eventType: 'payment_webhook_received',
-          payload: {
-            id: eventId || `wh_${Date.now()}`,
-            timestamp: payload.timestamp || new Date().toISOString(),
-            appId,
-            category: 'payment',
-            providerId: provider,
-            status: payload.status || 'success',
-            decisionReason: 'payment_webhook_received',
-            payload: clean,
-            response: clean.data ?? null,
-          },
-        });
-      });
-    } catch (err) {
-      console.error('[payment_webhook] Neon write failed — failing job for retry', err);
-      throw new Error('payment_webhook: database write failed — retrying');
-    }
-
-    // P0: Update transaction state based on webhook event type
-    const providerTxId = clean.data?.object?.id || providerEventId;
-    if (providerTxId) {
-      try {
-        const tx = await transactionRepository.findByProviderTransactionId(String(providerTxId));
-        if (tx) {
-          const newStatus =
-            clean.eventType === 'charge.succeeded' ? 'success'
-            : clean.eventType === 'charge.failed' ? 'failed'
-            : clean.eventType === 'charge.refunded' ? 'refunded'
-            : clean.eventType === 'charge.pending' ? 'pending'
-            : tx.status;
-          if (newStatus !== tx.status) {
-            await transactionRepository.updateStatus(tx.id, newStatus);
-          }
-        }
-      } catch (err) {
-        console.error('[payment_webhook] Transaction state update failed', err);
-        // Don't throw — the event was already persisted, this is best-effort
-      }
-    }
-
-    // Emit normalized event to EventBus for downstream pipeline (receipt, outbox, etc.)
-    await deps.eventBus.emit({
-      id: eventId || `wh_${Date.now()}`,
-      timestamp: payload.timestamp || new Date().toISOString(),
-      appId,
-      category: 'payment',
-      providerId: provider,
-      status: payload.status || 'success',
-      latency: 0,
-      cost: 0,
-      decisionReason: 'payment_webhook_received',
-      payload: clean,
-      response: clean.data ?? null,
+        },
+      },
+      transactionStatus:
+        providerTxId && newStatus
+          ? {
+              providerTransactionId: String(providerTxId),
+              toStatus: newStatus,
+              allowedFrom: transactionStatusesAllowedInto(newStatus),
+              paymentTransactionId: target.paymentTransactionId,
+            }
+          : undefined,
     });
-  };
+  } catch (err) {
+    console.error('[payment_webhook] Neon write failed — failing job for retry', err);
+    throw new Error('payment_webhook: database write failed — retrying');
+  }
+  if (persisted.inserted && newStatus && providerTxId && !persisted.transactionUpdated) {
+    // Not an error: no transaction carries this provider id yet, or the
+    // transition is not allowed from its current status (e.g. a late
+    // 'succeeded' after 'refunded').
+    console.warn(`[payment_webhook] transaction for ${String(providerTxId)} not moved to '${newStatus}' (absent or transition not allowed)`);
+  }
+
+  // Emit normalized event to EventBus for downstream pipeline (receipt, outbox, etc.)
+  await deps.eventBus.emit({
+    id: eventId,
+    timestamp: payload.timestamp || new Date().toISOString(),
+    appId,
+    ...(tenantId ? { tenantId } : {}),
+    category: 'payment',
+    providerId: provider,
+    status: payload.status || 'success',
+    latency: 0,
+    cost: 0,
+    decisionReason: 'payment_webhook_received',
+    payload: clean,
+    response: clean.data ?? null,
+  });
 }

@@ -91,16 +91,36 @@ function newRows<T extends { createdAt: Date }>(all: T[], baseline: T[]) {
   return all.filter((row) => !known.has(row));
 }
 
-function busEventsAfter(token: number, category?: string, providerId?: string) {
+// 'email' and 'example-msg' both declare the 'email' capability (see
+// packages/providers/src/registry.ts), so the routing engine's weighted
+// candidate selection can legitimately pick either one for an email send —
+// same tolerance packages/routing/src/routing.test.ts already asserts
+// (`expect(['email', 'example-msg']).toContain(result.providerId)`).
+const EMAIL_CAPABLE_PROVIDERS = ['email', 'example-msg'];
+
+// token = runtime.bus.getHistory().length at mark() time (see the MAX_HISTORY
+// comment in packages/events/src/index.ts, which documents this as the
+// intended pattern). getHistory() is newest-first (EventBus.emit() does
+// history.unshift()), so anything added since the mark is now sitting at
+// the front of the array, at indices [0, history.length - token). Using
+// array growth instead of a wall-clock timestamp comparison (the previous
+// `Date.now() - 1` / `timestamp >= token` version) sidesteps a real race:
+// an event created in the same millisecond as mark() — e.g. the payment
+// charge createDonation() triggers right before a test captures its
+// baseline — would satisfy `>= token` and get miscounted as "since the
+// mark" purely from clock-resolution collision, independent of actual
+// event ordering.
+function busEventsAfter(token: number, category?: string, providerId?: string | string[]) {
   const history = runtime.bus.getHistory();
-  return history
-    .filter((e: any) => new Date(e.timestamp).getTime() >= token)
+  const providerIds = typeof providerId === 'string' ? [providerId] : providerId;
+  const sinceMark = history.slice(0, Math.max(0, history.length - token));
+  return sinceMark
     .filter((e: any) => (category ? e.category === category : true))
-    .filter((e: any) => (providerId ? e.providerId === providerId : true));
+    .filter((e: any) => (providerIds ? providerIds.includes(e.providerId) : true));
 }
 
 function mark(): number {
-  return Date.now() - 1;
+  return runtime.bus.getHistory().length;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +180,7 @@ describe('complete donation flow (Reach Church -> ... -> Giving Receipt)', () =>
     expect(newRows(dbState.events, rowsBefore).some((r) => r.category === 'payment' && r.providerId === 'stripe')).toBe(true);
 
     // ---- Giving Receipt (wired pipeline) ----
-    const messaging = busEventsAfter(busToken, 'messaging', 'email');
+    const messaging = busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS);
     expect(messaging.some((e: any) => (e.payload?.recipient ?? e.response?.recipient) === DONOR_EMAIL)).toBe(true);
 
     // ---- Client can poll transaction status ----
@@ -188,14 +208,21 @@ describe('complete donation flow (Reach Church -> ... -> Giving Receipt)', () =>
 // ---------------------------------------------------------------------------
 
 describe('deliberate: duplicate requests', () => {
-  it('payment submission has no server-side idempotency — two identical POSTs charge twice (documented gap)', async () => {
+  // This test used to assert the double charge itself as the expected outcome
+  // (`expect(first.body.id).not.toBe(second.body.id)`) — gap register F9.
+  // The Idempotency-Key is now enforced (idempotency_records claim +
+  // request_hash, migration 0013), so it asserts the fixed behaviour: the
+  // second identical request replays the first charge instead of making a
+  // new one.
+  it('payment submission is idempotent — two identical POSTs with the same Idempotency-Key charge once', async () => {
+    const txBefore = dbState.transactions.filter((t) => t.idempotencyKey === 'donate:storefront:001').length;
     const first = await createDonation(runtime, { amount: 25, idempotencyKey: 'donate:storefront:001' });
     const second = await createDonation(runtime, { amount: 25, idempotencyKey: 'donate:storefront:001' });
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    expect(first.body.id).not.toBe(second.body.id);
-    // The platform ignores idempotency-key at the gateway layer → the gap we want surfaced.
-    console.warn('[gap] POST /v1/api/gateway/payment ignores Idempotency-Key: duplicate requests => duplicate charges');
+    expect(second.body.id).toBe(first.body.id);
+    expect(dbState.transactions.filter((t) => t.idempotencyKey === 'donate:storefront:001').length - txBefore).toBe(1);
+    console.warn('[fixed] POST /v1/api/gateway/payment honours Idempotency-Key: duplicate request => cached result, one charge');
   });
 
   it('but the worker de-duplicates a replayed webhook for the same charge', async () => {
@@ -228,13 +255,28 @@ describe('deliberate: duplicate requests', () => {
 
     // Exactly one record and one receipt — no double charge / double receipt.
     expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
-    expect(busEventsAfter(busToken, 'messaging', 'email').length).toBe(1);
+    expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
 
-    // The replay was rejected at the idempotency guard and dead-lettered.
+    // Phase 4 (gap register B5): the replay is recognised from the DURABLE
+    // consumer record — webhook_event_consumers says ('stripe', txId) /
+    // payment_webhook is already `processed` — and completes as a no-op.
+    // This test used to assert the job was dead-lettered with "Replay
+    // detected": that came from a Redis/memory setNx marker written BEFORE
+    // processing and never cleared, the same marker that permanently locked
+    // out legitimate retries after any transient failure. A genuine replay
+    // is not an error, so it no longer pollutes the dead-letter queue (which
+    // retry_processing would otherwise re-drive).
     const finalJob = await pipeline.queue.getJob(job2.id);
-    expect(finalJob?.status).toBe('dead');
-    expect(finalJob?.lastError).toContain('Replay detected');
+    expect(finalJob?.status).toBe('completed');
+    expect(finalJob?.lastError).toBeUndefined();
     expect(job1.id).not.toBe(job2.id);
+    const durable = dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === txId);
+    expect(durable).toHaveLength(1);
+    const consumer = dbState.webhookEventConsumers.find(
+      (c) => c.webhookEventId === durable[0].id && c.consumer === 'payment_webhook',
+    );
+    expect(consumer?.status).toBe('processed');
+    expect(consumer?.attempts).toBe(1);
   });
 });
 
@@ -243,19 +285,45 @@ describe('deliberate: duplicate requests', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: provider timeout', () => {
-  it('caps a slow/failing Stripe request via failover to another payment provider', async () => {
+  // Phase 11-12 (gap register A10/E4/PHASE3-01): this test used to be
+  // 'caps a slow/failing Stripe request via failover to another payment
+  // provider' and asserted the DEFECT — a read ETIMEDOUT (the request had
+  // already been sent; Stripe may have charged the card) was failed over to
+  // a second provider (`providerId !== 'stripe'`, 'Dynamic Failover'), i.e.
+  // a potential double charge was the asserted, "passing" behaviour. A
+  // thrown, unclassified error from a charge is now an ambiguous outcome:
+  // 202 'unknown', on Stripe, and no other payment provider is ever called.
+  it('a Stripe read-ETIMEDOUT (request already sent) is an ambiguous 202 unknown — never failed over to another provider', async () => {
     patchStripeProcessRequest(async () => {
       await sleep(30);
       throw new Error('ETIMEDOUT: read ETIMEDOUT (simulated Stripe gateway timeout)');
     });
+    const otherCalls: string[] = [];
+    for (const cfg of runtime.registry.getAllConfigs()) {
+      if (cfg.category !== 'payment' || cfg.id === 'stripe') continue;
+      const p = runtime.registry.getProvider(cfg.id) as unknown as { processRequest: (...a: any[]) => Promise<any> };
+      const original = p.processRequest;
+      p.processRequest = async (...a: any[]) => {
+        otherCalls.push(cfg.id);
+        return original.apply(p, a);
+      };
+      patches.push(() => {
+        p.processRequest = original;
+      });
+    }
     const donation = await createDonation(runtime);
-    expect(donation.status).toBe(200);
-    expect(donation.body.providerId).not.toBe('stripe');
-    expect(String(donation.body.decisionReason)).toContain('Dynamic Failover');
+    expect(donation.status).toBe(202);
+    expect(donation.body.status).toBe('unknown');
+    expect(donation.body.providerId).toBe('stripe');
+    expect(String(donation.body.decisionReason)).not.toContain('Dynamic Failover');
+    expect(otherCalls).toEqual([]);
+    const row = dbState.transactions.find((t) => t.id === donation.body.paymentTransactionId)!;
+    expect(row.status).toBe('unknown');
+    expect(row.providerTransactionId).toBeNull();
   });
 
   it(
-    'a hung provider is timed out and fails over instead of hanging forever (FIXED)',
+    'a hung provider is timed out and returned as an ambiguous 202, never retried via another provider (FIXED)',
     async () => {
       patchStripeProcessRequest(() => new Promise(() => undefined));
       const pending = runtime.request('POST', '/v1/api/gateway/payment', {
@@ -268,16 +336,23 @@ describe('deliberate: provider timeout', () => {
       });
 
       // packages/routing/src/index.ts wraps every provider call in
-      // withProviderTimeout() (PROVIDER_TIMEOUT_MS, 30s default) and fails
-      // over on timeout — this was never actually being exercised by a
-      // 1200ms local race, which can't distinguish "hung" from "just slow
-      // so far". See the equivalent fix in resilience-failure's R6 test.
+      // withProviderTimeout() (PROVIDER_TIMEOUT_MS, 30s default) — this was
+      // never actually being exercised by a 1200ms local race, which can't
+      // distinguish "hung" from "just slow so far". A PAYMENT timeout is
+      // genuinely ambiguous (the charge may have reached Stripe and
+      // succeeded before the response was lost), so routePayment()
+      // deliberately does NOT cascade to another provider on a timeout —
+      // only on a soft decline or thrown error, where the outcome is known
+      // NOT to have moved money. Retrying a timed-out charge risks a real
+      // double charge. See the equivalent fix in resilience-failure's R6
+      // test and the ProviderTimeoutError branch in routePayment.
       const res = await withTimeout(pending, PROVIDER_TIMEOUT_MS + 5000, 'gateway response to hanging provider');
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
       const body = await res.json();
-      expect(body.providerId).not.toBe('stripe');
+      expect(body.status).toBe('unknown');
+      expect(body.providerId).toBe('stripe');
       console.warn(
-        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and failed over to '${body.providerId}'`,
+        `[FIXED] hung provider timed out after ${PROVIDER_TIMEOUT_MS}ms and was returned as an ambiguous 'unknown' (202) rather than stalling indefinitely or risking a double charge via blind failover`,
       );
     },
     PROVIDER_TIMEOUT_MS + 15_000,
@@ -289,7 +364,7 @@ describe('deliberate: provider timeout', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: webhook arriving twice', () => {
-  it('only honours the first, and the second is dropped at the worker idempotency guard', async () => {
+  it('only honours the first, and the second is recognised as a replay from the durable webhook record', async () => {
     const donation = await createDonation(runtime);
     const txId = donation.body.id;
     const rowsBefore = dbState.events.filter((r) => r.category === 'payment_webhook').length;
@@ -316,9 +391,14 @@ describe('deliberate: webhook arriving twice', () => {
     await drain(pipeline, ['payment_webhook', 'message_delivery']);
 
     expect(dbState.events.filter((r) => r.category === 'payment_webhook').length).toBe(rowsBefore + 1);
-    expect(busEventsAfter(busToken, 'messaging', 'email').length).toBe(1);
+    expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
+    // Phase 4: the second job is a genuine replay of an already-`processed`
+    // durable consumer record, so it completes as a no-op (previously:
+    // dead-lettered by the never-cleared setNx marker — see above).
     const job2State = await pipeline.queue.getJob(job2.id);
-    expect(job2State?.status).toBe('dead');
+    expect(job2State?.status).toBe('completed');
+    expect(job2State?.lastError).toBeUndefined();
+    expect(dbState.webhookEvents.filter((e) => e.providerId === 'stripe' && e.providerEventId === txId)).toHaveLength(1);
     void job1;
   });
 });
@@ -473,7 +553,7 @@ describe('deliberate: database failure during processing', () => {
 
       // The flow did NOT continue in-memory: DB failure prevented further processing.
       expect(busEventsAfter(busToken, 'payment').some((e: any) => e.id === txId)).toBe(false);
-      expect(busEventsAfter(busToken, 'messaging', 'email').length).toBe(0);
+      expect(busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(0);
 
       console.warn(
         '[gap] DB outage causes job dead-lettering; no receipt fired — provider webhook replay (or reconciliation) is the recovery path',
@@ -510,7 +590,7 @@ describe('deliberate: worker restart', () => {
     const failingJob = await worker1.queue.enqueue('message_delivery', { appId: APP_SLUG });
     await drain(worker1, ['message_delivery']);
 
-    expect(busEventsAfter(historyToken, 'messaging', 'email').length).toBe(1);
+    expect(busEventsAfter(historyToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(1);
     expect((await worker1.queue.getJob(goodJob.id))?.status).toBe('completed');
     expect((await worker1.queue.getJob(failingJob.id))?.status).toBe('dead');
     expect((await counts(worker1, 'message_delivery')).dead).toBe(1);
@@ -540,7 +620,7 @@ describe('deliberate: worker restart', () => {
       timeoutMs: 10_000,
       label: 'idempotent gift',
     });
-    expect(busEventsAfter(historyToken, 'messaging', 'email').length).toBe(2);
+    expect(busEventsAfter(historyToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(2);
     await stopWorker(worker2);
 
     // ---- Worker #3: same idempotency key must NOT reprocess ----
@@ -554,7 +634,7 @@ describe('deliberate: worker restart', () => {
       timeoutMs: 10_000,
       label: 'idempotent replay after restart',
     });
-    expect(busEventsAfter(historyToken, 'messaging', 'email').length).toBe(2);
+    expect(busEventsAfter(historyToken, 'messaging', EMAIL_CAPABLE_PROVIDERS).length).toBe(2);
     await stopWorker(worker3);
   }, 30_000);
 });
@@ -627,7 +707,7 @@ describe('deliberate: refund', () => {
     await drain(pipeline, ['payment_webhook', 'message_delivery']);
 
     expect(dbState.events.filter((r) => (r.payload as any)?.type === 'charge.refunded').length).toBe(rowsBefore + 1);
-    const notices = busEventsAfter(busToken, 'messaging', 'email');
+    const notices = busEventsAfter(busToken, 'messaging', EMAIL_CAPABLE_PROVIDERS);
     expect(notices.some((e: any) => String(e.payload?.content).includes('refunded'))).toBe(true);
   });
 });
@@ -651,6 +731,11 @@ describe('deliberate: reconciliation', () => {
     expect(typeof report.neon).toBe('object');
     expect(typeof report.redis.deadLetters).toBe('object');
     expect(report.generatedAt).toBeTruthy();
+    // Phase 6: the job now also reconciles PAYMENTS (the transactions table)
+    // — read-only provider status checks where an adapter has one, otherwise
+    // escalation to the operator list — and never re-charges.
+    expect(report.payments).toMatchObject({ chargeAttempts: 0 });
+    expect(typeof report.payments.examined).toBe('number');
 
     const reconciles = busEventsAfter(token);
     expect(reconciles.some((e: any) => e.decisionReason === 'reconciliation_completed')).toBe(true);
@@ -659,6 +744,7 @@ describe('deliberate: reconciliation', () => {
   it('is resilient when the database is down, but cannot detect drift (documented)', async () => {
     dbState.failEventWrites = true;
     dbState.failAuditWrites = true;
+    dbState.failTransactionWrites = true;
     try {
       const auditsBefore = dbState.auditLogs.length;
       const token = mark();
@@ -670,12 +756,20 @@ describe('deliberate: reconciliation', () => {
       expect(dbState.auditLogs.length).toBe(auditsBefore);
       const reconciles = busEventsAfter(token);
       expect(reconciles.some((e: any) => e.decisionReason === 'reconciliation_completed')).toBe(true);
+      // Phase 6: payment reconciliation now exists (provider status check
+      // where an adapter supports one — Stripe only — else escalation for
+      // human review; see packages/workers/src/jobs/paymentReconciliation.ts),
+      // but it needs the database too: with Neon down it reports the error
+      // and changes nothing — it never guesses an outcome or re-charges.
+      const report = reconciles.find((e: any) => e.decisionReason === 'reconciliation_completed') as any;
+      expect(report.payload.payments.error).toMatch(/simulated transactions read failure/);
       console.warn(
-        '[gap] reconciliation cannot act as a durable audit while Neon is down, and it never reconciles against provider-reported transactions',
+        '[gap] reconciliation cannot act as a durable audit while Neon is down (payments are left untouched until it is back); provider-side status checks exist for Stripe only',
       );
     } finally {
       dbState.failEventWrites = false;
       dbState.failAuditWrites = false;
+      dbState.failTransactionWrites = false;
     }
   });
 });

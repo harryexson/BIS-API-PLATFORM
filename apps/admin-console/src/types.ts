@@ -77,6 +77,12 @@ export interface TransactionEvent {
   payload: any;
   response: any;
   error?: string;
+  // Phase 10 (messaging only): the channel decision — mirrors
+  // @company/schemas TransactionEvent.
+  requestedChannel?: 'sms' | 'whatsapp' | 'email';
+  requestedChannelSource?: 'explicit' | 'inferred';
+  selectedChannel?: 'sms' | 'whatsapp' | 'email' | null;
+  fallbackReason?: string | null;
 }
 
 export interface DashboardMetrics {

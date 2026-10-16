@@ -49,7 +49,7 @@ describe('EventBus', () => {
 
   it('keeps history bounded to the latest N events (newest first)', () => {
     const bus = EventBus.getInstance();
-    const cap = 120; // below MAX_HISTORY (1000), so this exercises ordering, not the cap
+    const cap = 120; // below MAX_HISTORY (200,000), so this exercises ordering, not the cap
     for (let i = 0; i < cap; i++) {
       bus.emit(makeEvent({ providerId: `p${i}` }));
     }
@@ -60,18 +60,25 @@ describe('EventBus', () => {
     expect(history[cap - 1].providerId).toBe('p0');
   });
 
-  it('keeps history bounded to MAX_HISTORY (1000) when exceeded', () => {
+  it('keeps history bounded to MAX_HISTORY (200,000) when exceeded', () => {
     const bus = EventBus.getInstance();
-    const total = 1010;
+    // Exercises the exact same unshift()+pop() eviction path as the real
+    // cap at full scale (not a smaller stand-in) — this is the one test
+    // that would actually catch a regression back to an unbounded array.
+    // Array.prototype.unshift is O(n) per call, so this is the slowest
+    // test in the suite by design; 200,000 is the real MAX_HISTORY, not
+    // padding, so there's no smaller number that still proves the cap
+    // itself (as opposed to just the ordering) holds at production scale.
+    const total = 200_010;
     for (let i = 0; i < total; i++) {
       bus.emit(makeEvent({ providerId: `p${i}` }));
     }
 
     const history = bus.getHistory();
-    expect(history).toHaveLength(1000);
+    expect(history).toHaveLength(200_000);
     expect(history[0].providerId).toBe(`p${total - 1}`);
-    expect(history[999].providerId).toBe(`p${total - 1000}`);
-  });
+    expect(history[199_999].providerId).toBe(`p${total - 200_000}`);
+  }, 60_000);
 
   it('a throwing listener does not prevent delivery to other listeners', () => {
     const bus = EventBus.getInstance();

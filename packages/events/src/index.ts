@@ -5,7 +5,27 @@ type EventListener = (event: TransactionEvent) => void;
 
 const EVENT_CHANNEL = 'bis:events';
 const HISTORY_KEY = 'bis:event_history';
-const MAX_HISTORY = 1000;
+// P0: Bumped from 1000. EventBus.getInstance() is a true process-wide
+// singleton, and packages/simulation's test harness boots the REAL gateway
+// (and its REAL EventBus) rather than a per-test instance — so its history
+// accumulates across every simulation test file that runs in the same
+// worker process, not just the current test. At 1000, a full simulation
+// suite run legitimately pushed the cap before later files' tests ran,
+// silently breaking any test using the mark()/busEventsAfter() pattern
+// (token = history.length at mark time; once history is capped, length
+// stops growing even as events keep flowing, so "events since token"
+// always read back as zero) — e.g. donation-system.simulation.test.ts's
+// giving-receipt assertions. Several unrelated simulation test files also
+// filter getHistory() by event *timestamp*, not array position — so it's
+// not just "since token" arithmetic that breaks near the cap, it's the
+// underlying event actually getting evicted (popped) from the shared
+// singleton's bounded array by the sheer combined volume of every other
+// concurrently-running test before this test ever reads it back. 200,000
+// gives a full suite run comfortable headroom — some tests (e.g.
+// resilience-failure's R10) deliberately push thousands of jobs/events
+// through in a single test — while still bounding memory for a
+// long-running production process (each TransactionEvent is small).
+const MAX_HISTORY = 200_000;
 const HISTORY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
@@ -16,6 +36,14 @@ const HISTORY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
  *
  * When Redis is unavailable, falls back to in-memory only (single-process mode).
  */
+/** emitOrThrow(): the cross-process publish did not happen. */
+export class EventBusPublishError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EventBusPublishError';
+  }
+}
+
 export class EventBus {
   private static instance: EventBus;
   private listeners: Set<EventListener> = new Set();
@@ -144,6 +172,59 @@ export class EventBus {
     }
 
     // Always emit to local listeners
+    this.listeners.forEach((listener) => {
+      try {
+        listener(event);
+      } catch (err) {
+        metrics.increment('queueFailures');
+        console.error('Error executing event listener:', err);
+      }
+    });
+  }
+
+  /**
+   * Phase 5 (transactional outbox): like emit(), but a failed cross-process
+   * publish is REPORTED (thrown) instead of swallowed, so the caller — the
+   * outbox poller — leaves the outbox row un-completed and retries it,
+   * rather than marking it delivered while Redis was down (silent loss).
+   *
+   * - Redis configured (REDIS_URL): the PUBLISH must succeed, otherwise this
+   *   throws EventBusPublishError and local listeners are NOT invoked (so a
+   *   retry does not hand them the same event twice). The capped history
+   *   list is best-effort, as in emit().
+   * - Redis not configured: single-process mode; local delivery is the
+   *   only delivery there is, exactly as emit().
+   *
+   * Delivery is at least once: a publish that reached Redis but whose reply
+   * was lost is retried. Consumers de-duplicate on `event.id`, which the
+   * outbox poller sets to the outbox row id (stable across retries/replays).
+   */
+  public async emitOrThrow(event: TransactionEvent): Promise<void> {
+    if (this.redisClient) {
+      if (!this.redisReady) {
+        metrics.increment('eventsEmitFailed');
+        throw new EventBusPublishError('Redis event channel not connected');
+      }
+      try {
+        await this.redisClient.publish(EVENT_CHANNEL, JSON.stringify(event));
+      } catch (err) {
+        metrics.increment('eventsEmitFailed');
+        throw new EventBusPublishError(`Redis publish failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      metrics.increment('eventsEmittedRedis');
+      try {
+        await this.redisClient.lpush(HISTORY_KEY, JSON.stringify(event));
+        await this.redisClient.ltrim(HISTORY_KEY, 0, MAX_HISTORY - 1);
+        await this.redisClient.expire(HISTORY_KEY, Math.floor(HISTORY_TTL_MS / 1000));
+      } catch {
+        // History is a convenience cache, not the delivery.
+      }
+    }
+
+    this.history.unshift(event);
+    if (this.history.length > this.maxHistory) {
+      this.history.pop();
+    }
     this.listeners.forEach((listener) => {
       try {
         listener(event);

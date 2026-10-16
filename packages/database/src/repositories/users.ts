@@ -17,6 +17,20 @@ export const userRepository = {
     return rows[0];
   },
 
+  // Global lookup — signup/login operate on email + password alone, with
+  // no application context supplied by the caller (the platform's account
+  // model is "one signup creates one application"). Email is enforced
+  // globally unique at the schema level (idx_users_email).
+  async findByEmail(email: string): Promise<User | undefined> {
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, email))
+      .limit(1);
+    return rows[0];
+  },
+
   async findByApplicationAndEmail(
     applicationId: string,
     email: string,
@@ -33,17 +47,6 @@ export const userRepository = {
       )
       .limit(1);
     return rows[0];
-  },
-
-  /**
-   * Global email lookup across applications — users.email is only unique
-   * per-application (idx_users_application_email), so the same email can
-   * exist under multiple applications. Login doesn't know the applicationId
-   * up front, so it checks each match's password rather than assuming one.
-   */
-  async findByEmail(email: string): Promise<User[]> {
-    const db = getDb();
-    return db.select().from(users).where(eq(users.email, email));
   },
 
   async findByApplicationId(applicationId: string): Promise<User[]> {

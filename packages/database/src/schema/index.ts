@@ -13,9 +13,55 @@ export { providerHealth, type ProviderHealthRecord, type NewProviderHealthRecord
 export { events, type EventRecord, type NewEventRecord } from './events';
 export { auditLogs, type AuditLog, type NewAuditLog } from './audit-logs';
 export { conversations, type Conversation, type NewConversation } from './conversations';
-export { outboxEvents, type OutboxEvent, type NewOutboxEvent } from './outbox-events';
+export { outboxEvents, OUTBOX_STATUSES, type OutboxEvent, type NewOutboxEvent, type OutboxStatus } from './outbox-events';
 export { transactions, type Transaction, type NewTransaction } from './transactions';
 export { idempotencyRecords, type IdempotencyRecord, type NewIdempotencyRecord } from './idempotency-records';
 export { suppliers, type Supplier, type NewSupplier } from './suppliers';
 export { webhookJobs, type WebhookJob, type NewWebhookJob } from './webhook-jobs';
+export {
+  webhookEvents,
+  webhookEventConsumers,
+  WEBHOOK_EVENT_STATUSES,
+  WEBHOOK_CONSUMER_STATUSES,
+  type WebhookEvent,
+  type NewWebhookEvent,
+  type WebhookEventConsumer,
+  type WebhookEventStatus,
+  type WebhookConsumerStatus,
+} from './webhook-events';
 export { checkoutSessions, type CheckoutSession, type NewCheckoutSession } from './checkout-sessions';
+export { userSessions, type UserSession, type NewUserSession } from './user-sessions';
+export {
+  userVerificationTokens,
+  type UserVerificationToken,
+  type NewUserVerificationToken,
+} from './user-verification-tokens';
+export { plans, type Plan, type NewPlan } from './plans';
+export { subscriptions, type Subscription, type NewSubscription } from './subscriptions';
+export { customerNotes, type CustomerNote, type NewCustomerNote } from './customer-notes';
+export { supportTickets, type SupportTicket, type NewSupportTicket } from './support-tickets';
+export { ticketComments, type TicketComment, type NewTicketComment } from './ticket-comments';
+export { consentRecords, type ConsentRecord, type NewConsentRecord } from './consent-records';
+export { messagingProfiles, type MessagingProfile, type NewMessagingProfile } from './messaging-profiles';
+export {
+  inboundMessageHolds,
+  senderOptOuts,
+  type InboundMessageHold,
+  type NewInboundMessageHold,
+  type SenderOptOut,
+  type NewSenderOptOut,
+} from './inbound-routing';
+export { webhookEndpoints, type WebhookEndpoint, type NewWebhookEndpoint } from './webhook-endpoints';
+export {
+  keywordCommands,
+  keywordCommandDispatches,
+  RESERVED_KEYWORDS,
+  KEYWORD_COMMAND_ACTIONS,
+  KEYWORD_DISPATCH_STATUSES,
+  type ReservedKeyword,
+  type KeywordCommandAction,
+  type KeywordCommand,
+  type NewKeywordCommand,
+  type KeywordCommandDispatch,
+  type NewKeywordCommandDispatch,
+} from './keyword-commands';

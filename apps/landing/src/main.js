@@ -1,7 +1,19 @@
-// DEPLOY STEP: point this at wherever the developer portal is actually served.
-const PORTAL_URL = '/portal';
+// Two different destinations, previously both wired to the same dead
+// '/portal' placeholder (nothing was ever served there):
+//  - Sign in / Get API keys / pricing CTAs -> apps/web, the account +
+//    billing app (signup, login, plan selection — see apps/web/src/App.tsx).
+//  - Footer "Developer portal" -> apps/developer-portal, the separate
+//    tenant-provisioning app for an existing developer managing API keys.
+// Both are configurable at build time (Vercel env vars for the real
+// deployed URLs); these are only the local-dev fallbacks.
+const ACCOUNT_APP_URL = import.meta.env.VITE_ACCOUNT_APP_URL || 'http://localhost:5176';
+const DEVELOPER_PORTAL_URL = import.meta.env.VITE_DEVELOPER_PORTAL_URL || 'http://localhost:5175';
+
+document.querySelectorAll('[data-account-link]').forEach((el) => {
+  el.setAttribute('href', ACCOUNT_APP_URL + el.dataset.accountLink);
+});
 document.querySelectorAll('[data-portal-link]').forEach((el) => {
-  el.setAttribute('href', PORTAL_URL + el.dataset.portalLink);
+  el.setAttribute('href', DEVELOPER_PORTAL_URL + el.dataset.portalLink);
 });
 
 document.getElementById('year').textContent = String(new Date().getFullYear());

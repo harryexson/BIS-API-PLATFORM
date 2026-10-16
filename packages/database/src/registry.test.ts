@@ -129,6 +129,26 @@ describe('ApplicationRegistry', () => {
       expect(result.apiKey.prefix).toMatch(/^bap_test_/);
     });
 
+    it('sets a default expiry on the newly issued key', async () => {
+      const before = Date.now();
+      await registry.createApplication({
+        name: 'Expiry Default',
+        slug: 'expiry-default',
+      });
+      const after = Date.now();
+
+      const keyRecord = keyRepo._keys.find(
+        (k) => k.keyHash && k.applicationId,
+      );
+      expect(keyRecord?.expiresAt).toBeInstanceOf(Date);
+      const expiryMs = (keyRecord!.expiresAt as Date).getTime();
+      // Default is API_KEY_DEFAULT_EXPIRY_DAYS (365 unless overridden) days out.
+      const expectedDays = Number(process.env.API_KEY_DEFAULT_EXPIRY_DAYS ?? 365);
+      const expectedMs = expectedDays * 24 * 60 * 60 * 1000;
+      expect(expiryMs).toBeGreaterThanOrEqual(before + expectedMs - 5000);
+      expect(expiryMs).toBeLessThanOrEqual(after + expectedMs + 5000);
+    });
+
     it('creates application with custom environment', async () => {
       const result = await registry.createApplication({
         name: 'Prod App',
@@ -207,6 +227,32 @@ describe('ApplicationRegistry', () => {
       expect(result.error).toBeUndefined();
     });
 
+    it('surfaces the matched key scopes on success', async () => {
+      const { apiKey, application } = await registry.createApplication({
+        name: 'Scope Auth',
+        slug: 'scope-auth',
+      });
+      const keyRecord = keyRepo._keys.find(
+        (k) => k.applicationId === application.id,
+      );
+      if (keyRecord) keyRecord.scopes = 'messaging:send';
+
+      const result = await registry.authenticateApplication(apiKey.raw);
+      expect(result.authenticated).toBe(true);
+      expect(result.scopes).toBe('messaging:send');
+    });
+
+    it('scopes is null when the key has none configured (unrestricted)', async () => {
+      const { apiKey } = await registry.createApplication({
+        name: 'No Scope Auth',
+        slug: 'no-scope-auth',
+      });
+
+      const result = await registry.authenticateApplication(apiKey.raw);
+      expect(result.authenticated).toBe(true);
+      expect(result.scopes).toBeNull();
+    });
+
     it('invalid application → rejected', async () => {
       const result = await registry.authenticateApplication(
         'nonexistent_key_12345',
@@ -252,6 +298,33 @@ describe('ApplicationRegistry', () => {
       expect(resultB.application?.id).toBe(appB.application.id);
 
       expect(resultA.application?.id).not.toBe(resultB.application?.id);
+
+      // Phase 7 (gap register F13): the assertions above only show that each
+      // key authenticates ITS OWN application — they never present A's
+      // credentials while trying to reach B. The registry has no "target
+      // application" input at all (the key alone decides the application —
+      // the gateway then overwrites any body appId with it, and the
+      // cross-application/cross-tenant HTTP cases are proven in
+      // packages/simulation/src/tenant-isolation.scenarios.ts), so the
+      // attempts that CAN be made at this layer are made here:
+      //   - A's key, however many times presented, never resolves to B;
+      const again = await registry.authenticateApplication(appA.apiKey.raw);
+      expect(again.application?.id).toBe(appA.application.id);
+      //   - a key forged by grafting B's key prefix onto A's secret part,
+      //     or by tampering with one character of B's key, is rejected;
+      const graftedPrefix = appB.apiKey.prefix + appA.apiKey.raw.slice(appB.apiKey.prefix.length);
+      expect(graftedPrefix).not.toBe(appB.apiKey.raw);
+      expect((await registry.authenticateApplication(graftedPrefix)).authenticated).toBe(false);
+      const last = appB.apiKey.raw.slice(-1);
+      const tamperedB = appB.apiKey.raw.slice(0, -1) + (last === 'a' ? 'b' : 'a');
+      expect((await registry.authenticateApplication(tamperedB)).authenticated).toBe(false);
+      //   - revoking B's key does not affect A, and A's key still only ever
+      //     yields A (no fallback to "some other active application").
+      await registry.revokeApplicationKey(appB.apiKey.id);
+      expect((await registry.authenticateApplication(appB.apiKey.raw)).authenticated).toBe(false);
+      const afterRevoke = await registry.authenticateApplication(appA.apiKey.raw);
+      expect(afterRevoke.authenticated).toBe(true);
+      expect(afterRevoke.application?.id).toBe(appA.application.id);
     });
 
     it('empty key → rejected', async () => {

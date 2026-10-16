@@ -13,7 +13,8 @@ export type JobType =
   | 'outbox_poller'
   | 'receipt_pipeline'
   | 'keyword_response_delivery'
-  | 'webhook_job_poller';
+  | 'webhook_job_poller'
+  | 'webhook_event_recovery';
 
 export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'dead';
 
@@ -71,6 +72,29 @@ export interface WorkerConfig {
    * rejects with QueueBackpressureError instead of accepting more work the
    * system has no near-term capacity to process. */
   maxQueueDepth: number;
+  /** Phase 4: lease a worker holds on a webhook_event_consumers claim (default 5 min). */
+  webhookConsumerLeaseMs?: number;
+  /** Phase 4: how often the worker sweeps webhook_events for stranded rows (default 30s). */
+  webhookRecoveryIntervalMs?: number;
+  /** Phase 4: an enqueued row still 'received' after this long is re-enqueued (default 10 min). */
+  webhookStaleEnqueueMs?: number;
+  /** Phase 6: payment reconciliation thresholds (see jobs/paymentReconciliation.ts). */
+  paymentReconciliation?: Partial<{
+    staleAfterMs: number;
+    recheckAfterMs: number;
+    escalateAfterMs: number;
+    batchSize: number;
+  }>;
+  /** Phase 5: transactional-outbox consumer tuning (see jobs/outboxPoller.ts). */
+  outbox?: Partial<{
+    batchSize: number;
+    staleAfterMs: number;
+    maxAttempts: number;
+    baseDelayMs: number;
+    maxDelayMs: number;
+    dispatchTimeoutMs: number;
+    rescueLimit: number;
+  }>;
 }
 
 export interface WorkerContext {
@@ -107,6 +131,24 @@ export function createWorkerConfig(): WorkerConfig {
       maxRequests: num(process.env.RATE_LIMIT_MAX_REQUESTS, 100),
     },
     maxQueueDepth: num(process.env.QUEUE_MAX_DEPTH, 10_000),
+    webhookConsumerLeaseMs: num(process.env.WEBHOOK_CONSUMER_LEASE_MS, 5 * 60_000),
+    webhookRecoveryIntervalMs: num(process.env.WEBHOOK_RECOVERY_INTERVAL_MS, 30_000),
+    webhookStaleEnqueueMs: num(process.env.WEBHOOK_STALE_ENQUEUE_MS, 10 * 60_000),
+    paymentReconciliation: {
+      staleAfterMs: num(process.env.PAYMENT_RECONCILIATION_STALE_MS, 15 * 60_000),
+      recheckAfterMs: num(process.env.PAYMENT_RECONCILIATION_RECHECK_MS, 5 * 60_000),
+      escalateAfterMs: num(process.env.PAYMENT_RECONCILIATION_ESCALATE_MS, 60 * 60_000),
+      batchSize: num(process.env.PAYMENT_RECONCILIATION_BATCH_SIZE, 100),
+    },
+    outbox: {
+      batchSize: num(process.env.OUTBOX_BATCH_SIZE, 10),
+      staleAfterMs: num(process.env.OUTBOX_STALE_AFTER_MS, 5 * 60_000),
+      maxAttempts: num(process.env.OUTBOX_MAX_ATTEMPTS, 10),
+      baseDelayMs: num(process.env.OUTBOX_RETRY_BASE_MS, 1_000),
+      maxDelayMs: num(process.env.OUTBOX_RETRY_MAX_MS, 5 * 60_000),
+      dispatchTimeoutMs: num(process.env.OUTBOX_DISPATCH_TIMEOUT_MS, 30_000),
+      rescueLimit: num(process.env.OUTBOX_RESCUE_LIMIT, 100),
+    },
   };
 }
 

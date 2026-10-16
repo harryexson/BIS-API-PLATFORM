@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity } from 'lucide-react';
+import { Network, Globe, RefreshCw, Cpu, Layers, Server, ShieldCheck, LogOut, Activity, Users } from 'lucide-react';
 import { MetricCards } from './components/MetricCards';
 import { LiveTopology } from './components/LiveTopology';
 import { ProviderRegistry } from './components/ProviderRegistry';
@@ -7,6 +7,7 @@ import { RequestPlayground } from './components/RequestPlayground';
 import { AuditLogs } from './components/AuditLogs';
 import { ProviderManagement } from './components/ProviderManagement';
 import { Observability } from './components/Observability';
+import { Customers } from './components/Customers';
 import { LoginGate } from './components/LoginGate';
 import { useAuth } from './auth';
 import { ProviderConfig, ProviderManagement as ProviderManagementType, TransactionEvent, DashboardMetrics } from './types';
@@ -20,7 +21,7 @@ const INITIAL_METRICS: DashboardMetrics = {
   volumePerApp: {}
 };
 
-type Tab = 'operations' | 'management' | 'observability';
+type Tab = 'operations' | 'management' | 'observability' | 'customers';
 
 export const App: React.FC = () => {
   const { token, isAdmin, logout } = useAuth();
@@ -274,6 +275,7 @@ export const App: React.FC = () => {
         <TabButton active={tab === 'operations'} onClick={() => setTab('operations')} icon={<Cpu className="w-4 h-4" />} label="Operations Dashboard" />
         <TabButton active={tab === 'management'} onClick={() => setTab('management')} icon={<Server className="w-4 h-4" />} label="Provider Management" />
         <TabButton active={tab === 'observability'} onClick={() => setTab('observability')} icon={<Activity className="w-4 h-4" />} label="Observability" />
+        <TabButton active={tab === 'customers'} onClick={() => setTab('customers')} icon={<Users className="w-4 h-4" />} label="Customers" />
       </div>
 
       {tab === 'operations' && (
@@ -315,6 +317,8 @@ export const App: React.FC = () => {
       )}
 
       {tab === 'observability' && <Observability />}
+
+      {tab === 'customers' && <Customers isAdmin={isAdmin} token={token} />}
 
       {showLogin && <LoginGate onClose={() => setShowLogin(false)} />}
     </div>

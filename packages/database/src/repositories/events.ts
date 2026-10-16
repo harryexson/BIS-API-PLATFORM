@@ -74,4 +74,24 @@ export const eventRepository = {
       );
     return Number(rows[0]?.value ?? 0);
   },
+
+  // Plan message-limit enforcement (services/api-gateway's
+  // /v1/api/gateway/messaging route): counts only successfully-sent
+  // messages within the current billing period — a failed send never
+  // reached a recipient, so it must not count against the limit.
+  async countSuccessfulByCategorySince(appId: string, category: string, since: Date): Promise<number> {
+    const db = getDb();
+    const rows = await db
+      .select({ value: count() })
+      .from(events)
+      .where(
+        and(
+          eq(events.appId, appId),
+          eq(events.category, category),
+          eq(events.status, 'success'),
+          sql`${events.createdAt} >= ${since.toISOString()}`,
+        ),
+      );
+    return Number(rows[0]?.value ?? 0);
+  },
 };

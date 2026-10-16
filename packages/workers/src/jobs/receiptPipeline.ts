@@ -1,6 +1,7 @@
 import { JobProcessor, WorkerContext } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
+import { channelDecisionColumns } from '@company/routing';
 
 /**
  * P0: Production receipt pipeline.
@@ -44,6 +45,8 @@ export function createReceiptPipelineProcessor(deps: JobDeps): JobProcessor {
         recipient,
         content: `Thank you for your gift of $${Math.round(amount / 100)}.00`,
         providerOverride: undefined,
+        // Phase 10: a receipt goes to receipt_email — explicitly email.
+        channel: 'email',
       });
 
       // Persist receipt delivery event
@@ -58,6 +61,7 @@ export function createReceiptPipelineProcessor(deps: JobDeps): JobProcessor {
         payload: event.payload,
         response: event.response,
         error: event.error,
+        ...channelDecisionColumns(event),
       });
     } catch (err) {
       console.error('[receipt_pipeline] Receipt delivery failed', err);

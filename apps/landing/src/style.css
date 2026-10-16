@@ -276,6 +276,7 @@ p { text-wrap: pretty; }
 }
 .price-card h3 { font-size: var(--text-lg); }
 .price-amount { font-family: var(--font-display); font-size: var(--text-2xl); font-weight: 500; margin-top: 6px; }
+.price-interval { font-family: var(--font-sans); font-size: var(--text-sm); font-weight: 400; color: var(--text-tertiary); }
 .price-note { color: var(--text-tertiary); font-size: var(--text-sm); margin-bottom: 14px; }
 .price-features { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; flex: 1; }
 .price-features li { font-size: var(--text-sm); color: var(--text-secondary); padding-left: 16px; position: relative; }
