@@ -3,6 +3,11 @@ export interface KVStore {
   get(key: string): Promise<string | null>;
   del(key: string): Promise<void>;
   setNx(key: string, value: string, ttlMs: number): Promise<boolean>;
+  /**
+   * Increment a counter. `ttlMs` is applied only when this call creates the
+   * key (or the key has no expiry): a fixed window, never re-armed by later
+   * increments (gap register B14).
+   */
   incr(key: string, ttlMs?: number): Promise<number>;
   expire(key: string, ttlMs: number): Promise<void>;
   pttl(key: string): Promise<number>;
