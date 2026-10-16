@@ -155,6 +155,48 @@ describe.skipIf(!ADMIN_URL)('Phase 6 — ambiguous provider outcome (timeout) on
     15_000,
   );
 
+  it(
+    'Phase 11-12: an ADAPTER-classified ambiguous outcome (real NMI adapter — no idempotency key, so no internal retry — provider 503 / connection reset) is stored as UNKNOWN with provider_transaction_id NULL, and no other provider is charged',
+    async () => {
+      const { vi } = await import('vitest');
+      for (const [label, respond] of [
+        ['503', async () => new Response('Service Unavailable', { status: 503, headers: { 'content-type': 'text/plain' } })],
+        ['ECONNRESET', async () => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) }); }],
+      ] as const) {
+        instrumentPaymentProviders('none');
+        const nmi = registry.getProvider('nmi');
+        nmi.setSecrets({ api_key: 'nmi_test_p11' });
+        restores.push(() => nmi.setSecrets({}));
+        let nmiHttp = 0;
+        vi.stubGlobal('fetch', vi.fn(async () => { nmiHttp++; return respond(); }));
+        restores.push(() => vi.unstubAllGlobals());
+
+        const key = `order-ambiguous-${label}`;
+        const row = (await repo.allocate({ appId: 'app_p6u', tenantId: 'ten_p6u', amount: '31', currency: 'USD', paymentMethod: 'card', idempotencyKey: key }))!;
+        const event = await routing.routePayment('app_p6u', {
+          amount: 31, currency: 'USD', paymentMethod: 'card', providerOverride: 'nmi', paymentToken: 'collectjs_tok', idempotencyKey: key, paymentTransactionId: row.id,
+        });
+
+        expect(event.status).toBe('unknown');
+        expect(event.id).toBe(row.id);
+        expect(calls).toEqual({ 'nmi.processRequest': 1 }); // no failover charge
+        expect(nmiHttp).toBe(1); // and the possibly-processed sale was never re-sent
+
+        await repo.recordOutcome(row.id, paymentOutcomeFromEvent(row.id, event, 'USD'));
+        const [r] = await client`SELECT status, provider_id, provider_transaction_id, outcome_unknown_at, reconciliation_reason FROM transactions WHERE id = ${row.id}`;
+        expect(r.status).toBe('unknown');
+        expect(r.provider_id).toBe('nmi');
+        expect(r.provider_transaction_id).toBeNull();
+        expect(r.outcome_unknown_at).not.toBeNull();
+        expect(r.reconciliation_reason).toMatch(/^provider_ambiguous_outcome: /);
+
+        while (restores.length) restores.pop()!();
+        for (const k of Object.keys(calls)) delete calls[k];
+      }
+    },
+    20_000,
+  );
+
   it('an UNKNOWN payment is never re-opened or re-allocated for another charge attempt by any repository path', async () => {
     instrumentPaymentProviders('none');
     const row = (await repo.allocate({ appId: 'app_p6u', tenantId: 'ten_p6u', amount: '9', currency: 'USD', idempotencyKey: 'order-timeout-2' }))!;

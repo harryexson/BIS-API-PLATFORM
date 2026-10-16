@@ -268,7 +268,11 @@ describe('NMIProvider', () => {
       expect(event.error).toBe('Invalid Credit Card Number');
     });
 
-    it('does not fabricate an outcome when the response has no response field', async () => {
+    // Phase 11-12: used to assert 'failed'. NMI answered HTTP 200 but with
+    // nothing we can read — the sale may have run, so failing over would risk
+    // a double charge. It is now the ambiguous 'unknown' (still never a
+    // fabricated outcome).
+    it('does not fabricate an outcome when the response has no response field (ambiguous → unknown, not failed)', async () => {
       process.env.NMI_API_KEY = 'test-security-key';
       const fetchSpy = vi.fn().mockResolvedValue(new Response('', { status: 200, headers: { 'content-type': 'text/plain' } }));
       vi.stubGlobal('fetch', fetchSpy);
@@ -280,13 +284,18 @@ describe('NMIProvider', () => {
         'test',
       );
 
-      expect(event.status).toBe('failed');
+      expect(event.status).toBe('unknown');
       expect(event.error).toMatch(/did not include a 'response' field/);
     });
 
-    it('retries on 5xx (via BaseProvider.http_request) and eventually reports failure if every attempt fails', async () => {
+    // Phase 11-12 (PHASE3-01): this test used to assert the DEFECT — a sale
+    // with no provider-side idempotency key was blindly re-sent on 5xx
+    // (calls > 1, each a potential second charge) and then reported 'failed'
+    // (so the router would charge another provider too). Now: sent exactly
+    // once, and the 5xx is the ambiguous 'unknown'.
+    it('never re-sends a non-idempotent sale on 5xx, and reports the 5xx as unknown (not failed)', async () => {
       process.env.NMI_API_KEY = 'test-security-key';
-      const fetchSpy = vi.fn().mockResolvedValue(new Response('Internal Server Error', { status: 500, headers: { 'content-type': 'text/plain' } }));
+      const fetchSpy = vi.fn().mockImplementation(async () => new Response('Internal Server Error', { status: 500, headers: { 'content-type': 'text/plain' } }));
       vi.stubGlobal('fetch', fetchSpy);
 
       const provider = new NMIProvider(makeConfig());
@@ -296,8 +305,8 @@ describe('NMIProvider', () => {
         'test',
       );
 
-      expect(fetchSpy.mock.calls.length).toBeGreaterThan(1);
-      expect(event.status).toBe('failed');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(event.status).toBe('unknown');
     }, 15_000);
 
     it('reports offline/maintenance status without making an HTTP call', async () => {

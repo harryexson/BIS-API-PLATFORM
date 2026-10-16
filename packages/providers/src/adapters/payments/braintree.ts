@@ -107,7 +107,8 @@ export class BraintreeProvider extends BaseProvider {
     query: string,
     variables: Record<string, unknown>,
     maxAttempts = 2,
-  ): Promise<{ data: any; errors?: any[] }> {
+    retryAmbiguous = true,
+  ): Promise<{ data: any; errors?: any[]; httpStatus: number }> {
     const res = await this.http_request({
       method: 'POST',
       url: this.baseUrl,
@@ -118,11 +119,29 @@ export class BraintreeProvider extends BaseProvider {
       body: { query, variables },
       timeoutMs: 30_000,
       maxAttempts,
+      retryAmbiguous,
     });
     if (res.status >= 400 && !res.body?.errors) {
-      throw new Error(`Braintree API error: HTTP ${res.status}`);
+      throw this.httpErrorOutcome(res, `Braintree API error: HTTP ${res.status}`);
     }
-    return res.body;
+    return { ...(res.body ?? {}), httpStatus: res.status };
+  }
+
+  /**
+   * Braintree GraphQL errors carry `extensions.errorClass`. INTERNAL and
+   * SERVICE_AVAILABILITY describe Braintree's own failure, not a decision
+   * about the charge — ambiguous (as is any error on an HTTP 5xx). Every
+   * other class (VALIDATION — which includes processor declines —
+   * AUTHENTICATION, AUTHORIZATION, NOT_FOUND, RESOURCE_LIMIT, ...) is a
+   * definite rejection of the request.
+   */
+  private graphqlErrorOutcome(errors: any[], httpStatus: number) {
+    const first = errors[0];
+    const message = first?.message || 'Braintree GraphQL error';
+    const ambiguous =
+      httpStatus >= 500 ||
+      errors.some((e) => ['INTERNAL', 'SERVICE_AVAILABILITY'].includes(String(e?.extensions?.errorClass ?? '')));
+    return ambiguous ? this.ambiguousOutcome(message, httpStatus) : this.definiteFailure(message, httpStatus);
   }
 
   async refund(appId: string, payload: RefundRequest, decisionReason: string): Promise<TransactionEvent> {
@@ -135,9 +154,11 @@ export class BraintreeProvider extends BaseProvider {
     }
 
     try {
+      // No refund idempotency key is sent (gap register E14): never blindly
+      // re-send a refund that may have reached Braintree.
       const result = await this.graphql(REFUND_MUTATION, {
         input: { transactionId: originalTransactionId, refund: { amount: amount.toFixed(2) } },
-      });
+      }, 2, false);
 
       const latency = Date.now() - startTime;
 
@@ -220,21 +241,26 @@ export class BraintreeProvider extends BaseProvider {
     const orderId = this.paymentIdempotencyIdentity(payload, { maxLength: 255 });
 
     try {
+      // maxAttempts 2 + retryAmbiguous:false: only a provably-unsent attempt
+      // (DNS/connect failure) or a 429 is ever retried — never one that may
+      // have reached Braintree (no idempotency key is sent, see above).
       const result = await this.graphql(
         CHARGE_MUTATION,
         { input: { paymentMethodId: paymentToken, transaction: { amount: amount.toFixed(2), orderId } } },
-        1,
+        2,
+        false,
       );
 
       const latency = Date.now() - startTime;
 
       if (result.errors?.length) {
-        throw new Error(result.errors[0]?.message || 'Braintree GraphQL error');
+        throw this.graphqlErrorOutcome(result.errors, result.httpStatus);
       }
 
       const transaction = result.data?.chargeCreditCard?.transaction;
       if (!transaction) {
-        throw new Error('Braintree returned no transaction in chargeCreditCard response');
+        // A response without errors AND without a transaction: not a decline.
+        throw this.ambiguousOutcome('Braintree returned no transaction in chargeCreditCard response', result.httpStatus);
       }
 
       const feePercent = this.config.transactionFeePercent || 0;
@@ -266,23 +292,7 @@ export class BraintreeProvider extends BaseProvider {
         ...(status === 'failed' ? { error: `Braintree transaction status: ${transaction.status}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'err_' });
     }
   }
 

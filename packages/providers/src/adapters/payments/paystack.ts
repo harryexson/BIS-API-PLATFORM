@@ -78,6 +78,9 @@ export class PaystackProvider extends BaseProvider {
         },
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // See the catch block: nothing this call does can move money, so
+        // retrying it is harmless (a duplicate `reference` is rejected).
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
@@ -111,23 +114,20 @@ export class PaystackProvider extends BaseProvider {
         response: data,
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      // Phase 11-12 (A10/E4) — Paystack is the one adapter where EVERY
+      // failure is a definite non-charge, including a timeout or a 5xx:
+      // /transaction/initialize only creates a hosted-checkout session and
+      // returns its authorization_url; no money moves until the customer
+      // opens that URL and pays. If the response was lost, nobody ever
+      // received the URL, so the session can never be paid. (A successful
+      // initialize is reported as 'pending', which the router never fails
+      // over.) So this deliberately stays 'failed' — classified, not
+      // flattened.
+      return this.paymentFailureEvent({
+        appId, payload, decisionReason, startTime, amount, currency,
+        err: this.definiteFailure(err?.message || String(err)),
+        idPrefix: 'err_',
+      });
     }
   }
 

@@ -31,6 +31,11 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  *   AUTHORIZENET_TRANSACTION_KEY — Transaction Key
  *   AUTHORIZENET_SANDBOX     — 'false' to use the production endpoint (defaults to sandbox)
  */
+/** See processRequest: transaction error codes whose outcome is not known. */
+const AUTHNET_AMBIGUOUS_ERROR_CODES = new Set([
+  '11', '19', '20', '21', '22', '23', '25', '26', '57', '58', '59', '60', '61', '62', '63', '120', '121', '122',
+]);
+
 export class AuthorizeNetProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
@@ -111,6 +116,11 @@ export class AuthorizeNetProvider extends BaseProvider {
         body: requestBody,
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // No idempotency key exists (see class comment): an attempt that may
+        // have reached Authorize.Net is never re-sent. (A re-send would at
+        // best be caught by the duplicate window as error 11 — which says
+        // nothing about whether the FIRST one was charged.)
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
@@ -118,11 +128,41 @@ export class AuthorizeNetProvider extends BaseProvider {
       const messageCode = res.body?.messages?.resultCode;
 
       if (messageCode !== 'Ok' || !result || result.responseCode !== '1') {
+        const errorCode = String(result?.errors?.[0]?.errorCode ?? '');
+        const messageCodeId = String(res.body?.messages?.message?.[0]?.code ?? '');
         const errText =
           result?.errors?.[0]?.errorText ||
           res.body?.messages?.message?.[0]?.text ||
           `Authorize.Net API error: ${res.status}`;
-        throw new Error(errText);
+        if (res.status >= 400) throw this.httpErrorOutcome(res, errText);
+        if (!res.body || typeof res.body !== 'object' || (!messageCode && !result)) {
+          // A 2xx we cannot interpret — the transaction may exist.
+          throw this.ambiguousOutcome(`Unreadable Authorize.Net response: ${errText}`, res.status);
+        }
+        // transactionResponse.responseCode (Authorize.Net's documented
+        // values): 1 approved, 2 declined, 3 error, 4 held for review.
+        //  - 4: the transaction was AUTHORIZED and is held by the merchant's
+        //    fraud filters pending review — it can still settle. Not a decline.
+        //  - 3 with error 11 ("A duplicate transaction has been submitted"):
+        //    an identical transaction already exists inside the duplicate
+        //    window — possibly this very payment.
+        //  - 3 with the "An error occurred during processing. Please try
+        //    again" family (19-23, 25, 26, 57-63, 120-122 — processor
+        //    communication/timeout errors) and API-level E00001 ("An error
+        //    occurred during processing"): Authorize.Net could not get a
+        //    definite answer from the processor.
+        // All of these are ambiguous; every other decline/error is definite.
+        if (
+          result?.responseCode === '4' ||
+          AUTHNET_AMBIGUOUS_ERROR_CODES.has(errorCode) ||
+          messageCodeId === 'E00001'
+        ) {
+          throw this.ambiguousOutcome(
+            `${errText} (responseCode ${result?.responseCode ?? 'n/a'}${errorCode ? `, errorCode ${errorCode}` : ''}${messageCodeId ? `, ${messageCodeId}` : ''}) — outcome not known`,
+            res.status,
+          );
+        }
+        throw this.definiteFailure(errText, res.status);
       }
 
       const feePercent = this.config.transactionFeePercent || 2.9;
@@ -145,23 +185,7 @@ export class AuthorizeNetProvider extends BaseProvider {
         response: result,
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'err_' });
     }
   }
 

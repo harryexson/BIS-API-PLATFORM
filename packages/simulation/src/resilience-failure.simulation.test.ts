@@ -355,42 +355,53 @@ describe('R6 — provider hang: gateway request timeout, ambiguous outcome not r
 });
 
 // ---------------------------------------------------------------------------
-// R7) Provider returns success but connection drops (GAP / OK)
+// R7) Provider returns success but connection drops (FIXED, Phase 11-12)
 // ---------------------------------------------------------------------------
 
-describe('R7 — success then connection drop (GAP)', () => {
-  it('a "success then drop" is treated as failure (no silent double charge)', async () => {
+describe('R7 — success then connection drop: ambiguous, never failed over (FIXED, Phase 11-12)', () => {
+  it('a "success then drop" is reported as unknown (202) on the original provider, and NO other provider is charged', async () => {
+    // Phase 11-12 (gap register A10/E4/PHASE3-01): this test used to assert
+    // `res.status === 503 || res.body.providerId !== 'stripe'` and call that
+    // "safe" — but `providerId !== 'stripe'` IS the double charge: Stripe
+    // processed the charge (the connection dropped AFTER its success), and
+    // the router then charged a second provider for the same payment. It now
+    // asserts the outcome is the ambiguous 'unknown' on Stripe, stored as
+    // 'unknown' with no fabricated provider id (reconcilable), with zero
+    // calls to any other payment provider.
     const stripe = runtime.registry.getProvider('stripe') as unknown as {
       processRequest: (...a: any[]) => Promise<any>;
     };
     const orig = stripe.processRequest.bind(stripe);
-    stripe.processRequest = async (appId: string, payload: any, decisionReason: string) => {
-      const evt = {
-        id: 'chg_ok1',
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: 'stripe',
-        status: 'success',
-        latency: 10,
-        cost: 0,
-        decisionReason: 'approved',
-        payload,
-        response: null,
-      };
+    stripe.processRequest = async () => {
       // Simulate the connection dropping after the provider returned success.
       throw new Error('ECONNRESET after success');
     };
     patches.push(() => {
       stripe.processRequest = orig;
     });
+    const otherCalls: string[] = [];
+    for (const cfg of runtime.registry.getAllConfigs()) {
+      if (cfg.category !== 'payment' || cfg.id === 'stripe') continue;
+      const p = runtime.registry.getProvider(cfg.id) as unknown as { processRequest: (...a: any[]) => Promise<any> };
+      const original = p.processRequest;
+      p.processRequest = async (...a: any[]) => {
+        otherCalls.push(cfg.id);
+        return original.apply(p, a);
+      };
+      patches.push(() => {
+        p.processRequest = original;
+      });
+    }
 
     const res = await createDonation(runtime, { amount: 5000, currency: 'USD' }, AUTH);
-    // Safe: treated as failure (failover/503), never a silent double charge.
-    expect(res.status === 503 || res.body.providerId !== 'stripe').toBe(true);
-    console.warn(
-      '[GAP] a "success then drop" is treated as failure (safe vs double-charge) but there is no at-least-once retry guarantee',
-    );
+    expect(res.status).toBe(202);
+    expect(res.body.status).toBe('unknown');
+    expect(res.body.providerId).toBe('stripe');
+    expect(otherCalls).toEqual([]);
+    const row = dbState.transactions.find((t) => t.id === res.body.paymentTransactionId)!;
+    expect(row.status).toBe('unknown');
+    expect(row.providerTransactionId).toBeNull();
+    console.warn('[FIXED] a "success then drop" is an ambiguous unknown (reconciled), never failed over to a second provider');
   });
 });
 

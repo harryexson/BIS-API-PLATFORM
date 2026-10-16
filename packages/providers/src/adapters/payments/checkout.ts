@@ -73,15 +73,36 @@ export class CheckoutComProvider extends BaseProvider {
         },
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // Cko-Idempotency-Key: Checkout.com returns the original payment for
+        // a repeated key — retrying an ambiguous attempt cannot charge twice.
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400) {
-        throw new Error(`Checkout.com API error: ${res.status} - ${JSON.stringify(res.body)}`);
+        // 401 / 422 (invalid request, error_codes[]) / 429 are rejected
+        // before processing (definite); 409 (idempotency conflict) and 5xx
+        // (e.g. 502) are ambiguous — the generic rule.
+        throw this.httpErrorOutcome(res, `Checkout.com API error: ${res.status} - ${JSON.stringify(res.body)}`);
       }
 
       const payment = res.body;
+      if (!payment || typeof payment !== 'object') {
+        throw this.ambiguousOutcome(`Checkout.com returned HTTP ${res.status} with an unreadable body`, res.status);
+      }
+      // Checkout.com's documented outcomes for POST /payments: 201 with
+      // approved:true (Authorized/Captured) — money moving; 201 with
+      // approved:false / status 'Declined' — a definite decline
+      // (response_code/response_summary say why); 202 status 'Pending'
+      // (3DS / async) — unresolved. It used to map everything that was not
+      // approved — including 'Pending' — to 'failed', which the router
+      // failed over while the original payment could still complete.
+      const status: 'success' | 'failed' | 'unknown' =
+        payment.status === 'Pending' ? 'unknown'
+          : payment.approved === true || payment.status === 'Authorized' || payment.status === 'Captured' ? 'success'
+            : payment.approved === false || payment.status === 'Declined' ? 'failed'
+              : 'unknown';
       const feePercent = this.config.transactionFeePercent || 2.6;
       const feeFlat = this.config.transactionFeeFlat || 0.25;
       const cost = (amount * feePercent) / 100 + feeFlat;
@@ -92,7 +113,7 @@ export class CheckoutComProvider extends BaseProvider {
         appId,
         category: 'payment',
         providerId: this.config.id,
-        status: payment.approved || payment.status === 'Authorized' ? 'success' : 'failed',
+        status,
         amount,
         currency,
         latency,
@@ -100,25 +121,12 @@ export class CheckoutComProvider extends BaseProvider {
         decisionReason,
         payload,
         response: payment,
+        ...(status === 'failed'
+          ? { error: payment.response_summary || `Checkout.com payment status: ${payment.status}${payment.response_code ? ` (${payment.response_code})` : ''}` }
+          : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'err_' });
     }
   }
 

@@ -186,9 +186,14 @@ describe('PawaPayProvider', () => {
       expect(event.error).toBe('Invalid currency for this provider');
     });
 
-    it('retries on 5xx (via BaseProvider.http_request) and eventually reports failure if every attempt fails', async () => {
+    // Phase 11-12 (A10/E4): this test used to end with `status 'failed'` —
+    // which the router failed over to a different provider even though a 5xx
+    // can mean the charge was processed. The retry itself is legitimate here
+    // (same idempotency key → no second charge) and is still asserted; the
+    // final classification is now the ambiguous 'unknown'.
+    it('retries a 5xx (safe: the provider dedupes on its idempotency key) and reports the outcome as unknown, not failed', async () => {
       process.env.PAWAPAY_API_KEY = 'test-key';
-      const fetchSpy = vi.fn().mockResolvedValue(
+      const fetchSpy = vi.fn().mockImplementation(async () =>
         new Response(JSON.stringify({ message: 'Internal error' }), {
           status: 500,
           headers: { 'content-type': 'application/json' },
@@ -200,7 +205,7 @@ describe('PawaPayProvider', () => {
       const event = await provider.processRequest('app1', validPayload, 'test');
 
       expect(fetchSpy.mock.calls.length).toBeGreaterThan(1);
-      expect(event.status).toBe('failed');
+      expect(event.status).toBe('unknown');
     }, 15_000);
 
     it('reports offline/maintenance status without making an HTTP call', async () => {

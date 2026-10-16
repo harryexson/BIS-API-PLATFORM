@@ -143,6 +143,9 @@ export class NMIProvider extends BaseProvider {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body,
         timeoutMs: 30_000,
+        // No refund idempotency key is sent (gap register E14), so a refund
+        // that may have reached the provider is never blindly re-sent.
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
@@ -241,6 +244,12 @@ export class NMIProvider extends BaseProvider {
         },
         body,
         timeoutMs: 30_000,
+        // Phase 11-12 (PHASE3-01): transact.php has no idempotency key, so a
+        // sale whose first attempt may have reached NMI (timeout, reset, 5xx)
+        // is NEVER re-sent — the old default retried it up to 3 times, each
+        // a potential second charge. Only provably-unsent attempts
+        // (DNS/connect failure) and 429s are retried.
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
@@ -252,16 +261,35 @@ export class NMIProvider extends BaseProvider {
       const parsed = new URLSearchParams(typeof res.body === 'string' ? res.body : String(res.body ?? ''));
       const responseCode = parsed.get('response');
       const responseText = parsed.get('responsetext') || '';
+      const resultCode = parsed.get('response_code') || '';
       const transactionId = parsed.get('transactionid');
 
       if (!responseCode) {
-        throw new Error(`NMI response did not include a 'response' field: ${JSON.stringify(res.body)}`);
+        const message = `NMI response did not include a 'response' field (HTTP ${res.status}): ${JSON.stringify(res.body)}`;
+        // A 5xx, or a 2xx we cannot read: NMI may have run the sale.
+        if (res.status >= 400) throw this.httpErrorOutcome(res, message);
+        throw this.ambiguousOutcome(message, res.status);
       }
 
-      // 1 = approved, 2 = declined, 3 = error in transaction data/system
-      // error — both 2 and 3 are definite, non-ambiguous failures (NMI
-      // told us exactly what happened synchronously; this is not a
-      // provider-timeout situation).
+      // 1 = approved, 2 = declined (definite), 3 = error. Most response=3
+      // results are definite rejections of bad input/configuration, EXCEPT
+      // the ones that say nothing about whether the sale went through
+      // (NMI's documented result-code table): 420/421 "communication error
+      // (with issuer)" — the processor round-trip itself failed — and 430
+      // "duplicate transaction at processor" / a gateway "Duplicate
+      // transaction REFID:..." rejection — an identical sale already exists
+      // at NMI, which may be this very payment. Those are ambiguous and must
+      // not be failed over to another provider.
+      if (responseCode !== '1' && responseCode !== '2') {
+        const ambiguousNmiError =
+          ['420', '421', '430'].includes(resultCode) || /duplicate/i.test(responseText);
+        if (ambiguousNmiError) {
+          throw this.ambiguousOutcome(
+            `NMI response=${responseCode} response_code=${resultCode || 'n/a'}: ${responseText || 'no text'} — outcome of the sale is not known`,
+            res.status,
+          );
+        }
+      }
       const approved = responseCode === '1';
 
       const feePercent = this.config.transactionFeePercent || 2.2;
@@ -287,23 +315,7 @@ export class NMIProvider extends BaseProvider {
         ...(approved ? {} : { error: responseText || `NMI response code ${responseCode}` }),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'nmi_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'nmi_err_' });
     }
   }
 

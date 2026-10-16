@@ -211,7 +211,14 @@ export class PayPalProvider extends BaseProvider {
     const requestId = this.paymentIdempotencyIdentity(payload, { maxLength: 108 });
 
     try {
-      const token = await this.getAccessToken();
+      // The OAuth step moves no money: if it fails (even ambiguously), the
+      // charge request below was never sent — a definite non-charge.
+      let token: string;
+      try {
+        token = await this.getAccessToken();
+      } catch (authErr: any) {
+        throw this.definiteFailure(authErr?.message || String(authErr));
+      }
 
       const res = await this.http_request({
         method: 'POST',
@@ -227,13 +234,23 @@ export class PayPalProvider extends BaseProvider {
         },
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // PayPal-Request-Id is PayPal's idempotency header: a repeat returns
+        // the original order instead of creating a second one.
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400) {
         const err = res.body;
-        throw new Error(err?.message || err?.details?.[0]?.description || `PayPal API error: HTTP ${res.status}`);
+        // PayPal's error envelope ({name, message, details[].issue}): 400
+        // INVALID_REQUEST / 422 UNPROCESSABLE_ENTITY (e.g. issue
+        // INSTRUMENT_DECLINED) / 401 / 403 are definite rejections; 409
+        // (a request with this PayPal-Request-Id is still being processed)
+        // and 5xx are ambiguous (generic rule).
+        const issue = err?.details?.[0]?.issue;
+        const message = (err?.message || err?.details?.[0]?.description || `PayPal API error: HTTP ${res.status}`) + (issue ? ` (${issue})` : '');
+        throw this.httpErrorOutcome(res, message);
       }
 
       const order = res.body;
@@ -246,8 +263,19 @@ export class PayPalProvider extends BaseProvider {
       // moved. VOIDED: a definite, non-ambiguous failure. Anything else
       // (PAYER_ACTION_REQUIRED, PENDING, ...) is genuinely unresolved —
       // this gateway has no redirect flow to relay a payer action through.
+      //
+      // Phase 11-12: an order can be COMPLETED while its capture is not —
+      // PayPal reports the capture's own outcome on
+      // purchase_units[].payments.captures[].status (COMPLETED / PENDING /
+      // DECLINED / FAILED ...). A DECLINED/FAILED capture is a definite
+      // non-charge; a PENDING one is unresolved. (Previously a COMPLETED
+      // order was always 'success', even with a declined capture.)
+      const captureStatus: string | undefined = capture?.status;
       const status =
-        order?.status === 'COMPLETED' ? 'success'
+        order?.status === 'COMPLETED'
+          ? !captureStatus || captureStatus === 'COMPLETED' ? 'success'
+            : ['DECLINED', 'FAILED'].includes(captureStatus) ? 'failed'
+              : 'unknown'
           : order?.status === 'VOIDED' ? 'failed'
             : 'unknown';
 
@@ -265,26 +293,10 @@ export class PayPalProvider extends BaseProvider {
         decisionReason,
         payload,
         response: order,
-        ...(status === 'failed' ? { error: `PayPal order status: ${order?.status}` } : {}),
+        ...(status === 'failed' ? { error: `PayPal order status: ${order?.status}${captureStatus ? `, capture status: ${captureStatus}` : ''}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'paypal_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'paypal_err_' });
     }
   }
 

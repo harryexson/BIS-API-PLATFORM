@@ -357,9 +357,14 @@ describe('StripeProvider', () => {
       expect(event.error).toBe('Missing required param: currency.');
     });
 
-    it('retries on 5xx (via BaseProvider.http_request) and eventually reports failure if every attempt fails', async () => {
+    // Phase 11-12 (A10/E4): this test used to end with `status 'failed'` —
+    // which the router failed over to a different provider even though a 5xx
+    // can mean the charge was processed. The retry itself is legitimate here
+    // (same idempotency key → no second charge) and is still asserted; the
+    // final classification is now the ambiguous 'unknown'.
+    it('retries a 5xx (safe: the provider dedupes on its idempotency key) and reports the outcome as unknown, not failed', async () => {
       process.env.STRIPE_SECRET_KEY = 'sk_test_123';
-      const fetchSpy = vi.fn().mockResolvedValue(
+      const fetchSpy = vi.fn().mockImplementation(async () =>
         new Response(JSON.stringify({ error: { message: 'Internal error' } }), {
           status: 500,
           headers: { 'content-type': 'application/json' },
@@ -378,7 +383,7 @@ describe('StripeProvider', () => {
       // own internal retries) — assert it used more than one, not the
       // default-3 count other adapters use.
       expect(fetchSpy.mock.calls.length).toBeGreaterThan(1);
-      expect(event.status).toBe('failed');
+      expect(event.status).toBe('unknown');
     }, 15_000);
 
     it('surfaces Radar\'s risk_level/risk_score from the expanded latest_charge on a normal-risk success', async () => {
@@ -408,9 +413,14 @@ describe('StripeProvider', () => {
       expect(event.fraudRiskScore).toBe(12);
     });
 
-    it('blocks a charge Radar scores as risk_level "highest", even though Stripe itself authorized it', async () => {
+    // Phase 11-12 (gap register E5): this test used to assert only
+    // `status 'failed'` with a SINGLE fetch — i.e. it passed while the
+    // captured charge was left dangling at Stripe (no refund call at all)
+    // and the router went on to charge another provider. It now also
+    // requires the real refund of the captured PaymentIntent.
+    it('blocks a charge Radar scores as risk_level "highest", even though Stripe itself authorized it — and refunds the captured charge first', async () => {
       process.env.STRIPE_SECRET_KEY = 'sk_test_123';
-      const fetchSpy = vi.fn().mockResolvedValue(
+      const fetchSpy = vi.fn().mockResolvedValueOnce(
         new Response(
           JSON.stringify({
             id: 'pi_risky',
@@ -423,6 +433,11 @@ describe('StripeProvider', () => {
           }),
           { status: 200, headers: { 'content-type': 'application/json' } },
         ),
+      ).mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 're_risky', object: 'refund', status: 'succeeded', payment_intent: 'pi_risky' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
       );
       vi.stubGlobal('fetch', fetchSpy);
 
@@ -438,6 +453,12 @@ describe('StripeProvider', () => {
       expect(event.fraudRiskScore).toBe(91);
       expect(event.error).toContain('Radar');
       expect(event.error).toContain('highly likely to be fraudulent');
+      expect(event.error).toContain('refunded');
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const [refundUrl, refundInit] = fetchSpy.mock.calls[1];
+      expect(refundUrl).toBe('https://api.stripe.com/v1/refunds');
+      expect(String(refundInit.body)).toContain('payment_intent=pi_risky');
+      expect(refundInit.headers['Idempotency-Key']).toMatch(/_radar_refund$/);
     });
 
     it('does not surface fraud fields when the response carries no Radar outcome at all', async () => {

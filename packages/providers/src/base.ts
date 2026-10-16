@@ -1,5 +1,127 @@
 import { randomUUID, createHash } from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, OtherRequest, RefundRequest } from '@company/schemas';
+
+// ---------------------------------------------------------------------------
+// Outcome classification for provider calls (Phase 11-12 — gap register
+// A10 / E4 / PHASE3-01: the cross-provider double-charge path).
+// ---------------------------------------------------------------------------
+//
+// Every failure of a money-moving provider call is one of exactly two kinds:
+//
+//  - DEFINITE: the platform KNOWS the provider did not move money — either
+//    nothing was ever sent (missing credentials, provider offline, the TCP
+//    connection was refused, an auth step before the charge failed), or the
+//    provider answered unambiguously that it did not (a decline, a 4xx
+//    validation error). Safe for the router to try another provider.
+//
+//  - AMBIGUOUS: the request may have reached the provider and been processed,
+//    but no trustworthy answer came back — a timeout/abort after send, a
+//    connection reset, an unparseable body, any 5xx (the provider's own
+//    server failed, possibly after processing), or a duplicate-rejection from
+//    a retry of an attempt that was itself ambiguous. These become the
+//    payment state machine's 'unknown' (Phase 6) and are NEVER retried on a
+//    different provider: they are reconciled instead.
+//
+// `ambiguous` is carried on the error itself so every layer (http_request,
+// the adapter's catch block, the router) classifies the same way. An error
+// that carries no `ambiguous` flag at all is treated as AMBIGUOUS by the
+// router (fail safe: an unclassified failure inside a charge path is "we
+// don't know", never "it definitely failed").
+
+/** A provider-call failure that knows whether its outcome is ambiguous. */
+export class ProviderCallError extends Error {
+  readonly ambiguous: boolean;
+  /** The provider's HTTP status, when a response was received. */
+  readonly httpStatus?: number;
+  /** The call was cancelled by its caller (e.g. the router's timeout) — see http_request. */
+  readonly cancelled: boolean;
+  /** How many HTTP attempts were actually started. */
+  readonly attempts?: number;
+
+  constructor(
+    message: string,
+    opts: { ambiguous: boolean; httpStatus?: number; cancelled?: boolean; attempts?: number; cause?: unknown },
+  ) {
+    super(message);
+    this.name = 'ProviderCallError';
+    this.ambiguous = opts.ambiguous;
+    this.httpStatus = opts.httpStatus;
+    this.cancelled = opts.cancelled ?? false;
+    this.attempts = opts.attempts;
+    if (opts.cause !== undefined) (this as { cause?: unknown }).cause = opts.cause;
+  }
+}
+
+/** The provider is offline / in maintenance — nothing was sent. Definite. */
+export class ProviderUnavailableError extends Error {
+  readonly ambiguous = false;
+  readonly code = 'provider_unavailable';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderUnavailableError';
+  }
+}
+
+/**
+ * true unless the error itself says the outcome is definite. Unclassified
+ * errors (no boolean `ambiguous` property) are ambiguous — fail safe.
+ */
+export function isAmbiguousProviderError(err: unknown): boolean {
+  const flag = (err as { ambiguous?: unknown } | null | undefined)?.ambiguous;
+  return typeof flag === 'boolean' ? flag : true;
+}
+
+/**
+ * Transport error codes that can only occur BEFORE any byte of the HTTP
+ * request reached the provider (name resolution / TCP connect phase). A
+ * request that failed this way provably was not processed. Everything else
+ * — ECONNRESET, socket hang-up, UND_ERR_SOCKET, a body-read failure, an
+ * AbortError — may have happened after the provider received the request.
+ */
+const PRE_SEND_ERROR_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+
+function transportErrorCode(err: any): string | undefined {
+  return err?.cause?.code ?? err?.code ?? err?.cause?.cause?.code;
+}
+
+export function isPreSendTransportError(err: unknown): boolean {
+  const code = transportErrorCode(err);
+  return typeof code === 'string' && PRE_SEND_ERROR_CODES.has(code);
+}
+
+// ---------------------------------------------------------------------------
+// Call context — cancellation propagated from the router (gap register E6).
+// ---------------------------------------------------------------------------
+
+/** Options the router passes into a provider call. */
+export interface ProviderCallOptions {
+  /**
+   * Aborted when the caller (RoutingEngine's timeout) has given up on this
+   * call. http_request aborts the in-flight fetch, stops its retry loop
+   * (including a pending backoff sleep), and refuses to START any further
+   * request under this signal — so no background charge attempt can fire
+   * after the platform has already reported the outcome as 'unknown'.
+   */
+  signal?: AbortSignal;
+}
+
+const providerCallContext = new AsyncLocalStorage<ProviderCallOptions>();
+
+/**
+ * Runs `fn` with `options.signal` as the ambient cancellation signal of every
+ * BaseProvider.http_request call made anywhere inside it (including from
+ * code that forgot to forward the signal explicitly — adapters do not need to
+ * thread it by hand, which is how the old version created a signal and never
+ * delivered it anywhere).
+ */
+export function runWithProviderCallOptions<T>(options: ProviderCallOptions, fn: () => Promise<T>): Promise<T> {
+  return providerCallContext.run(options, fn);
+}
+
+export function currentProviderCallSignal(): AbortSignal | undefined {
+  return providerCallContext.getStore()?.signal;
+}
 
 // ---------------------------------------------------------------------------
 // Production kill-switch for simulated provider fallbacks (gap register E2).
@@ -12,6 +134,8 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, MessageRequest, Other
  * was sent to any provider) and the gateway never reports money as moved.
  */
 export class SimulatedFallbackBlockedError extends Error {
+  /** Thrown before any provider request — a definite non-charge. */
+  readonly ambiguous = false;
   readonly code: string;
   readonly providerId: string;
   readonly missing: string[];
@@ -55,6 +179,8 @@ export class MissingPaymentInputError extends SimulatedFallbackBlockedError {
 
 /** A real money-moving call was attempted without the platform's own transaction id. */
 export class MissingPaymentTransactionIdError extends Error {
+  /** Thrown before any provider request — a definite non-charge. */
+  readonly ambiguous = false;
   readonly code = 'missing_payment_transaction_id';
   constructor() {
     super(
@@ -180,17 +306,70 @@ export interface HttpRequestOptions {
   body?: any;
   timeoutMs?: number;
   maxAttempts?: number;
+  /**
+   * Caller cancellation (gap register E6). Defaults to the ambient signal set
+   * by runWithProviderCallOptions() — i.e. the router's timeout.
+   */
+  signal?: AbortSignal;
+  /**
+   * May an attempt whose outcome is AMBIGUOUS (a 5xx, or a transport failure
+   * after the request may have been sent) be retried by this loop?
+   *
+   * Only safe when the provider deduplicates the retry on an idempotency key
+   * it genuinely honours (the retry is then the same logical operation, and
+   * the provider replays the original result). For a money-moving call to a
+   * provider WITHOUT such a key (NMI, Authorize.Net, Braintree as built, and
+   * reference-only providers whose duplicate check answers with an error
+   * rather than the original result) a blind retry can charge twice, so those
+   * calls set this to false. Failures that provably never reached the
+   * provider (DNS/connect-refused) and 429s are always retryable.
+   *
+   * Default true, preserving the previous behaviour for messaging/other/
+   * read-only calls. Every payment charge call in this package sets it
+   * explicitly.
+   */
+  retryAmbiguous?: boolean;
 }
 
 export interface HttpResponse {
   status: number;
   headers: Record<string, string>;
   body: any;
+  /** Attempts actually started for this request (1 = no retry happened). */
+  attempts?: number;
+  /**
+   * How many EARLIER attempts ended ambiguously (5xx / post-send transport
+   * failure) before this response. When > 0, an error response here may be
+   * the provider rejecting a duplicate of a request it already processed —
+   * see BaseProvider.httpErrorOutcome().
+   */
+  ambiguousPriorAttempts?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const RETRY_BASE_MS = 500;
+
+/** Sleeps `ms`, returning early (true) if `signal` aborts first. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(false);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function abortReasonText(signal: AbortSignal): string {
+  const reason = signal.reason as { message?: unknown } | undefined;
+  return typeof reason?.message === 'string' ? reason.message : 'aborted by caller';
+}
 
 // ---------------------------------------------------------------------------
 // Read-only payment status query (Phase 6 — gap register D4 reconciliation).
@@ -281,12 +460,35 @@ export abstract class BaseProvider {
   }
 
   /**
-   * Make an HTTP request to the provider's API with automatic retry and timeout.
+   * Make an HTTP request to the provider's API with bounded timeout and
+   * classified retry.
+   *
+   * Timeout: every attempt is bounded by `timeoutMs` via its own
+   * AbortController, covering BOTH the response headers and the body read
+   * (the old version cleared the timer as soon as headers arrived, leaving
+   * the body read unbounded).
+   *
+   * Cancellation (gap register E6): `opts.signal` — or, by default, the
+   * ambient signal installed by runWithProviderCallOptions() (the router's
+   * timeout) — aborts the in-flight fetch, interrupts a pending backoff, and
+   * prevents any further attempt from starting. The old version ran up to 3
+   * attempts (~91.5s) in the background after the router had already told the
+   * client the outcome was 'unknown'.
    *
    * Retry strategy:
-   * - Retries on 429 (rate limit), 500-599 (server errors), and network errors
-   * - Exponential backoff: 500ms → 1s → 2s (capped at 10s)
-   * - Respects Retry-After header from 429 responses
+   * - 429: retried (the provider rejected it unprocessed), honouring
+   *   Retry-After; exponential backoff 500ms → 1s → 2s (capped at 10s).
+   * - Transport failures that provably happened before the request was sent
+   *   (DNS / connection refused / connect timeout): retried.
+   * - AMBIGUOUS failures (5xx, or a transport failure/timeout after the
+   *   request may have been sent): retried only when `retryAmbiguous` is not
+   *   false — see HttpRequestOptions.retryAmbiguous.
+   *
+   * Errors: a transport failure is thrown as ProviderCallError whose
+   * `ambiguous` says whether ANY attempt may have reached the provider; a
+   * cancellation is thrown as ProviderCallError with `cancelled: true`.
+   * HTTP error statuses are returned (not thrown) with `attempts` and
+   * `ambiguousPriorAttempts` so adapters can classify them.
    */
   protected async http_request(opts: HttpRequestOptions): Promise<HttpResponse> {
     const {
@@ -296,13 +498,32 @@ export abstract class BaseProvider {
       body,
       timeoutMs = DEFAULT_TIMEOUT_MS,
       maxAttempts = DEFAULT_MAX_ATTEMPTS,
+      retryAmbiguous = true,
     } = opts;
+    const signal = opts.signal ?? currentProviderCallSignal();
 
-    let lastError: Error | undefined;
+    let started = 0;
+    let ambiguousAttempts = 0;
+    const cancelledError = (inFlight: boolean, cause?: unknown) =>
+      new ProviderCallError(
+        `Provider request cancelled by caller (${signal ? abortReasonText(signal) : 'aborted'}) after ${started} attempt(s)` +
+          (inFlight || ambiguousAttempts > 0 ? ' — an attempt may have reached the provider' : ' — no attempt was in flight'),
+        { ambiguous: inFlight || ambiguousAttempts > 0, cancelled: true, attempts: started, cause },
+      );
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // Never START a request the caller has already given up on.
+      if (signal?.aborted) throw cancelledError(false);
+
+      started++;
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+      const onCallerAbort = () => controller.abort();
+      signal?.addEventListener('abort', onCallerAbort, { once: true });
 
       try {
         const fetchOpts: RequestInit = {
@@ -322,9 +543,8 @@ export abstract class BaseProvider {
         }
 
         const res = await fetch(url, fetchOpts);
-        clearTimeout(timeout);
 
-        // Parse response
+        // Parse response (still under this attempt's timeout).
         const contentType = res.headers.get('content-type') || '';
         let responseBody: any;
         if (contentType.includes('application/json')) {
@@ -339,37 +559,137 @@ export abstract class BaseProvider {
           responseHeaders[key] = value;
         });
 
-        // Retry on rate limit or server errors
-        if (res.status === 429 || res.status >= 500) {
+        const ambiguousStatus = res.status >= 500;
+        const retryable = res.status === 429 || (ambiguousStatus && retryAmbiguous);
+        if (retryable && attempt < maxAttempts) {
+          if (ambiguousStatus) ambiguousAttempts++;
           const retryAfter = res.headers.get('retry-after');
           const retryMs = retryAfter
             ? parseInt(retryAfter, 10) * 1000
             : Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), 10_000);
-
-          if (attempt < maxAttempts) {
-            await new Promise((r) => setTimeout(r, retryMs));
-            continue;
-          }
+          if (await sleepUnlessAborted(retryMs, signal)) throw cancelledError(false);
+          continue;
         }
 
         return {
           status: res.status,
           headers: responseHeaders,
           body: responseBody,
+          attempts: started,
+          ambiguousPriorAttempts: ambiguousAttempts,
         };
       } catch (err: any) {
-        clearTimeout(timeout);
-        lastError = err;
+        if (err instanceof ProviderCallError) throw err;
+        if (signal?.aborted) throw cancelledError(true, err);
 
-        // Don't retry on abort (timeout) for the last attempt
-        if (attempt < maxAttempts) {
-          const retryMs = Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), 10_000);
-          await new Promise((r) => setTimeout(r, retryMs));
+        const preSend = isPreSendTransportError(err);
+        if (!preSend) ambiguousAttempts++;
+        const code = transportErrorCode(err);
+        const baseMessage = err?.message || String(err);
+        const message = timedOut
+          ? `Provider request timed out after ${timeoutMs}ms with no complete response (it may have been processed)`
+          : code && !baseMessage.includes(code)
+            ? `${baseMessage} (${code}${preSend ? ' — request never sent' : ''})`
+            : baseMessage;
+
+        const canRetry = attempt < maxAttempts && (preSend || retryAmbiguous);
+        if (!canRetry) {
+          throw new ProviderCallError(message, { ambiguous: ambiguousAttempts > 0, attempts: started, cause: err });
         }
+        const retryMs = Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), 10_000);
+        if (await sleepUnlessAborted(retryMs, signal)) throw cancelledError(false, err);
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', onCallerAbort);
       }
     }
 
-    throw lastError || new Error(`HTTP request failed after ${maxAttempts} attempts`);
+    throw new ProviderCallError(`HTTP request failed after ${maxAttempts} attempts`, {
+      ambiguous: ambiguousAttempts > 0,
+      attempts: started,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Payment outcome classification helpers (Phase 11-12, A10/E4).
+  // -------------------------------------------------------------------------
+
+  /** A failure the provider answered unambiguously (or that never reached it). */
+  protected definiteFailure(message: string, httpStatus?: number): ProviderCallError {
+    return new ProviderCallError(message, { ambiguous: false, httpStatus });
+  }
+
+  /** A failure where the provider may have processed the request. */
+  protected ambiguousOutcome(message: string, httpStatus?: number): ProviderCallError {
+    return new ProviderCallError(message, { ambiguous: true, httpStatus });
+  }
+
+  /**
+   * Classifies an HTTP error response (status >= 400) from a money-moving call:
+   *  - 5xx: the provider's own server failed, possibly after processing → ambiguous.
+   *  - 408 (request timeout) / 409 (conflict — e.g. Stripe's
+   *    `idempotency_key_in_use` while the original is still executing) →
+   *    ambiguous: neither is a decision about the charge.
+   *  - ANY error status after an earlier attempt of the same call ended
+   *    ambiguously → ambiguous: a retry rejected as a duplicate of a request the
+   *    provider already processed looks exactly like a 4xx.
+   *  - Any other 4xx (402 decline, 400/422 validation, 401/403 auth, 404, 429)
+   *    → definite: the provider received the request and refused it.
+   */
+  protected httpErrorOutcome(res: HttpResponse, message: string): ProviderCallError {
+    const prior = res.ambiguousPriorAttempts ?? 0;
+    const ambiguous = res.status >= 500 || res.status === 408 || res.status === 409 || prior > 0;
+    return new ProviderCallError(
+      ambiguous && prior > 0 && res.status < 500
+        ? `${message} (after ${prior} earlier ambiguous attempt(s) — may be a duplicate of an already-processed request)`
+        : message,
+      { ambiguous, httpStatus: res.status },
+    );
+  }
+
+  /**
+   * The TransactionEvent for a charge attempt that threw. Ambiguous failures
+   * become the state machine's 'unknown' (Phase 6), identified by the
+   * platform's own pre-allocated transaction id (so the gateway stores
+   * provider_transaction_id = NULL rather than a fabricated id) unless a real
+   * provider id is already known; definite failures stay 'failed'. The router
+   * never retries an 'unknown' on another provider.
+   */
+  protected paymentFailureEvent(args: {
+    appId: string;
+    payload: PaymentRequest;
+    decisionReason: string;
+    err: unknown;
+    startTime: number;
+    amount: number;
+    currency: string;
+    idPrefix: string;
+    providerTransactionId?: string;
+    response?: unknown;
+  }): TransactionEvent {
+    const ambiguous = isAmbiguousProviderError(args.err);
+    const message = (args.err as { message?: string } | null)?.message || String(args.err);
+    const id = ambiguous
+      ? args.providerTransactionId || args.payload.paymentTransactionId || `${args.idPrefix}unknown_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+      : args.idPrefix + randomUUID().replace(/-/g, '').slice(0, 16);
+    return {
+      id,
+      timestamp: new Date().toISOString(),
+      appId: args.appId,
+      category: 'payment',
+      providerId: this.config.id,
+      status: ambiguous ? 'unknown' : 'failed',
+      amount: args.amount,
+      currency: args.currency,
+      latency: Date.now() - args.startTime,
+      cost: 0,
+      decisionReason: ambiguous
+        ? `${args.decisionReason} | Ambiguous provider outcome (${message}) — the provider may have processed this charge. Reported as 'unknown'; not retried via another provider; must be reconciled.`
+        : args.decisionReason,
+      payload: args.payload,
+      response: args.response ?? null,
+      error: message,
+    };
   }
 
   /**
@@ -572,16 +892,23 @@ export abstract class BaseProvider {
   // Checks status, throwing error if not online
   protected verifyAvailability() {
     if (this.config.status === 'offline') {
-      throw new Error(`Provider ${this.config.name} is currently OFFLINE`);
+      throw new ProviderUnavailableError(`Provider ${this.config.name} is currently OFFLINE`);
     }
     if (this.config.status === 'maintenance') {
-      throw new Error(`Provider ${this.config.name} is undergoing MAINTENANCE`);
+      throw new ProviderUnavailableError(`Provider ${this.config.name} is undergoing MAINTENANCE`);
     }
   }
 
+  /**
+   * `options.signal` (when given) is the caller's cancellation — adapters do
+   * not need to forward it by hand: the router also installs it as the
+   * ambient signal for every http_request() made inside this call (see
+   * runWithProviderCallOptions), so it reaches the HTTP layer either way.
+   */
   abstract processRequest(
     appId: string,
     payload: PaymentRequest | MessageRequest | OtherRequest,
-    decisionReason: string
+    decisionReason: string,
+    options?: ProviderCallOptions,
   ): Promise<TransactionEvent>;
 }

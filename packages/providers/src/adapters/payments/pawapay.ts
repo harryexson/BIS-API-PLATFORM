@@ -118,18 +118,27 @@ export class PawaPayProvider extends BaseProvider {
           },
         },
         timeoutMs: 30_000,
+        // depositId is PawaPay's idempotency key: a repeat is answered with
+        // DUPLICATE_IGNORED (mapped to 'unknown' below), never a second
+        // deposit — so retrying an ambiguous attempt is safe.
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400) {
-        throw new Error(res.body?.failureReason?.failureMessage || res.body?.message || `PawaPay API error: HTTP ${res.status}`);
+        // 4xx: the request was rejected before any deposit was initiated
+        // (definite); 5xx: ambiguous (generic rule).
+        throw this.httpErrorOutcome(
+          res,
+          res.body?.failureReason?.failureMessage || res.body?.message || `PawaPay API error: HTTP ${res.status}`,
+        );
       }
 
       const body = res.body;
       const pawaStatus = body?.status;
       if (!pawaStatus) {
-        throw new Error('PawaPay response did not include a status field');
+        throw this.ambiguousOutcome('PawaPay response did not include a status field', res.status);
       }
 
       // ACCEPTED (and the duplicate-request case, whose real outcome we
@@ -161,23 +170,13 @@ export class PawaPayProvider extends BaseProvider {
         ...(status === 'failed' ? { error: body?.failureReason?.failureMessage || `PawaPay status: ${pawaStatus}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'paw_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      // An ambiguous deposit keeps its deterministic depositId — PawaPay's
+      // own id for it — so a later callback/status check can match it.
+      return this.paymentFailureEvent({
+        appId, payload, decisionReason, err, startTime, amount, currency,
+        idPrefix: 'paw_err_',
+        providerTransactionId: depositId,
+      });
     }
   }
 

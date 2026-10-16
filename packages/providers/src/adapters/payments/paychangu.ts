@@ -118,22 +118,39 @@ export class PayChanguProvider extends BaseProvider {
           charge_id: chargeId,
         },
         timeoutMs: 30_000,
+        // This call pushes a payment prompt straight to the customer's phone,
+        // so it can move money without us ever seeing the answer. charge_id
+        // is a merchant reference whose duplicate handling is not documented
+        // as replaying the original result, so a request that may have
+        // reached PayChangu is never re-sent (the old default retried
+        // 5xx/timeouts up to 3 times — up to 3 prompts/charges).
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400 || res.body?.status === 'error' || res.body?.status === 'failed') {
-        throw new Error(res.body?.message || `PayChangu API error: HTTP ${res.status}`);
+        const message = res.body?.message || `PayChangu API error: HTTP ${res.status}`;
+        // 5xx and a duplicate-charge_id rejection are ambiguous; any other
+        // explicit rejection is definite.
+        if (/duplicate|already exists/i.test(String(message))) throw this.ambiguousOutcome(message, res.status);
+        if (res.status >= 400) throw this.httpErrorOutcome(res, message);
+        throw this.definiteFailure(message, res.status);
       }
 
       const data = res.body?.data;
       if (!data) {
-        throw new Error('PayChangu response did not include a data object');
+        throw this.ambiguousOutcome('PayChangu response did not include a data object', res.status);
       }
 
       // Top-level status: "success" only means the request was accepted
-      // for processing — data.status is the real transaction outcome.
-      const status = data.status === 'success' ? 'success' : data.status === 'pending' ? 'unknown' : 'failed';
+      // for processing — data.status is the real transaction outcome. Only
+      // an explicit 'failed' is a decline; anything unrecognised is
+      // unresolved (it used to default to 'failed').
+      const status =
+        data.status === 'success' ? 'success'
+          : data.status === 'failed' ? 'failed'
+            : 'unknown';
 
       const feePercent = this.config.transactionFeePercent || 1.5;
       const cost = status === 'success' ? (amount * feePercent) / 100 : 0;
@@ -155,23 +172,11 @@ export class PayChanguProvider extends BaseProvider {
         ...(status === 'failed' ? { error: data.message || `PayChangu data.status: ${data.status}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'pc_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({
+        appId, payload, decisionReason, err, startTime, amount, currency,
+        idPrefix: 'pc_err_',
+        providerTransactionId: chargeId,
+      });
     }
   }
 

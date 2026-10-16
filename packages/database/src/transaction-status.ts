@@ -206,7 +206,12 @@ export function paymentOutcomeFromEvent(
       ? {
           reconciliationReason: providerTransactionId
             ? `provider_reported_unresolved: provider '${event.providerId}' returned an unresolved status for ${providerTransactionId}`
-            : `provider_timeout: no response from provider '${event.providerId}'${event.error ? ` (${event.error})` : ''} — the request may have been processed`,
+            : /timed out/i.test(event.error ?? '') || !event.error
+              ? `provider_timeout: no response from provider '${event.providerId}'${event.error ? ` (${event.error})` : ''} — the request may have been processed`
+              // Phase 11-12 (A10/E4): an adapter-classified ambiguous failure
+              // (5xx, connection reset, unreadable answer, duplicate-after-
+              // retry) — the provider may have processed the charge.
+              : `provider_ambiguous_outcome: no definite answer from provider '${event.providerId}' (${event.error}) — the request may have been processed`,
         }
       : {}),
   };

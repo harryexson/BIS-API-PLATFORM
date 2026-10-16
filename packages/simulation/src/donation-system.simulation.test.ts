@@ -285,15 +285,41 @@ describe('deliberate: duplicate requests', () => {
 // ---------------------------------------------------------------------------
 
 describe('deliberate: provider timeout', () => {
-  it('caps a slow/failing Stripe request via failover to another payment provider', async () => {
+  // Phase 11-12 (gap register A10/E4/PHASE3-01): this test used to be
+  // 'caps a slow/failing Stripe request via failover to another payment
+  // provider' and asserted the DEFECT — a read ETIMEDOUT (the request had
+  // already been sent; Stripe may have charged the card) was failed over to
+  // a second provider (`providerId !== 'stripe'`, 'Dynamic Failover'), i.e.
+  // a potential double charge was the asserted, "passing" behaviour. A
+  // thrown, unclassified error from a charge is now an ambiguous outcome:
+  // 202 'unknown', on Stripe, and no other payment provider is ever called.
+  it('a Stripe read-ETIMEDOUT (request already sent) is an ambiguous 202 unknown — never failed over to another provider', async () => {
     patchStripeProcessRequest(async () => {
       await sleep(30);
       throw new Error('ETIMEDOUT: read ETIMEDOUT (simulated Stripe gateway timeout)');
     });
+    const otherCalls: string[] = [];
+    for (const cfg of runtime.registry.getAllConfigs()) {
+      if (cfg.category !== 'payment' || cfg.id === 'stripe') continue;
+      const p = runtime.registry.getProvider(cfg.id) as unknown as { processRequest: (...a: any[]) => Promise<any> };
+      const original = p.processRequest;
+      p.processRequest = async (...a: any[]) => {
+        otherCalls.push(cfg.id);
+        return original.apply(p, a);
+      };
+      patches.push(() => {
+        p.processRequest = original;
+      });
+    }
     const donation = await createDonation(runtime);
-    expect(donation.status).toBe(200);
-    expect(donation.body.providerId).not.toBe('stripe');
-    expect(String(donation.body.decisionReason)).toContain('Dynamic Failover');
+    expect(donation.status).toBe(202);
+    expect(donation.body.status).toBe('unknown');
+    expect(donation.body.providerId).toBe('stripe');
+    expect(String(donation.body.decisionReason)).not.toContain('Dynamic Failover');
+    expect(otherCalls).toEqual([]);
+    const row = dbState.transactions.find((t) => t.id === donation.body.paymentTransactionId)!;
+    expect(row.status).toBe('unknown');
+    expect(row.providerTransactionId).toBeNull();
   });
 
   it(

@@ -7,6 +7,8 @@ import {
   ConsentBlockedError,
   MessageChannelUnavailableError,
   InvalidMessageChannelRequestError,
+  PaymentRouteUnavailableError,
+  PaymentOverrideIncapableError,
   parseChannelPolicy,
   isMessageChannel,
   MESSAGE_CHANNELS,
@@ -1374,7 +1376,18 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, asyncHandle
     if (idempotencyRecordId) {
       await platformIdempotency.fail(idempotencyRecordId, errorEvent.error).catch(logIdempotencyFinaliseError(idempotencyRecordId, 'fail'));
     }
-    return res.status(503).json({ error: 'Payment routing failed', id: errorEvent.id, paymentTransactionId });
+    // Phase 11-12 (A8): a payment no capable provider can take, or an
+    // override naming an incapable provider, gets a SPECIFIC reason (nothing
+    // was sent to any provider in either case). 422 for the override (the
+    // request itself can never succeed as sent), 503 for "no capable
+    // provider online".
+    const routeError = err instanceof PaymentOverrideIncapableError || err instanceof PaymentRouteUnavailableError ? err : null;
+    return res.status(err instanceof PaymentOverrideIncapableError ? 422 : 503).json({
+      error: 'Payment routing failed',
+      id: errorEvent.id,
+      paymentTransactionId,
+      ...(routeError ? { code: routeError.code, detail: routeError.message } : {}),
+    });
   }
 }));
 
@@ -2970,7 +2983,11 @@ app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response)
     });
   } catch (err: any) {
     await recordPaymentRoutingFailure(paymentTransactionId, 'failed_route', err instanceof Error ? err.message : String(err), metadata);
-    return res.status(503).json({ error: 'Payment failed', cancelUrl: session.cancelUrl });
+    return res.status(503).json({
+      error: 'Payment failed',
+      cancelUrl: session.cancelUrl,
+      ...(err instanceof PaymentRouteUnavailableError || err instanceof PaymentOverrideIncapableError ? { code: err.code, detail: err.message } : {}),
+    });
   }
 });
 

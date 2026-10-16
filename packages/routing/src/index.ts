@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { ProviderConfig, TransactionEvent, PaymentRequest, PaymentRoutingRequest } from '@company/schemas';
-import { ProviderRegistry, BaseProvider } from '@company/providers';
+import {
+  ProviderRegistry,
+  BaseProvider,
+  isAmbiguousProviderError,
+  runWithProviderCallOptions,
+  type ProviderCallOptions,
+} from '@company/providers';
 import {
   consentRecordRepository,
   messagingProfileRepository,
@@ -122,32 +128,74 @@ export const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 30
 export class ProviderTimeoutError extends Error {}
 
 /**
- * Wraps a provider processRequest call with an AbortSignal timeout.
- * If the provider doesn't respond within the timeout, the call is aborted.
+ * Runs one provider call under a bounded timeout that genuinely CANCELS the
+ * call when it fires (gap register E6).
+ *
+ * The old version raced `fn()` against an `AbortSignal.timeout()` that was
+ * created but never handed to the provider: the router reported 'unknown'
+ * while the adapter's own http_request retry loop (up to 3 attempts with
+ * backoff, ~91.5s) kept firing real charge attempts in the background that
+ * nobody would ever read the result of. Now the signal is passed to
+ * `fn(options)` AND installed as the ambient signal for every
+ * BaseProvider.http_request made inside the call (runWithProviderCallOptions),
+ * so on timeout: the in-flight fetch is aborted, any pending retry backoff
+ * is interrupted, and no further request is started.
  */
 async function withProviderTimeout<T>(
-  fn: () => Promise<T>,
+  fn: (options: ProviderCallOptions) => Promise<T>,
   timeoutMs: number = PROVIDER_TIMEOUT_MS,
 ): Promise<T> {
-  // AbortSignal.timeout is available in Node 18+
-  if (typeof AbortSignal.timeout === 'function') {
-    const controller = AbortSignal.timeout(timeoutMs);
-    return Promise.race([
-      fn(),
-      new Promise<never>((_, reject) =>
-        controller.addEventListener('abort', () =>
-          reject(new ProviderTimeoutError(`Provider request timed out after ${timeoutMs}ms`)),
-        ),
-      ),
-    ]);
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new ProviderTimeoutError(`Provider request timed out after ${timeoutMs}ms`);
+      controller.abort(err);
+      reject(err);
+    }, timeoutMs);
+  });
+  const options: ProviderCallOptions = { signal: controller.signal };
+  const call = runWithProviderCallOptions(options, () => fn(options));
+  // The losing promise must never surface as an unhandled rejection.
+  call.catch(() => {});
+  try {
+    return await Promise.race([call, timedOut]);
+  } finally {
+    clearTimeout(timer);
   }
-  // Fallback for environments without AbortSignal.timeout
-  return Promise.race([
-    fn(),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new ProviderTimeoutError(`Provider request timed out after ${timeoutMs}ms`)), timeoutMs),
-    ),
-  ]);
+}
+
+/**
+ * Phase 11-12 (gap register A8, payments half): no online provider can take
+ * this payment for its currency / payment method / country — the request
+ * fails closed with a specific reason instead of being routed to an
+ * incapable provider (the old hardcoded ['stripe','nmi','airwallex'] "global
+ * fallback pool" could send an MWK mobile-money payment to Stripe as a card
+ * charge).
+ */
+export class PaymentRouteUnavailableError extends Error {
+  readonly code = 'payment_route_unavailable';
+  /** Nothing was sent to any provider. */
+  readonly ambiguous = false;
+  constructor(readonly detail: string) {
+    super(`Payment routing failure: ${detail}`);
+    this.name = 'PaymentRouteUnavailableError';
+  }
+}
+
+/**
+ * Phase 11-12 (A8): the caller explicitly named a provider (providerOverride)
+ * that is online but cannot handle this payment's currency / payment method /
+ * country. Rejected rather than either charging through it or silently
+ * substituting another provider — see routePayment for the reasoning.
+ */
+export class PaymentOverrideIncapableError extends Error {
+  readonly code = 'provider_override_incapable';
+  readonly ambiguous = false;
+  constructor(readonly providerId: string, readonly detail: string) {
+    super(`Provider override '${providerId}' cannot process this payment: ${detail}`);
+    this.name = 'PaymentOverrideIncapableError';
+  }
 }
 
 /** Phase 8: the sender-level STOP lookup failed — the send is aborted, never cascaded. */
@@ -245,46 +293,94 @@ export class RoutingEngine {
       throw new Error('All payment providers are currently OFFLINE / UNDER MAINTENANCE');
     }
 
-    // 1. Manual override
+    // The capable pool: every online, production-eligible payment provider
+    // that supports this payment's capability, currency AND country
+    // (registry.findByCategoryAndCapabilities — the one place that logic
+    // lives). Phase 11-12 (gap register A8, payments half): EVERY selection
+    // path — override, routing rule, scored pick, and the failover cascade —
+    // now only ever picks from this pool. Previously the override and
+    // rule-target paths checked only availability/live-eligibility, and an
+    // empty pool fell back to a hardcoded ['stripe','nmi','airwallex'] pool,
+    // so e.g. an MWK mobile-money payment could be sent to Stripe as a card
+    // charge.
+    const cur = currency.toUpperCase();
+    const countryCode = country ? String(country).toUpperCase() : undefined;
+    const capabilities = [paymentMethod];
+    if (paymentMethod === 'mobile_money') capabilities.push('mobile_money');
+    const candidatePool: RankedCandidate[] = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur, countryCode);
+    const capableIds = new Set(candidatePool.map((c) => c.id));
+    const requirement = `${cur}/${paymentMethod}${countryCode ? `/${countryCode}` : ''}`;
+    const usable = (id: string) => this.registry.isProviderAvailable(id) && this.registry.isLiveEligible(id);
+
+    // 1. Manual override.
+    //
+    // Design decision (Phase 11-12): an explicit providerOverride does NOT
+    // bypass the capability/currency/country checks, and an override that is
+    // online but incapable is REJECTED (PaymentOverrideIncapableError), not
+    // silently swapped for another provider:
+    //  - providerOverride is a field of the tenant's API request, not
+    //    operator configuration. Country/currency enablement is also where
+    //    compliance restrictions live (a provider not licensed/enabled for a
+    //    country), and a request body must not be able to route around them.
+    //  - a caller that names a provider almost always holds a
+    //    provider-specific instrument (paymentToken is a Stripe pm_..., an
+    //    Adyen storedPaymentMethodId, ...). Charging it through a DIFFERENT
+    //    provider cannot be what the caller meant, and charging it through
+    //    the named-but-incapable provider (wrong currency/country/method)
+    //    can only fail or settle wrongly. A specific error the caller can
+    //    fix beats both.
+    //  - an override that is merely offline/unavailable keeps its existing,
+    //    tested behaviour (fall back to the capable pool), because that is a
+    //    transient condition rather than a request that can never succeed.
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
-      if (provider && this.registry.isProviderAvailable(providerOverride) && this.registry.isLiveEligible(providerOverride)) {
+      if (!provider || !usable(providerOverride)) {
+        reason = `Manual override '${providerOverride}' requested but provider is offline/invalid/not production-eligible. Falling back. | `;
+      } else if (!capableIds.has(providerOverride)) {
+        throw new PaymentOverrideIncapableError(
+          providerOverride,
+          this.paymentCapabilityGap(providerOverride, capabilities, cur, countryCode) ?? `not eligible for ${requirement}`,
+        );
+      } else {
         selectedProvider = provider;
         reason = `Manual override matched: Forced routing to '${provider.config.name}'.`;
-      } else {
-        reason = `Manual override '${providerOverride}' requested but provider is offline/invalid/not production-eligible. Falling back. | `;
       }
     }
 
-    // 2. Admin-configured routing rule
+    // 2. Admin-configured routing rule — its target is used only if it is in
+    // the capable pool. A rule is a broad admin policy ("amount > 100 →
+    // adyen"); a target that cannot take THIS payment simply does not apply
+    // to it (recorded in decisionReason), and routing continues with the
+    // capable pool.
     if (!selectedProvider) {
-      const ctx: RoutingContext = { currency: currency?.toUpperCase(), amount, paymentMethod, country: country?.toUpperCase() };
+      const ctx: RoutingContext = { currency: cur, amount, paymentMethod, country: countryCode };
       const rule = findMatchingRule(this.registry.getEnabledRoutingRules(), ctx);
       if (rule) {
         const provider = this.registry.getProvider(rule.target);
-        if (provider && this.registry.isProviderAvailable(rule.target) && this.registry.isLiveEligible(rule.target)) {
+        if (!provider || !usable(rule.target)) {
+          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' is offline/invalid. Falling back. | `;
+        } else if (!capableIds.has(rule.target)) {
+          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' cannot process ${requirement} (${this.paymentCapabilityGap(rule.target, capabilities, cur, countryCode) ?? 'not eligible'}) — rule not applied. Falling back. | `;
+        } else {
           selectedProvider = provider;
           reason += `Routing rule matched ('${rule.match}'${rule.description ? ` — ${rule.description}` : ''}): routed to '${provider.config.name}'.`;
-        } else {
-          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' is offline/invalid. Falling back. | `;
         }
       }
     }
 
-    // 3. Capability + success-rate/cost-scored candidate pool — also the
-    // basis for the cascading fallback order below, whether or not step 1
-    // or 2 already picked a provider.
-    const cur = currency.toUpperCase();
-    const capabilities = [paymentMethod];
-    if (paymentMethod === 'mobile_money') capabilities.push('mobile_money');
-
-    let candidatePool: RankedCandidate[] = this.registry.findByCategoryAndCapabilities('payment', capabilities, cur, country);
-    let poolDescription = `capability match for ${cur}/${paymentMethod}${country ? `/${String(country).toUpperCase()}` : ''}`;
+    // 3. No capable provider at all: fail closed (never an incapable one).
     if (candidatePool.length === 0) {
-      candidatePool = activePayments.filter(p => ['stripe', 'nmi', 'airwallex'].includes(p.id));
-      poolDescription = 'global weight-allocation fallback pool';
+      throw new PaymentRouteUnavailableError(
+        `no online, production-eligible payment provider supports ${requirement} ` +
+          `(capability ${capabilities.join('+')}, currency ${cur}${countryCode ? `, country ${countryCode}` : ''}). ` +
+          'The payment was NOT sent to any provider.',
+      );
     }
+
+    // 4. Success-rate/cost-scored pick among the capable pool — also the
+    // basis for the cascading fallback order below.
     const ranked = rankByScore(candidatePool, { amount });
+    const poolDescription = `capability match for ${requirement}`;
 
     if (!selectedProvider && ranked.length > 0) {
       const chosen = weightedRandomSelect(ranked, c => computeProviderScore(c, { amount }));
@@ -296,7 +392,7 @@ export class RoutingEngine {
     }
 
     if (!selectedProvider) {
-      throw new Error('Routing failure: Unable to find a suitable online payment provider.');
+      throw new PaymentRouteUnavailableError(`no capable provider for ${requirement} could be instantiated.`);
     }
 
     const fallbackOrder = ranked.filter(c => c.id !== selectedProvider!.config.id);
@@ -309,20 +405,27 @@ export class RoutingEngine {
 
       // A soft decline (the provider call succeeded and returned a
       // definite 'failed' TransactionEvent — a real decline, not an
-      // infrastructure failure) is just as safe to retry via another
-      // provider/acquirer as a thrown error: the charge is known NOT to
-      // have moved money. This is what real orchestration platforms mean
-      // by "retry logic" — without this branch, only network/HTTP-level
-      // failures ever cascaded, and an ordinary declined card silently
-      // returned as failed with no failover, despite the cascade
-      // machinery existing right here.
+      // infrastructure failure) is safe to retry via another
+      // provider/acquirer: the charge is known NOT to have moved money.
+      //
+      // Phase 11-12 (gap register A10/E4/PHASE3-01): that is now the ONLY
+      // kind of outcome that cascades. Every adapter classifies its own
+      // failures — network error / timeout / 5xx / unreadable answer →
+      // 'unknown', a genuine decline → 'failed' (see BaseProvider's
+      // ProviderCallError) — and the router never retries an 'unknown'. A
+      // THROWN error cascades only if it is explicitly classified definite
+      // (ambiguous === false: provider offline, not configured, missing
+      // input — nothing was sent). An unclassified thrown error is treated
+      // as ambiguous: the router cannot know whether the adapter had already
+      // sent the charge, so "we don't know" is the only honest answer.
       let event: TransactionEvent | undefined;
       let declineMessage: string | undefined;
       try {
-        // P1: Wrap provider call with timeout to prevent hung requests
-        event = await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
+        // Bounded, and genuinely cancelling: on timeout the adapter's
+        // in-flight request and any internal retries are aborted (E6).
+        event = await withProviderTimeout((options) => currentProvider!.processRequest(appId, payload, currentReason, options));
       } catch (err: any) {
-        if (err instanceof ProviderTimeoutError) {
+        if (err instanceof ProviderTimeoutError || isAmbiguousProviderError(err)) {
           // Phase 6 (gap register D4): the provider's own id was never
           // received, so there is none to report. The event's id is the
           // platform's own pre-allocated, stable payment transaction id —
@@ -333,6 +436,7 @@ export class RoutingEngine {
           // paymentOutcomeFromEvent in @company/database) and the row in the
           // distinct 'unknown' status. Only a caller that allocated no row
           // gets a clearly-labelled placeholder.
+          const timedOut = err instanceof ProviderTimeoutError;
           return {
             id: request.paymentTransactionId || `unknown_${randomUUID()}`,
             timestamp: new Date().toISOString(),
@@ -342,20 +446,20 @@ export class RoutingEngine {
             status: 'unknown',
             amount,
             currency,
-            latency: PROVIDER_TIMEOUT_MS,
+            latency: timedOut ? PROVIDER_TIMEOUT_MS : 0,
             cost: 0,
-            decisionReason: `${currentReason} | Ambiguous outcome: ${err.message}. Not retried via another provider — outcome must be reconciled via webhook/status check before any further action.`,
+            decisionReason: `${currentReason} | Ambiguous outcome: ${err?.message ?? err}. Not retried via another provider — outcome must be reconciled via webhook/status check before any further action.`,
             payload,
             response: null,
-            error: err.message,
+            error: err?.message ?? String(err),
           };
         }
         declineMessage = err.message;
       }
 
-      // 'success' or the genuinely ambiguous 'unknown' both return
-      // immediately — 'unknown' must never be retried via another
-      // provider for the same double-charge-risk reason a timeout isn't.
+      // 'success', 'pending' or the genuinely ambiguous 'unknown' all return
+      // immediately — 'unknown' must never be retried via another provider
+      // for the same double-charge-risk reason a timeout isn't.
       if (event && event.status !== 'failed') {
         return event;
       }
@@ -377,6 +481,23 @@ export class RoutingEngine {
       currentReason = `Dynamic Failover (cascading, attempt ${attempt + 1}/${Math.min(MAX_ROUTING_ATTEMPTS, fallbackOrder.length + 1)}): '${currentProvider.config.name}' ${verb} (${declineMessage}). Trying next-best-ranked '${nextProvider.config.name}'. | ${currentReason}`;
       currentProvider = nextProvider;
     }
+  }
+
+  /** Why a payment provider is not in the capable pool (null = it is capable). */
+  private paymentCapabilityGap(providerId: string, capabilities: string[], currency: string, country?: string): string | null {
+    const view = this.registry.getManagementView(providerId);
+    if (!view || view.category !== 'payment') return `'${providerId}' is not a payment provider`;
+    const missing = capabilities.filter((c) => !view.capabilities.includes(c));
+    if (missing.length > 0) {
+      return `does not support payment method '${missing.join("', '")}' (supports: ${view.capabilities.join(', ') || 'none'})`;
+    }
+    if (!view.currencies.includes(currency) && !view.currencies.includes('*')) {
+      return `does not support currency ${currency} (supports: ${view.currencies.join(', ') || 'none'})`;
+    }
+    if (country && !view.countries.includes(country) && !view.countries.includes('*')) {
+      return `is not enabled for country ${country} (enabled: ${view.countries.join(', ') || 'none'})`;
+    }
+    return null;
   }
 
   // Capability-based messaging routing. Same precedence model as
@@ -715,7 +836,7 @@ export class RoutingEngine {
           throw new ConsentBlockedError(address, channel);
         }
         // P1: Wrap provider call with timeout to prevent hung requests
-        const event = await withProviderTimeout(() => currentProvider!.processRequest(appId, sendPayload, currentReason));
+        const event = await withProviderTimeout((options) => currentProvider!.processRequest(appId, sendPayload, currentReason, options));
         // P2-8: Record conversation after successful delivery — on the
         // business number it was sent from (Phase 8), on the channel it was
         // actually sent on (Phase 10).
@@ -826,7 +947,7 @@ export class RoutingEngine {
 
     // P1: Wrap provider call with timeout to prevent hung requests
     return await withProviderTimeout(
-      () => selectedProvider!.processRequest(appId, payload, reason),
+      (options) => selectedProvider!.processRequest(appId, payload, reason, options),
     );
   }
 }

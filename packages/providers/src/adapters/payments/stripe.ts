@@ -82,6 +82,10 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, RefundRequest } from 
  *     below to verify Stripe's own Stripe-Signature header, separate from
  *     the payment API credential above.
  */
+type RadarReversal =
+  | { ok: true; kind: 'refund' | 'cancel'; id: string; providerStatus: string }
+  | { ok: false; kind: 'refund' | 'cancel'; error: string };
+
 export class StripeProvider extends BaseProvider {
   private baseUrl = 'https://api.stripe.com/v1';
 
@@ -280,6 +284,9 @@ export class StripeProvider extends BaseProvider {
         body,
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // No refund idempotency key is sent (gap register E14), so a refund
+        // that may have reached the provider is never blindly re-sent.
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
@@ -386,13 +393,33 @@ export class StripeProvider extends BaseProvider {
         body,
         timeoutMs: 30_000,
         maxAttempts: 2, // Stripe handles its own internal retries
+        // Safe to retry an ambiguous attempt: Stripe honours Idempotency-Key
+        // and replays the first attempt's saved result (including a 500)
+        // for the same key, so a retry can never create a second charge.
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400) {
         const errBody = res.body?.error;
-        throw new Error(errBody?.message || `Stripe API error: HTTP ${res.status}`);
+        const message = errBody?.message || `Stripe API error: HTTP ${res.status}`;
+        // Stripe's documented error types: `card_error` (HTTP 402) is the
+        // issuer's/Radar's decline of THIS PaymentIntent — a definite
+        // non-charge even after an earlier ambiguous attempt, because Stripe
+        // replays one saved result per Idempotency-Key (a 402 here IS the
+        // single logical charge's outcome). `idempotency_error` means the key
+        // was already used — the platform cannot tell what the earlier
+        // request did, so it is ambiguous. Everything else follows the
+        // generic rule (5xx/408/409 ambiguous, other 4xx definite).
+        if (errBody?.type === 'card_error') {
+          throw this.definiteFailure(
+            errBody.decline_code ? `${message} (decline_code: ${errBody.decline_code})` : message,
+            res.status,
+          );
+        }
+        if (errBody?.type === 'idempotency_error') throw this.ambiguousOutcome(message, res.status);
+        throw this.httpErrorOutcome(res, message);
       }
 
       const intent = res.body;
@@ -410,9 +437,13 @@ export class StripeProvider extends BaseProvider {
       // adapter could relay one — genuinely unresolved too, the same as
       // Adyen's/Airwallex's equivalent challenge-required states, not a
       // definite decline.
+      // Phase 11-12: 'requires_capture' (authorized and holding funds, not
+      // yet captured — only reachable if manual capture is configured) is
+      // NOT a decline either; it used to fall through to 'failed', which the
+      // router would fail over while the authorization hold stayed live.
       let status: 'success' | 'failed' | 'unknown' =
         intent.status === 'succeeded' ? 'success'
-          : intent.status === 'processing' || intent.status === 'requires_action' ? 'unknown'
+          : intent.status === 'processing' || intent.status === 'requires_action' || intent.status === 'requires_capture' ? 'unknown'
             : 'failed';
 
       // Radar's own risk assessment lives on the Charge (see class comment
@@ -426,10 +457,33 @@ export class StripeProvider extends BaseProvider {
       // charge it scores 'highest' risk is blocked here even if Stripe
       // itself authorized it — surfaced into the actual payment decision,
       // not a fraud rule this platform invented independently of Radar.
+      //
+      // Phase 11-12 (gap register E5): by this point the money has ALREADY
+      // moved at Stripe (confirm=true + automatic capture → 'succeeded'), or
+      // is at least authorized ('requires_capture', if the account/PI uses
+      // manual capture). Reporting 'failed' without undoing that left a
+      // captured charge dangling at Stripe while the router charged a second
+      // provider for the same payment — a guaranteed double charge. The
+      // charge is now actually reversed first (refund if captured, cancel if
+      // only authorized — see reverseRadarBlockedIntent), and 'failed' is
+      // reported ONLY once Stripe has accepted that reversal. If the reversal
+      // cannot be confirmed, the charge may still be captured, so the outcome
+      // is 'unknown' (never 'failed'): the router will not charge anyone else
+      // and the payment goes to reconciliation/manual review.
       let fraudBlockedMessage: string | undefined;
-      if (status === 'success' && fraudRiskLevel === 'highest') {
-        status = 'failed';
-        fraudBlockedMessage = `Blocked by Stripe Radar: risk_level 'highest'${outcome?.seller_message ? ` — ${outcome.seller_message}` : ''}`;
+      let radarReversal: RadarReversal | undefined;
+      const radarBlocked =
+        fraudRiskLevel === 'highest' && (intent.status === 'succeeded' || intent.status === 'requires_capture');
+      if (radarBlocked) {
+        radarReversal = await this.reverseRadarBlockedIntent(intent, idempotencyKey);
+        const radarNote = `Blocked by Stripe Radar: risk_level 'highest'${outcome?.seller_message ? ` — ${outcome.seller_message}` : ''}`;
+        if (radarReversal.ok) {
+          status = 'failed';
+          fraudBlockedMessage = `${radarNote}; the ${radarReversal.kind === 'refund' ? 'captured charge was refunded' : 'authorization was cancelled'} at Stripe (${radarReversal.id}, status ${radarReversal.providerStatus})`;
+        } else {
+          status = 'unknown';
+          fraudBlockedMessage = `${radarNote}; automatic ${radarReversal.kind} of PaymentIntent ${intent.id} could NOT be confirmed (${radarReversal.error}) — the charge may still be captured at Stripe. Not failed over; requires reconciliation/manual review.`;
+        }
       }
 
       return {
@@ -445,31 +499,87 @@ export class StripeProvider extends BaseProvider {
         cost,
         decisionReason,
         payload,
-        response: intent,
+        response: radarReversal ? { ...intent, bisRadarReversal: radarReversal } : intent,
         ...(fraudRiskLevel !== undefined ? { fraudRiskLevel } : {}),
         ...(fraudRiskScore !== undefined ? { fraudRiskScore } : {}),
-        ...(status === 'failed'
+        ...(status === 'failed' || fraudBlockedMessage
           ? { error: fraudBlockedMessage || intent.last_payment_error?.message || `PaymentIntent status: ${intent.status}` }
           : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      // Network error / timeout / 5xx / unparseable answer → 'unknown'
+      // (never failed over); a real decline / 4xx → 'failed'.
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'err_' });
+    }
+  }
+
+  /**
+   * Undoes a PaymentIntent that Radar scored 'highest' risk AFTER Stripe
+   * accepted it (gap register E5). Stripe's model makes this two different
+   * calls depending on capture state (Stripe API reference — PaymentIntents
+   * "cancel" and Refunds "create"):
+   *
+   *  - 'requires_capture' (authorized, not captured): POST
+   *    /v1/payment_intents/:id/cancel with cancellation_reason=fraudulent —
+   *    releases the authorization; no money was taken. A cancelled
+   *    PaymentIntent reports status 'canceled'.
+   *  - 'succeeded' (captured — this adapter's normal confirm=true,
+   *    automatic-capture flow): a succeeded PaymentIntent can NOT be
+   *    cancelled; the money is returned with POST /v1/refunds
+   *    {payment_intent}. A refund reports 'succeeded' or 'pending' (accepted,
+   *    settling) — both mean Stripe has taken responsibility for returning
+   *    the funds; 'failed'/'canceled'/'requires_action' do not.
+   *
+   * Both calls carry their own deterministic Idempotency-Key (derived from
+   * the charge's), so a retry can never refund/cancel twice. They run to
+   * completion even if the router has already given up on this call (an
+   * explicit, never-aborted signal): returning a customer's money must not
+   * be abandoned half-way by the charge's own timeout. Returns ok:false —
+   * never throws — when the reversal cannot be confirmed.
+   */
+  private async reverseRadarBlockedIntent(intent: any, chargeIdempotencyKey: string): Promise<RadarReversal> {
+    const kind: 'refund' | 'cancel' = intent.status === 'requires_capture' ? 'cancel' : 'refund';
+    const headers = {
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Idempotency-Key': `${chargeIdempotencyKey}_radar_${kind}`.slice(0, 255),
+    };
+    const keepRunning = new AbortController().signal;
+    try {
+      const res = kind === 'cancel'
+        ? await this.http_request({
+            method: 'POST',
+            url: `${this.baseUrl}/payment_intents/${encodeURIComponent(intent.id)}/cancel`,
+            headers,
+            body: this.toFormBody({ cancellation_reason: 'fraudulent' }),
+            timeoutMs: 15_000,
+            maxAttempts: 3,
+            retryAmbiguous: true,
+            signal: keepRunning,
+          })
+        : await this.http_request({
+            method: 'POST',
+            url: `${this.baseUrl}/refunds`,
+            headers,
+            body: this.toFormBody({
+              payment_intent: intent.id,
+              'metadata[bisReason]': 'stripe_radar_risk_level_highest',
+            }),
+            timeoutMs: 15_000,
+            maxAttempts: 3,
+            retryAmbiguous: true,
+            signal: keepRunning,
+          });
+      if (res.status >= 400) {
+        return { ok: false, kind, error: res.body?.error?.message || `Stripe ${kind} error: HTTP ${res.status}` };
+      }
+      const providerStatus = String(res.body?.status ?? '');
+      const ok = kind === 'cancel' ? providerStatus === 'canceled' : providerStatus === 'succeeded' || providerStatus === 'pending';
+      return ok
+        ? { ok: true, kind, id: String(res.body?.id ?? ''), providerStatus }
+        : { ok: false, kind, error: `Stripe ${kind} returned status '${providerStatus || 'none'}'` };
+    } catch (err: any) {
+      return { ok: false, kind, error: err?.message || String(err) };
     }
   }
 

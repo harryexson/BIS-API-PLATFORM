@@ -152,28 +152,39 @@ export class AirwallexProvider extends BaseProvider {
     const confirmRequestId = this.paymentIdempotencyIdentity(payload, { maxLength: 64, suffix: 'confirm' });
     const orderId = requestId;
 
+    // Phase 11-12 (A10/E4): the login and create-intent steps move no
+    // money — a PaymentIntent is only charged by /confirm. ANY failure
+    // before /confirm is sent (even an ambiguous one: at worst an orphaned,
+    // never-confirmed intent exists at Airwallex) is therefore a definite
+    // non-charge. Only the confirm step can be ambiguous.
+    let intentId: string | undefined;
     try {
-      const token = await this.getAccessToken();
-
-      const createRes = await this.http_request({
-        method: 'POST',
-        url: `${this.baseUrl}/api/v1/pa/payment_intents/create`,
-        headers: { Authorization: `Bearer ${token}` },
-        body: {
-          request_id: requestId,
-          amount,
-          currency: currency.toUpperCase(),
-          merchant_order_id: orderId,
-        },
-      });
-
-      if (createRes.status >= 400) {
-        throw new Error(createRes.body?.message || `Airwallex create-intent error: HTTP ${createRes.status}`);
+      let token: string;
+      let createRes;
+      try {
+        token = await this.getAccessToken();
+        createRes = await this.http_request({
+          method: 'POST',
+          url: `${this.baseUrl}/api/v1/pa/payment_intents/create`,
+          headers: { Authorization: `Bearer ${token}` },
+          body: {
+            request_id: requestId,
+            amount,
+            currency: currency.toUpperCase(),
+            merchant_order_id: orderId,
+          },
+        });
+      } catch (preConfirmErr: any) {
+        throw this.definiteFailure(preConfirmErr?.message || String(preConfirmErr));
       }
 
-      const intentId = createRes.body?.id;
+      if (createRes.status >= 400) {
+        throw this.definiteFailure(createRes.body?.message || `Airwallex create-intent error: HTTP ${createRes.status}`, createRes.status);
+      }
+
+      intentId = createRes.body?.id;
       if (!intentId) {
-        throw new Error('Airwallex create-intent response did not include an id');
+        throw this.definiteFailure('Airwallex create-intent response did not include an id (confirm was not attempted)');
       }
 
       const confirmRes = await this.http_request({
@@ -185,22 +196,35 @@ export class AirwallexProvider extends BaseProvider {
           customer_id: customerId,
           payment_consent_id: paymentToken,
         },
+        // Not relying on Airwallex replaying a repeated request_id (it is
+        // documented as a uniqueness key; whether a duplicate returns the
+        // original result or a rejection is not verified here). A confirm
+        // that may have reached Airwallex is never re-sent.
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
 
       if (confirmRes.status >= 400) {
-        throw new Error(confirmRes.body?.message || `Airwallex confirm error: HTTP ${confirmRes.status}`);
+        const message = confirmRes.body?.message || `Airwallex confirm error: HTTP ${confirmRes.status}`;
+        // A request_id duplicate rejection means an earlier confirm with this
+        // id exists — whose outcome we do not have: ambiguous. Otherwise the
+        // generic rule (4xx definite, 5xx ambiguous).
+        if (/duplicate/i.test(String(confirmRes.body?.code ?? ''))) throw this.ambiguousOutcome(message, confirmRes.status);
+        throw this.httpErrorOutcome(confirmRes, message);
       }
 
       const intent = confirmRes.body;
-      // SUCCEEDED: money moved. PENDING/REQUIRES_CUSTOMER_ACTION: genuinely
-      // unresolved (e.g. a 3DS challenge this adapter has no flow to
-      // relay) — not a failure. Everything else Airwallex could return
-      // synchronously here (REQUIRES_PAYMENT_METHOD, CANCELLED, EXPIRED)
-      // is a definite, non-ambiguous failure.
+      // SUCCEEDED: money moved. REQUIRES_PAYMENT_METHOD (the confirm was
+      // declined), CANCELLED, EXPIRED: definite, non-ambiguous failures.
+      // Everything else — PENDING, REQUIRES_CUSTOMER_ACTION (e.g. a 3DS
+      // challenge this adapter has no flow to relay), REQUIRES_CAPTURE (an
+      // authorization holding funds; it used to fall through to 'failed'),
+      // or a status this adapter does not recognise — is unresolved.
       const status =
-        intent.status === 'SUCCEEDED' ? 'success' : intent.status === 'PENDING' || intent.status === 'REQUIRES_CUSTOMER_ACTION' ? 'unknown' : 'failed';
+        intent?.status === 'SUCCEEDED' ? 'success'
+          : ['REQUIRES_PAYMENT_METHOD', 'CANCELLED', 'EXPIRED'].includes(intent?.status) ? 'failed'
+            : 'unknown';
 
       const feePercent = this.config.transactionFeePercent || 2.0;
       const cost = status === 'success' ? (amount * feePercent) / 100 : 0;
@@ -222,23 +246,13 @@ export class AirwallexProvider extends BaseProvider {
         ...(status === 'failed' ? { error: intent.message || `Airwallex status: ${intent.status}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'awx_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      // An ambiguous confirm keeps the real PaymentIntent id (known from the
+      // create step) so reconciliation can look it up.
+      return this.paymentFailureEvent({
+        appId, payload, decisionReason, err, startTime, amount, currency,
+        idPrefix: 'awx_err_',
+        providerTransactionId: intentId,
+      });
     }
   }
 

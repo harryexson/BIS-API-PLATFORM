@@ -239,18 +239,32 @@ export class SquareProvider extends BaseProvider {
         },
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // Square dedupes CreatePayment on idempotency_key and returns the
+        // original payment for a repeated key — retrying cannot charge twice.
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400) {
         const err = res.body?.errors?.[0];
-        throw new Error(err?.detail || `Square API error: HTTP ${res.status}`);
+        const message = (err?.detail || `Square API error: HTTP ${res.status}`) + (err?.code ? ` (${err.code})` : '');
+        // Square's documented error categories: PAYMENT_METHOD_ERROR (HTTP
+        // 402 — CARD_DECLINED, INSUFFICIENT_FUNDS, CVV_FAILURE, ...) is the
+        // issuer's answer for this idempotency key's single payment: a
+        // definite decline. IDEMPOTENCY_KEY_REUSED means a payment with this
+        // key already exists with different parameters — what it did is not
+        // known here: ambiguous. Otherwise the generic rule (5xx API_ERROR /
+        // SERVICE_UNAVAILABLE / GATEWAY_TIMEOUT ambiguous, other 4xx definite).
+        if (err?.category === 'PAYMENT_METHOD_ERROR') throw this.definiteFailure(message, res.status);
+        if (err?.code === 'IDEMPOTENCY_KEY_REUSED') throw this.ambiguousOutcome(message, res.status);
+        throw this.httpErrorOutcome(res, message);
       }
 
       const payment = res.body?.payment;
       if (!payment) {
-        throw new Error('Square CreatePayment response did not include a payment object');
+        // A 2xx we cannot interpret: the payment may exist.
+        throw this.ambiguousOutcome('Square CreatePayment response did not include a payment object', res.status);
       }
 
       const feePercent = this.config.transactionFeePercent || 0;
@@ -283,23 +297,7 @@ export class SquareProvider extends BaseProvider {
         ...(status === 'failed' ? { error: `Square payment status: ${payment.status}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'square_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'square_err_' });
     }
   }
 

@@ -131,6 +131,9 @@ export class FlutterwaveProvider extends BaseProvider {
         headers: { Authorization: `Bearer ${this.apiKey}` },
         body: { amount },
         timeoutMs: 30_000,
+        // No refund idempotency key is sent (gap register E14), so a refund
+        // that may have reached the provider is never blindly re-sent.
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
@@ -222,20 +225,32 @@ export class FlutterwaveProvider extends BaseProvider {
           narration: decisionReason.slice(0, 100),
         },
         timeoutMs: 30_000,
+        // tx_ref is a uniqueness reference, not a replaying idempotency key:
+        // a re-sent charge with the same tx_ref is (at best) rejected as a
+        // duplicate, which says nothing about whether the first went
+        // through. So a charge that may have reached Flutterwave is never
+        // re-sent (the old default retried 5xx/timeouts up to 3 times).
+        retryAmbiguous: false,
       });
 
       const latency = Date.now() - startTime;
 
-      // A non-2xx or a top-level status: "error" both mean the request
-      // itself was rejected (bad params, invalid/expired token, auth
-      // failure) — never got far enough to attempt a charge at all.
+      // A 4xx or a top-level status: "error" both mean the request itself
+      // was rejected (bad params, invalid/expired token, auth failure) —
+      // never got far enough to attempt a charge at all. EXCEPT: a 5xx
+      // (Flutterwave's own server failed, possibly after charging) and a
+      // duplicate-tx_ref rejection (a charge with this payment's reference
+      // already exists) are ambiguous.
       if (res.status >= 400 || res.body?.status === 'error') {
-        throw new Error(res.body?.message || `Flutterwave API error: HTTP ${res.status}`);
+        const message = res.body?.message || `Flutterwave API error: HTTP ${res.status}`;
+        if (/duplicate/i.test(String(message))) throw this.ambiguousOutcome(message, res.status);
+        if (res.status >= 400) throw this.httpErrorOutcome(res, message);
+        throw this.definiteFailure(message, res.status);
       }
 
       const data = res.body?.data;
       if (!data) {
-        throw new Error('Flutterwave response did not include a data object');
+        throw this.ambiguousOutcome('Flutterwave response did not include a data object', res.status);
       }
 
       // The top-level status: "success" only means the request was
@@ -243,7 +258,13 @@ export class FlutterwaveProvider extends BaseProvider {
       // 'pending' is a genuinely unresolved outcome (common for bank
       // transfer / mobile money legs of a charge still settling), not a
       // confirmed failure — must not be conflated with 'failed'.
-      const status = data.status === 'successful' ? 'success' : data.status === 'pending' ? 'unknown' : 'failed';
+      // Phase 11-12: only an explicit 'failed'/'error' data.status is a
+      // definite decline; an unrecognised/missing one is unresolved (it used
+      // to default to 'failed').
+      const status =
+        data.status === 'successful' ? 'success'
+          : data.status === 'failed' || data.status === 'error' ? 'failed'
+            : 'unknown';
 
       const isLocal = ['NGN', 'GHS', 'KES'].includes(currency.toUpperCase());
       const feePercent = this.config.transactionFeePercent || (isLocal ? 1.4 : 3.8);
@@ -266,23 +287,7 @@ export class FlutterwaveProvider extends BaseProvider {
         ...(status === 'failed' ? { error: data.processor_response || `Flutterwave data.status: ${data.status}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'flw_err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'flw_err_' });
     }
   }
 

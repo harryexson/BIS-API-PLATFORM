@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { RoutingEngine, ProviderTimeoutError } from './index';
-import { ProviderRegistry } from '@company/providers';
+import { ProviderRegistry, ProviderUnavailableError } from '@company/providers';
 
 describe('RoutingEngine', () => {
   let engine: RoutingEngine;
@@ -376,8 +376,13 @@ describe('RoutingEngine', () => {
       const registry = ProviderRegistry.getInstance();
       const stripe = registry.getProvider('stripe')!;
 
+      // Phase 11-12: the mocked error is now exactly what the adapter's own
+      // pre-flight check (BaseProvider.verifyAvailability) throws — a
+      // ProviderUnavailableError, explicitly classified definite (nothing was
+      // sent). A thrown error with NO classification is treated as ambiguous
+      // and is not failed over (see payment-ambiguity.test.ts).
       const stripeSpy = vi.spyOn(stripe, 'processRequest').mockRejectedValueOnce(
-        new Error('Provider Stripe is currently OFFLINE'),
+        new ProviderUnavailableError('Provider Stripe is currently OFFLINE'),
       );
 
       const result = await engine.routePayment('testapp', {

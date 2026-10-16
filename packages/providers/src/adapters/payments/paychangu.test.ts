@@ -221,9 +221,13 @@ describe('PayChanguProvider', () => {
       expect(event.error).toBe('Unauthorized');
     });
 
-    it('retries on 5xx (via BaseProvider.http_request) and eventually reports failure if every attempt fails', async () => {
+    // Phase 11-12 (A10/E4): this test used to assert the DEFECT — the charge
+    // was blindly re-sent on 5xx (this provider's reference is a uniqueness
+    // check, not a replaying idempotency key) and then reported 'failed', which
+    // the router failed over. Now: exactly one request, outcome 'unknown'.
+    it('never re-sends a charge whose 5xx may have been processed (no replaying idempotency key), and reports it as unknown', async () => {
       process.env.PAYCHANGU_API_KEY = 'test-key';
-      const fetchSpy = vi.fn().mockResolvedValue(
+      const fetchSpy = vi.fn().mockImplementation(async () =>
         new Response(JSON.stringify({ status: 'error', message: 'Internal error' }), {
           status: 500,
           headers: { 'content-type': 'application/json' },
@@ -234,8 +238,8 @@ describe('PayChanguProvider', () => {
       const provider = new PayChanguProvider(makeConfig());
       const event = await provider.processRequest('app1', validPayload, 'test');
 
-      expect(fetchSpy.mock.calls.length).toBeGreaterThan(1);
-      expect(event.status).toBe('failed');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(event.status).toBe('unknown');
     }, 15_000);
 
     it('reports offline/maintenance status without making an HTTP call', async () => {

@@ -253,13 +253,25 @@ export class AdyenProvider extends BaseProvider {
         },
         timeoutMs: 30_000,
         maxAttempts: 2,
+        // Adyen honours the Idempotency-Key header and returns the original
+        // response for a repeated key, so retrying an ambiguous attempt
+        // cannot create a second payment.
+        retryAmbiguous: true,
       });
 
       const latency = Date.now() - startTime;
 
       if (res.status >= 400) {
         const err = res.body;
-        throw new Error(err?.message || `Adyen API error: HTTP ${res.status}`);
+        const message = err?.message || `Adyen API error: HTTP ${res.status}`;
+        // Adyen's error envelope ({status, errorCode, message, errorType}):
+        // 4xx validation/security errors are rejected before any
+        // authorisation (definite). errorCode 704 ("request already
+        // processed or in progress" for this Idempotency-Key) says an
+        // earlier request with the same key exists whose result we did not
+        // get — ambiguous. 5xx is ambiguous (generic rule).
+        if (String(err?.errorCode ?? '') === '704') throw this.ambiguousOutcome(message, res.status);
+        throw this.httpErrorOutcome(res, message);
       }
 
       const result = res.body;
@@ -306,23 +318,10 @@ export class AdyenProvider extends BaseProvider {
         ...(status === 'failed' ? { error: result.refusalReason || `resultCode: ${result.resultCode}` } : {}),
       };
     } catch (err: any) {
-      const latency = Date.now() - startTime;
-      return {
-        id: 'err_' + randomUUID().replace(/-/g, '').slice(0, 16),
-        timestamp: new Date().toISOString(),
-        appId,
-        category: 'payment',
-        providerId: this.config.id,
-        status: 'failed',
-        amount,
-        currency,
-        latency,
-        cost: 0,
-        decisionReason,
-        payload,
-        response: null,
-        error: err.message,
-      };
+      // Transport error / timeout / 5xx / 704 → 'unknown' (never failed
+      // over); a 4xx rejection → 'failed'. A Refused resultCode never gets
+      // here — it is a 200 with a definite answer, mapped above.
+      return this.paymentFailureEvent({ appId, payload, decisionReason, err, startTime, amount, currency, idPrefix: 'err_' });
     }
   }
 
