@@ -205,21 +205,24 @@ Redis is never actually used by this deployment as currently wired — `createSt
 - **Test proving remediation:** `webhook-pipeline.postgres.integration.test.ts` (8 tests, real Postgres + real Redis) proves a temporary DB failure is retried to completion (consumer attempts=2, exactly 1 events row + 1 outbox row written), and a later replay of the same event completes as a no-op. `resilience-failure.simulation.test.ts`'s R8 test — which previously *asserted* the permanent-lockout bug as correct behavior — was rewritten to assert the retry completes correctly instead (a strictly stronger test, not a weakened one). Independently re-run by the orchestrating session: 677/732 passing, 0 failed.
 - **Status:** **FIXED**
 
-### B6. Rescued job with a stuck idempotency claim completes without running
+### B6. Rescued job with a stuck idempotency claim completes without running — **FIXED, Phase 13**
 
-- **File/Line:** `packages/workers/src/worker.ts` `processJob` L106-112; `idempotency.ts` `claim` L18-23
-- **Finding:** `if (state === 'completed' || state === 'processing') { await this.queue.complete(job); return; }` — a job rescued by the stale-job reaper after a worker crash, whose idempotency claim is still `processing` (24h TTL, never released by the crash), gets marked `completed` having run zero times.
-- **Severity:** **P0**
-- **Reproduced:** probe2-B (0 processor runs, final status `completed`).
-- **Status:** OPEN
+- **Original defect:** `packages/workers/src/worker.ts` `processJob` — `if (state === 'completed' || state === 'processing') { await this.queue.complete(job); return; }`. A job rescued by the stale-job reaper after a worker crash, whose idempotency claim was still `processing` (24h TTL, never released by the crash), got marked `completed` having run zero times.
+- **Reproduced (original defect):** probe2-B (0 processor runs, final status `completed`).
+- **Fix:** `idempotency.ts`'s `IdempotencyRecord` now carries an optional `ownerJobId`; `claim()` stores it. `queue.ts`'s `rescueStuckJobs` calls a new `releaseAbandonedClaim(key, jobId)` before re-queueing a stale job — it deletes the claim only if it is still `processing` *and* owned by that same job id, so a claim held by a different job sharing the key, or one already `completed`, is left alone.
+- **Test proving remediation:** `packages/workers/src/worker-reliability.test.ts` (new, 20 tests across MemoryStore and real Redis). The core B6 scenario: worker A crashes mid-job holding the claim; replacement worker B's startup reaper rescues it and the job runs exactly once. Two scope guards: a claim held by a different job is not released; a `completed` claim is not re-run.
+- **Independently verified by the orchestrating session:** code read directly in `queue.ts`/`idempotency.ts`/`worker.ts`, matching the above; `worker-reliability.test.ts` run in isolation — 20/20 passing, real Redis confirmed in the log output (`[worker] rescued 1 orphaned processing job(s) on startup`).
+- **Residual risk, disclosed:** claims written *before* this fix ships carry no `ownerJobId`, so the reaper won't release them — a job that crashes during the rolling deploy of this fix can still hit B6 once, until that claim's 24h TTL expires (PHASE13-03). The fix also trusts the reaper's staleness judgment, which has no heartbeat to rely on (B10, still open) — PHASE13-04.
+- **Status:** **FIXED**
 
-### B7. `promoteDelayed()` races and duplicates jobs
+### B7. `promoteDelayed()` races and duplicates jobs — **FIXED, Phase 13**
 
-- **File/Line:** `packages/workers/src/queue.ts` `promoteDelayed` L111-121
-- **Finding:** `zrem`'s return value is ignored, so concurrent promoters (5 worker loops per process, plus a periodic sweep timer per replica) can each `rpush` the same job id, and two workers then process the same job concurrently. This affects every retried job, including non-idempotent ones like message sends.
-- **Severity:** **P0**
-- **Reproduced:** probe2-A (duplicate id in ready list).
-- **Status:** OPEN
+- **Original defect:** `packages/workers/src/queue.ts` `promoteDelayed` — `zrem`'s return value was ignored, so concurrent promoters (5 worker loops per process, plus a periodic sweep timer per replica) could each `rpush` the same job id, and two workers then processed the same job concurrently. Affected every retried job, including non-idempotent ones like message sends.
+- **Reproduced (original defect):** probe2-A (duplicate id in ready list); independently re-reproduced by the orchestrating session below.
+- **Fix:** `zrem` is now the claim itself — `rpush` (and the promoted-count increment) only happens if `zrem` returned 1. Redis executes `ZREM` atomically, so for a given id exactly one concurrent caller wins. `promoteDelayed` now returns the number of jobs *that call* promoted (`Promise<number>`, was `void`); both callers ignore the value.
+- **Test proving remediation:** `worker-reliability.test.ts` — five concurrent promoters over the same due jobs push each id onto the ready list exactly once (MemoryStore and real Redis); an end-to-end run with 2 managers × 5 loops where a job fails once confirms it is run exactly twice (fail + retry), not more.
+- **Independently verified by the orchestrating session:** code read directly in `queue.ts`, matching the above. The orchestrating session also independently reproduced the original defect as its own negative control: reverted `promoteDelayed` to the naive (return-value-ignored) form, re-ran the concurrent-promoters test, and got the exact failure `expected 100 to be 20` (every one of 20 due jobs pushed 5 times) — then restored the fix and confirmed the restored file's SHA-256 matched the pre-revert fix byte-for-byte, and all 20 tests in the file passed again.
+- **Status:** **FIXED**
 
 ### B8. Gateway acknowledges a webhook, marks it seen, then can still drop it — **FIXED, Phase 4**
 
@@ -240,7 +243,8 @@ Redis is never actually used by this deployment as currently wired — `createSt
 - **File/Line:** `queue.ts` `rescueStuckJobs` L186-214; invoked with a 5-minute default at one startup site, a 2-minute default at another, and every `reconciliationIntervalMs` (300s) on a timer — three different effective windows.
 - **Finding:** `updatedAt` is only written at dequeue time, so a legitimately long-running job can be rescued (and double-processed via B7) while still genuinely in progress, especially during rolling deploys. The reaper also does a full `SCAN` of every job key every pass (O(total jobs), every 5 minutes) and its `setInterval` callback has no try/catch, so a transient store error becomes an unhandled rejection that can crash the worker process outright (default Node behavior).
 - **Severity:** P1 / P2 (bundled)
-- **Status:** OPEN
+- **New sub-finding from Phase 13 (PHASE13-01, not fixed, explicitly deferred to this finding):** `rescueStuckJobs` itself has the same unclaimed-race shape B7 had — two replicas reaping concurrently each push the same stale job id, probed directly by the Phase 13 agent on both MemoryStore and real Redis (`rescued: [1,1]`, same job id in both ready lists). The Phase 13 B6 fix limits the damage for idempotency-keyed jobs (the duplicate copy hits the "processing → skip" dedup instead of running twice) but jobs without an idempotency key are still double-run. Left unfixed deliberately — it is reaper-claim territory, i.e. this finding, not B6/B7's.
+- **Status:** OPEN (now carrying PHASE13-01 as a confirmed, probed sub-instance)
 
 ### B11. Graceful shutdown is broken
 
@@ -262,19 +266,23 @@ Redis is never actually used by this deployment as currently wired — `createSt
 - **Severity:** P1
 - **Status:** OPEN
 
-### B14. Rate-limiter window never resets under continuous traffic
+### B14. Rate-limiter window never resets under continuous traffic — **FIXED, Phase 14**
 
-- **File/Line:** `packages/workers/src/rateLimit.ts` `limit` L19-36; `store.redis.ts incr` L131-136; `store.memory.ts incr` L47-52
-- **Finding:** `incr` re-applies the full TTL on every single call (not just the first), so under steady traffic the key never naturally expires; once an app hits `maxRequests` it stays blocked indefinitely, and each blocked attempt extends the window further.
-- **Severity:** P1
-- **Status:** OPEN
+- **Original defect:** `packages/workers/src/rateLimit.ts` `limit`; `store.redis.ts incr`; `store.memory.ts incr`. `incr` re-applied the full TTL on every single call (not just the first), so under steady traffic the key never naturally expired; once an app hit `maxRequests` it stayed blocked indefinitely, and each blocked attempt extended the window further.
+- **Reproduced (original defect):** 150ms after creating a 400ms key, the TTL read back as 400 (memory)/399 (Redis); a caller retrying every 25ms was never allowed again after its first 3 requests.
+- **Fix:** both stores now implement a genuine fixed window. `store.redis.ts` uses a single atomic Lua script (`INCR`, then `PEXPIRE` only if the result is 1, or if `PTTL` reads -1 — the latter a guard so a counter somehow left without a TTL, e.g. by a pre-fix key, can never become a permanent block) — one atomic server-side step, so concurrent first-increments from different processes can't each re-arm the window. `store.memory.ts`'s `incr` sets the expiry only on the call that creates the key (or if the existing key somehow has none). `rateLimit.ts`'s redundant, non-atomic follow-up `expire()` call is removed.
+- **Test proving remediation:** `packages/workers/src/rate-limit.test.ts` (new, 8 tests, MemoryStore and real Redis, following Phase 13's dual-backend pattern) — confirms the window actually closes on schedule under steady/concurrent traffic, and that a pre-existing TTL-less key is still eventually given one.
+- **Independently verified by the orchestrating session:** `store.redis.ts`/`store.memory.ts`/`rateLimit.ts` read directly, matching the above exactly; `npx tsc --noEmit` clean; full suite 996/0/167 (1163 total), confirmed directly.
+- **Status:** **FIXED**
 
-### B15. Distributed lock throws on contention instead of waiting/skipping
+### B15. Distributed lock throws on contention instead of waiting/skipping — **PARTIALLY FIXED, Phase 13**
 
-- **File/Line:** `packages/workers/src/lock.ts` `withLock` L24-27
-- **Finding:** Contention immediately throws rather than retrying or deferring, which is the direct mechanism behind B5's provider-webhook-vs-health-check collision. No lease renewal or fencing token exists either.
-- **Severity:** P1 (P0 in combination with B5 for provider webhooks)
-- **Status:** OPEN
+- **Original defect:** `packages/workers/src/lock.ts` `withLock` — contention immediately threw rather than retrying or deferring, which was the direct mechanism behind B5's provider-webhook-vs-health-check collision (B5 itself already fixed in Phase 4 by removing that lock dependency entirely).
+- **Fix:** `lock.ts` gains `acquireWithWait` (bounded exponential backoff: 25ms doubling to a 500ms cap) and `tryWithLock` (returns `{acquired:false}` on contention, never throws for contention — store errors still propagate). `withLock` itself now waits up to a default 5s before throwing the new `LockNotAcquiredError`, rather than throwing immediately. All three call sites were checked individually: `jobs/reconciliation.ts` and `jobs/providerHealth.ts` switch to `tryWithLock` and skip with a warning (each is a sweep/check every replica enqueues, so a losing replica skipping is correct — the work is already being done); `jobs/providerWebhook.ts` keeps `withLock` (now waiting) since a webhook status update must not be skipped.
+- **Test proving remediation:** `worker-reliability.test.ts` — `withLock` waits for a holder that releases within the bound then runs; `withLock` gives up after the bound with `LockNotAcquiredError`; `tryWithLock` returns `{acquired:false}` and never throws; a real `provider_health` job under contention completes (skips) with `attempts=0` instead of failing into retry/dead-letter; the reconciliation job skips cleanly with no throw.
+- **Independently verified by the orchestrating session:** `lock.ts` read directly in full, matching the above; `worker-reliability.test.ts` run in isolation, 20/20 passing with the real-Redis skip messages (`[provider_health] skipped p1: another health check holds the provider lock`, `[reconciliation] skipped: another reconciliation run holds the lock`) visible in the output.
+- **Why PARTIALLY FIXED, not FIXED:** the register's own text also named "no lease renewal and no fencing token" as part of this finding — neither was added this phase (lock TTL is `retry.maxDelayMs`, 300s, and critical sections are short, so the implementing agent judged practical risk low, but the gap itself remains OPEN as PHASE13-05).
+- **Status:** **PARTIALLY FIXED** — contention behavior (the P0-in-combination mechanism) is fixed; lease renewal/fencing is not, tracked as PHASE13-05.
 
 ### B16. Minor/Info findings (workers/queue)
 
@@ -282,7 +290,7 @@ Redis is never actually used by this deployment as currently wired — `createSt
 - Dead letters and job bodies expire after 24h (`idempotencyTtlMs`); no durable Postgres record of permanently-failed payment webhooks (P1).
 - `retry_processing`'s dead-letter re-drive has no lock of its own, so overlapping runs can double re-drive the same dead job (P1).
 - No admin HTTP route exists to list or replay dead letters; operators are limited to `redis-cli`, which is moot while B1 is open (P1).
-- The gateway's rate limiter (`rate-limiter-flexible`, separate from the workers package's own `RateLimiter`) reports `type:'redis'` whenever `REDIS_URL` is merely set, regardless of actual connectivity — a misleading readiness signal layered on top of B13 (P2).
+- The gateway's rate limiter (`rate-limiter-flexible`, separate from the workers package's own `RateLimiter`) reports `type:'redis'` whenever `REDIS_URL` is merely set, regardless of actual connectivity — a misleading readiness signal layered on top of B13 (P2). **Phase 14 found and fixed a concrete instance of the underlying connectivity bug** (PHASE14-01: the gateway's Redis limiter client was created with `lazyConnect`+`enableOfflineQueue:false` and never actually connected, so its first real command was silently rejected and that request fell through to the per-process in-memory insurance limiter instead of the shared distributed one) — but the readiness-reporting misrepresentation itself (`storeBacked:true` regardless of actual connection state) remains unfixed, explicitly deferred to B13/Phase 19.
 - Fixed per-process worker concurrency (default 5) with no per-type fairness; strict priority-order scheduling can starve low-priority job types under a constant high-priority backlog (P2/P3).
 
 ---
@@ -383,18 +391,23 @@ The gateway correctly derives application identity server-side and never trusts 
 - **Severity:** P1 — conditional account takeover if any staging/pre-prod deployment forgets to set `NODE_ENV=production` exactly
 - **Status:** OPEN
 
-### C14. Rate limiting runs before auth, keyed on an unvalidated attacker-chosen string — enables admin-token brute force
+### C14. Rate limiting runs before auth, keyed on an unvalidated attacker-chosen string — enables admin-token brute force — **FIXED, Phase 14**
 
-- **File/Line:** `auth.ts:145-151` (`const id = auth.extractKey(req) || req.ip || 'anonymous'`); admin routes authenticate via `x-admin-token`, not `x-api-key`, so sending a fresh random `x-api-key` per request gives each request a fresh rate-limit bucket
-- **Severity:** P1
-- **Risk:** Unlimited brute-force attempts against the single shared `ADMIN_API_TOKEN`, with `/api/dashboard/admin/verify` as a free oracle; unlimited invalid-API-key DB-lookup attempts on `/v1/api/*`.
-- **Status:** OPEN
+- **Original defect:** `auth.ts` — `const id = auth.extractKey(req) || req.ip || 'anonymous'`. Admin routes authenticate via `x-admin-token`, not `x-api-key`, so sending a fresh random `x-api-key` per request gave each request a fresh rate-limit bucket — defeating rate limiting entirely for brute-forcing the shared `ADMIN_API_TOKEN` (`/api/dashboard/admin/verify` as a free oracle) or for API-key guessing on `/v1/api/*`.
+- **Reproduced (original defect):** over real HTTP with a limit of 5 — 10 guesses at `/api/dashboard/admin/verify`, each with a fresh random `x-api-key`, all came back 403 with no 429 ever triggered; random Bearer keys on an authenticated route all came back 401, never throttled.
+- **Fix:** every request on a rate-limited mount is now charged to `ip:<caller IP>` **before** any key lookup happens — a throttled caller can no longer use the gateway as a key-validity oracle, and a concurrent burst can't race past the limit while lookups are in flight. Only a key that actually authenticates has its charge moved to a per-application bucket (`app:<slug>`, with the IP point refunded) — so legitimate tenants keep an independent per-application budget even when sharing an address; a failed key stays charged to the IP. Admin routes (which never authenticate via `x-api-key`) and public reads now rate-limit on IP alone. A new strict-tier limiter (`authRateLimit`, default 20 requests/15min, its own Redis key prefix) is used for credential-sensitive public routes (see C15). The `AuthService.authenticate()` lookup the new IP-first check performs is cached on the request (`preAuth`) so the downstream `apiKey` middleware doesn't repeat the same DB lookup.
+- **Test proving remediation:** `packages/simulation/src/rate-limiting.scenarios.ts`/`.simulation.test.ts`/`.redis.simulation.test.ts` (10 shared HTTP scenarios, run against both the in-memory limiter and a real spawned Redis) — repeated-fresh-key admin guesses now hit 429 after the configured limit; concurrent bursts can't exceed the limit; two separate `AuthService` instances sharing one Redis bucket are jointly bounded by the limit (not each independently). `security-isolation.simulation.test.ts`'s own admin-brute-force case (N) was strengthened in the same pass as F10 below.
+- **Independently verified by the orchestrating session:** `auth.ts` read directly in full — the IP-first-charge/refund-to-app-bucket logic matches the above exactly. **Independently reproduced the original defect as its own negative control**, not only trusting the agent's report: reverted the `rateLimit` middleware to the pre-fix `extractKey(req) || req.ip` form, re-ran `rate-limiting.simulation.test.ts`, and got 4 failing tests with exactly the reported shape (fresh-key admin/API guesses never reaching 429 — e.g. `expected [400,400,400,400,400] to deeply equal [429,429,429,429,429]`) — then restored the fix and confirmed the restored file's SHA-256 matched the pre-revert fix byte-for-byte; all 10 tests passed again.
+- **New finding from this fix (PHASE14-02, not a defect, a hardening side-effect):** gateway rate-limit bucket keys used to be `rl:<raw API key>` — the raw API key stored as a literal substring of a Redis key name. They are now `app:<slug>`/`ip:<address>`, so a plaintext key never appears in Redis key names, and every key belonging to one application now correctly shares one budget instead of each key getting its own.
+- **Status:** **FIXED**
 
-### C15. Several high-value routes have no rate limiting at all
+### C15. Several high-value routes have no rate limiting at all — **FIXED, Phase 14**
 
-- **File/Line:** `/refunds` (898), `/v1/portal/auth/login` (1605), `/v1/portal/auth/signup` (1533), `/v1/checkout/sessions/:token[/pay]` (1744,1760) — none sit under a rate-limited mount
-- **Severity:** P1
-- **Status:** OPEN
+- **Original defect:** `/refunds`, `/v1/portal/auth/login`, `/v1/portal/auth/signup`, `/v1/checkout/sessions/:token` and its `/pay` sub-route sat under none of the gateway's rate-limited mounts (line numbers in the original finding had drifted after 13 prior phases of changes; the implementing agent re-enumerated every `app.*` route outside the rate-limited mounts directly against HEAD to confirm all five, and every request to all five, were unlimited).
+- **Fix:** `/refunds` now sits under the general API rate limit; signup, login, and checkout's `/pay` now use the new strict `authRateLimit` tier (default 20 requests/15min per IP — credential/abuse-sensitive routes); checkout's `GET` (read-only) uses the general IP budget.
+- **Test proving remediation:** the same `rate-limiting.scenarios.ts` suite as C14 — all five routes proven throttled on both the in-memory limiter and real Redis.
+- **Independently verified by the orchestrating session:** `app.ts`'s five new middleware mount points read directly, matching the agent's reported line numbers and middleware choices.
+- **Status:** **FIXED**
 
 ### C16. SSE stream's tenant filter is a permanent no-op — **FIXED, Phase 7**
 
@@ -760,12 +773,15 @@ Every CI check is green and every prior document claims a PASS/FIXED/Remediated 
 - **Severity:** **P0** — per the user's explicit, repeated, verbatim instruction: "DO NOT hide failing tests. DO NOT weaken assertions. DO NOT delete failing tests. DO NOT convert real failures into skipped tests." These tests go further than any of those three prohibited patterns — they were written to assert the defect itself as the correct, expected outcome, which means fixing the underlying P0s in Sections B/C/D/E will make these specific tests fail and will need to be corrected as part of that remediation, not treated as a regression.
 - **Status:** OPEN — flagged explicitly for remediation-phase attention: these assertions must be inverted to assert the *fixed* behavior once the underlying P0 is remediated, never weakened or left as-is.
 
-### F10. "FIXED" admin-auth and rate-limit tests pass vacuously because `ADMIN_API_TOKEN` is never actually configured in the test harness
+### F10. "FIXED" admin-auth and rate-limit tests pass vacuously because `ADMIN_API_TOKEN` is never actually configured in the test harness — **PARTIALLY FIXED, Phase 14**
 
-- **File/Line:** `security-isolation.simulation.test.ts:189-204,274-284,297-311` — three tests accept a `503 Admin access not configured` response as a passing result, because the test harness never sets `ADMIN_API_TOKEN`; a fourth test's "rate limiting" assertion is satisfied entirely by `503`s (`RATE_LIMIT_MAX_REQUESTS` is set to `'100000'` in the harness, so the real limit is never hit)
-- **Severity:** P1
-- **Risk:** The actual wrong-token-returns-403 / correct-token-returns-200 / admin-rate-limiting paths are never exercised by any test in the repo.
-- **Status:** OPEN
+- **Original defect:** `security-isolation.simulation.test.ts` — three tests (I, M, and the original N) accepted a `503 Admin access not configured` response as a passing result, because the test harness never set `ADMIN_API_TOKEN`; N's "rate limiting" assertion was satisfied entirely by `503`s (`RATE_LIMIT_MAX_REQUESTS='100000'` in the harness, so the real configured limit was never hit).
+- **Proof the original test was vacuous, independently reproducible:** with admin rate limiting deleted from `app.ts` entirely, the original test file still passed 16/16.
+- **Fix:** the file now boots with a real `ADMIN_API_TOKEN` and `RATE_LIMIT_MAX_REQUESTS=60`, restoring the env afterwards. **N** now sends 200 parallel requests and asserts the exact split (60×403, 140×429, 0×503) — both with the correct token and with a fresh random key per request. **I** now asserts exactly 403 with no/wrong token and 200 with the correct one. **M** asserts 403 with no token, then — with the token — seeds a real probe secret through the live POST route and checks it comes back masked with the raw value absent.
+- **Test proving remediation:** the strengthened `security-isolation.simulation.test.ts` itself; a reverted-fix negative control (admin mounts removed from `app.ts`) left the *original* file passing 16/16 (confirming it was still vacuous) while the *new* file correctly failed both N cases.
+- **Independently verified by the orchestrating session:** code and diff read directly; full-suite run (996/0/167) includes this strengthened file passing for real with a configured token.
+- **Why PARTIALLY FIXED, not FIXED:** the original finding's own text named three specific vacuous tests (admin-auth I/M/N) — all three are now genuinely exercised. But the finding's broader item (`F10`'s companion line in the inventory: "portal JWT auth, billing, consent and webhook-endpoint route tests — zero", i.e. inventory item 15 under Section F) remains unaddressed; this phase fixed the admin-auth/rate-limit vacuity specifically, not the full breadth of missing HTTP-level auth test coverage.
+- **Status:** **PARTIALLY FIXED** — admin-auth/rate-limit vacuity closed; broader missing HTTP-auth test coverage (portal JWT, billing, consent, webhook-endpoint routes) remains OPEN, tracked as PHASE14-08.
 
 ### F11. OpenAPI spec would cause a 100x overcharge for any spec-compliant client, and documents routes/fields that don't exist in the gateway
 
@@ -822,8 +838,8 @@ This is the complete list from the CI/CD agent's cross-reference against the cer
 4. ~~**Public payment/checkout routes never forward `paymentToken`/`country`/`idempotencyKey`, so 9-10 of 14 card/mobile-money adapters' "no token" fallback fires and returns a fabricated success against a live, correctly-configured provider key — in production, on the platform's primary API route.**~~ **FIXED, Phase 3** — see C1/E1 for full remediation detail and test evidence (including a real-HTTP proof against a local mock Stripe server). This was the single highest-confidence, highest-severity finding in the register.
 5. ~~`createStore()` always falls back to in-memory, partitioning gateway and worker and silently dropping cross-process jobs (B1/B2).~~ **FIXED, Phase 4** — real Redis connection bug fixed, proven against a real `redis-server`.
 6. ~~Payment/provider webhook replay markers are set before processing and never cleared, making the first transient failure permanent (B5)...~~ **FIXED, Phase 4** — replaced with a token-based claim on a new durable table; proven on real Postgres+Redis.
-7. Rescued jobs with a stuck idempotency claim complete without ever running (B6).
-8. `promoteDelayed()` race duplicates retried jobs, including non-idempotent sends (B7).
+7. ~~Rescued jobs with a stuck idempotency claim complete without ever running (B6).~~ **FIXED, Phase 13** — see B6; reaper now releases an abandoned claim it owns before re-queueing, proven on MemoryStore and real Redis.
+8. ~~`promoteDelayed()` race duplicates retried jobs, including non-idempotent sends (B7).~~ **FIXED, Phase 13** — see B7; `zrem` is now the atomic claim. Independently re-reproduced by the orchestrating session as its own negative control.
 9. ~~Gateway acknowledges + marks-seen a webhook before a fire-and-forget enqueue that can silently fail (B8)...~~ **FIXED, Phase 4** — persist-before-acknowledge pipeline with DB-enforced uniqueness; see B8/D7.
 10. ~~**`db.transaction()` throws unconditionally on the neon-http driver...(D1).**~~ **FIXED (de-risked), Phase 4** — the dangerous call site is removed entirely; see D1 for the standing constraint this leaves for future phases.
 11. **The documented duplicate-charge-prevention unique index on `transactions` exists only in the Drizzle schema/snapshot, not in any actual migration — every real database is missing it, and the drift is permanently invisible to `drizzle-kit check` (D3).** *(FIXED, Phase 2 — see D3.)*
@@ -848,7 +864,7 @@ This is the complete list from the CI/CD agent's cross-reference against the cer
 30. **The OpenAPI specification documents payment amounts in the wrong unit; any client built correctly from the published spec's own example value overcharges every customer 100x (F11).**
 31. **Six prior "certification"/"security audit"/"disaster recovery" documents already present in this repository assert PASS/FIXED/Remediated/"None outstanding" outcomes that this Phase-0 inventory directly and specifically contradicts, including RTO claims for infrastructure (Railway config, a working build) that does not exist in the repository at all (F12) — this is the exact failure mode the certifying directive named by name as out of bounds for this engagement, and these documents must be retracted rather than cited going forward.**
 
-**P1 (selected; growing list, not exhaustive):** carrier-level vs per-tenant STOP conflict; swallowed consent-write failures; channel misattribution on consent checks; fail-open consent on DB error; capability/currency/country bypass via override/rule-target/fallback pool; silent-and-permanent channel switching; no country filter for messaging; Postgres webhook-job bridge is dead code; no idempotency key on send-then-write job processors; no reaper heartbeat + inconsistent thresholds; broken graceful shutdown drain; unbuildable worker start script; misleading `/ready` signals (confirmed at the gateway too — C6); rate-limiter window that never resets; lock-throws-on-contention; single shared non-timing-safe admin token with no RBAC/audit (C7); admin playground bypasses tenant/consent (C8); test keys usable for live traffic (C9); no real schema validation, presence-only checks (C10); Idempotency-Key never forwarded to providers, weak time-bucketed fallback (C11); 60s timer doesn't abort work and a late result corrupts state further (C12); password-reset tokens leak via response body outside `NODE_ENV=production` (C13); rate-limit keyed on attacker-controlled string, enabling admin-token brute force (C14); several high-value routes entirely unrate-limited (C15); SSE tenant filter is a permanent no-op (C16); refund amount/currency checks are weak, no cumulative tracking (C17); outbox write would not be atomic even with a working transaction (D2); DB-level request-hash for idempotency doesn't exist — application-only dedup, an explicit spec violation (D8); outbox/webhook-job claim-batch over-claims and treats failure as terminal (D10); `updateStatus` is a non-atomic read-then-write (D11); all 7 native provider webhook signature verifiers that exist are dead code, so async/ambiguous outcomes can never be reconciled at the provider-trust level (E10); live/sandbox host selection broken for 4 adapters because `ProviderConfig.environment` is never actually populated (E11); provider management config (rules, priority, circuit state) is 100% in-memory, lost on restart, diverges across replicas (E12, confirms A14/D from the registry side); credentials/token caches are global per provider not per tenant — needs an explicit product decision (E13); full refunds send `amount:0` on 6 adapters; refunds carry no idempotency key on 4 adapters that retry; unscoped client idempotency keys on PawaPay/Airwallex can cross-link two tenants' transactions at the provider.
+**P1 (selected; growing list, not exhaustive):** carrier-level vs per-tenant STOP conflict; swallowed consent-write failures; channel misattribution on consent checks; fail-open consent on DB error; capability/currency/country bypass via override/rule-target/fallback pool; silent-and-permanent channel switching; no country filter for messaging; Postgres webhook-job bridge is dead code; no idempotency key on send-then-write job processors; no reaper heartbeat + inconsistent thresholds (B10 — now also carrying PHASE13-01, a confirmed reaper-level duplicate-rescue race); broken graceful shutdown drain; unbuildable worker start script; misleading `/ready` signals (confirmed at the gateway too — C6); ~~rate-limiter window that never resets~~ **FIXED, Phase 14** (B14); ~~lock-throws-on-contention~~ **FIXED, Phase 13** (B15 contention behavior only — lease renewal/fencing still absent, PHASE13-05); single shared non-timing-safe admin token with no RBAC/audit (C7, now also carrying PHASE14-06 — failed admin attempts not separately counted, comparison still non-timing-safe); admin playground bypasses tenant/consent (C8); test keys usable for live traffic (C9); no real schema validation, presence-only checks (C10); Idempotency-Key never forwarded to providers, weak time-bucketed fallback (C11); 60s timer doesn't abort work and a late result corrupts state further (C12); password-reset tokens leak via response body outside `NODE_ENV=production` (C13); ~~rate-limit keyed on attacker-controlled string, enabling admin-token brute force~~ **FIXED, Phase 14** (C14); ~~several high-value routes entirely unrate-limited~~ **FIXED, Phase 14** (C15); SSE tenant filter is a permanent no-op (C16); refund amount/currency checks are weak, no cumulative tracking (C17); outbox write would not be atomic even with a working transaction (D2); DB-level request-hash for idempotency doesn't exist — application-only dedup, an explicit spec violation (D8); outbox/webhook-job claim-batch over-claims and treats failure as terminal (D10); `updateStatus` is a non-atomic read-then-write (D11); all 7 native provider webhook signature verifiers that exist are dead code, so async/ambiguous outcomes can never be reconciled at the provider-trust level (E10); live/sandbox host selection broken for 4 adapters because `ProviderConfig.environment` is never actually populated (E11); provider management config (rules, priority, circuit state) is 100% in-memory, lost on restart, diverges across replicas (E12, confirms A14/D from the registry side); credentials/token caches are global per provider not per tenant — needs an explicit product decision (E13); full refunds send `amount:0` on 6 adapters; refunds carry no idempotency key on 4 adapters that retry; unscoped client idempotency keys on PawaPay/Airwallex can cross-link two tenants' transactions at the provider.
 
 **P2/P3 (selected):** half-open breaker unlimited probes; breaker state read-mutates and is per-process; ambiguous-event mistagging; conversation upsert race; hardcoded church wording shown to all tenants; missing CHECK IN/WHERE IS MY DRIVER keywords; non-atomic dequeue; dead-letter retention/replay gaps; scheduling fairness; unauthenticated provider-config disclosure endpoint (confirmed twice — C-minor and E14); no SSRF guard on webhook URLs; tenant status never checked, only link existence; free-text tenant/app IDs with no FK or RLS (D14); 9-of-13 missing migration snapshots and hand-written migrations (D15); secret-mask reveals full value for short secrets (confirmed three times — D13, C-minor, E14); no key-rotation support for secrets encryption; none of the 25 adapters implements the canonical provider interface (status query/webhook normalization/delivery receipts/capability declaration) — architectural, not a quick fix (E14); provider-specific fields leak through the generic payload contract, defeating provider-agnostic routing (E14); lint/type-check coverage gaps on 4-5 frontend apps (F7); drizzle-kit version skew (F13); stale/empty governance docs (F13).
 
@@ -1239,3 +1255,113 @@ Webhook correctness is no longer dependent on in-memory state as the correctness
 **Outstanding BLOCKED items:** no real provider sandbox credentials were available for any of the 14 adapters — every classification decision above is built from documented API knowledge, not verified against a live account; stock PostgreSQL 16 only (no Neon-specific verification); no multi-process deployment; `fetch` was stubbed throughout, no real network sockets exercised.
 
 **This closes out the payments-correctness work that began in Phase 2.** Phases 2, 3, 5, 6, and now 11-12 together mean: idempotency is DB-constraint-backed, provider identity is deterministic, outbox writes are proven atomic with commit-boundary confirmation, the state machine correctly represents and safely reconciles ambiguous outcomes, and the cross-provider double-charge cascade — the single most severe finding in the register — is closed with adapter-by-adapter rigor. **Proceeding to Phase 13 (worker reliability) next**, per the spec's own phase ordering — this returns to Section B's remaining open findings: B6 (a rescued job with a stuck idempotency claim completes without ever running), B7 (`promoteDelayed()`'s race duplicates retried jobs), and B15 (the distributed lock throws on contention rather than waiting/skipping), none of which have been touched by any phase since Phase 0's original inventory.
+
+---
+
+## PHASE 13 — WORKER RELIABILITY — COMPLETE
+
+All three findings carried forward from Phase 0's original inventory (B6, B7, and the contention half of B15) are confirmed real, fixed, and proven with negative controls. All three live entirely in the Redis/KVStore job layer (`packages/workers/src`), not Postgres — there is no new migration this phase.
+
+**Fixed and independently verified by the orchestrating session:** B6 (in full), B7 (in full), B15 (contention behavior only — lease renewal/fencing explicitly not addressed, see PHASE13-05).
+
+**Verification performed directly by the orchestrating session:**
+- `npx tsc --noEmit -p tsconfig.json` → exit 0, confirmed directly.
+- `npx vitest run` → **966 passed, 0 failed, 167 skipped (1133 total)**, confirmed directly, matching the implementing agent's own final figure exactly (+20 over Phase 11-12's 946, exactly the size of the new test file).
+- Spot-checked `packages/workers/src/queue.ts` directly: confirmed `promoteDelayed`'s `zrem`-as-claim fix and `rescueStuckJobs`'s new `releaseAbandonedClaim` call exist exactly as described.
+- Spot-checked `packages/workers/src/lock.ts` directly, in full: confirmed `LockNotAcquiredError`, `acquireWithWait`, `tryWithLock`, and `withLock`'s new bounded-wait-then-throw behavior exist exactly as described.
+- Ran the new `packages/workers/src/worker-reliability.test.ts` in isolation: **20/20 passing**, with real-Redis log lines visible in the output (`[worker] rescued 1 orphaned processing job(s) on startup`, `[provider_health] skipped p1: another health check holds the provider lock`, `[reconciliation] skipped: another reconciliation run holds the lock`) — confirming the tests exercise a real Redis server, not only an in-memory double.
+- **Independently reproduced the original B7 defect as its own negative control**, rather than only trusting the implementing agent's report of it: reverted `promoteDelayed` to the pre-fix (return-value-ignored) form, re-ran the concurrent-promoters test, got `expected 100 to be 20` (every one of 20 due jobs pushed onto the ready list 5 times instead of once) — the identical failure the implementing agent reported. Restored the fix and confirmed the restored file's SHA-256 (`ee99b9d1...4171`) matched the pre-revert fix byte-for-byte; all 20 tests in the file passed again.
+- Did not independently re-run the implementing agent's B6 and B15 negative controls (direct code inspection plus the B7 reproduction above were judged sufficient corroboration of the agent's described methodology, which matched the pattern used successfully in every prior phase).
+
+**Why no `*.postgres.integration.test.ts` variant this phase:** none of B6/B7/B15 touch Postgres locking — all three bugs and fixes live in the Redis/KVStore job queue. The implementing agent did re-run every existing Postgres-backed suite (including `payment-reconciliation.postgres.integration.test.ts`, whose hand-written lock mock needed a `tryWithLock` addition since `reconciliation.ts` now calls it) against a real local Postgres 16.15 with no regressions: 1121 passed / 0 failed / 12 skipped, up from 1101 before (the same +20).
+
+**New findings surfaced during remediation, added to the register:**
+
+### PHASE13-01. `rescueStuckJobs` has the same unclaimed-race shape B7 had
+- **Status:** OPEN — filed under B10 above (the reaper-territory finding this belongs to), not fixed this phase. See B10's updated entry for detail.
+
+### PHASE13-02 (NEW, OPEN). MemoryStore and RedisStore disagree on same-owner lock re-acquisition
+- **Finding:** `RedisStore`'s `SET NX` correctly refuses to let the same owner re-acquire a lock it already holds (returns false); `MemoryStore`'s `acquireLock` incorrectly returns true and extends the TTL for a same-owner re-acquire. Probed directly by the implementing agent: `memory.sameOwnerAgain=true`, `redis.sameOwnerAgain=false`. A test written only against MemoryStore could therefore pass in CI while the equivalent production (Redis) behavior would not. Current callers all generate a random owner id per invocation, so this has no live production effect today — but the test double and the real store silently diverge, which risks a future false-positive test.
+- **Severity:** P2
+- **Status:** OPEN — not fixed this phase (fixing `MemoryStore` to match Redis semantics is the correct direction; deferred as a test-infrastructure fix rather than a production defect).
+
+### PHASE13-03 (NEW, OPEN). Deploy-window residual on the B6 fix
+- **Finding:** idempotency claims written before this fix ships carry no `ownerJobId` field, so the reaper's new `releaseAbandonedClaim` cannot release them (it checks ownership before deleting). A job that crashes during the rolling deploy that ships this fix can still hit the original B6 failure mode once, until that specific claim's 24h TTL naturally expires.
+- **Severity:** P3 (self-healing within 24h, deploy-window-only, bounded blast radius)
+- **Status:** OPEN — acceptable as a one-time deploy artifact; no fix proposed, noted for the deployment runbook (Phase 23-24 territory).
+
+### PHASE13-04 (NEW, OPEN). B6's fix soundness depends on B10's still-open heartbeat gap
+- **Finding:** the B6 fix trusts the stale-job reaper's judgment that a crashed job's claim is safe to release. Without a heartbeat (B10, still open), a *live* idempotency-keyed job that happens to run past the reaper's staleness threshold (2-5 minutes, inconsistent per B10's own finding) would be wrongly judged dead, rescued, and now genuinely run a second time — where before this phase's fix it would merely have been skipped (silently dropping the retry, the original B6 behavior). The fix is net-positive but its safety is conditional on B10's eventual resolution.
+- **Severity:** P1 (currently low practical risk given short typical job durations, but the dependency is real and should not be forgotten)
+- **Status:** OPEN — tracked as a direct dependency for whichever phase resolves B10.
+
+### PHASE13-05 (confirms and narrows B15's original finding). Lock contention fixed; lease renewal and fencing tokens remain absent
+- **Status:** OPEN — carried forward from B15's own text, explicitly not addressed by this phase (see B15's updated entry above for the implementing agent's stated risk judgment).
+
+**Outstanding BLOCKED items:** none specific to this phase beyond the general stock-Postgres-only / no-multi-process-deployment caveats already on file from prior phases — this phase's defects and fixes are entirely in-process/Redis-level and were fully exercisable in this sandbox, including against a real spawned Redis server.
+
+**Proceeding to Phase 14 (Redis-backed distributed rate limiting) next**, per the spec's own phase ordering — this will pick up B14 (rate-limiter window never resets under continuous traffic), scoped specifically to the rate-limiting subsystem (B14, plus C14/C15 which are the same subsystem's gateway-side counterparts). B13 (readiness endpoints reporting healthy regardless of actual backend state) is explicitly deferred in full to the dedicated future "Phase 19: health/readiness endpoints" task, rather than split awkwardly across two phases.
+
+---
+
+## PHASE 14 — REDIS-BACKED DISTRIBUTED RATE LIMITING — COMPLETE
+
+Scoped to the rate-limiting subsystem specifically: B14 (the fixed-window counter in `packages/workers/src`), plus its gateway-side counterparts C14 and C15, plus the test-quality finding F10 which concerns the same admin-rate-limit code path. B13 (readiness reporting) remains explicitly out of scope, deferred to Phase 19.
+
+**Fixed and independently verified by the orchestrating session:** B14 (in full), C14 (in full), C15 (in full), F10 (partially — the specific admin-auth/rate-limit vacuity named in the original finding, not the full breadth of missing HTTP-auth test coverage).
+
+**Verification performed directly by the orchestrating session:**
+- `npx tsc --noEmit -p tsconfig.json` → exit 0, confirmed directly.
+- `npx vitest run` → **996 passed, 0 failed, 167 skipped (1163 total)**, confirmed directly, matching the implementing agent's own final figure exactly (+30 over Phase 13's 966: 8 B14 + 10 in-memory gateway scenarios + 11 real-Redis gateway scenarios + 1 new admin-brute-force case).
+- Spot-checked `services/api-gateway/src/auth.ts` directly, in full: confirmed the IP-first-charge/refund-to-app-bucket logic for `rateLimit`, the IP-only `ipRateLimit` for admin/public routes, and the new strict-tier `authRateLimit` all exist exactly as described.
+- Spot-checked `packages/workers/src/store.redis.ts`/`store.memory.ts`/`rateLimit.ts` directly: confirmed the atomic Lua-script fixed-window claim (Redis) and the create-time-only expiry logic (memory) exist exactly as described.
+- **Independently reproduced the original C14 defect as its own negative control**, rather than only trusting the implementing agent's report: reverted the `rateLimit` middleware to the pre-fix `extractKey(req) || req.ip` form, re-ran `rate-limiting.simulation.test.ts`, and got 4 failing tests with exactly the reported shape (fresh-key admin/API guesses never reaching 429, e.g. `expected [400,400,400,400,400] to deeply equal [429,429,429,429,429]`) — then restored the fix and confirmed the restored file's SHA-256 (`58d8567f...4ec6`) matched the pre-revert fix byte-for-byte; all 10 tests in the file passed again.
+- Did not independently re-run the implementing agent's B14 and F10 negative controls (direct code inspection plus the C14 reproduction above were judged sufficient corroboration of the agent's described methodology, consistent with the pattern used successfully in every prior phase).
+
+**This phase is a genuine security fix, not only a reliability one:** C14 was a complete bypass of rate limiting for brute-forcing the platform's single shared `ADMIN_API_TOKEN` (and for API-key guessing) — an attacker needed only to send a fresh random header value per request. The fix is structural (charge-then-refund by IP before any key lookup succeeds), not a cosmetic key-normalization patch, so a fresh random key can no longer buy a fresh bucket.
+
+**New findings surfaced during remediation, added to the register:**
+
+### PHASE14-01 (FIXED as part of this phase). Gateway's Redis rate-limiter client never actually connected
+- **Finding:** created with `lazyConnect`+`enableOfflineQueue:false` and nothing ever called `.connect()`. Each process's first real command was silently rejected, so that request fell through to the per-process in-memory insurance limiter instead of the shared distributed one — meaning the gateway's rate limiting was, in practice, per-replica rather than cluster-wide whenever this path was hit. Found only by testing against a real spawned Redis server, not the in-memory double. Fixed: the shared client now calls `.connect()` immediately on creation.
+- **Residual, not fixed:** while Redis is genuinely down (not just this bug), the insurance limiter still makes the effective limit per-replica (N replicas × limit) rather than cluster-wide — an inherent property of having a fallback at all, not a new defect. `getRateLimiterInfo()` also still reports `storeBacked:true` regardless of actual connection health — B13/Phase 19 territory, see B16's updated entry.
+- **Status:** FIXED (the never-connected-client bug); the fallback-limiter-is-per-replica and misleading-readiness properties remain open, tracked under B13.
+
+### PHASE14-02 (FIXED as a side effect of C14, not separately pursued). Plaintext API keys as Redis key-name substrings
+- **Finding:** gateway rate-limit bucket keys used to be `rl:<raw API key>`. They are now `app:<slug>`/`ip:<address>`.
+- **Status:** FIXED (incidental to the C14 fix).
+
+### PHASE14-03 (NEW, OPEN). No `trust proxy` configuration — all per-IP buckets collapse to one behind a load balancer/reverse proxy
+- **Finding:** the gateway has no `app.set('trust proxy', ...)`. Behind any reverse proxy or load balancer, `req.ip` is the proxy's own address for every caller, so every per-IP bucket (admin, failed-key traffic, login, signup, checkout) is actually shared by every caller behind that proxy — one noisy client can exhaust it for everyone else. This pre-existed for keyless traffic before this phase (an inherited condition, not introduced by it), but more routes now depend on IP identity as a direct result of this phase's own fix, so its blast radius has grown. Authenticated API traffic is unaffected (it uses per-application buckets, not IP). Fix is a deployment-topology-specific `trust proxy` setting (exact hop count or proxy CIDR, never a blanket `true`, which would let a spoofed `X-Forwarded-For` header recreate exactly the C14 bypass this phase just closed).
+- **Severity:** P1 (becomes a real multi-tenant denial-of-service risk the moment the platform runs behind any reverse proxy/load balancer — which any real production deployment will)
+- **Status:** OPEN — flagged for whichever phase owns deployment topology (Phase 23-24 territory) or is run when the actual production reverse-proxy setup is known.
+
+### PHASE14-04 (NEW, OPEN, by code reading only — not independently run by the orchestrating session). Workers' `RateLimiter.limit`'s `weight` parameter is accepted but not used for counting
+- **Finding:** `weight` always effectively counts as 1 regardless of its value; `remaining` is computed as `limit - count - weight`, which undercounts by `weight - 1` whenever a non-default weight is passed. Blocked results report `resetMs: 0`, producing a misleading "reset in 0ms" message (e.g. in `messageDelivery`'s error text). Currently low practical impact: the only caller in the codebase passes weight 1.
+- **Severity:** P2
+- **Status:** OPEN — not fixed this phase (no caller currently exercises a non-1 weight, so no negative control was possible to write without first deciding the correct `remaining`/`resetMs` semantics).
+
+### PHASE14-05 (NEW, OPEN, by code reading only — not independently run). Gateway HTTP rate limits and worker message-delivery rate limits share the same `RATE_LIMIT_*` environment variables
+- **Finding:** a rate-limited `message_delivery` job throws, which (per the normal worker retry path) consumes a retry attempt and can end in the dead-letter queue purely because the gateway-tier limit and the worker-tier limit happen to share one config knob, not because the message itself is problematic.
+- **Severity:** P2
+- **Status:** OPEN — needs a deliberate decision on whether gateway and worker rate limits should be configured independently.
+
+### PHASE14-06 (NEW, OPEN, confirms and narrows C7). Admin brute-force protection is now the general per-IP budget, not a dedicated failed-attempt counter
+- **Finding:** failed admin-token attempts are now rate-limited (closing C14), but only via the same general per-IP budget as everything else (default 100/min) — there's no counter specific to failed admin attempts, and the token comparison itself is still a plain `!==` (not timing-safe). Both were already named in C7's original finding; this phase narrows C7 but doesn't close it.
+- **Status:** OPEN — tracked as C7 work (admin auth hardening: RBAC, audit, timing-safe comparison, dedicated failed-attempt counting).
+
+### PHASE14-07 (NEW, OPEN, by code reading only — not independently run). Several routes this phase touched aren't wrapped in `asyncHandler`
+- **Finding:** portal login/signup and checkout GET/pay route handlers aren't wrapped in the gateway's `asyncHandler` utility. A repository error thrown inside one becomes an unhandled promise rejection; the process-level safety net (noted in earlier phases) keeps the gateway process alive, but the specific request appears to simply hang with no response ever sent.
+- **Severity:** P1
+- **Status:** OPEN — a pre-existing gap this phase's agent noticed while touching these routes' middleware, not introduced by this phase, and not fixed as it's outside this phase's rate-limiting scope.
+
+### PHASE14-08 (narrows F10's original finding to what remains). Broader missing HTTP-level auth test coverage
+- **Status:** OPEN — the admin-auth/rate-limit vacuity F10 specifically named is now fixed; portal JWT auth, billing, consent, and webhook-endpoint route tests (F10's and Section F's broader "zero" coverage claim) remain untested.
+
+**Decisions made by the implementing agent, reviewed and accepted by the orchestrating session:**
+- Strict-tier defaults of 20 requests/15min per IP for login/signup/checkout-pay (configurable via new `AUTH_RATE_LIMIT_WINDOW_MS`/`AUTH_RATE_LIMIT_MAX_REQUESTS` env vars, documented in `.env.example`); checkout's read-only `GET` uses the general budget instead, since it carries no abuse/credential risk of its own.
+- Per-application buckets retained for authenticated traffic rather than keying everything on IP — the alternative (IP-only) would make every tenant behind one shared proxy collapse onto a single 100/min budget, which is a materially worse outcome than the chosen design's PHASE14-03 residual.
+
+**Outstanding BLOCKED items:** none specific to this phase — B14/C14/C15/F10 were all fully exercisable in this sandbox, including against a real spawned Redis server and real HTTP requests through the gateway.
+
+**Proceeding to Phase 15 (provider registry persistence + secret handling) next**, per the spec's own phase ordering.

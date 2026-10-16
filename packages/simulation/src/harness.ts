@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from 'node:crypto';
-import type { Server } from 'node:http';
+import { request as httpRequest, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { EventBus, WebhookDelivery } from '@company/events';
 import { ProviderRegistry } from '@company/providers';
@@ -56,6 +56,47 @@ export const DEFAULT_WORKER_CONFIG: WorkerConfig = {
   },
   maxQueueDepth: 10_000,
 };
+
+/**
+ * One HTTP request to the gateway sent FROM a chosen local (source) address,
+ * which is what the gateway sees as req.ip. All of 127.0.0.0/8 is loopback on
+ * Linux, so tests can act as distinct callers (127.x.y.z) — used to exercise
+ * the gateway's per-IP rate limits (Phase 14). Resolves with the status code.
+ */
+export function requestFrom(
+  baseUrl: string,
+  sourceIp: string,
+  method: string,
+  path: string,
+  headers: Record<string, string> = {},
+  body?: unknown,
+): Promise<number> {
+  const url = new URL(baseUrl);
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: url.hostname,
+        port: Number(url.port),
+        path,
+        method,
+        localAddress: sourceIp,
+        agent: false,
+        headers: {
+          ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}),
+          ...headers,
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode ?? 0));
+      },
+    );
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -148,7 +189,15 @@ export async function createSimulation(
   // namespace so a developer's local Redis can never leak queued jobs
   // between test runs.
   if (!process.env.WORKER_QUEUE_PREFIX) process.env.WORKER_QUEUE_PREFIX = `bis-sim-${randomUUID().slice(0, 8)}`;
+  // Same for the gateway's rate-limit buckets (Phase 14): with a shared Redis,
+  // parallel test files and back-to-back runs must not share `rl:*` counters.
+  if (!process.env.RATE_LIMIT_KEY_PREFIX) process.env.RATE_LIMIT_KEY_PREFIX = `${process.env.WORKER_QUEUE_PREFIX}-rl`;
+  // Functional suites send everything from 127.0.0.1, so by default the
+  // gateway's limits are set out of reach here. The limits themselves are
+  // exercised with real, small values by rate-limiting.simulation.test.ts and
+  // security-isolation.simulation.test.ts (N), which pass their own env.
   if (!process.env.RATE_LIMIT_MAX_REQUESTS) process.env.RATE_LIMIT_MAX_REQUESTS = '100000';
+  if (!process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) process.env.AUTH_RATE_LIMIT_MAX_REQUESTS = '100000';
 
   // Always re-import (cheap: Node's module cache makes this a no-op after
   // the first call) — this is how we also reach the getGatewayQueueForTests/

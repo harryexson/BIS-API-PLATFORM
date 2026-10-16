@@ -647,13 +647,22 @@ const auth = new AuthService({
     windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
     max: Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
   },
+  // Phase 14 (C15): strict per-IP budget for login / signup / checkout pay.
+  authRateLimit: {
+    windowMs: Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60_000,
+    max: Number(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) || 20,
+  },
 });
 const mw = createMiddleware(auth);
 
+// Phase 14 (C14): per-application once the API key really authenticates,
+// otherwise per caller IP — never keyed on the raw, attacker-chosen key string.
 app.use('/v1/api', mw.rateLimit);
-// P0: Rate-limit admin endpoints to prevent brute-force attacks
-app.use('/api/dashboard', mw.rateLimit);
-app.use('/api/observability', mw.rateLimit);
+// P0: Rate-limit admin endpoints to prevent brute-force attacks.
+// Phase 14 (C14): by caller IP only — admin auth is x-admin-token, so an
+// x-api-key header must not be able to mint a fresh bucket per guess.
+app.use('/api/dashboard', mw.ipRateLimit);
+app.use('/api/observability', mw.ipRateLimit);
 
 // P1-1: Request timeout middleware — prevents hung provider calls from holding connections.
 // A payment timeout must not automatically mean retry; ambiguous outcomes are reconciled via webhook.
@@ -1564,7 +1573,8 @@ app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req
 });
 
 // POST /refunds — refund a previously captured payment. See docs/openapi.yaml.
-app.post('/refunds', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+// Phase 14 (C15): rate limited like /v1/api (it isn't under that mount).
+app.post('/refunds', mw.rateLimit, mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const refundScope = authContext(req);
   const { tenantId } = refundScope;
@@ -2647,7 +2657,8 @@ function slugify(input: string): string {
     .slice(0, 60) || 'app';
 }
 
-app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
+// Phase 14 (C15): strict per-IP budget against signup abuse.
+app.post('/v1/portal/auth/signup', mw.authRateLimit, async (req: Request, res: Response) => {
   const { companyName, email, password } = req.body;
   if (!companyName || !email || !password) {
     return res.status(400).json({ error: 'companyName, email, and password are required' });
@@ -2719,7 +2730,8 @@ app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/v1/portal/auth/login', async (req: Request, res: Response) => {
+// Phase 14 (C15): strict per-IP budget against password brute force.
+app.post('/v1/portal/auth/login', mw.authRateLimit, async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required' });
@@ -2858,7 +2870,8 @@ app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, a
 // Public — no API key. The session token is itself the capability: it's
 // single-use, expiring, and scoped to exactly the amount/currency/app it
 // was created for, so the browser never needs the application's secret key.
-app.get('/v1/checkout/sessions/:token', async (req: Request, res: Response) => {
+// Phase 14 (C15): per-IP budget against session-token enumeration.
+app.get('/v1/checkout/sessions/:token', mw.ipRateLimit, async (req: Request, res: Response) => {
   await checkoutSessionRepository.markExpiredIfPast(req.params.token);
   const session = await checkoutSessionRepository.findByToken(req.params.token);
   if (!session) {
@@ -2874,7 +2887,8 @@ app.get('/v1/checkout/sessions/:token', async (req: Request, res: Response) => {
   });
 });
 
-app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response) => {
+// Phase 14 (C15): strict per-IP budget — this route charges cards (card testing).
+app.post('/v1/checkout/sessions/:token/pay', mw.authRateLimit, async (req: Request, res: Response) => {
   await checkoutSessionRepository.markExpiredIfPast(req.params.token);
   const session = await checkoutSessionRepository.findByToken(req.params.token);
   if (!session) {

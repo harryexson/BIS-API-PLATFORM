@@ -44,10 +44,19 @@ export class MemoryStore implements KVStore {
     return true;
   }
 
+  // B14 FIX: fixed window — the TTL is set only when this call creates the
+  // key (or the existing key has no expiry at all); later increments keep the
+  // original expiry instead of re-arming the full window. Same semantics as
+  // RedisStore.incr.
   async incr(key: string, ttlMs?: number): Promise<number> {
-    const current = this.expired(key) ? 0 : Number(this.kv.get(key)!.value) || 0;
-    const next = current + 1;
-    await this.set(key, String(next), ttlMs);
+    const existing = this.expired(key) ? undefined : this.kv.get(key);
+    if (!existing) {
+      await this.set(key, '1', ttlMs);
+      return 1;
+    }
+    const next = (Number(existing.value) || 0) + 1;
+    existing.value = String(next);
+    if (ttlMs && existing.expiresAt === null) existing.expiresAt = Date.now() + ttlMs;
     return next;
   }
 
