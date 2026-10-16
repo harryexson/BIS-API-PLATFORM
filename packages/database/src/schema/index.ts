@@ -52,3 +52,16 @@ export {
   type NewSenderOptOut,
 } from './inbound-routing';
 export { webhookEndpoints, type WebhookEndpoint, type NewWebhookEndpoint } from './webhook-endpoints';
+export {
+  keywordCommands,
+  keywordCommandDispatches,
+  RESERVED_KEYWORDS,
+  KEYWORD_COMMAND_ACTIONS,
+  KEYWORD_DISPATCH_STATUSES,
+  type ReservedKeyword,
+  type KeywordCommandAction,
+  type KeywordCommand,
+  type NewKeywordCommand,
+  type KeywordCommandDispatch,
+  type NewKeywordCommandDispatch,
+} from './keyword-commands';

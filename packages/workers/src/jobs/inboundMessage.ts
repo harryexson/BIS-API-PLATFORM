@@ -1,10 +1,13 @@
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
+import type { JobQueue } from '../queue';
 import {
   eventRepository,
   conversationRepository,
   inboundMessageHoldRepository,
   senderOptOutRepository,
+  keywordCommandRepository,
+  keywordCommandDispatchRepository,
   normalizeMessagingAddress,
   channelFromAddress,
   type InboundHoldCandidate,
@@ -12,8 +15,10 @@ import {
 import {
   handleKeyword,
   classifyKeyword,
+  matchKeywordCommand,
   ConversationResolver,
   type ConversationOwner,
+  type KeywordResult,
 } from '@company/routing';
 
 /**
@@ -45,6 +50,21 @@ import {
  * until an operator attributes the message. The outbound router refuses to
  * send from that number to that customer meanwhile. See the Phase 8 section
  * of docs/FINAL_PRODUCTION_GAP_REGISTER.md for the full rationale.
+ *
+ * Phase 9 (gap register A13) — keyword commands, once the owner is known:
+ *   receive → provider → destination number → owner (resolver) →
+ *   conversation → keyword recognition against THAT owner's configuration
+ *   (universal STOP/START/HELP/YES/NO first, then the owner's own
+ *   keyword_commands) → dispatch:
+ *     universal / 'reply' command → handled here; the reply is ENQUEUED for
+ *       real delivery (keyword_response_delivery — it used to be emitted on
+ *       the bus only and never sent to the customer);
+ *     'dispatch' command (e.g. HaulPro WHERE IS MY DRIVER) → a durable,
+ *       deduplicated keyword_command_dispatches row + the conversation's
+ *       workflow_id + a tenant-scoped 'keyword_command' event the owning
+ *       application consumes (webhook push or the pull API). The platform
+ *       never answers the business question itself;
+ *   → audit (events rows, consent/sender-opt-out rows, dispatch rows).
  */
 
 /** appId used for platform-level (non-tenant) monitoring events. Never has webhook endpoints. */
@@ -59,12 +79,48 @@ export interface NormalizedInbound {
   messageType: 'message' | 'status_update' | 'delivery_receipt' | 'unknown';
 }
 
-export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
+export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): JobProcessor {
   const resolver = new ConversationResolver();
+
+  /**
+   * Phase 9: hand a keyword reply to keyword_response_delivery so it is
+   * really SENT (previously it was only emitted on the bus — nothing ever
+   * enqueued the delivery job). Idempotent per inbound message: a retried
+   * inbound job or redelivered webhook never sends the reply twice.
+   */
+  async function enqueueReply(args: {
+    dedupeKey: string;
+    providerId: string;
+    owner: ConversationOwner;
+    recipient: string;
+    businessNumber: string | null;
+    conversationId: string;
+    result: KeywordResult;
+  }): Promise<void> {
+    if (!queue || !args.result.response) return;
+    await queue.enqueue(
+      'keyword_response_delivery',
+      {
+        senderPhone: args.recipient,
+        content: args.result.response,
+        appId: args.owner.appId,
+        tenantId: args.owner.tenantId,
+        supplierId: args.owner.supplierId,
+        providerId: args.providerId,
+        keyword: args.result.action,
+        keywordName: args.result.keyword ?? null,
+        conversationId: args.conversationId,
+        businessNumber: args.businessNumber,
+      },
+      { idempotencyKey: `keyword_reply:${args.dedupeKey}` },
+    );
+  }
 
   /** Deliver a message to the ONE owner it was attributed to (pre-Phase-8 steps 3-5). */
   async function deliverToOwner(args: {
     jobId: string;
+    /** Stable identity of this inbound message across job retries / webhook redeliveries. */
+    dedupeKey: string;
     providerId: string;
     owner: ConversationOwner;
     conversationId: string;
@@ -79,7 +135,11 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
     const supplierId = owner.supplierId ?? undefined;
     const scope = { tenantId, ...(supplierId ? { supplierId } : {}) };
 
-    // --- Keyword commands (STOP, HELP, YES, NO, PRAY, JOIN) ---
+    // --- Keyword commands: universal (STOP/START/HELP/YES/NO) + THIS owner's
+    // configured ones (Phase 9). Only this owner's configuration is loaded —
+    // never another tenant's. A lookup failure throws (job retries); it is
+    // never mistaken for "no commands configured".
+    const commands = await keywordCommandRepository.findEffectiveForOwner(appId, tenantId);
     const keywordResult = await handleKeyword({
       senderPhone: inbound.senderPhone,
       appId,
@@ -88,6 +148,10 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       content: inbound.content,
       providerId,
       channel: inbound.channel,
+      commands,
+      conversationId,
+      attribution: args.basis,
+      holdId: args.holdId ?? null,
     });
 
     if (keywordResult.handled) {
@@ -107,8 +171,68 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       }
 
       console.log(
-        `[inbound_message] Keyword "${inbound.content.trim()}" handled for ${inbound.senderPhone}: ${keywordResult.action}`,
+        `[inbound_message] Keyword "${inbound.content.trim()}" handled for ${inbound.senderPhone}: ${keywordResult.action}${keywordResult.command ? ` (${keywordResult.command.keyword}, ${keywordResult.command.mode})` : ''}`,
       );
+
+      // --- App-specific command → generic dispatch to the owning application ---
+      if (keywordResult.command?.mode === 'dispatch') {
+        const cmd = keywordResult.command;
+        const { dispatch } = await keywordCommandDispatchRepository.recordOnce({
+          dedupeKey: args.dedupeKey,
+          appId,
+          tenantId,
+          supplierId: owner.supplierId ?? null,
+          conversationId,
+          commandId: cmd.commandId,
+          keyword: cmd.keyword,
+          argument: cmd.argument,
+          workflowId: cmd.workflowId,
+          customerPhone: inbound.senderPhone,
+          businessNumber,
+          providerId,
+          channel: inbound.channel,
+          content: inbound.content,
+          holdId: args.holdId ?? null,
+        });
+        if (cmd.workflowId) {
+          // "Full pipeline through workflow resolution": the conversation now
+          // records which application workflow this command started.
+          await conversationRepository.setWorkflow(conversationId, cmd.workflowId);
+        }
+        // Tenant-scoped (appId + tenantId [+ supplierId]) — the gateway's
+        // outbound-webhook fan-out delivers it to this owner's endpoints
+        // only. The event id is derived from the durable dispatch row, so a
+        // re-emit after a retry carries the same id (consumers dedupe on it).
+        await deps.eventBus.emit({
+          id: `keyword_dispatch_${dispatch.id}`,
+          timestamp: new Date().toISOString(),
+          appId,
+          ...scope,
+          category: 'messaging',
+          messageType: 'keyword_command',
+          providerId,
+          status: 'pending',
+          latency: 0,
+          cost: 0,
+          decisionReason: `keyword_command:${cmd.keyword}`,
+          payload: {
+            type: 'keyword.command',
+            dispatchId: dispatch.id,
+            keyword: cmd.keyword,
+            argument: cmd.argument,
+            workflowId: cmd.workflowId,
+            conversationId,
+            sender: inbound.senderPhone,
+            businessNumber,
+            channel: inbound.channel,
+            content: inbound.content,
+            receivedAt: dispatch.createdAt instanceof Date ? dispatch.createdAt.toISOString() : String(dispatch.createdAt),
+            ...(args.holdId ? { holdId: args.holdId } : {}),
+            ...scope,
+          },
+          response: null,
+        });
+      }
 
       if (keywordResult.response) {
         await deps.eventBus.emit({
@@ -128,10 +252,20 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
             businessNumber,
             content: keywordResult.response,
             keyword: keywordResult.action,
+            keywordName: keywordResult.keyword ?? null,
             conversationId,
             ...scope,
           },
           response: null,
+        });
+        await enqueueReply({
+          dedupeKey: args.dedupeKey,
+          providerId,
+          owner,
+          recipient: inbound.senderPhone,
+          businessNumber,
+          conversationId,
+          result: keywordResult,
         });
       }
       return;
@@ -200,6 +334,11 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
     rawPayload: unknown;
   }): Promise<void> {
     const keyword = classifyKeyword(args.inbound.content);
+    // Phase 9: an app-specific command is NOT used to pick an owner (that
+    // would let any tenant claim ambiguous messages by registering common
+    // words). It is only recorded per candidate as a hint for the operator
+    // who attributes the hold.
+    const candidates = keyword ? [...args.candidates] : await annotateCandidates(args.candidates, args.inbound.content);
     const { hold: row, created } = await inboundMessageHoldRepository.createOrGet({
       dedupeKey: args.dedupeKey,
       providerId: args.providerId,
@@ -209,7 +348,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       content: args.inbound.content,
       keyword,
       reason: args.reason,
-      candidates: [...args.candidates],
+      candidates,
       rawPayload: args.rawPayload,
     });
 
@@ -262,6 +401,18 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
     }
   }
 
+  async function annotateCandidates(
+    candidates: readonly InboundHoldCandidate[],
+    content: string,
+  ): Promise<InboundHoldCandidate[]> {
+    const out: InboundHoldCandidate[] = [];
+    for (const c of candidates) {
+      const match = matchKeywordCommand(content, await keywordCommandRepository.findEffectiveForOwner(c.appId, c.tenantId));
+      out.push(match ? { ...c, matchedCommand: match.keyword } : { ...c });
+    }
+    return out;
+  }
+
   /** Deliver a held message an operator has attributed (admin resolve route enqueues this). */
   async function deliverResolvedHold(jobId: string, holdId: string): Promise<void> {
     const row = await inboundMessageHoldRepository.findById(holdId);
@@ -292,6 +443,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
     const candidates = (row.candidates ?? []) as InboundHoldCandidate[];
     await deliverToOwner({
       jobId,
+      dedupeKey: `hold:${row.id}`,
       providerId: row.providerId,
       owner,
       conversationId: conversation.id,
@@ -332,6 +484,13 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       return;
     }
 
+    const webhookEventId = typeof job.payload.webhookEventId === 'string' ? job.payload.webhookEventId : null;
+    const dedupeKey = webhookEventId
+      ? `webhook_event:${webhookEventId}`
+      : inbound.providerMessageId
+        ? `provider_message:${providerId}:${inbound.providerMessageId}`
+        : `job:${job.id}`;
+
     // --- Step 2: provider → destination number → owner → conversation ---
     const resolution = await resolver.resolve({
       senderPhone: inbound.senderPhone,
@@ -346,6 +505,7 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       }
       return deliverToOwner({
         jobId: job.id,
+        dedupeKey,
         providerId,
         owner: resolution.owner,
         conversationId: resolution.conversation.id,
@@ -363,13 +523,6 @@ export function createInboundMessageProcessor(deps: JobDeps): JobProcessor {
       console.warn(`[inbound_message] ${inbound.messageType} from ${providerId} not attributable (${resolution.reason}) — ignoring`);
       return;
     }
-
-    const webhookEventId = typeof job.payload.webhookEventId === 'string' ? job.payload.webhookEventId : null;
-    const dedupeKey = webhookEventId
-      ? `webhook_event:${webhookEventId}`
-      : inbound.providerMessageId
-        ? `provider_message:${providerId}:${inbound.providerMessageId}`
-        : `job:${job.id}`;
 
     await hold({
       jobId: job.id,

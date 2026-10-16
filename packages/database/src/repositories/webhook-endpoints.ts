@@ -6,13 +6,15 @@ import { encryptSecret, decryptSecret } from '../crypto';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const VALID_CATEGORIES = new Set(['payment', 'messaging', 'other', '*']);
+// Phase 9: 'messaging.keyword_command' subscribes to app-specific keyword
+// command dispatches only (TransactionEvent.messageType 'keyword_command').
+const VALID_CATEGORIES = new Set(['payment', 'messaging', 'other', '*', 'messaging.keyword_command']);
 
 function normalizeEventTypes(eventTypes?: string[]): string[] {
   if (!eventTypes || eventTypes.length === 0) return ['*'];
   const invalid = eventTypes.filter((e) => !VALID_CATEGORIES.has(e));
   if (invalid.length > 0) {
-    throw new Error(`Invalid event type(s): ${invalid.join(', ')} — expected one of payment, messaging, other, *`);
+    throw new Error(`Invalid event type(s): ${invalid.join(', ')} — expected one of payment, messaging, other, *, messaging.keyword_command`);
   }
   return eventTypes;
 }

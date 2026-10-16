@@ -213,6 +213,19 @@ export const conversationRepository = {
   },
 
   /**
+   * Phase 9: record the workflow an app-specific keyword command started on
+   * the conversation it arrived on (the conversations.workflow_id Phase 8
+   * reserved). Stored verbatim; the owning application interprets it.
+   */
+  async setWorkflow(id: string, workflowId: string | null): Promise<void> {
+    const db = getDb();
+    await db
+      .update(conversations)
+      .set({ workflowId, updatedAt: new Date() })
+      .where(eq(conversations.id, id));
+  },
+
+  /**
    * P0 FIX: Close now includes tenantId to only close the correct tenant's
    * conversation(s) — every business number / supplier thread of that owner.
    */

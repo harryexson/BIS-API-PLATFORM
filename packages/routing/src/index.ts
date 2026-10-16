@@ -20,7 +20,18 @@ export {
   type ConversationOwner,
   type ResolvedConversation,
 } from './conversation-resolver';
-export { handleKeyword, classifyKeyword, type KeywordClass, type KeywordContext, type KeywordResult } from './keywords';
+export {
+  handleKeyword,
+  classifyKeyword,
+  matchKeywordCommand,
+  buildHelpResponse,
+  DEFAULT_KEYWORD_RESPONSES,
+  type KeywordClass,
+  type KeywordContext,
+  type KeywordResult,
+  type KeywordCommandConfig,
+  type KeywordCommandMatch,
+} from './keywords';
 export { evaluateRule, findMatchingRule, type RoutingContext } from './rules';
 export { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
 
@@ -41,6 +52,21 @@ interface RankedCandidate extends ScorableCandidate {
  * Distinguishable from a generic routing failure so callers (the gateway)
  * can surface a 403 instead of a retryable 503 — retrying doesn't help.
  */
+/**
+ * Internal options for routeMessage — a separate parameter, deliberately NOT
+ * part of the payload, so nothing a tenant puts in a request body can set
+ * them (the gateway calls routeMessage with two arguments only).
+ */
+export interface RouteMessageOptions {
+  /**
+   * Phase 9: this send IS the confirmation of a STOP the recipient just sent
+   * (the inbound keyword pipeline's reply). Skips the tenant-level and
+   * sender-level opt-out checks for this one message only. Used solely by
+   * the keyword_response_delivery job for an 'opt_out' reply.
+   */
+  optOutConfirmation?: boolean;
+}
+
 export class ConsentBlockedError extends Error {
   constructor(recipient: string, channel: string) {
     super(`Recipient ${recipient} has opted out of ${channel} messaging (STOP) — outbound blocked.`);
@@ -345,7 +371,7 @@ export class RoutingEngine {
   // explicit providerOverride: conversation continuity (reusing the
   // provider an ongoing thread already used) — a routing rule or a
   // score-based pick must never silently switch providers mid-conversation.
-  public async routeMessage(appId: string, payload: any): Promise<TransactionEvent> {
+  public async routeMessage(appId: string, payload: any, options: RouteMessageOptions = {}): Promise<TransactionEvent> {
     const { recipient = '', content = '', providerOverride, tenantId = 'default' } = payload;
     // Phase 8: the gateway's VERIFIED supplier scope (never a body field —
     // resolveTenantContext strips those). Part of the conversation owner key.
@@ -368,8 +394,12 @@ export class RoutingEngine {
     // recipient could receive a message during a DB outage) surfaced via
     // console.error rather than swallowed silently; hardening it to
     // fail-closed is a documented follow-up, not done here.
+    // Phase 9: the ONE message a recipient may receive after opting out is
+    // the confirmation of that opt-out (CTIA). Internal-only option, never
+    // reachable from a request body (see RouteMessageOptions).
+    const optOutConfirmation = options.optOutConfirmation === true;
     let optedOut = false;
-    if (recipient) {
+    if (recipient && !optOutConfirmation) {
       try {
         optedOut = await consentRecordRepository.isOptedOut(appId, tenantId, recipient, channel);
       } catch (err: any) {
@@ -475,7 +505,7 @@ export class RoutingEngine {
         // never a send past a possible STOP.
         const sender = await this.senderFor(appId, tenantId, supplierId, currentProvider, recipient);
         let senderOptedOut = false;
-        if (sender.businessNumber && recipient) {
+        if (sender.businessNumber && recipient && !optOutConfirmation) {
           try {
             senderOptedOut = await senderOptOutRepository.isOptedOut(sender.businessNumber, recipient, channel);
           } catch (lookupErr: any) {

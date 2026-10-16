@@ -144,3 +144,24 @@ export {
 // Phase 8 (gap register A1-A4): canonical messaging-address form used by
 // every conversation / messaging-profile / inbound-hold read and write.
 export { normalizeMessagingAddress, channelFromAddress } from './messaging-address';
+
+// Phase 9 (gap register A13): DB-free keyword grammar shared by the inbound
+// keyword pipeline, keyword_commands validation and the simulation double.
+export {
+  normalizeKeywordText,
+  collapseKeywordText,
+  classifyUniversalKeyword,
+  validateKeywordCommand,
+  mergeEffectiveKeywordCommands,
+  findPhraseConflict,
+  aliasesOf,
+  isReservedKeywordName,
+  KeywordCommandValidationError,
+  RESERVED_KEYWORD_NAMES,
+  RESERVED_TO_CLASS,
+  type UniversalKeywordClass,
+  type ReservedKeywordName,
+  type KeywordCommandInput,
+  type ValidKeywordCommand,
+  type KeywordCommandRowLike,
+} from './keyword-grammar';

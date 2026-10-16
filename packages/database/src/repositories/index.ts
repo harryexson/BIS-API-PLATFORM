@@ -74,3 +74,8 @@ export {
   type WebhookConsumerClaimResult,
 } from './webhook-events';
 export { checkoutSessionRepository } from './checkout-sessions';
+export {
+  keywordCommandRepository,
+  keywordCommandDispatchRepository,
+  type KeywordDispatchInput,
+} from './keyword-commands';

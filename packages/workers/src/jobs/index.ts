@@ -63,7 +63,9 @@ export function registerAllProcessors(
   manager.register('retry_processing', createRetryProcessingProcessor(deps, queue));
   manager.register('reconciliation', createReconciliationProcessor(deps, queue));
   // P0: Register inbound message processor — routes webhooks to apps
-  manager.register('inbound_message', createInboundMessageProcessor(deps));
+  // Phase 9: given the queue so keyword replies are really delivered
+  // (keyword_response_delivery below), not only emitted on the bus.
+  manager.register('inbound_message', createInboundMessageProcessor(deps, queue));
   // P0: Register outbox poller — ensures at-least-once delivery of domain events
   manager.register('outbox_poller', createOutboxPollerProcessor(deps));
   // P0: Register receipt pipeline — sends receipts for successful charges

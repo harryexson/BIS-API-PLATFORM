@@ -39,7 +39,16 @@ const ctx = (content: string) => ({ senderPhone: '+265880000001', appId: 'reach'
 describe('classifyKeyword', () => {
   it.each([
     ['STOP', 'STOP'], ['stop please', 'STOP'], ['UNSUBSCRIBE', 'STOP'], ['Yes', 'YES'], ['n', 'NO'],
-    ['HELP', 'HELP'], ['pray', 'PRAY'], ['START', 'JOIN'], ['Please pray for my mother', null], ['', null],
+    ['HELP', 'HELP'], ['START', 'JOIN'], ['Please pray for my mother', null], ['', null],
+    // Phase 9 (gap register A13): PRAY is no longer a PLATFORM keyword — it
+    // used to be hard-coded here (with church wording) for every tenant. It
+    // now exists only for owners that configure it (keyword_commands), so
+    // classifyKeyword — which must work without knowing the owner — no
+    // longer labels it. Covered positively in keyword-commands.test.ts.
+    ['pray', null],
+    // Phase 9: trailing punctuation / extra whitespace no longer defeats a
+    // compliance keyword.
+    ['Stop.', 'STOP'], ['  stop  ', 'STOP'], ['STOPALL', 'STOP'], ['yes!', 'YES'], ['?', 'HELP'], ['UNSTOP', 'JOIN'],
   ])('%s → %s', (input, expected) => {
     expect(classifyKeyword(input)).toBe(expected);
   });

@@ -31,6 +31,9 @@ import { DEFAULT_OUTBOX_RETRY_POLICY, DEFAULT_OUTBOX_STALE_AFTER_MS } from '../.
 // real package — the mock injects its own in-memory repositories into it.
 import { SupplierScope, isUuid } from '../../database/src/supplier-scope';
 import { normalizeMessagingAddress, channelFromAddress } from '../../database/src/messaging-address';
+// Phase 9: DB-free keyword grammar, shared verbatim with the real
+// keyword_commands repository (validation, effective-config merge).
+import * as keywordGrammar from '../../database/src/keyword-grammar';
 
 const MESSAGING_PROFILE_COMPLIANCE_STATUSES = new Set(['unregistered', 'pending', 'approved', 'rejected', 'suspended']);
 const MESSAGING_PROFILE_SENDER_TYPES = new Set(['phone', '10dlc', 'tollfree', 'shortcode', 'alphanumeric']);
@@ -115,6 +118,46 @@ export interface InboundHoldRow {
   deliveredAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/** Phase 9: mirrors keyword_commands (packages/database/src/schema/keyword-commands.ts). */
+export interface KeywordCommandRow {
+  id: string;
+  appId: string;
+  tenantId: string | null;
+  keyword: string;
+  aliases: string[];
+  action: string;
+  responseText: string | null;
+  helpText: string | null;
+  workflowId: string | null;
+  enabled: boolean;
+  updatedBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Phase 9: mirrors keyword_command_dispatches. */
+export interface KeywordDispatchRow {
+  id: string;
+  dedupeKey: string;
+  appId: string;
+  tenantId: string;
+  supplierId: string | null;
+  conversationId: string | null;
+  commandId: string | null;
+  keyword: string;
+  argument: string | null;
+  workflowId: string | null;
+  customerPhone: string;
+  businessNumber: string | null;
+  providerId: string;
+  channel: string;
+  content: string;
+  holdId: string | null;
+  status: 'pending' | 'acknowledged';
+  acknowledgedAt: Date | null;
+  createdAt: Date;
 }
 
 export interface SenderOptOutRow {
@@ -286,6 +329,8 @@ export interface DbState {
   messagingProfiles: MessagingProfileRow[];
   inboundHolds: InboundHoldRow[];
   senderOptOuts: SenderOptOutRow[];
+  keywordCommands: KeywordCommandRow[];
+  keywordDispatches: KeywordDispatchRow[];
   users: UserRow[];
   userSessions: UserSessionRow[];
   userVerificationTokens: UserVerificationTokenRow[];
@@ -557,6 +602,8 @@ export const dbState: DbState = {
   messagingProfiles: [],
   inboundHolds: [],
   senderOptOuts: [],
+  keywordCommands: [],
+  keywordDispatches: [],
   users: [],
   userSessions: [],
   userVerificationTokens: [],
@@ -671,6 +718,8 @@ export function clearDb(): void {
   dbState.messagingProfiles = [];
   dbState.inboundHolds = [];
   dbState.senderOptOuts = [];
+  dbState.keywordCommands = [];
+  dbState.keywordDispatches = [];
   dbState.users = [];
   dbState.userSessions = [];
   dbState.userVerificationTokens = [];
@@ -887,6 +936,94 @@ export function installDatabaseMock(): Record<string, unknown> {
     isUuid,
     normalizeMessagingAddress,
     channelFromAddress,
+    ...keywordGrammar,
+    // Phase 9: mirrors packages/database/src/repositories/keyword-commands.ts
+    keywordCommandRepository: {
+      async listForScope(appId: string, tenantId: string | null) {
+        return dbState.keywordCommands
+          .filter((r) => r.appId === appId && r.tenantId === tenantId)
+          .sort((a, b) => a.keyword.localeCompare(b.keyword));
+      },
+      async findEffectiveForOwner(appId: string, tenantId: string) {
+        return keywordGrammar.mergeEffectiveKeywordCommands(
+          dbState.keywordCommands.filter((r) => r.appId === appId && (r.tenantId === null || r.tenantId === tenantId)),
+          tenantId,
+        );
+      },
+      async upsert(appId: string, tenantId: string | null, input: keywordGrammar.KeywordCommandInput, updatedBy: string) {
+        const valid = keywordGrammar.validateKeywordCommand(input);
+        const inForce = tenantId === null
+          ? dbState.keywordCommands.filter((r) => r.appId === appId && r.tenantId === null && r.enabled)
+          : keywordGrammar.mergeEffectiveKeywordCommands(
+            dbState.keywordCommands.filter((r) => r.appId === appId && (r.tenantId === null || r.tenantId === tenantId)),
+            tenantId,
+          );
+        const conflict = keywordGrammar.findPhraseConflict(valid, inForce);
+        if (conflict) {
+          throw new keywordGrammar.KeywordCommandValidationError(
+            'aliases',
+            `"${conflict.phrase}" is already recognised as the ${conflict.claimedBy} command for this owner`,
+          );
+        }
+        let row = dbState.keywordCommands.find((r) => r.appId === appId && r.tenantId === tenantId && r.keyword === valid.keyword);
+        if (!row) {
+          row = { id: randomUUID(), appId, tenantId, keyword: valid.keyword, aliases: [], action: valid.action, responseText: null, helpText: null, workflowId: null, enabled: true, updatedBy: null, createdAt: new Date(), updatedAt: new Date() };
+          dbState.keywordCommands.push(row);
+        }
+        Object.assign(row, {
+          aliases: valid.aliases,
+          action: valid.action,
+          responseText: valid.responseText,
+          helpText: valid.helpText,
+          workflowId: valid.workflowId,
+          enabled: valid.enabled,
+          updatedBy,
+          updatedAt: new Date(),
+        });
+        return row;
+      },
+      async remove(appId: string, tenantId: string | null, keyword: string) {
+        const k = keywordGrammar.normalizeKeywordText(keyword);
+        const before = dbState.keywordCommands.length;
+        dbState.keywordCommands = dbState.keywordCommands.filter((r) => !(r.appId === appId && r.tenantId === tenantId && r.keyword === k));
+        return dbState.keywordCommands.length < before;
+      },
+    },
+    keywordCommandDispatchRepository: {
+      async recordOnce(data: Omit<KeywordDispatchRow, 'id' | 'status' | 'acknowledgedAt' | 'createdAt'>) {
+        const existing = dbState.keywordDispatches.find((d) => d.dedupeKey === data.dedupeKey);
+        if (existing) return { dispatch: existing, created: false };
+        const row: KeywordDispatchRow = {
+          ...data,
+          id: randomUUID(),
+          customerPhone: normalizeMessagingAddress(data.customerPhone),
+          businessNumber: data.businessNumber ? normalizeMessagingAddress(data.businessNumber) : null,
+          status: 'pending',
+          acknowledgedAt: null,
+          createdAt: new Date(),
+        };
+        dbState.keywordDispatches.push(row);
+        return { dispatch: row, created: true };
+      },
+      async listForOwner(appId: string, tenantId: string, opts: { status?: string; supplierId?: string | null; limit?: number } = {}) {
+        return dbState.keywordDispatches
+          .filter((d) => d.appId === appId && d.tenantId === tenantId)
+          .filter((d) => !opts.status || d.status === opts.status)
+          .filter((d) => !opts.supplierId || d.supplierId === opts.supplierId)
+          .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+          .slice(0, opts.limit ?? 100);
+      },
+      async acknowledge(id: string, owner: { appId: string; tenantId: string; supplierId?: string | null }) {
+        const row = dbState.keywordDispatches.find(
+          (d) => d.id === id && d.appId === owner.appId && d.tenantId === owner.tenantId && d.status === 'pending'
+            && (!owner.supplierId || d.supplierId === owner.supplierId),
+        );
+        if (!row) return undefined;
+        row.status = 'acknowledged';
+        row.acknowledgedAt = new Date();
+        return row;
+      },
+    },
     eventRepository: {
       async create(data: Record<string, unknown>): Promise<EventRow> {
         if (dbState.failEventWrites) {
@@ -1438,6 +1575,13 @@ export function installDatabaseMock(): Record<string, unknown> {
         apply(row);
         dbState.conversations.push(row);
         return row;
+      },
+      async setWorkflow(id: string, workflowId: string | null): Promise<void> {
+        const row = dbState.conversations.find((c) => c.id === id);
+        if (row) {
+          row.workflowId = workflowId;
+          row.updatedAt = new Date();
+        }
       },
       async touch(id: string): Promise<void> {
         const row = dbState.conversations.find((c) => c.id === id);
@@ -3105,11 +3249,11 @@ export function installDatabaseMock(): Record<string, unknown> {
         return dbState.webhookEndpoints.filter((w) => w.appId === appId && w.tenantId === tenantId && w.active);
       },
       async create(data: { appId: string; tenantId: string; url: string; eventTypes?: string[] }) {
-        const validCategories = new Set(['payment', 'messaging', 'other', '*']);
+        const validCategories = new Set(['payment', 'messaging', 'other', '*', 'messaging.keyword_command']);
         const eventTypes = data.eventTypes && data.eventTypes.length > 0 ? data.eventTypes : ['*'];
         const invalid = eventTypes.filter((e) => !validCategories.has(e));
         if (invalid.length > 0) {
-          throw new Error(`Invalid event type(s): ${invalid.join(', ')} — expected one of payment, messaging, other, *`);
+          throw new Error(`Invalid event type(s): ${invalid.join(', ')} — expected one of payment, messaging, other, *, messaging.keyword_command`);
         }
         const secret = 'whsec_' + randomUUID().replace(/-/g, '');
         const payload = encryptSecret(secret);

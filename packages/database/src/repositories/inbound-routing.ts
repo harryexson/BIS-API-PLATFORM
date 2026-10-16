@@ -18,6 +18,12 @@ export interface InboundHoldCandidate {
   tenantId: string;
   supplierId: string | null;
   conversationId: string | null;
+  /**
+   * Phase 9: this candidate has an application-specific keyword command the
+   * held message matches (e.g. only HaulPro configured WHERE IS MY DRIVER).
+   * An operator HINT only — never used to route (see inboundMessage.ts).
+   */
+  matchedCommand?: string;
 }
 
 export type InboundHoldReason = 'ambiguous_owner' | 'no_owner';

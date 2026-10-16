@@ -51,6 +51,12 @@ import {
   SupplierScope,
   inboundMessageHoldRepository,
   type InboundMessageHold,
+  keywordCommandRepository,
+  keywordCommandDispatchRepository,
+  KeywordCommandValidationError,
+  RESERVED_KEYWORD_NAMES,
+  type KeywordCommand,
+  type KeywordCommandDispatch,
 } from '@company/database';
 import {
   logger,
@@ -666,7 +672,11 @@ async function dispatchOutboundWebhooks(event: TransactionEvent): Promise<void> 
       continue;
     }
     const eventTypes = Array.isArray(endpoint.eventTypes) ? (endpoint.eventTypes as string[]) : ['*'];
-    if (!eventTypes.includes('*') && !eventTypes.includes(event.category)) continue;
+    // Phase 9: an endpoint may also subscribe to one message type within a
+    // category, e.g. 'messaging.keyword_command' (app-specific keyword
+    // commands only) instead of every 'messaging' event.
+    const subtype = event.messageType ? `${event.category}.${event.messageType}` : null;
+    if (!eventTypes.includes('*') && !eventTypes.includes(event.category) && !(subtype && eventTypes.includes(subtype))) continue;
 
     let secret: string | undefined;
     try {
@@ -1947,6 +1957,189 @@ app.patch('/api/dashboard/messaging-profiles/:id', requireAdmin, async (req: Req
     return res.status(400).json({ error: err.message || 'Failed to update compliance status' });
   }
 });
+
+// ----------------------------------------------------
+// KEYWORD COMMANDS (Phase 9, gap register A13)
+// ----------------------------------------------------
+// Each application/tenant defines its OWN inbound keyword commands instead
+// of every tenant getting the platform's hard-coded church wording:
+//   - tenant scope (/v1/api/gateway/keyword-commands, API key + verified
+//     x-tenant-id): the authenticated tenant's own commands/overrides;
+//   - application scope (/api/dashboard/applications/:appId/keyword-commands,
+//     requireAdmin): defaults for every tenant of an application.
+// STOP/START/HELP/YES/NO are always recognised by the platform with fixed
+// consent semantics; a row with one of those names can only change its
+// reply WORDING (validated in @company/database's keyword grammar).
+// App-specific 'dispatch' commands are delivered to the owning application
+// as a tenant-scoped 'keyword_command' event (webhook) and as durable rows
+// it can pull and acknowledge (/v1/api/gateway/keyword-dispatches).
+function keywordCommandView(row: KeywordCommand) {
+  return {
+    id: row.id,
+    scope: row.tenantId === null ? 'application' : 'tenant',
+    keyword: row.keyword,
+    aliases: row.aliases,
+    action: row.action,
+    responseText: row.responseText,
+    helpText: row.helpText,
+    workflowId: row.workflowId,
+    enabled: row.enabled,
+    updatedBy: row.updatedBy,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function keywordDispatchView(row: KeywordCommandDispatch) {
+  return {
+    id: row.id,
+    keyword: row.keyword,
+    argument: row.argument,
+    workflowId: row.workflowId,
+    conversationId: row.conversationId,
+    customerPhone: row.customerPhone,
+    businessNumber: row.businessNumber,
+    channel: row.channel,
+    content: row.content,
+    supplierId: row.supplierId,
+    status: row.status,
+    createdAt: row.createdAt,
+    acknowledgedAt: row.acknowledgedAt,
+  };
+}
+
+function keywordCommandError(res: Response, err: unknown) {
+  if (err instanceof KeywordCommandValidationError) return invalidRequest(res, err.field, err.message);
+  throw err;
+}
+
+const UNIVERSAL_KEYWORDS_VIEW = {
+  reserved: RESERVED_KEYWORD_NAMES,
+  note: 'STOP/START/HELP/YES/NO are recognised for every owner with fixed consent semantics; only their reply wording is configurable.',
+};
+
+app.get('/v1/api/gateway/keyword-commands', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) return res.status(400).json({ error: 'Missing authenticated appId' });
+  const { tenantId } = authContext(req);
+  const [applicationDefaults, tenantOverrides, effective] = await Promise.all([
+    keywordCommandRepository.listForScope(appId, null),
+    keywordCommandRepository.listForScope(appId, tenantId),
+    keywordCommandRepository.findEffectiveForOwner(appId, tenantId),
+  ]);
+  return res.json({
+    universal: UNIVERSAL_KEYWORDS_VIEW,
+    applicationDefaults: applicationDefaults.map(keywordCommandView),
+    tenantOverrides: tenantOverrides.map(keywordCommandView),
+    effective: effective.map(keywordCommandView),
+  });
+}));
+
+app.put('/v1/api/gateway/keyword-commands/:keyword', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) return res.status(400).json({ error: 'Missing authenticated appId' });
+  // The tenant comes ONLY from the verified context — never the body.
+  const { tenantId } = authContext(req);
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  try {
+    const row = await keywordCommandRepository.upsert(
+      appId,
+      tenantId,
+      {
+        keyword: req.params.keyword,
+        action: body.action as string,
+        aliases: body.aliases,
+        responseText: body.responseText,
+        helpText: body.helpText,
+        workflowId: body.workflowId,
+        enabled: body.enabled,
+      },
+      `tenant:${tenantId}`,
+    );
+    logger.info('keyword command configured', { operation: 'keyword-command-upsert', status: 'success', applicationId: appId, tenantId });
+    return res.json(keywordCommandView(row));
+  } catch (err) {
+    return keywordCommandError(res, err);
+  }
+}));
+
+app.delete('/v1/api/gateway/keyword-commands/:keyword', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) return res.status(400).json({ error: 'Missing authenticated appId' });
+  const { tenantId } = authContext(req);
+  const removed = await keywordCommandRepository.remove(appId, tenantId, req.params.keyword);
+  return removed ? res.json({ deleted: true }) : res.status(404).json({ error: 'keyword command not found for this tenant' });
+}));
+
+app.get('/v1/api/gateway/keyword-dispatches', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) return res.status(400).json({ error: 'Missing authenticated appId' });
+  const { tenantId, supplierId } = authContext(req);
+  const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+  if (status && !['pending', 'acknowledged'].includes(status)) {
+    return invalidRequest(res, 'status', "status must be 'pending' or 'acknowledged'");
+  }
+  const limit = Number(req.query.limit);
+  const rows = await keywordCommandDispatchRepository.listForOwner(appId, tenantId, {
+    status,
+    supplierId: supplierId ?? null,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+  });
+  return res.json({ data: rows.map(keywordDispatchView), count: rows.length });
+}));
+
+app.post('/v1/api/gateway/keyword-dispatches/:id/ack', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+  const appId = (req as Request & { appId?: string }).appId;
+  if (!appId) return res.status(400).json({ error: 'Missing authenticated appId' });
+  if (!UUID_PATTERN.test(req.params.id)) return res.status(400).json({ error: 'invalid dispatch id' });
+  const { tenantId, supplierId } = authContext(req);
+  const row = await keywordCommandDispatchRepository.acknowledge(req.params.id, { appId, tenantId, supplierId: supplierId ?? null });
+  // 404 for "not yours" and "not pending" alike — never confirm another
+  // tenant's dispatch exists.
+  return row ? res.json(keywordDispatchView(row)) : res.status(404).json({ error: 'pending dispatch not found' });
+}));
+
+app.get('/api/dashboard/applications/:appId/keyword-commands', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const rows = await keywordCommandRepository.listForScope(req.params.appId, null);
+  return res.json({ universal: UNIVERSAL_KEYWORDS_VIEW, applicationDefaults: rows.map(keywordCommandView) });
+}));
+
+app.put('/api/dashboard/applications/:appId/keyword-commands/:keyword', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  // The admin token carries no identity (gap register C7): the operator
+  // names themselves, recorded verbatim on the row.
+  if (typeof body.updatedBy !== 'string' || body.updatedBy.trim() === '' || body.updatedBy.length > 200) {
+    return invalidRequest(res, 'updatedBy', 'updatedBy is required, at most 200 characters');
+  }
+  try {
+    const row = await keywordCommandRepository.upsert(
+      req.params.appId,
+      null,
+      {
+        keyword: req.params.keyword,
+        action: body.action as string,
+        aliases: body.aliases,
+        responseText: body.responseText,
+        helpText: body.helpText,
+        workflowId: body.workflowId,
+        enabled: body.enabled,
+      },
+      `operator:${body.updatedBy.trim()}`,
+    );
+    logger.warn('application-wide keyword command configured', {
+      operation: 'keyword-command-upsert',
+      status: 'success',
+      applicationId: req.params.appId,
+    });
+    return res.json(keywordCommandView(row));
+  } catch (err) {
+    return keywordCommandError(res, err);
+  }
+}));
+
+app.delete('/api/dashboard/applications/:appId/keyword-commands/:keyword', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const removed = await keywordCommandRepository.remove(req.params.appId, null, req.params.keyword);
+  return removed ? res.json({ deleted: true }) : res.status(404).json({ error: 'keyword command not found' });
+}));
 
 // ----------------------------------------------------
 // OUTBOUND WEBHOOK REGISTRATION (/v1/api/gateway/webhooks)

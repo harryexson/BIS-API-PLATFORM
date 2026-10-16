@@ -395,27 +395,53 @@ describe('Conversation Update (ConversationManager record + continuity)', () => 
 });
 
 describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS MY DRIVER?', () => {
-  // `handled` reflects whether packages/routing/src/keywords.ts's
-  // handleKeyword() actually has a case for this keyword today — CHECK IN
-  // and WHERE IS MY DRIVER? fall through to `{ handled: false }`, a
-  // separate, still-open gap (no app-specific keyword handler exists for
-  // either) that this file doesn't attempt to close. What this describe
-  // block used to document as "no keyword handler runs" for ALL of these
-  // was really one gap upstream of that: the inbound webhook never reached
-  // handleKeyword() at all (see the enqueue-path fix below).
+  // Phase 9 (gap register A13): this block used to document CHECK IN and
+  // WHERE IS MY DRIVER? as gaps (`handled: false`, a console.warn('[gap]'))
+  // and relied on PRAY being hard-coded — with church wording — for EVERY
+  // tenant in the shared routing package. Keywords are now:
+  //   - universal (YES / NO / HELP / STOP): recognised for every owner;
+  //   - configured per owner (keyword_commands). Reach Church configures, via
+  //     the real tenant-authenticated gateway route, PRAY as a 'reply'
+  //     command and CHECK IN as a 'dispatch' command handed to its own
+  //     backend (generic dispatch: durable row + tenant-scoped event);
+  //   - WHERE IS MY DRIVER? is a logistics command Reach Church does NOT
+  //     configure — so for this church tenant it is, correctly, ordinary
+  //     inbound content, not a recognised command. (HaulPro's configured
+  //     WHERE IS MY DRIVER is proven in keyword-commands.scenarios.ts.)
   const KEYWORDS = [
-    { keyword: 'YES', compliant: 'acknowledge/confirm the intent and auto-reply with a confirmation', handled: true, phone: '+15556010001' },
-    { keyword: 'NO', compliant: 'acknowledge the cancellation and halt the confirmation flow', handled: true, phone: '+15556010002' },
-    { keyword: 'HELP', compliant: 'reply with the help text including the STOP opt-out', handled: true, phone: '+15556010003' },
-    { keyword: 'STOP', compliant: 'record opt-out consent and block all further outbound messaging to this recipient', handled: true, phone: '+15556010004' },
-    { keyword: 'PRAY', compliant: 'log a prayer request and reply with a confirmation + guidance', handled: true, phone: '+15556010005' },
-    { keyword: 'CHECK IN', compliant: 'respond with the member’s check-in status', handled: false, phone: '+15556010006' },
-    { keyword: 'WHERE IS MY DRIVER?', compliant: 'resolve the trip and reply with the driver/location update', handled: false, phone: '+15556010007' },
-  ];
+    { keyword: 'YES', expected: 'universal', reason: 'keyword_response:confirmation', phone: '+15556010001' },
+    { keyword: 'NO', expected: 'universal', reason: 'keyword_response:confirmation', phone: '+15556010002' },
+    { keyword: 'HELP', expected: 'universal', reason: 'keyword_response:help', phone: '+15556010003' },
+    { keyword: 'STOP', expected: 'universal', reason: 'keyword_response:opt_out', phone: '+15556010004' },
+    { keyword: 'PRAY', expected: 'reply', reason: 'keyword_response:command', phone: '+15556010005' },
+    { keyword: 'CHECK IN', expected: 'dispatch', reason: 'keyword_command:CHECK IN', phone: '+15556010006' },
+    { keyword: 'WHERE IS MY DRIVER?', expected: 'not_configured', reason: 'inbound_routed:', phone: '+15556010007' },
+  ] as const;
+
+  beforeAll(async () => {
+    const put = (keyword: string, body: unknown) =>
+      runtime.request('PUT', `/v1/api/gateway/keyword-commands/${encodeURIComponent(keyword)}`, {
+        headers: { 'content-type': 'application/json', ...AUTH },
+        body: JSON.stringify(body),
+      });
+    const pray = await put('PRAY', {
+      action: 'reply',
+      responseText: 'Your prayer request has been received. Our prayer team will pray for you.',
+      helpText: 'send a prayer request',
+    });
+    expect(pray.status, await pray.clone().text()).toBe(200);
+    const checkIn = await put('CHECK IN', {
+      action: 'dispatch',
+      aliases: ['CHECKIN'],
+      workflowId: 'reach.service_check_in',
+      helpText: 'check in to a service',
+    });
+    expect(checkIn.status, await checkIn.clone().text()).toBe(200);
+  });
 
   it.each(KEYWORDS)(
-    'inbound "$keyword" is verified, really enqueued, and routed through handleKeyword() end-to-end',
-    async ({ keyword, compliant, handled, phone }) => {
+    'inbound "$keyword" is verified, really enqueued, and handled per Reach Church\'s own keyword configuration ($expected)',
+    async ({ keyword, expected, reason, phone }) => {
       // Provider -> Platform Webhook only delivers a reply for a number the
       // app has an active conversation with; seed one via an outbound send
       // (mirrors what ConversationResolver requires — see inboundMessage.ts).
@@ -439,17 +465,40 @@ describe('inbound messages: YES / NO / HELP / STOP / PRAY / CHECK IN / WHERE IS 
 
       const events = busEventsAfter(token, 'messaging');
       expect(events.length).toBeGreaterThan(0);
-      if (handled) {
-        expect(events.some((e: any) => String(e.decisionReason).startsWith('keyword_response:'))).toBe(true);
+      expect(events.some((e: any) => String(e.decisionReason).startsWith(reason))).toBe(true);
+      const dispatches = dbState.keywordDispatches.filter((d) => d.customerPhone === phone);
+      if (expected === 'dispatch') {
+        // Generic dispatch, attributed to Reach Church's tenant: a durable
+        // row + a tenant-scoped event; no fabricated business answer.
+        expect(dispatches).toHaveLength(1);
+        expect(dispatches[0]).toMatchObject({ appId: APP_SLUG, tenantId: TENANT_ID, keyword: 'CHECK IN', workflowId: 'reach.service_check_in' });
+        const evt: any = events.find((e: any) => e.decisionReason === 'keyword_command:CHECK IN');
+        expect(evt.tenantId).toBe(TENANT_ID);
+        expect(evt.payload.dispatchId).toBe(dispatches[0].id);
+        expect(events.some((e: any) => String(e.decisionReason).startsWith('keyword_response:'))).toBe(false);
+        expect(findConversation(APP_SLUG, phone)?.workflowId).toBe('reach.service_check_in');
       } else {
-        // Reaches handleKeyword() for real now, but there's no case for this
-        // keyword — falls through to the generic "inbound_routed" event
-        // (inboundMessage.ts Step 5), same as any unrecognized text.
-        expect(events.some((e: any) => String(e.decisionReason).startsWith('inbound_routed:'))).toBe(true);
-        console.warn(`[gap] "${keyword}" reaches handleKeyword() for real now, but no handler exists for it — a compliant platform would: ${compliant}`);
+        expect(dispatches).toHaveLength(0);
+      }
+      if (expected === 'not_configured') {
+        // Not a command for THIS tenant: delivered as ordinary content.
+        expect(events.some((e: any) => String(e.decisionReason).startsWith('keyword_'))).toBe(false);
       }
     },
   );
+
+  it('HELP lists the church\'s own commands, not a hard-coded platform list', async () => {
+    const phone = '+15556010008';
+    await sendMessage(runtime, { recipient: phone, content: 'Welcome!', providerOverride: 'signalhouse' });
+    const token = mark();
+    await deliverWebhook(runtime, 'signalhouse', buildInboundSms({ from: phone, text: 'HELP' }));
+    await drain(gatewayPipeline, ['inbound_message']);
+    const help: any = busEventsAfter(token, 'messaging').find((e: any) => e.decisionReason === 'keyword_response:help');
+    expect(help.payload.content).toContain('STOP');
+    expect(help.payload.content).toContain('PRAY (send a prayer request)');
+    expect(help.payload.content).toContain('CHECK IN (check in to a service)');
+    expect(help.payload.content).not.toContain('DRIVER');
+  });
 
   it('inbound STOP via the real webhook route is really processed end-to-end: consent recorded, conversation stays active', async () => {
     // ConversationResolver matches sender+provider, so the seed send must

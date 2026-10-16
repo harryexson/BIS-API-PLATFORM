@@ -160,6 +160,13 @@ export function registerSharedNumberScenarios(getWorld: () => SharedNumberWorld)
     await registerNumber(w.haulpro, HAUL_ZM, 'ZM');
     await registerNumber(w.stayscape, SHARED_MW, 'MW');
     await registerNumber(w.reach, REACH_DED, 'MW', 'infobip');
+    // Phase 9 (gap register A13): PRAY is no longer a platform-wide keyword;
+    // Reach Church configures it for itself through its own tenant route.
+    const pray = await w.runtime.request('PUT', '/v1/api/gateway/keyword-commands/PRAY', {
+      headers: { 'content-type': 'application/json', ...auth(w.reach) },
+      body: JSON.stringify({ action: 'reply', responseText: 'Your prayer request has been received.', helpText: 'send a prayer request' }),
+    });
+    expect(pray.status, await pray.clone().text()).toBe(200);
   }, 60_000);
 
   afterAll(async () => {
@@ -495,7 +502,9 @@ export function registerSharedNumberScenarios(getWorld: () => SharedNumberWorld)
       const elapsed = Date.now() - started;
 
       const rows = await w.eventsFor(c);
-      expect(rows.some((r) => r.decisionReason === 'keyword_prayer' && r.appId === w.reach.appSlug)).toBe(true);
+      // Phase 9: Reach Church's own configured PRAY command (was the
+      // hard-coded, platform-wide 'keyword_prayer').
+      expect(rows.some((r) => r.decisionReason === 'keyword_command:PRAY' && r.appId === w.reach.appSlug)).toBe(true);
       expect(rows.some((r) => String(r.decisionReason).startsWith('inbound_from_') && r.appId === w.reach.appSlug)).toBe(true);
       expect(await holdsFor(c)).toHaveLength(0);
       // Generous bound — two full webhook → queue → worker round trips.
