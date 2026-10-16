@@ -2,6 +2,8 @@ import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
 import { providerHealthRepository, providerRepository } from '@company/database';
 
+const PROVIDER_HEALTH_LOCK_WAIT_MS = 1_000;
+
 export function createProviderHealthProcessor(deps: JobDeps): JobProcessor {
   return async (job) => {
     const target = job.payload?.providerId as string | undefined;
@@ -12,7 +14,13 @@ export function createProviderHealthProcessor(deps: JobDeps): JobProcessor {
     const ttl = deps.config.retry.maxDelayMs;
 
     for (const cfg of candidates) {
-      await deps.lock.withLock(`provider:${cfg.id}`, owner, ttl, async () => {
+      // B15: `provider:<id>` is shared with provider_webhook's (very short)
+      // status update, and every replica enqueues a health check per
+      // provider each interval. Wait briefly for a webhook update to finish;
+      // if the lock is still held, another health check for this provider is
+      // running right now — skip this provider rather than throwing (which
+      // failed the whole job into retries/dead-letter).
+      const outcome = await deps.lock.tryWithLock(`provider:${cfg.id}`, owner, ttl, async () => {
         const summary = await deps.registry.runHealthCheck(cfg.id);
         if (!summary) return;
 
@@ -38,7 +46,10 @@ export function createProviderHealthProcessor(deps: JobDeps): JobProcessor {
           lastSuccessfulRequest: summary.status === 'healthy' ? summary.checkedAt : undefined,
           errorRate: summary.status === 'down' ? 100 : summary.status === 'degraded' ? 50 : 0,
         });
-      });
+      }, { waitMs: PROVIDER_HEALTH_LOCK_WAIT_MS });
+      if (!outcome.acquired) {
+        console.warn(`[provider_health] skipped ${cfg.id}: another health check holds the provider lock`);
+      }
     }
   };
 }

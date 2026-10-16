@@ -87,6 +87,10 @@ async function processProviderWebhook(job: Job, deps: JobDeps, store: WebhookEve
   const owner = `webhook_${providerId}_${Math.random().toString(36).slice(2, 8)}`;
   const ttl = deps.config.retry.maxDelayMs;
 
+  // B15: a webhook's status update must not be skipped, so this uses
+  // withLock — which now waits (bounded backoff) for a concurrent health
+  // check to release the lock instead of throwing at once, and only throws
+  // LockNotAcquiredError (→ normal job retry) if it is still held after that.
   await deps.lock.withLock(`provider:${providerId}`, owner, ttl, async () => {
     if (status) {
       deps.registry.updateManagement(providerId, { status });

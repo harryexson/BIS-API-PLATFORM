@@ -104,7 +104,9 @@ export class WorkerManager {
     }
 
     if (job.idempotencyKey) {
-      const state = await this.idempotency.claim(job.idempotencyKey);
+      // B6: record which job holds the claim so the stale-job reaper can
+      // release it if this attempt crashes (see JobQueue.rescueStuckJobs).
+      const state = await this.idempotency.claim(job.idempotencyKey, job.id);
       if (state === 'completed' || state === 'processing') {
         await this.queue.complete(job);
         return;
