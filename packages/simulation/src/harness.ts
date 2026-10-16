@@ -381,7 +381,15 @@ export interface MessageResult {
  */
 export async function sendMessage(
   runtime: SimRuntime,
-  payload: { recipient: string; content: string; providerOverride?: string },
+  payload: {
+    recipient: string;
+    content: string;
+    providerOverride?: string;
+    // Phase 10: the explicit channel and opt-in channel-switch policy —
+    // sent only when given, so existing callers' requests are unchanged.
+    channel?: string;
+    channelPolicy?: Record<string, unknown>;
+  },
   extraHeaders: Record<string, string> = {},
 ): Promise<MessageResult> {
   const res = await runtime.post(
@@ -390,6 +398,8 @@ export async function sendMessage(
       recipient: payload.recipient,
       content: payload.content,
       providerOverride: payload.providerOverride,
+      ...(payload.channel !== undefined ? { channel: payload.channel } : {}),
+      ...(payload.channelPolicy !== undefined ? { channelPolicy: payload.channelPolicy } : {}),
     },
     {
       'content-type': 'application/json',

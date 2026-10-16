@@ -105,6 +105,59 @@ export interface TransactionEvent {
   // Payments only: the platform's own transactions.id this event belongs to
   // (see PaymentRequest.paymentTransactionId), when the caller allocated one.
   paymentTransactionId?: string;
+
+  // ---- Messaging only: the channel decision (Phase 10, gap register A6/A9) ----
+  // Stable, machine-checkable fields — the channel decision used to exist
+  // only as free text inside decisionReason. Set by RoutingEngine.routeMessage
+  // on EVERY messaging event it produces (success or failure).
+  //
+  // The channel the message was REQUESTED on: the caller's explicit
+  // MessageRequest.channel, or — only when the caller sent none — the
+  // legacy content-based default (see requestedChannelSource).
+  requestedChannel?: MessageChannel;
+  // 'explicit' = the caller named the channel; 'inferred' = the caller did
+  // not, and the platform's backward-compatible default inference picked it.
+  requestedChannelSource?: MessageChannelSource;
+  // The channel the message was actually handed to a provider on. null on a
+  // failure event (nothing was sent on any channel).
+  selectedChannel?: MessageChannel | null;
+  // null whenever selectedChannel === requestedChannel. When they differ it
+  // is ALWAYS a specific, non-empty explanation (which providers of the
+  // requested channel were unavailable/failed, and that the caller opted in
+  // to a channel switch) — a channel is never changed silently.
+  fallbackReason?: string | null;
+}
+
+/**
+ * Phase 10 (gap register A6/A9): the communication channels outbound
+ * messaging routes on. Each is also the provider capability name a
+ * messaging adapter declares (ProviderConfig.capabilities).
+ */
+export type MessageChannel = 'sms' | 'whatsapp' | 'email';
+export const MESSAGE_CHANNELS: readonly MessageChannel[] = ['sms', 'whatsapp', 'email'];
+export type MessageChannelSource = 'explicit' | 'inferred';
+
+/**
+ * Phase 10: the per-request channel-switch policy. The platform default is
+ * "never switch channel": an SMS whose SMS providers are all unavailable
+ * FAILS rather than going out as an email/WhatsApp. A caller that genuinely
+ * prefers a different channel to no message at all must opt in, per
+ * message, here.
+ */
+export interface MessageChannelPolicy {
+  // Default false. Only `true` (the boolean) enables a channel switch.
+  allowChannelSwitch?: boolean;
+  // Ordered channels to fall back to, tried only after every provider of
+  // the requested channel is unavailable or has failed. Defaults (when
+  // allowChannelSwitch is true and this is omitted) to every other channel
+  // in MESSAGE_CHANNELS order.
+  fallbackChannels?: MessageChannel[];
+  // The recipient's address on a fallback channel whose address type
+  // differs from the requested one (an email address for an SMS recipient).
+  // sms <-> whatsapp reuse the original phone number when omitted; a
+  // fallback channel with no usable address is skipped (and says so in the
+  // failure/fallback reason) — a phone number is never "emailed".
+  fallbackRecipients?: Partial<Record<MessageChannel, string>>;
 }
 
 // Request to BaseProvider.refund() — refunds a previously successful
@@ -225,6 +278,18 @@ export interface MessageRequest {
   recipient: string;
   content: string;
   subject?: string;
+  // Phase 10 (gap register A6): the channel the caller wants this message
+  // sent on. When present it is authoritative — it always wins over the
+  // legacy content-based inference (recipient '@' -> email, body 'wa:' or
+  // > 300 chars -> whatsapp, otherwise sms), which now only applies as a
+  // backward-compatible default for callers that send no channel at all.
+  // RoutingEngine also sets it on the payload it hands a provider adapter,
+  // to the channel actually selected (adapters such as Twilio read it to
+  // choose SMS vs WhatsApp).
+  channel?: MessageChannel;
+  // Phase 10 (gap register A9): opt-in channel-switch policy for this one
+  // message. Absent = never switch channel.
+  channelPolicy?: MessageChannelPolicy;
   [key: string]: unknown;
 }
 

@@ -211,13 +211,23 @@ describe('Provider Selection edge cases', () => {
     expect(String(res.body.decisionReason)).toContain('Dynamic Failover');
   });
 
-  it('when all SMS providers are offline, an SMS silently falls back to email (documented gap)', async () => {
-    // whatsapp is also offlined here even though it isn't SMS-capable: it's
-    // a real, online, non-SMS messaging channel, and if left online it (not
-    // email) becomes the deterministic fallback pick — this test is about
-    // proving the "any channel, not just email" gap, and needs a single
-    // surviving channel (email) to assert against reliably.
+  it('when all SMS providers are offline, an SMS is NOT silently sent over email: it fails with a specific, observable reason (Phase 10 — was a documented gap)', async () => {
+    // Phase 10 (gap register A9/A8): this test used to assert the defect —
+    // `expect(res.body.providerId).toBe('email')` plus a decisionReason of
+    // "Defaulted to first available messaging channel" — i.e. that an SMS
+    // silently went out via email. It now asserts the corrected behaviour:
+    // with no channel switch opted into, the send FAILS, says exactly why,
+    // and the email provider is never handed the message.
+    //
+    // whatsapp is also offlined (as before) so email is the single surviving
+    // channel — the strongest possible temptation for a silent switch.
     const smsProviders = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'africastalking', 'sinch', 'vibes', 'twilio', 'whatsapp', 'vonage'];
+    let emailCalls = 0;
+    patchProviderProcessRequest('email', async () => {
+      emailCalls++;
+      throw new Error('email provider must not be used for an SMS');
+    });
+    const token = mark();
     try {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'offline' });
 
@@ -225,11 +235,23 @@ describe('Provider Selection edge cases', () => {
         recipient: '+15550003333',
         content: 'Please text me back on this number.',
       });
-      expect(res.status).toBe(200);
-      // Active messaging providers now = [email]; routeMessage defaults there.
-      expect(res.body.providerId).toBe('email');
-      expect(String(res.body.decisionReason)).toContain('Defaulted to first available messaging channel');
-      console.warn('[gap] SMS channel is not preserved when all SMS providers are offline: an SMS silently goes out via email');
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('channel_unavailable');
+      // This caller sent no channel: the legacy default inferred 'sms', and
+      // the response says so.
+      expect(res.body.requestedChannel).toBe('sms');
+      expect(res.body.requestedChannelSource).toBe('inferred');
+      expect(res.body.selectedChannel).toBeNull();
+      expect(res.body.fallbackReason).toBeNull();
+      expect(String(res.body.detail)).toContain("requested channel 'sms' is unavailable");
+      expect(String(res.body.detail)).toContain('no online, production-eligible sms-capable messaging provider');
+      expect(String(res.body.detail)).toContain('NOT sent on any other channel');
+      expect(emailCalls).toBe(0);
+
+      const failed = busEventsAfter(token, 'messaging');
+      expect(failed.some((e: any) => e.providerId === 'email' && e.status === 'success')).toBe(false);
+      const errorEvent = failed.find((e: any) => e.id === res.body.id);
+      expect(errorEvent).toMatchObject({ status: 'failed', requestedChannel: 'sms', selectedChannel: null, fallbackReason: null });
     } finally {
       for (const p of smsProviders) runtime.registry.updateManagement(p, { status: 'online' });
     }

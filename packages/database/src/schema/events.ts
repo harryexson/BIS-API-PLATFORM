@@ -1,4 +1,5 @@
 import {
+  check,
   pgTable,
   uuid,
   text,
@@ -40,6 +41,15 @@ export const events = pgTable(
     response: jsonb('response'),
     error: text('error'),
     idempotencyKey: text('idempotency_key'),
+    // Phase 10 (gap register A6/A9, migration 0019): a messaging event's
+    // channel decision as stable columns, not free text in decision_reason.
+    // CHECK chk_events_channel_fallback_reason makes a silent channel change
+    // unrepresentable: when requested and selected channel are both known,
+    // fallback_reason is NULL iff they are equal, and non-blank iff they
+    // differ.
+    requestedChannel: text('requested_channel'),
+    selectedChannel: text('selected_channel'),
+    fallbackReason: text('fallback_reason'),
     createdAt: timestamp('created_at', { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -55,6 +65,12 @@ export const events = pgTable(
     // EXISTS guard, so a retried webhook job cannot record its event twice.
     // Partial: most events rows have no key.
     index('idx_events_idempotency_key').on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
+    // Phase 10: audit query "every message that changed channel".
+    index('idx_events_channel_fallback').on(t.createdAt).where(sql`${t.fallbackReason} IS NOT NULL`),
+    check(
+      'chk_events_channel_fallback_reason',
+      sql`${t.requestedChannel} IS NULL OR ${t.selectedChannel} IS NULL OR (${t.requestedChannel} = ${t.selectedChannel} AND ${t.fallbackReason} IS NULL) OR (${t.requestedChannel} <> ${t.selectedChannel} AND ${t.fallbackReason} IS NOT NULL AND length(btrim(${t.fallbackReason})) > 0)`,
+    ),
   ],
 );
 

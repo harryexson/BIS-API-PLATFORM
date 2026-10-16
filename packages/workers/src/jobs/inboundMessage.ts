@@ -96,6 +96,8 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
     businessNumber: string | null;
     conversationId: string;
     result: KeywordResult;
+    /** Phase 10: the channel the inbound message arrived on — the reply goes back on it. */
+    channel: string;
   }): Promise<void> {
     if (!queue || !args.result.response) return;
     await queue.enqueue(
@@ -111,6 +113,7 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
         keywordName: args.result.keyword ?? null,
         conversationId: args.conversationId,
         businessNumber: args.businessNumber,
+        channel: args.channel,
       },
       { idempotencyKey: `keyword_reply:${args.dedupeKey}` },
     );
@@ -266,6 +269,7 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
           businessNumber,
           conversationId,
           result: keywordResult,
+          channel: inbound.channel,
         });
       }
       return;

@@ -10,6 +10,15 @@ import {
 import { ConversationManager, ConversationContext, type ConversationSenderInfo } from './conversation';
 import { findMatchingRule, type RoutingContext } from './rules';
 import { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
+import {
+  MESSAGE_CHANNELS,
+  MessageChannelUnavailableError,
+  addressSuitsChannel,
+  effectiveChannelPolicy,
+  resolveRequestedChannel,
+  type EffectiveChannelPolicy,
+  type MessageChannel,
+} from './channel';
 
 export { ConversationManager, type ConversationContext } from './conversation';
 export {
@@ -75,26 +84,30 @@ export class ConsentBlockedError extends Error {
 }
 
 /**
- * P1-4: Channel fallback policy.
- *
- * Defines whether channel switching (e.g., SMS → Email) is allowed.
- * Do NOT silently change a communication channel — the routing policy
- * must explicitly define whether fallback is permitted.
+ * P1-4 / Phase 10: Channel fallback policy — see ./channel.ts. Before Phase
+ * 10 this interface and its default existed here but only
+ * allowAlternateProvider was ever read: allowChannelSwitch/requiresConsent
+ * were decorative, and an SMS could silently (and, via conversation
+ * continuity, permanently) go out as an email (gap register A9). All three
+ * are now enforced by routeMessage.
  */
-export interface ChannelFallbackPolicy {
-  /** Allow fallback to alternate SMS provider (e.g., SignalHouse → FutureSMS) */
-  allowAlternateProvider: boolean;
-  /** Allow channel switching (e.g., SMS → Email) — disabled by default */
-  allowChannelSwitch: boolean;
-  /** Whether channel switching requires recipient consent */
-  requiresConsent: boolean;
-}
-
-const DEFAULT_FALLBACK_POLICY: ChannelFallbackPolicy = {
-  allowAlternateProvider: true,
-  allowChannelSwitch: false,
-  requiresConsent: true,
-};
+export {
+  DEFAULT_FALLBACK_POLICY,
+  MessageChannelUnavailableError,
+  InvalidMessageChannelRequestError,
+  parseChannelPolicy,
+  isMessageChannel,
+  inferChannelFromContent,
+  resolveRequestedChannel,
+  addressSuitsChannel,
+  channelDecisionColumns,
+  MESSAGE_CHANNELS,
+  type MessageChannel,
+  type MessageChannelPolicy,
+  type ChannelFallbackPolicy,
+  type EffectiveChannelPolicy,
+  type RequestedChannel,
+} from './channel';
 
 // P1: Default provider request timeout (30 seconds).
 // Prevents hung provider calls from blocking the entire gateway.
@@ -371,19 +384,52 @@ export class RoutingEngine {
   // explicit providerOverride: conversation continuity (reusing the
   // provider an ongoing thread already used) — a routing rule or a
   // score-based pick must never silently switch providers mid-conversation.
+  //
+  // Phase 10 (gap register A6/A8/A9) — the CHANNEL is never changed
+  // silently:
+  //  - the requested channel is the caller's explicit `channel`, or (only
+  //    when absent) the legacy content-inferred default — see ./channel.ts;
+  //  - every step (override, continuity, rule target, scored pool, failover
+  //    cascade) only ever considers providers that declare the requested
+  //    channel's capability. The old last-resort pool — "any active
+  //    messaging provider", which is how an SMS used to become an email —
+  //    is gone;
+  //  - when no provider of the requested channel can take the message, the
+  //    send FAILS (MessageChannelUnavailableError, with a specific reason)
+  //    unless the caller opted in for this message via
+  //    channelPolicy.allowChannelSwitch === true, in which case the opted-in
+  //    fallback channels are tried — each one only with a usable address
+  //    and the recipient's affirmative consent on it (requiresConsent);
+  //  - every event carries requestedChannel / requestedChannelSource /
+  //    selectedChannel / fallbackReason (null unless the channel differs);
+  //  - a fallback is per-message, never sticky: the next message starts
+  //    again from its own requested channel, and continuity only reuses a
+  //    thread on that same channel.
   public async routeMessage(appId: string, payload: any, options: RouteMessageOptions = {}): Promise<TransactionEvent> {
     const { recipient = '', content = '', providerOverride, tenantId = 'default' } = payload;
     // Phase 8: the gateway's VERIFIED supplier scope (never a body field —
     // resolveTenantContext strips those). Part of the conversation owner key.
     const supplierId: string | null = typeof payload.supplierId === 'string' && payload.supplierId ? payload.supplierId : null;
-    let selectedProvider: BaseProvider | null = null;
-    let reason = '';
 
     // Determined once, reused for consent checking, capability routing, and
-    // conversation recording — previously recomputed inline in three places.
-    const channel = recipient.includes('@') ? 'email'
-      : content.toLowerCase().includes('wa:') || content.length > 300 ? 'whatsapp'
-      : 'sms';
+    // conversation recording. EXPLICIT request first; the content heuristic
+    // only as the backward-compatible default (see resolveRequestedChannel).
+    const requested = resolveRequestedChannel({
+      explicit: payload.channel,
+      recipient,
+      content,
+      overrideId: typeof providerOverride === 'string' ? providerOverride : undefined,
+      overrideChannels: typeof providerOverride === 'string' ? this.channelsOf(providerOverride) : undefined,
+    });
+    const requestedChannel = requested.channel;
+    const policy = effectiveChannelPolicy(payload.channelPolicy, requestedChannel);
+    const stamp = (event: TransactionEvent, selectedChannel: MessageChannel, fallbackReason: string | null): TransactionEvent => ({
+      ...event,
+      requestedChannel,
+      requestedChannelSource: requested.source,
+      selectedChannel,
+      fallbackReason,
+    });
 
     // Consent: a STOP keyword blocks non-permitted outbound messaging on
     // this channel until the recipient opts back in (JOIN/START/HELP).
@@ -393,7 +439,7 @@ export class RoutingEngine {
     // outbound messaging. This is a real tradeoff (a genuinely opted-out
     // recipient could receive a message during a DB outage) surfaced via
     // console.error rather than swallowed silently; hardening it to
-    // fail-closed is a documented follow-up, not done here.
+    // fail-closed is a documented follow-up (gap register A7), not done here.
     // Phase 9: the ONE message a recipient may receive after opting out is
     // the confirmation of that opt-out (CTIA). Internal-only option, never
     // reachable from a request body (see RouteMessageOptions).
@@ -401,70 +447,214 @@ export class RoutingEngine {
     let optedOut = false;
     if (recipient && !optOutConfirmation) {
       try {
-        optedOut = await consentRecordRepository.isOptedOut(appId, tenantId, recipient, channel);
+        optedOut = await consentRecordRepository.isOptedOut(appId, tenantId, recipient, requestedChannel);
       } catch (err: any) {
         console.error(`[routing] consent lookup failed for ${recipient} — failing open (send proceeds): ${err.message}`);
       }
     }
     if (optedOut) {
-      throw new ConsentBlockedError(recipient, channel);
+      throw new ConsentBlockedError(recipient, requestedChannel);
     }
 
-    // P0 FIX: Check conversation history — now includes tenantId for isolation
-    const conversationCtx: ConversationContext = { phoneNumber: recipient, appId, tenantId, supplierId };
-    const conversation = await this.conversationManager.resolve(conversationCtx);
-
-    if (conversation && !providerOverride) {
-      const provider = this.registry.getProvider(conversation.providerId);
-      if (provider && this.registry.isProviderAvailable(conversation.providerId)) {
-        selectedProvider = provider;
-        reason = `Conversation continuity: Reusing ${conversation.channel} provider '${provider.config.name}' for ${recipient}.`;
-      }
-    }
-
-    const allProviders = this.registry.getAllConfigs();
-    const activeMsg = allProviders.filter(
+    const activeMsg = this.registry.getAllConfigs().filter(
       p => p.category === 'messaging' && this.registry.isProviderAvailable(p.id) && this.registry.isLiveEligible(p.id),
     );
-
-    if (activeMsg.length === 0 && !selectedProvider) {
-      throw new Error('All messaging providers are currently OFFLINE / UNDER MAINTENANCE');
+    if (activeMsg.length === 0) {
+      throw new MessageChannelUnavailableError(
+        requestedChannel,
+        requested.source,
+        'All messaging providers are currently OFFLINE / UNDER MAINTENANCE (no online, production-eligible messaging provider on any channel).',
+      );
     }
 
-    // 1. Manual override check
+    // 1. The requested channel.
+    const primary = await this.sendOnChannel({
+      appId, payload, tenantId, supplierId, optOutConfirmation, policy,
+      channel: requestedChannel,
+      address: recipient,
+      providerOverride: typeof providerOverride === 'string' && providerOverride ? providerOverride : undefined,
+      reasonPrefix: `${requested.note} | `,
+    });
+    if (primary.kind === 'sent') return stamp(primary.event, requestedChannel, null);
+
+    if (!policy.allowChannelSwitch) {
+      throw new MessageChannelUnavailableError(
+        requestedChannel,
+        requested.source,
+        `${primary.reason}. Channel switching is not permitted for this message (channelPolicy.allowChannelSwitch is not true), so it was NOT sent on any other channel.`,
+      );
+    }
+
+    // 2. Opted-in channel switch: each fallback channel in the caller's
+    // order, each re-checked for an address, consent, and its own providers.
+    const skipped: string[] = [];
+    for (const channel of policy.fallbackChannels) {
+      const address = policy.fallbackRecipients[channel] ?? (addressSuitsChannel(recipient, channel) ? recipient : undefined);
+      if (!address) {
+        skipped.push(`'${channel}' skipped: no ${channel} address for this recipient (channelPolicy.fallbackRecipients.${channel} not provided)`);
+        continue;
+      }
+      const consent = await this.fallbackConsent(appId, tenantId, address, channel, policy);
+      if (!consent.ok) {
+        skipped.push(`'${channel}' skipped: ${consent.reason}`);
+        continue;
+      }
+      let attempt: Awaited<ReturnType<RoutingEngine['sendOnChannel']>>;
+      try {
+        attempt = await this.sendOnChannel({
+          appId, payload, tenantId, supplierId, optOutConfirmation, policy,
+          channel,
+          address,
+          providerOverride: undefined, // an override names a provider for the REQUESTED channel only
+          reasonPrefix: `${requested.note} | Channel switch ${requestedChannel} -> ${channel} (caller opted in): ${primary.reason}. | `,
+        });
+      } catch (err) {
+        // A number-level STOP on a fallback channel only rules out THAT
+        // channel; a failed sender-consent lookup still aborts everything.
+        if (err instanceof ConsentBlockedError) {
+          skipped.push(`'${channel}' skipped: recipient ${address} has opted out of ${channel} on the sending number`);
+          continue;
+        }
+        throw err;
+      }
+      if (attempt.kind === 'sent') {
+        const fallbackReason =
+          `Requested channel '${requestedChannel}' unavailable: ${primary.reason}. ` +
+          `Sent on fallback channel '${channel}' to ${address} because the caller opted in to channel switching for this message (channelPolicy.allowChannelSwitch=true)` +
+          (skipped.length > 0 ? `; earlier fallback channels: ${skipped.join('; ')}` : '') +
+          '.';
+        return stamp(attempt.event, channel, fallbackReason);
+      }
+      skipped.push(`'${channel}' failed: ${attempt.reason}`);
+    }
+
+    throw new MessageChannelUnavailableError(
+      requestedChannel,
+      requested.source,
+      `${primary.reason}. Channel switching was permitted, but no fallback channel delivered it: ${skipped.length > 0 ? skipped.join('; ') : 'no fallback channels to try'}.`,
+    );
+  }
+
+  /** Messaging channels a provider declares (its capabilities ∩ MESSAGE_CHANNELS). */
+  private channelsOf(providerId: string): MessageChannel[] {
+    const view = this.registry.getManagementView(providerId);
+    if (!view || view.category !== 'messaging') return [];
+    return MESSAGE_CHANNELS.filter((c) => view.capabilities.includes(c));
+  }
+
+  private supportsChannel(providerId: string, channel: MessageChannel): boolean {
+    return this.channelsOf(providerId).includes(channel);
+  }
+
+  /**
+   * requiresConsent (Phase 10): a channel the recipient was NOT asked to be
+   * contacted on is used only with their affirmative consent on it — an
+   * 'opted_in' record for that address and channel — and never past an
+   * opt-out. A lookup error rules the channel out (fail closed): a channel
+   * switch is an exception path, never worth guessing consent for.
+   */
+  private async fallbackConsent(
+    appId: string,
+    tenantId: string,
+    address: string,
+    channel: MessageChannel,
+    policy: EffectiveChannelPolicy,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    let status: string | undefined;
+    try {
+      status = (await consentRecordRepository.findByRecipient(appId, tenantId, address, channel))?.status;
+    } catch (err: any) {
+      return { ok: false, reason: `consent lookup for ${address} on ${channel} failed (${err?.message ?? err}) — not switching channel without it` };
+    }
+    if (status === 'opted_out') return { ok: false, reason: `recipient ${address} has opted out of ${channel}` };
+    if (policy.requiresConsent && status !== 'opted_in') {
+      return { ok: false, reason: `recipient ${address} has no recorded opt-in for ${channel} (channel switching requires the recipient's consent on the fallback channel)` };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * One channel's provider selection + same-channel failover cascade. Only
+   * providers declaring `channel` are ever considered. Returns 'unavailable'
+   * with a SPECIFIC reason (never a generic one) when nothing on this
+   * channel took the message; throws only for consent conditions, which are
+   * never routed around.
+   */
+  private async sendOnChannel(args: {
+    appId: string;
+    payload: any;
+    tenantId: string;
+    supplierId: string | null;
+    optOutConfirmation: boolean;
+    policy: EffectiveChannelPolicy;
+    channel: MessageChannel;
+    address: string;
+    providerOverride?: string;
+    reasonPrefix: string;
+  }): Promise<{ kind: 'sent'; event: TransactionEvent } | { kind: 'unavailable'; reason: string }> {
+    const { appId, tenantId, supplierId, optOutConfirmation, policy, channel, address, providerOverride } = args;
+    const usable = (id: string) => this.registry.isProviderAvailable(id) && this.registry.isLiveEligible(id);
+    const notes: string[] = [];
+    let selectedProvider: BaseProvider | null = null;
+    let reason = args.reasonPrefix;
+
+    const conversationCtx: ConversationContext = { phoneNumber: address, appId, tenantId, supplierId };
+
+    // 1. Manual override check — honoured only for a provider that can
+    // actually send on this channel.
     if (providerOverride) {
       const provider = this.registry.getProvider(providerOverride);
-      if (provider && this.registry.isProviderAvailable(providerOverride) && this.registry.isLiveEligible(providerOverride)) {
-        selectedProvider = provider;
-        reason = `Manual override matched: Forced messaging route to '${provider.config.name}'.`;
+      if (!provider || !usable(providerOverride)) {
+        reason += `Override '${providerOverride}' unavailable or not production-eligible. Falling back. | `;
+        notes.push(`requested provider '${providerOverride}' is offline/unavailable or not production-eligible`);
+      } else if (!this.supportsChannel(providerOverride, channel)) {
+        reason += `Override '${providerOverride}' does not support the '${channel}' channel — not used. Falling back. | `;
+        notes.push(`requested provider '${providerOverride}' does not support ${channel}`);
       } else {
-        reason = `Override '${providerOverride}' unavailable or not production-eligible. Falling back. | `;
+        selectedProvider = provider;
+        reason += `Manual override matched: Forced messaging route to '${provider.config.name}'.`;
       }
     }
 
-    // 2. Admin-configured routing rule (never overrides conversation
-    // continuity above — see this method's class comment)
+    // 2. Conversation continuity — this owner's thread ON THIS CHANNEL only
+    // (Phase 10: a thread on a fallback channel never captures later sends).
+    // An explicit providerOverride takes priority (even an unusable one
+    // skips continuity, as before).
+    if (!selectedProvider && !providerOverride) {
+      const conversation = await this.conversationManager.resolve(conversationCtx, channel);
+      if (conversation) {
+        const provider = this.registry.getProvider(conversation.providerId);
+        if (provider && usable(conversation.providerId) && this.supportsChannel(conversation.providerId, channel)) {
+          selectedProvider = provider;
+          reason += `Conversation continuity: Reusing ${channel} provider '${provider.config.name}' for ${address}.`;
+        } else {
+          reason += `Conversation continuity: previous ${channel} provider '${conversation.providerId}' is unavailable. | `;
+        }
+      }
+    }
+
+    // 3. Admin-configured routing rule (never overrides conversation
+    // continuity above — see routeMessage's comment). Its target must
+    // support this channel.
     if (!selectedProvider) {
       const ctx: RoutingContext = { channel };
       const rule = findMatchingRule(this.registry.getEnabledRoutingRules(), ctx);
       if (rule) {
         const provider = this.registry.getProvider(rule.target);
-        if (provider && this.registry.isProviderAvailable(rule.target) && this.registry.isLiveEligible(rule.target)) {
+        if (provider && usable(rule.target) && this.supportsChannel(rule.target, channel)) {
           selectedProvider = provider;
           reason += `Routing rule matched ('${rule.match}'${rule.description ? ` — ${rule.description}` : ''}): routed to '${provider.config.name}'.`;
         } else {
-          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' is offline/invalid. Falling back. | `;
+          reason += `Routing rule matched ('${rule.match}') but target '${rule.target}' is offline/invalid or does not support ${channel}. Falling back. | `;
         }
       }
     }
 
-    // 3. Channel detection + success-rate/cost-scored capability routing.
-    // Do NOT silently change a communication channel — every candidate
-    // pool below is scoped to providers that declare the detected
-    // channel's capability, matching the P1-4 fallback policy above.
-    const channelCapability = channel === 'email' ? 'email' : channel === 'whatsapp' ? 'whatsapp' : 'sms';
-    let ranked: RankedCandidate[] = rankByScore(
-      this.registry.findByCategoryAndCapabilities('messaging', [channelCapability]),
+    // 4. Success-rate/cost-scored capability routing — this channel's
+    // capability only. Same-channel failover is what
+    // policy.allowAlternateProvider governs.
+    const ranked: RankedCandidate[] = rankByScore(
+      this.registry.findByCategoryAndCapabilities('messaging', [channel]),
     );
 
     if (!selectedProvider && ranked.length > 0) {
@@ -476,13 +666,14 @@ export class RoutingEngine {
       }
     }
 
+    // Phase 10 (gap register A8): there is NO "any available messaging
+    // provider" last resort any more — that pool is exactly how an SMS used
+    // to be handed to the email provider.
     if (!selectedProvider) {
-      selectedProvider = this.registry.getProvider(activeMsg[0].id) || null;
-      reason += `Defaulted to first available messaging channel: '${selectedProvider?.config.name}'.`;
-    }
-
-    if (!selectedProvider) {
-      throw new Error('Routing failure: Unable to find a suitable online messaging provider.');
+      return {
+        kind: 'unavailable',
+        reason: `no online, production-eligible ${channel}-capable messaging provider is available${notes.length > 0 ? ` (${notes.join('; ')})` : ''}`,
+      };
     }
 
     // Cascading waterfall across same-channel candidates, best-first by
@@ -490,10 +681,14 @@ export class RoutingEngine {
     // messaging timeout is not treated as an ambiguous outcome worth
     // stopping the cascade for — resending a message carries none of a
     // duplicate-charge's real-money risk.
-    const fallbackOrder = ranked.filter(c => c.id !== selectedProvider!.config.id);
+    const fallbackOrder = policy.allowAlternateProvider ? ranked.filter(c => c.id !== selectedProvider!.config.id) : [];
     const attemptedIds = new Set<string>();
+    const failures: string[] = [];
     let currentProvider = selectedProvider;
     let currentReason = reason;
+    // What the adapter is told to send: the address on THIS channel, and the
+    // channel itself (Twilio, for one, chooses SMS vs WhatsApp from it).
+    const sendPayload = { ...args.payload, recipient: address, channel };
 
     for (let attempt = 1; ; attempt++) {
       attemptedIds.add(currentProvider.config.id);
@@ -503,11 +698,11 @@ export class RoutingEngine {
         // shared number — see sender_opt_outs). Fails CLOSED: a lookup
         // error aborts the whole send (no cascade to another provider),
         // never a send past a possible STOP.
-        const sender = await this.senderFor(appId, tenantId, supplierId, currentProvider, recipient);
+        const sender = await this.senderFor(appId, tenantId, supplierId, currentProvider, address);
         let senderOptedOut = false;
-        if (sender.businessNumber && recipient && !optOutConfirmation) {
+        if (sender.businessNumber && address && !optOutConfirmation) {
           try {
-            senderOptedOut = await senderOptOutRepository.isOptedOut(sender.businessNumber, recipient, channel);
+            senderOptedOut = await senderOptOutRepository.isOptedOut(sender.businessNumber, address, channel);
           } catch (lookupErr: any) {
             throw new SenderConsentLookupError(`sender-level consent lookup failed for ${sender.businessNumber}: ${lookupErr?.message}`);
           }
@@ -517,20 +712,27 @@ export class RoutingEngine {
           // another provider/number automatically. (A caller that genuinely
           // owns a different number may still send from it explicitly via
           // providerOverride.)
-          throw new ConsentBlockedError(recipient, channel);
+          throw new ConsentBlockedError(address, channel);
         }
         // P1: Wrap provider call with timeout to prevent hung requests
-        const event = await withProviderTimeout(() => currentProvider!.processRequest(appId, payload, currentReason));
+        const event = await withProviderTimeout(() => currentProvider!.processRequest(appId, sendPayload, currentReason));
         // P2-8: Record conversation after successful delivery — on the
-        // business number it was sent from (Phase 8).
+        // business number it was sent from (Phase 8), on the channel it was
+        // actually sent on (Phase 10).
         await this.conversationManager.record(conversationCtx, currentProvider.config.id, channel, sender);
-        return event;
+        return { kind: 'sent', event };
       } catch (err: any) {
         if (err instanceof ConsentBlockedError || err instanceof SenderConsentLookupError) throw err;
-        const next = fallbackOrder.find(c => !attemptedIds.has(c.id))
-          ?? (DEFAULT_FALLBACK_POLICY.allowAlternateProvider ? activeMsg.find(p => !attemptedIds.has(p.id)) : undefined);
+        failures.push(`'${currentProvider.config.name}' failed (${err.message})`);
+        const next = fallbackOrder.find(c => !attemptedIds.has(c.id));
         if (!next || attempt >= MAX_ROUTING_ATTEMPTS) {
-          throw new Error(`Messaging dispatch failed on '${currentProvider.config.name}' (${err.message}) with no available failover routes.`);
+          const why = !next
+            ? (policy.allowAlternateProvider ? `no other ${channel}-capable provider available` : 'alternate-provider failover disabled')
+            : `stopped after MAX_ROUTING_ATTEMPTS=${MAX_ROUTING_ATTEMPTS}`;
+          return {
+            kind: 'unavailable',
+            reason: `Messaging dispatch failed on every ${channel} provider tried — ${failures.join('; ')} — ${why}${notes.length > 0 ? ` (${notes.join('; ')})` : ''}`,
+          };
         }
         const nextProvider = this.registry.getProvider(next.id)!;
         currentReason = `Dynamic Failover (cascading, attempt ${attempt + 1}): '${currentProvider.config.name}' failed (${err.message}). Switched to '${nextProvider.config.name}'. | ${currentReason}`;

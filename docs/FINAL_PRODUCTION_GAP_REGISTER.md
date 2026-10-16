@@ -73,12 +73,31 @@ The platform's shared-phone-number requirement is **not met**. `ConversationReso
 - **Fix:** a failed STOP/JOIN consent write now throws, causing the job to retry rather than falsely confirming success to the customer.
 - **Status:** **FIXED**
 
-### A6. Consent channel is hardcoded / inferred from content, not the real channel
+### A6. Consent channel is hardcoded / inferred from content, not the real channel — **FIXED (send path), Phase 10**
 
-- **File/Line:** `inboundMessage.ts` (channel never passed, defaults to `'sms'`); `packages/routing/src/index.ts` `routeMessage` L284-307 (channel inferred from body length / `wa:` substring)
-- **Finding:** A STOP received over WhatsApp is recorded as an `sms` opt-out and does not block future WhatsApp sends. On the send path, an SMS body over 300 characters or containing `wa:` is silently sent as WhatsApp and checked against WhatsApp consent instead of SMS consent — a STOP sender could still receive a message if their opt-out was recorded under the other inferred channel.
-- **Severity:** P1 (consent-bypass potential)
-- **Status:** OPEN
+- **Original defect:** an SMS body over 300 characters or containing `wa:` was silently sent as WhatsApp and checked against WhatsApp consent instead of SMS consent.
+- **Fix:** `MessageRequest.channel` is now a real, explicit field (`'sms' | 'whatsapp' | 'email'`); an explicit value always wins over content-based inference, and every event records `requestedChannelSource: 'explicit' | 'inferred'` so it's visible which path decided. Content-based inference (the old length/`wa:`-substring heuristic) is preserved only as the last-resort default when no channel is specified at all — not removed, since existing callers that never specified a channel must keep working, but it can no longer silently override an explicit request. An invalid channel, or an explicit channel that doesn't fit the recipient address (e.g. an email channel with a phone number), is now a 400, not a guess.
+- **Status:** **FIXED** for the outbound/send path described here. **The inbound half (STOP arriving over WhatsApp still defaulting to an `sms` opt-out) was explicitly out of scope for Phase 10 and remains OPEN** — tracked below as a residual.
+
+### A7. Consent check fails open on DB error
+
+- **File/Line:** `routing/src/index.ts`, consent lookup `catch` block: `console.error(...failing open (send proceeds)...)`
+- **Severity:** P1
+- **Status:** OPEN — confirmed still open; Phase 10's new channel-fallback consent check (for an opted-in cross-channel send specifically) does fail *closed*, but the original send-path consent check this finding describes is unchanged.
+
+### A8. Capability/health gates are bypassed by override, rule-target, and hardcoded fallback pools — **PARTIALLY FIXED (messaging half), Phase 10**
+
+- **Original defect (messaging half):** `activeMsg[0]`/`activeMsg.find(...)` picked ANY available messaging provider regardless of channel, and conversation continuity made a fallback silent and permanent.
+- **Fix:** the any-channel last-resort pool is gone entirely. Provider override, conversation continuity, rule targets, scored selection, and failover now all only consider providers that actually support the channel being sent on; conversation continuity specifically now only reuses a thread on the *same* channel, so a fallback can never become permanent — each new message re-evaluates its own requested channel independently.
+- **Test proving remediation:** see A9 below (same test suite covers both). Negative control: reintroducing the old any-channel pool made 10 tests fail, including one where the event itself falsely reported `selectedChannel:'sms'` while the provider actually used was WhatsApp — a concrete reproduction of exactly the silent-mislabeling risk this finding describes.
+- **Status:** **PARTIALLY FIXED** — the messaging half is closed; the payments half (override/rule-target bypassing capability/currency/country checks, and the hardcoded `['stripe','nmi','airwallex']` fallback pool) was out of scope for this phase and remains OPEN, tracked for Phase 11-12 (provider routing).
+
+### A9. Silent channel switching — `allowChannelSwitch` policy flag never read — **FIXED, Phase 10**
+
+- **Original defect:** `allowChannelSwitch`/`requiresConsent` were defined but never consulted; only `allowAlternateProvider` was checked. No `requested_channel`/`selected_channel`/`fallback_reason` fields existed anywhere.
+- **Fix:** `allowChannelSwitch` is now genuinely enforced, configured per-request via a `channelPolicy` field (deliberately per-request rather than per-tenant — reasoning: whether a different channel beats no message at all depends on the specific message, e.g. an OTP should never silently switch channels while an appointment reminder reasonably might; a tenant-wide default would just reintroduce silent switching for any caller who didn't think to set it; and the opt-in traveling on the request/event payload keeps it auditable per-send rather than hidden in config). When `channelPolicy.allowChannelSwitch` is false (the default), a requested channel with no available provider now fails with `503 channel_unavailable` and a specific detail message — never a silent substitution. When explicitly opted in, a cross-channel fallback is only used if a real address exists for that channel (a phone number is never silently "emailed") and the recipient has an actual `opted_in` consent record on the fallback channel specifically, with that consent check failing *closed*. `requestedChannel`, `requestedChannelSource`, `selectedChannel`, and `fallbackReason` are now real fields on every messaging event (success or failure), visible in the API response body, the emitted event (SSE and tenant webhooks per Phase 7's tenant-scoping), and the 503 failure body — never only free-text in `decisionReason`. A new migration adds these three columns to `events` with a **database CHECK constraint that makes a silently-unexplained channel change a constraint violation**, not just a code-review convention: `fallback_reason` must be NULL when the channel didn't change, and must be a real, non-blank reason when it did.
+- **Test proving remediation:** `channel-fallback.simulation.test.ts` (13 tests) proves all four required scenarios: (1) SMS down with no opt-in gets a specific failure with zero calls to any other channel's provider; (2) an opted-in fallback is fully visible in both the HTTP response and the bus event with the exact requested/selected/reason fields; (3) a fallback is never sticky — the next message, explicit or inferred, correctly uses the original channel again once it's available; (4) content-based inference still works as a last-resort default but never overrides an explicit request. `channel-policy.test.ts` (11 unit tests) and `channel-fallback.postgres.integration.test.ts` (5 tests, real Postgres, including a clean upgrade from an existing 0018 database with pre-existing rows) extend coverage. Negative controls, each independently reverted and restored (SHA-256 verified): unscoped conversation continuity (3 failures), the any-channel last resort (10 failures, including the false-labeling case above), ignoring `allowChannelSwitch`/consent (8 failures), and inference overriding an explicit channel (4 failures). Independently re-run by the orchestrating session: full suite 864/1030 passing, 0 failed, confirmed directly; the `chk_events_channel_fallback_reason` CHECK constraint and the `channel_unavailable` error code spot-checked directly in source; confirmed the old `activeMsg[0]`/`activeMsg.find()` any-channel pool no longer exists in `routeMessage`.
+- **Status:** **FIXED**
 
 ### A7. Consent check fails open on DB error
 
@@ -1167,4 +1186,31 @@ Webhook correctness is no longer dependent on in-memory state as the correctness
 
 **Outstanding BLOCKED items:** real carrier behavior (e.g. Twilio Advanced Opt-Out potentially sending its own STOP confirmation and rejecting the platform's, error 21610 — noted as a real risk, not verified); real Twilio/Africa's Talking/Infobip inbound payload shapes; Neon-specific verification (stock Postgres 16 only); genuine multi-process gateway/worker deployment against managed Redis; real webhook delivery across an actual network (only a local HTTP listener was used); production data volumes.
 
-**This closes the last of the shared-number/messaging-focused phases that began with Phase 8.** The payment-correctness phases (2-6) and the tenant/messaging-correctness phases (7-9) have now both been substantially hardened. **Proceeding to Phase 10 (silent channel fallback observability) next**, per the spec's own phase ordering — this returns to a payment/messaging-routing-adjacent finding (A9) still open since Phase 0: an SMS can silently and permanently become an email send with no `requested_channel`/`selected_channel`/`fallback_reason` visible anywhere in the response or event schema.
+**This closes the last of the shared-number/messaging-focused phases that began with Phase 8.** The payment-correctness phases (2-6) and the tenant/messaging-correctness phases (7-9) have now both been substantially hardened.
+
+---
+
+## PHASE 10 — SILENT CHANNEL FALLBACK OBSERVABILITY — COMPLETE
+
+**Fixed and independently verified by the orchestrating session:** A9 (in full), A6 (send path), A8 (messaging half).
+
+**Verification performed directly by the orchestrating session:**
+- `npx tsc --noEmit` → exit 0, confirmed directly.
+- `npx vitest run` → **864 passed, 0 failed, 166 skipped (1030 total)**, confirmed directly, matching the implementing agent's own final figure exactly.
+- Spot-checked `packages/database/drizzle/0019_channel_decision_audit.sql` directly: confirmed the `chk_events_channel_fallback_reason` CHECK constraint exists exactly as described — a DB-level ban on recording a channel change with no reason, or a reason with no change.
+- Spot-checked `packages/routing/src/channel.ts` and `packages/routing/src/index.ts` directly: confirmed the `channel_unavailable` error code exists, and confirmed the old `activeMsg[0]`/`activeMsg.find()` any-channel-picking logic is genuinely gone from `routeMessage` — the remaining `activeMsg` reference is only a global "are any messaging providers online at all" pre-check, with channel-aware selection happening afterward.
+
+**This is a notably strong result: the "never silently change channel" requirement is now enforced at the database schema level**, not merely by application-code discipline — a future code change that tried to silently reintroduce this defect would hit a Postgres constraint violation, not just an unreviewed code path.
+
+**Honest residuals, disclosed by the implementing agent and preserved here:**
+- **Messages sent directly through `/v1/api/gateway/messaging` are still never written to the `events` table at all** — a pre-existing gap, not introduced by this phase. The channel decision is fully visible in the response, the emitted event, and tenant webhooks, but not durably persisted for that route specifically. The implementing agent also flagged that persisting them would interact with an existing code comment claiming a plan message-limit count is enforced on this route when it actually isn't — correctly identified as a decision needing deliberate attention rather than an incidental fix, and left for a future phase.
+- **Only the Twilio adapter actually reads `payload.channel`** to decide its real wire behavior; Infobip and SignalHouse are simulation-only (E3, already tracked) and ignore it regardless.
+- **The inbound half of A6** (a STOP arriving over WhatsApp still defaulting to an `sms`-labeled opt-out) was explicitly out of scope for this phase and remains OPEN.
+- **The payments half of A8** (provider override/rule-target bypassing capability/currency/country checks for payments, and the hardcoded `['stripe','nmi','airwallex']` fallback pool) remains OPEN, explicitly deferred to Phase 11-12.
+- **A new interaction flagged, not yet a confirmed defect:** an opted-in multi-channel fallback can now take up to `MAX_ROUTING_ATTEMPTS × (1 + number of fallback channels)` provider calls, each individually bounded by `PROVIDER_TIMEOUT_MS` — worth checking against the gateway's overall 60s response timeout (C12, still open) in a future phase rather than assuming it's fine.
+- `docs/openapi.yaml` was not updated and continues to document a `/v1/messages` route that doesn't exist in the actual gateway (already tracked as F11).
+- The admin-console UI changes (a channel picker, a switch-enable checkbox, a fallback-email field) are type-checked only, not rendered/verified in an actual browser in this pass.
+
+**Outstanding BLOCKED items:** Neon-specific verification (stock Postgres 16 only); real provider channel-handling behavior (does Twilio genuinely send WhatsApp when told to, real carrier behavior); real email delivery to a fallback address; a genuine multi-process gateway/worker deployment.
+
+**Proceeding to Phase 11-12 (provider routing + bounded timeouts) next**, per the spec's own phase ordering — this will address the payments half of A8 deferred above, plus the still-fully-open A10/E4/PHASE3-01 cross-provider double-charge cascade (flattened network-error failure classification triggering a retry on a different provider), which remains the most severe unresolved finding in the payments area of the register.

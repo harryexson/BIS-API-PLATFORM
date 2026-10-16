@@ -2,9 +2,17 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { ProviderRegistry } from '@company/providers';
-import { RoutingEngine, ConsentBlockedError } from '@company/routing';
+import {
+  RoutingEngine,
+  ConsentBlockedError,
+  MessageChannelUnavailableError,
+  InvalidMessageChannelRequestError,
+  parseChannelPolicy,
+  isMessageChannel,
+  MESSAGE_CHANNELS,
+} from '@company/routing';
 import { EventBus, WebhookDelivery } from '@company/events';
-import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch } from '@company/schemas';
+import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch, type MessageChannel, type MessageChannelPolicy } from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
 import {
   TenantRegistry,
@@ -210,6 +218,50 @@ function parsePaymentExtras(body: Record<string, unknown> | undefined): FieldVal
 
 function invalidRequest(res: Response, field: string, message: string) {
   return res.status(400).json({ error: { code: 'invalid_request', field, message } });
+}
+
+/**
+ * Phase 10 (gap register A6/A9): the messaging request's channel fields —
+ * the explicit `channel` and the opt-in `channelPolicy`. Validated here so a
+ * malformed value is a 400, never silently ignored (an ignored `channel`
+ * would quietly fall back to content inference — exactly the guess this
+ * field exists to replace).
+ */
+function parseMessagingChannelFields(body: Record<string, unknown>):
+  | { ok: true; channel?: MessageChannel; channelPolicy?: MessageChannelPolicy }
+  | { ok: false; field: string; message: string } {
+  let channel: MessageChannel | undefined;
+  if (body.channel !== undefined && body.channel !== null && body.channel !== '') {
+    const raw = typeof body.channel === 'string' ? body.channel.trim().toLowerCase() : body.channel;
+    if (!isMessageChannel(raw)) {
+      return { ok: false, field: 'channel', message: `channel must be one of ${MESSAGE_CHANNELS.join(', ')}` };
+    }
+    channel = raw;
+  }
+  const policy = parseChannelPolicy(body.channelPolicy);
+  if (!policy.ok) return { ok: false, field: policy.field, message: policy.message };
+  return { ok: true, ...(channel ? { channel } : {}), ...(policy.value ? { channelPolicy: policy.value } : {}) };
+}
+
+/**
+ * Phase 10: the channel-decision fields of a messaging FAILURE — visible to
+ * the API caller (and on the emitted event), not just in logs. Nothing was
+ * sent, so selectedChannel is null.
+ */
+function messagingFailureChannelFields(err: unknown, fallback: { channel?: MessageChannel }) {
+  if (err instanceof MessageChannelUnavailableError) {
+    return {
+      requestedChannel: err.requestedChannel,
+      requestedChannelSource: err.requestedChannelSource,
+      selectedChannel: null,
+      fallbackReason: null,
+    };
+  }
+  return {
+    ...(fallback.channel ? { requestedChannel: fallback.channel, requestedChannelSource: 'explicit' as const } : {}),
+    selectedChannel: null,
+    fallbackReason: null,
+  };
 }
 
 // ----------------------------------------------------
@@ -1335,6 +1387,11 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
   if (!appId || !recipient || !content) {
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
   }
+  // Phase 10: explicit channel + opt-in channel-switch policy (see
+  // parseMessagingChannelFields). Absent channel = legacy inferred default.
+  const channelFields = parseMessagingChannelFields(req.body ?? {});
+  if (!channelFields.ok) return invalidRequest(res, channelFields.field, channelFields.message);
+  const { channel, channelPolicy } = channelFields;
 
   try {
     const event = scopeEvent(
@@ -1342,6 +1399,8 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
         recipient,
         content,
         providerOverride,
+        ...(channel ? { channel } : {}),
+        ...(channelPolicy ? { channelPolicy } : {}),
         tenantId, // Pass authenticated tenant to routing engine
         // Phase 8: verified supplier scope → part of the conversation's
         // owner key (two hotels of one tenant on one shared number are two
@@ -1353,12 +1412,19 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
 
     eventBus.emit(event);
     observe(event);
+    // The event (returned as the response body) carries requestedChannel /
+    // requestedChannelSource / selectedChannel / fallbackReason.
     return res.json(event);
   } catch (err: any) {
+    if (err instanceof InvalidMessageChannelRequestError) {
+      return invalidRequest(res, err.field, err.message);
+    }
     // Consent block is not a transient/retryable failure — surface it
     // distinctly (403) rather than the generic 503 routing failure, so
     // callers don't retry a send that will never succeed.
     const isConsentBlock = err instanceof ConsentBlockedError;
+    const channelUnavailable = err instanceof MessageChannelUnavailableError ? err : null;
+    const channelDecision = messagingFailureChannelFields(err, { channel });
     const errorEvent = {
       id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
@@ -1373,15 +1439,27 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
       decisionReason: isConsentBlock ? 'consent_blocked' : 'routing_failure',
       payload: {},
       response: null,
-      error: isConsentBlock ? 'Recipient has opted out' : 'Message routing failed'
+      error: isConsentBlock ? 'Recipient has opted out' : channelUnavailable ? channelUnavailable.message : 'Message routing failed',
+      ...channelDecision,
     };
     eventBus.emit(errorEvent);
-    observeFailure('messaging', errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
+    observeFailure('messaging', errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : channelUnavailable ? 'CHANNEL_UNAVAILABLE' : 'ROUTING_FAILED');
     observe(errorEvent);
     if (isConsentBlock) {
-      return res.status(403).json({ error: 'Recipient has opted out of messaging on this channel', id: errorEvent.id });
+      return res.status(403).json({ error: 'Recipient has opted out of messaging on this channel', id: errorEvent.id, ...channelDecision });
     }
-    return res.status(503).json({ error: 'Message routing failed', id: errorEvent.id });
+    if (channelUnavailable) {
+      // Specific and actionable: which channel, why nothing on it could
+      // send, and that no other channel was used (or why none could be).
+      return res.status(503).json({
+        error: 'Message routing failed',
+        code: channelUnavailable.code,
+        detail: channelUnavailable.message,
+        id: errorEvent.id,
+        ...channelDecision,
+      });
+    }
+    return res.status(503).json({ error: 'Message routing failed', id: errorEvent.id, ...channelDecision });
   }
 });
 
@@ -2481,8 +2559,19 @@ app.post('/api/dashboard/playground/dispatch', requireAdmin, async (req: Request
       await recordPaymentOutcome(paymentTransactionId, event, currency || 'USD');
     } else if (category === 'messaging') {
       const { recipient, content, providerOverride } = fields;
+      // Phase 10: the playground forwards the explicit channel and the
+      // opt-in channel-switch policy exactly like the public route.
+      const channelFields = parseMessagingChannelFields(fields);
+      if (!channelFields.ok) return invalidRequest(res, channelFields.field, channelFields.message);
       // Consent is checked under the REAL tenant (it used to be 'default').
-      event = markAdmin(await routingEngine.routeMessage(appId, { recipient, content, providerOverride, tenantId }));
+      event = markAdmin(await routingEngine.routeMessage(appId, {
+        recipient,
+        content,
+        providerOverride,
+        ...(channelFields.channel ? { channel: channelFields.channel } : {}),
+        ...(channelFields.channelPolicy ? { channelPolicy: channelFields.channelPolicy } : {}),
+        tenantId,
+      }));
     } else if (category === 'other') {
       const { serviceType, payload, providerOverride } = fields;
       event = markAdmin(await routingEngine.routeOther(appId, { serviceType, payload, providerOverride }));
@@ -2494,7 +2583,13 @@ app.post('/api/dashboard/playground/dispatch', requireAdmin, async (req: Request
     observe(event);
     return res.status(event.status === 'unknown' ? 202 : 200).json(event);
   } catch (err: any) {
+    if (err instanceof InvalidMessageChannelRequestError) {
+      return invalidRequest(res, err.field, err.message);
+    }
     const isConsentBlock = err instanceof ConsentBlockedError;
+    const channelDecision = category === 'messaging'
+      ? messagingFailureChannelFields(err, { channel: isMessageChannel(fields.channel) ? fields.channel : undefined })
+      : {};
     const errorEvent = {
       id: 'err_' + randomUUID(),
       timestamp: new Date().toISOString(),
@@ -2510,11 +2605,17 @@ app.post('/api/dashboard/playground/dispatch', requireAdmin, async (req: Request
       payload: {},
       response: null,
       error: isConsentBlock ? 'Recipient has opted out' : err.message || 'Routing failed',
+      ...channelDecision,
     };
     eventBus.emit(errorEvent);
-    observeFailure(category, errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : 'ROUTING_FAILED');
+    observeFailure(category, errorEvent.providerId, isConsentBlock ? 'CONSENT_BLOCKED' : err instanceof MessageChannelUnavailableError ? 'CHANNEL_UNAVAILABLE' : 'ROUTING_FAILED');
     observe(errorEvent);
-    return res.status(isConsentBlock ? 403 : 503).json({ error: errorEvent.error, id: errorEvent.id });
+    return res.status(isConsentBlock ? 403 : 503).json({
+      error: errorEvent.error,
+      id: errorEvent.id,
+      ...(err instanceof MessageChannelUnavailableError ? { code: err.code } : {}),
+      ...channelDecision,
+    });
   }
 });
 

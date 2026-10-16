@@ -204,20 +204,35 @@ describe('R3 — primary SMS provider offline: failover works (OK)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R4) All SMS providers offline — silent channel change (GAP)
+// R4) All SMS providers offline — NO silent channel change (FIXED, Phase 10)
 // ---------------------------------------------------------------------------
 
-describe('R4 — all SMS providers offline: silent channel change (GAP)', () => {
-  it('an SMS is silently routed over email when no SMS provider is available', async () => {
+describe('R4 — all SMS providers offline: no silent channel change (FIXED, Phase 10)', () => {
+  it('an SMS fails with a specific channel_unavailable reason instead of being silently routed over email', async () => {
+    // Phase 10 (gap register A9): this test used to assert the defect
+    // (`res.status === 200 && providerId === 'email'` for an SMS). It now
+    // asserts the corrected, observable behaviour for both an inferred-sms
+    // caller (no channel field) and an explicit channel:'sms' caller.
     const sms = ['signalhouse', 'infobip', 'futuresms', 'example-msg', 'twilio', 'whatsapp', 'vonage', 'africastalking', 'sinch', 'vibes'];
     for (const p of sms) runtime.registry.updateManagement(p, { status: 'offline' });
     try {
-      const res = await sendMessage(runtime, { recipient: '+15550003333', content: 'x' }, AUTH);
-      expect(res.status).toBe(200);
-      expect(res.body.providerId).toBe('email');
-      console.warn(
-        '[GAP] when all SMS providers are offline, an SMS is silently routed over email (channel changed without alert)',
-      );
+      for (const body of [
+        { recipient: '+15550003333', content: 'x' },
+        { recipient: '+15550003333', content: 'x', channel: 'sms' },
+      ]) {
+        const res = await sendMessage(runtime, body, AUTH);
+        expect(res.status).toBe(503);
+        expect(res.body.providerId).toBeUndefined();
+        expect(res.body).toMatchObject({
+          code: 'channel_unavailable',
+          requestedChannel: 'sms',
+          requestedChannelSource: body.channel ? 'explicit' : 'inferred',
+          selectedChannel: null,
+          fallbackReason: null,
+        });
+        expect(String(res.body.detail)).toContain('allowChannelSwitch');
+      }
+      console.warn('[FIXED] when all SMS providers are offline, an SMS fails loudly (channel_unavailable) instead of silently going out as email');
     } finally {
       for (const p of sms) runtime.registry.updateManagement(p, { status: 'online' });
     }

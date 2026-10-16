@@ -62,6 +62,10 @@ export interface EventRow {
   error: string | null;
   /** events.idempotency_key — set by the Phase-4 webhook consumers' at-most-once write. */
   idempotencyKey?: string | null;
+  /** Phase 10 (migration 0019): a messaging event's channel decision. */
+  requestedChannel?: string | null;
+  selectedChannel?: string | null;
+  fallbackReason?: string | null;
   createdAt: Date;
 }
 
@@ -898,6 +902,19 @@ export function countRows(predicate: (row: EventRow) => boolean): number {
 }
 
 function normalizeRow(data: Record<string, unknown>): EventRow {
+  const requestedChannel = data.requestedChannel != null ? String(data.requestedChannel) : null;
+  const selectedChannel = data.selectedChannel != null ? String(data.selectedChannel) : null;
+  const fallbackReason = data.fallbackReason != null ? String(data.fallbackReason) : null;
+  // Mirrors migration 0019's chk_events_channel_fallback_reason, so the
+  // in-memory double rejects exactly what real Postgres rejects.
+  if (requestedChannel !== null && selectedChannel !== null) {
+    const ok = requestedChannel === selectedChannel
+      ? fallbackReason === null
+      : fallbackReason !== null && fallbackReason.trim().length > 0;
+    if (!ok) {
+      throw new Error('new row for relation "events" violates check constraint "chk_events_channel_fallback_reason" (simulated)');
+    }
+  }
   return {
     id: `evt_${randomUUID().slice(0, 12)}`,
     appId: String(data.appId ?? 'system'),
@@ -913,6 +930,9 @@ function normalizeRow(data: Record<string, unknown>): EventRow {
     response: data.response ?? null,
     error: data.error != null ? String(data.error) : null,
     idempotencyKey: data.idempotencyKey != null ? String(data.idempotencyKey) : null,
+    requestedChannel,
+    selectedChannel,
+    fallbackReason,
     createdAt: new Date(),
   };
 }

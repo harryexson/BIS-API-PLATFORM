@@ -1,6 +1,7 @@
 import { JobProcessor, WorkerContext } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
+import { channelDecisionColumns, isMessageChannel } from '@company/routing';
 
 /**
  * P0: Keyword response delivery processor.
@@ -25,6 +26,12 @@ import { eventRepository } from '@company/database';
 export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProcessor {
   return async (job, _ctx: WorkerContext) => {
     const { senderPhone, content, appId, providerId, tenantId, supplierId, keyword, keywordName, conversationId } = job.payload;
+    // Phase 10 (gap register A6): a reply goes back on the channel the
+    // inbound message ARRIVED on — an explicit channel, never re-guessed from
+    // the reply's wording (a long HELP reply used to be inferred as
+    // WhatsApp). Jobs enqueued before this field existed fall back to the
+    // router's inferred default.
+    const channel = isMessageChannel(job.payload.channel) ? job.payload.channel : undefined;
 
     if (!senderPhone || !content) {
       throw new Error('keyword_response_delivery requires senderPhone and content');
@@ -43,6 +50,7 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
           recipient: senderPhone,
           content,
           providerOverride: providerId,
+          ...(channel ? { channel } : {}),
           ...scope,
         },
         keyword === 'opt_out' ? { optOutConfirmation: true } : {},
@@ -59,6 +67,7 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
             decisionReason: `keyword_response_suppressed:${keyword || 'unknown'}`,
             payload: { recipient: senderPhone, keyword: keywordName ?? keyword, conversationId, ...scope },
             error: err.message,
+            ...(channel ? { requestedChannel: channel } : {}),
           });
         } catch {
           // audit is best-effort here; the send was (correctly) not made
@@ -84,6 +93,7 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
         payload: { ...(event.payload ?? {}), keyword: keywordName ?? keyword, conversationId, ...scope },
         response: event.response,
         error: event.error,
+        ...channelDecisionColumns(event),
       });
     } catch (err) {
       console.error('[keyword_response_delivery] reply sent but its audit event could not be written', err);

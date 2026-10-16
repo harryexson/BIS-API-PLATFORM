@@ -33,14 +33,21 @@ export class ConversationManager {
    * looks at the sending owner's threads, so recency here can never pick
    * another tenant's conversation.
    */
-  async resolve(ctx: ConversationContext): Promise<ConversationResult | null> {
+  async resolve(ctx: ConversationContext, channel?: string): Promise<ConversationResult | null> {
     try {
       const threads = await conversationRepository.findActiveForOwner(ctx.phoneNumber, {
         appId: ctx.appId,
         tenantId: ctx.tenantId,
         supplierId: ctx.supplierId ?? null,
       });
-      const existing = threads[0];
+      // Phase 10 (gap register A8/A9): continuity is scoped to the channel
+      // being sent on. Before, the most recent thread won regardless of its
+      // channel — so once a send had fallen back to another channel (SMS →
+      // email) and been recorded, every later send reused that fallback
+      // provider via "continuity" and the conversation stayed on the wrong
+      // channel permanently. A thread on another channel is never a reason
+      // to use that channel.
+      const existing = channel ? threads.find((t) => t.channel === channel) : threads[0];
       if (existing && existing.status === 'active') {
         return {
           providerId: existing.providerId,
