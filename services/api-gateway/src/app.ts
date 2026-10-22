@@ -14,7 +14,19 @@ import {
   MESSAGE_CHANNELS,
 } from '@company/routing';
 import { EventBus, WebhookDelivery } from '@company/events';
-import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch, type MessageChannel, type MessageChannelPolicy } from '@company/schemas';
+import {
+  TransactionEvent,
+  TransactionStatusResponse,
+  ProviderCapabilityMatch,
+  type MessageChannel,
+  type MessageChannelPolicy,
+  parseMoneyAmount,
+  parseCurrencyCode,
+  parseMessageRecipient,
+  parseMessageContent,
+  parseProviderConfigUpdate,
+  parseProviderManagementUpdate,
+} from '@company/schemas';
 import { AuthService, createMiddleware } from './auth';
 import {
   TenantRegistry,
@@ -1274,11 +1286,15 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, asyncHandle
     return invalidRequest(res, 'idempotency_key', `Idempotency-Key must be a string of at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`);
   }
   const idempotencyKey: string | undefined = typeof rawIdempotencyKey === 'string' && rawIdempotencyKey !== '' ? rawIdempotencyKey : undefined;
-  // The amount is now written to the transactions row BEFORE routing, so a
-  // non-numeric/non-positive amount must be a 400 here, not a database error.
-  if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-    return invalidRequest(res, 'amount', 'amount must be a positive number');
-  }
+  // The amount is written to the transactions row BEFORE routing, and it is
+  // in MAJOR currency units (49.99 = USD 49.99; each adapter converts to its
+  // provider's wire format). Phase 17-18 (C10): this used to be only
+  // `Number(amount) > 0`, which let `true` (→ 1), `[5]`, "0x10" (→ 16) and
+  // sub-cent values like 49.999999 through to a provider.
+  const amountCheck = parseMoneyAmount(amount);
+  if (!amountCheck.ok) return invalidRequest(res, amountCheck.field, amountCheck.message);
+  const currencyCheck = parseCurrencyCode(currency, { required: false });
+  if (!currencyCheck.ok) return invalidRequest(res, currencyCheck.field, currencyCheck.message);
 
   // paymentToken / country / metadata used to be silently dropped here, so
   // every card adapter fell back to a fabricated "success" (gap register
@@ -1467,9 +1483,16 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
   // P0: Use the authenticated (link-verified) tenant, NOT the request body
   const { tenantId, supplierId } = authContext(req);
 
-  if (!appId || !recipient || !content) {
+  if (!appId) {
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
   }
+  // Phase 17-18 (C10): recipient/content used to be checked for presence
+  // only — a number, a non-address string or a whitespace body went straight
+  // to a provider.
+  const recipientCheck = parseMessageRecipient(recipient);
+  if (!recipientCheck.ok) return invalidRequest(res, recipientCheck.field, recipientCheck.message);
+  const contentCheck = parseMessageContent(content);
+  if (!contentCheck.ok) return invalidRequest(res, contentCheck.field, contentCheck.message);
   // Phase 10: explicit channel + opt-in channel-switch policy (see
   // parseMessagingChannelFields). Absent channel = legacy inferred default.
   const channelFields = parseMessagingChannelFields(req.body ?? {});
@@ -2595,9 +2618,11 @@ app.post('/api/dashboard/playground/dispatch', requireAdmin, async (req: Request
       const { amount, currency, paymentMethod, providerOverride, phoneNumber } = fields;
       const extras = parsePaymentExtras(fields);
       if (!extras.ok) return invalidRequest(res, extras.field, extras.message);
-      if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-        return invalidRequest(res, 'amount', 'amount must be a positive number');
-      }
+      // Same money validation as the public route (Phase 17-18, C10).
+      const amountCheck = parseMoneyAmount(amount);
+      if (!amountCheck.ok) return invalidRequest(res, amountCheck.field, amountCheck.message);
+      const currencyCheck = parseCurrencyCode(currency, { required: false });
+      if (!currencyCheck.ok) return invalidRequest(res, currencyCheck.field, currencyCheck.message);
       const idempotencyKey = typeof fields.idempotencyKey === 'string' && fields.idempotencyKey ? fields.idempotencyKey : undefined;
       // Same rule as the public route: a durable transaction row (and its id,
       // the provider idempotency identity's payment_transaction_id) exists
@@ -2904,16 +2929,20 @@ app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, a
   if (!appId) {
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
   }
-  if (!amount || !currency) {
-    return res.status(400).json({ error: 'amount and currency are required' });
-  }
+  // Phase 17-18 (C10): this was only `!amount || !currency`, so "-5", "abc"
+  // or 49.999 created a session that /pay would later try to charge. Same
+  // MAJOR-unit, 2-decimal rule as the payment route.
+  const amountCheck = parseMoneyAmount(amount);
+  if (!amountCheck.ok) return invalidRequest(res, amountCheck.field, amountCheck.message);
+  const currencyCheck = parseCurrencyCode(currency, { required: true });
+  if (!currencyCheck.ok) return invalidRequest(res, currencyCheck.field, currencyCheck.message);
 
   const token = randomUUID().replace(/-/g, '');
   const session = await checkoutSessionRepository.create({
     token,
     appId,
     tenantId,
-    amount: String(amount),
+    amount: String(amountCheck.value),
     currency,
     successUrl: successUrl || null,
     cancelUrl: cancelUrl || null,
@@ -3376,7 +3405,15 @@ app.get('/api/dashboard/providers', (req: Request, res: Response) => {
 // mutation of this one process's memory.
 app.patch('/api/dashboard/providers/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const updates = req.body || {};
+  // Phase 17-18 (C10, PHASE15-02/03): this used to spread the RAW body into
+  // the live config — including fields that are not persisted (a name /
+  // category "rename" applied on this replica only) and wrongly-typed ones
+  // that other replicas then loaded differently. Only the persisted,
+  // admin-controlled fields, type- and range-checked, get through; anything
+  // else is a 400 and nothing is changed anywhere.
+  const parsed = parseProviderConfigUpdate(req.body);
+  if (!parsed.ok) return invalidRequest(res, parsed.field, parsed.message);
+  const updates = parsed.value;
 
   const persisted = await persistProviderChange(res, id, 'management', () => registry.updateProviderConfig(id, updates));
   if (!persisted.ok) return;
@@ -3414,7 +3451,13 @@ app.get('/api/dashboard/providers/:id/management', requireAdmin, (req: Request, 
 
 app.patch('/api/dashboard/providers/:id/management', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
-  const persisted = await persistProviderChange(res, id, 'management', () => registry.updateManagement(id, req.body || {}));
+  // Phase 17-18 (C10, PHASE15-03): e.g. `currencies: "USD"` used to be
+  // stored as a string here and persisted as ["U","S","D"]. See
+  // parseProviderManagementUpdate.
+  const parsed = parseProviderManagementUpdate(req.body);
+  if (!parsed.ok) return invalidRequest(res, parsed.field, parsed.message);
+  const updates = parsed.value;
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.updateManagement(id, updates));
   if (!persisted.ok) return;
   return res.json(persisted.result);
 }));

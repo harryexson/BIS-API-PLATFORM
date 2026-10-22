@@ -203,6 +203,112 @@ export function registerProviderStateScenarios(getWorld: () => ProviderStateWorl
     expect(getWorld().runtime.registry.getSecretLoadFailures()).toEqual([]);
   });
 
+  // -------------------------------------------------------------------------
+  // Phase 17-18 (gap register C10 → PHASE15-02 / PHASE15-03): the admin
+  // provider-config routes used to spread the raw body into the live config.
+  // Now only the persisted, type-checked fields get through, so the replica
+  // that took the write and every other replica hold the SAME configuration.
+  // Each test asserts that convergence FIRST, then the 400.
+  // -------------------------------------------------------------------------
+  const configView = (r: ProviderRegistry, id: string) => {
+    const v = r.getManagementView(id)!;
+    return {
+      name: v.name,
+      category: v.category,
+      status: v.status,
+      weight: v.weight,
+      latencyMin: v.latencyMin,
+      latencyMax: v.latencyMax,
+      environment: v.environment,
+      countries: v.countries,
+      currencies: v.currencies,
+      capabilities: v.capabilities,
+      priority: v.priority,
+      routingRules: v.routingRules,
+    };
+  };
+  const gatewayView = (id: string) => configView(getWorld().runtime.registry, id);
+
+  it('PHASE15-02: a rename/recategorisation through PATCH /providers/:id is refused (400) — no replica diverges, nothing is stored', async () => {
+    const before = (await getWorld().store.load('adyen'))?.managementVersion ?? 0;
+    const res = await patch('/api/dashboard/providers/adyen', { name: 'Adyen (renamed)', category: 'messaging', status: 'online' });
+
+    const replica = await freshReplica();
+    expect(gatewayView('adyen')).toEqual(configView(replica, 'adyen'));
+    expect(gatewayView('adyen')).toMatchObject({ name: 'Adyen', category: 'payment' });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatchObject({ code: 'invalid_request', field: 'name' });
+    expect((await getWorld().store.load('adyen'))?.managementVersion ?? 0).toBe(before);
+  });
+
+  it('PHASE15-03: a string where an array is expected is refused (400) — never persisted character-split', async () => {
+    const res = await patch('/api/dashboard/providers/nmi/management', { currencies: 'USD' });
+
+    const replica = await freshReplica();
+    expect(gatewayView('nmi')).toEqual(configView(replica, 'nmi'));
+    expect(replica.getManagementView('nmi')!.currencies).toEqual(['USD', 'CAD']);
+    const stored = (await getWorld().store.load('nmi'))?.management as { currencies?: unknown } | null;
+    expect(stored?.currencies).not.toEqual(['U', 'S', 'D']);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatchObject({ code: 'invalid_request', field: 'currencies' });
+  });
+
+  it('C10: wrongly-typed persisted fields are refused (400) instead of being applied on the writing replica only', async () => {
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['/api/dashboard/providers/paypal', { weight: '50' }, 'weight'],
+      ['/api/dashboard/providers/paypal', { status: 'broken' }, 'status'],
+      ['/api/dashboard/providers/paypal/management', { priority: '70' }, 'priority'],
+      ['/api/dashboard/providers/paypal/management', { countries: 'US' }, 'countries'],
+    ];
+    for (const [path, body, field] of cases) {
+      const res = await patch(path, body);
+      const replica = await freshReplica();
+      expect(gatewayView('paypal'), JSON.stringify(body)).toEqual(configView(replica, 'paypal'));
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      expect((await res.json()).error).toMatchObject({ code: 'invalid_request', field });
+    }
+  });
+
+  it('C10: a valid update is applied identically on the writer and every replica, with codes normalised the way routing compares them', async () => {
+    const res = await patch('/api/dashboard/providers/airwallex/management', {
+      currencies: ['usd', 'hkd'],
+      countries: ['hk', 'sg'],
+      priority: 64,
+      environment: 'live',
+    });
+    expect(res.status).toBe(200);
+    const replica = await freshReplica();
+    expect(gatewayView('airwallex')).toEqual(configView(replica, 'airwallex'));
+    expect(configView(replica, 'airwallex')).toMatchObject({ currencies: ['USD', 'HKD'], countries: ['HK', 'SG'], priority: 64, weight: 64 });
+    // ...and routing finds it for an upper-cased request currency.
+    expect(replica.findByCategoryAndCapabilities('payment', ['card'], 'hkd').map((p) => p.id)).toContain('airwallex');
+  });
+
+  it('PHASE15-02: a write that cannot be persisted leaves nothing applied on the replica that attempted it (a rename is refused up front; allowed fields are fully rolled back on 503)', async () => {
+    const store = getWorld().store;
+    const before = gatewayView('square');
+    const original = store.saveManagement;
+    store.saveManagement = async () => {
+      throw new Error('provider state store unreachable (injected)');
+    };
+    try {
+      // The register's case: a body carrying a non-persisted field (a rename)
+      // in a write that fails. It used to be a 503 that left the rename
+      // applied on this replica (the rollback restores persisted fields only);
+      // it is now refused before anything is touched.
+      const renamed = await patch('/api/dashboard/providers/square', { name: 'Square (renamed)', status: 'maintenance' });
+      expect(gatewayView('square')).toEqual(before);
+      expect(renamed.status).toBe(400);
+
+      // Every field that CAN get through is fully rolled back on a failed write.
+      const res = await patch('/api/dashboard/providers/square', { status: 'maintenance', weight: 12, latencyMin: 1, latencyMax: 2, transactionFeePercent: 9 });
+      expect(res.status).toBe(503);
+    } finally {
+      store.saveManagement = original;
+    }
+    expect(gatewayView('square')).toEqual(before);
+  });
+
   it('C9: a production deployment refuses a test-tier API key (and a non-production one refuses a live-tier key)', async () => {
     const { runtime, tenantId, testTierKey, liveTierKey } = getWorld();
     const call = (key: string) =>

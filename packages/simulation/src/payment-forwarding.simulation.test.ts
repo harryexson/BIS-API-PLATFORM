@@ -212,6 +212,24 @@ describe('Phase 3 — public payment route forwards every payment field (C1/E1)'
     expect(txById(ptx)!.status).toBe('success');
   });
 
+  it('F11 (Phase 17-18): the public amount is MAJOR currency units end to end — 49.99 reaches Stripe as 4999 cents and is recorded as 49.99', async () => {
+    useMockStripe();
+    const res = await pay({ amount: 49.99, paymentToken: 'pm_card_visa' }, 'p17-major-units-001');
+
+    expect(res.status).toBe(200);
+    expect(stripeCalls).toHaveLength(1);
+    expect(stripeCalls[0].form.amount).toBe('4999'); // USD 49.99 — Stripe's unit is cents
+    expect(stripeCalls[0].form.currency).toBe('usd');
+    expect(res.body.amount).toBe(49.99);
+    expect(txById(res.body.paymentTransactionId)!.amount).toBe('49.99');
+
+    // The value the old docs/openapi.yaml told clients to send for USD 49.99
+    // ("smallest currency unit", example 4999) is charged as USD 4,999.00.
+    const asOldSpec = await pay({ amount: 4999, paymentToken: 'pm_card_visa' }, 'p17-major-units-002');
+    expect(asOldSpec.status).toBe(200);
+    expect(stripeCalls[1].form.amount).toBe('499900');
+  });
+
   it('without a paymentToken (test env) Stripe is NOT called — the simulated path is used, and that is visible', async () => {
     useMockStripe();
     const res = await pay({}, 'p3-no-token-001');

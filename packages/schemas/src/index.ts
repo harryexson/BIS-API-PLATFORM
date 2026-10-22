@@ -1,3 +1,6 @@
+// Request-field validators shared by the gateway's routes (Phase 17-18, C10/F11).
+export * from './request-validation';
+
 export type ProviderCategory = 'payment' | 'messaging' | 'other';
 export type ProviderStatus = 'online' | 'offline' | 'maintenance';
 // 'unknown' is a legitimate, distinct outcome — not a synonym for 'failed'.
