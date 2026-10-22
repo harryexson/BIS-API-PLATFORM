@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, beforeEach, vi } from 'vitest';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
-import { dbState, clearDb, seedReachChurch, installDatabaseMock, TENANT_ID } from './db';
+import { dbState, clearDb, seedReachChurch, installDatabaseMock, TENANT_ID, APP_SLUG } from './db';
 
 // Phase 3 — gap register C1/E1 (payment fields dropped by the public
 // routes), E7/C11 (deterministic provider idempotency identity) and E2
@@ -125,11 +126,11 @@ function useMockStripe() {
   });
 }
 
-async function pay(body: Record<string, unknown>, key?: string) {
+async function pay(body: Record<string, unknown>, key?: string, auth: Record<string, string> = AUTH) {
   const res = await runtime.post(
     '/v1/api/gateway/payment',
     { amount: 40, currency: 'USD', paymentMethod: 'card', providerOverride: 'stripe', ...body },
-    key ? { ...AUTH, 'idempotency-key': key } : AUTH,
+    key ? { ...auth, 'idempotency-key': key } : auth,
   );
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
@@ -333,8 +334,21 @@ describe('Phase 3 — hosted checkout /pay forwards fields and allocates first',
 
 describe('Phase 3 — production kill-switch end-to-end (E2)', () => {
   it('NODE_ENV=production with no provider credentials: no fabricated success — 503, failed row, no provider id', async () => {
+    // Phase 15 (gap register C9): a production deployment only accepts a
+    // LIVE-tier API key (the seeded reach-church key is development/test
+    // tier and is now refused with 401 there). This test is about what
+    // happens AFTER authentication, so it authenticates with a live key.
+    const liveKey = 'bap_live_reachchurch_p3_killswitch';
+    dbState.apiKeys.push({
+      id: 'key_reach_church_live_p3',
+      keyHash: createHash('sha256').update(liveKey).digest('hex'),
+      applicationId: `app_${APP_SLUG}`,
+      environment: 'live',
+      revokedAt: null,
+      expiresAt: null,
+    });
     process.env.NODE_ENV = 'production';
-    const res = await pay({ paymentToken: 'pm_card_visa' }, 'p3-prod-unconfigured-001');
+    const res = await pay({ paymentToken: 'pm_card_visa' }, 'p3-prod-unconfigured-001', { ...AUTH, authorization: `Bearer ${liveKey}` });
     expect(res.status).toBe(503);
     expect(res.body.error).toBe('Payment routing failed');
     const row = txById(res.body.paymentTransactionId)!;

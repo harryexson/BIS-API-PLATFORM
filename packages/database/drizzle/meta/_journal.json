@@ -141,6 +141,13 @@
       "when": 1792500000000,
       "tag": "0019_channel_decision_audit",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1792600000000,
+      "tag": "0020_provider_management_persistence",
+      "breakpoints": true
     }
   ]
 }

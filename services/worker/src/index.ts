@@ -4,7 +4,8 @@ import dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
 
 import { createServer } from 'node:http';
-import { ProviderRegistry } from '@company/providers';
+import { ProviderRegistry, ProviderStateSync } from '@company/providers';
+import { providerStateStore } from '@company/database';
 import { RoutingEngine } from '@company/routing';
 import { EventBus } from '@company/events';
 import {
@@ -27,6 +28,28 @@ async function main(): Promise<void> {
 
   const registry = ProviderRegistry.getInstance();
   const routing = new RoutingEngine();
+
+  // Phase 15 (gap register E12): the worker dispatches provider calls too,
+  // so it must route by the same persisted configuration and secrets as the
+  // gateway — previously it never loaded either (not even the secrets the
+  // gateway hydrated) and ran on code defaults + env vars. Loaded before
+  // any job is processed, then kept converged on admin changes.
+  const providerStateSync = new ProviderStateSync(registry, providerStateStore, {
+    intervalMs: Number(process.env.PROVIDER_STATE_REFRESH_MS) || 5_000,
+    onReport(report) {
+      for (const f of report.secretFailures) {
+        console.error(`[providers] persisted secrets for '${f.slug}' could not be decrypted — provider withheld from routing: ${f.error}`);
+      }
+    },
+    onError(err) {
+      console.error('[providers] provider state load failed', err);
+    },
+  });
+  await providerStateSync.initialLoad;
+  if (!providerStateSync.status().loaded && process.env.NODE_ENV === 'production') {
+    throw new Error(`persisted provider state could not be loaded: ${providerStateSync.status().lastError}`);
+  }
+  providerStateSync.start();
   const eventBus = EventBus.getInstance();
 
   const lock = new DistributedLock(store, keys);
@@ -163,6 +186,7 @@ async function main(): Promise<void> {
     clearInterval(outboxTimer);
     clearInterval(webhookJobPollerTimer);
     clearInterval(webhookRecoveryTimer);
+    providerStateSync.stop();
     healthServer.close();
 
     // Drain: wait for in-flight jobs to complete (max 30s)

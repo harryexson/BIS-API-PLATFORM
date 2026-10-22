@@ -60,7 +60,124 @@ export interface PersistableProviderSecret {
   field: string;
   label: string;
   value: string;
+  // Phase 15: carried through persistence so every replica shows (and can
+  // DELETE by) the same secret id. Optional — rows written before Phase 15
+  // have neither; one is generated on load.
+  id?: string;
+  lastUpdated?: string;
 }
+
+// ----------------------------------------------------
+// PERSISTED PROVIDER STATE (gap register E12, Phase 15)
+// ----------------------------------------------------
+// The admin-controlled provider configuration — what an operator sets
+// through the dashboard and expects every gateway/worker replica to route
+// by, and to survive a restart. Previously this lived ONLY in this
+// process's `management` Map (lost on restart, divergent across replicas).
+// Runtime telemetry (health, errorRate, lastSuccessfulRequest) and the
+// circuit breaker are deliberately NOT part of it: they are per-process
+// observations of live traffic, not configuration (see the circuit breaker
+// note on isCircuitAvailable()).
+export interface PersistableProviderManagement {
+  status: ProviderConfig['status'];
+  weight: number;
+  latencyMin: number;
+  latencyMax: number;
+  transactionFeePercent?: number;
+  transactionFeeFlat?: number;
+  messageCost?: number;
+  environment: ProviderEnvironment;
+  countries: string[];
+  currencies: string[];
+  capabilities: string[];
+  priority: number;
+  routingRules: RoutingRule[];
+}
+
+/** One provider's persisted state, as read back from the store. */
+export interface PersistedProviderState {
+  slug: string;
+  /** 0 = no configuration has ever been persisted for this provider. */
+  managementVersion: number;
+  /**
+   * The stored document. Typed `unknown` on purpose: it is read back from
+   * storage, so every field is type-checked before use (applyManagement).
+   */
+  management: unknown;
+  /** 0 = no secrets have ever been persisted for this provider. */
+  secretsVersion: number;
+  /**
+   * Decrypts and returns the persisted secrets. THROWS when they cannot be
+   * decrypted (e.g. SECRET_ENCRYPTION_KEY changed) — never silently returns
+   * nothing (gap register D13).
+   */
+  readSecrets(): PersistableProviderSecret[];
+}
+
+export type ProviderStateWriteResult = { saved: true; version: number } | { saved: false };
+
+/**
+ * Where the registry's persisted state lives (Postgres, via
+ * @company/database's providerStateStore). An interface so this package
+ * stays DB-free (see docs/providers/ADDING_A_PROVIDER.md).
+ *
+ * Both writes are compare-and-set: they succeed only if the stored version
+ * still equals `expectedVersion`, and return the new version. A `saved:
+ * false` means another writer (usually another replica) got there first.
+ */
+export interface ProviderStateStore {
+  loadAll(): Promise<PersistedProviderState[]>;
+  load(slug: string): Promise<PersistedProviderState | null>;
+  saveManagement(input: {
+    slug: string;
+    name: string;
+    category: string;
+    management: PersistableProviderManagement;
+    expectedVersion: number;
+  }): Promise<ProviderStateWriteResult>;
+  saveSecrets(input: {
+    slug: string;
+    name: string;
+    category: string;
+    secrets: PersistableProviderSecret[];
+    expectedVersion: number;
+  }): Promise<ProviderStateWriteResult>;
+}
+
+export interface ProviderStateSyncReport {
+  /** Providers whose configuration was replaced by a newer persisted version. */
+  managementApplied: string[];
+  /** Providers whose secrets were replaced by a newer persisted version. */
+  secretsApplied: string[];
+  /**
+   * Providers whose persisted secrets could not be decrypted. Each such
+   * provider is withheld from routing (isProviderAvailable() → false) until
+   * a later version decrypts — it must not silently fall back to env-var or
+   * simulated credentials (gap register D13).
+   */
+  secretFailures: Array<{ slug: string; version: number; error: string }>;
+}
+
+/** A persisted write kept losing the compare-and-set race. Nothing was changed. */
+export class ProviderStateConflictError extends Error {
+  readonly code = 'provider_state_conflict';
+  constructor(readonly providerId: string, readonly kind: 'management' | 'secrets') {
+    super(`Concurrent ${kind} updates to provider '${providerId}' — the change was not applied; retry.`);
+    this.name = 'ProviderStateConflictError';
+  }
+}
+
+const PERSISTED_WRITE_ATTEMPTS = 5;
+
+const SECRET_MASK_MAX_VISIBLE = 4;
+const SECRET_MASK_WIDTH = 8;
+
+function newSecretId(): string {
+  return 'sec_' + randomUUID().replace(/-/g, '').slice(0, 12);
+}
+
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === 'string');
+const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
 export interface ManagementState {
   environment: ProviderEnvironment;
@@ -76,6 +193,16 @@ export interface ManagementState {
   circuitState: ProviderCircuitState;
   consecutiveFailures: number;
   circuitOpenedAt: number | null;
+  // When the single in-flight HALF_OPEN recovery probe was dispatched
+  // (null = no probe in flight). See tryAcquireDispatch().
+  halfOpenProbeAt: number | null;
+  // Version of the persisted configuration / secrets this process holds
+  // (0 = none loaded). See syncFromStore().
+  managementVersion: number;
+  secretsVersion: number;
+  // Set while this provider's persisted secrets cannot be decrypted; the
+  // provider is withheld from routing meanwhile (gap register D13).
+  secretsLoadError: { version: number; error: string } | null;
 }
 
 // Circuit breaker tuning. Configurable per Phase 21 of the master plan:
@@ -85,15 +212,32 @@ export interface ManagementState {
 // provider from being hammered.
 const CIRCUIT_FAILURE_THRESHOLD = Number(process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD) || 5;
 const CIRCUIT_COOLDOWN_MS = Number(process.env.CIRCUIT_BREAKER_COOLDOWN_MS) || 30_000;
+// A half-open probe whose outcome is never reported (the caller crashed or
+// dropped it) must not wedge the circuit in HALF_OPEN forever: after this
+// long the probe slot is considered abandoned and a new probe may go out.
+const CIRCUIT_PROBE_TIMEOUT_MS = Number(process.env.CIRCUIT_BREAKER_PROBE_TIMEOUT_MS) || CIRCUIT_COOLDOWN_MS;
 
 export class ProviderRegistry {
   private static instance: ProviderRegistry;
   private providers: Map<string, BaseProvider> = new Map();
   private management: Map<string, ManagementState> = new Map();
+  // Serializes persisted writes per provider within this process (see
+  // mutatePersisted()).
+  private writeChains: Map<string, Promise<unknown>> = new Map();
 
   private constructor() {
     this.initializeProviders();
     this.warnUnconfiguredLiveProviders();
+  }
+
+  /**
+   * A fresh, independent registry — what a second gateway/worker replica (or
+   * a restarted process) holds before it loads persisted state. Production
+   * code uses getInstance(); this exists so multi-replica convergence and
+   * restart behaviour can be exercised in one test process.
+   */
+  public static createIsolatedInstance(): ProviderRegistry {
+    return new ProviderRegistry();
   }
 
   // P0: There was previously zero registration-time validation of any
@@ -486,6 +630,10 @@ export class ProviderRegistry {
       circuitState: 'closed',
       consecutiveFailures: 0,
       circuitOpenedAt: null,
+      halfOpenProbeAt: null,
+      managementVersion: 0,
+      secretsVersion: 0,
+      secretsLoadError: null,
       secrets: [],
     });
   }
@@ -523,36 +671,86 @@ export class ProviderRegistry {
     return Array.from(this.providers.values()).map(p => p.config);
   }
 
-  // Circuit breaker: whether a provider may currently receive routed
-  // traffic. CLOSED — yes. OPEN — no, unless the cooldown has elapsed, in
-  // which case this call transitions the circuit to HALF_OPEN and allows
-  // exactly one probe request through. HALF_OPEN — yes (the probe already
-  // in flight); recordTraffic() resolves it to CLOSED or back to OPEN.
+  // Circuit breaker: whether a provider is currently ELIGIBLE to be
+  // selected for routed traffic. A pure read (gap register A14b — this used
+  // to flip OPEN → HALF_OPEN as a side effect of merely being checked, e.g.
+  // while filtering a candidate pool, even for a provider that was never
+  // then selected):
+  //  - CLOSED: yes.
+  //  - OPEN: no, until the cooldown has elapsed — then yes, as a candidate
+  //    for the single recovery probe.
+  //  - HALF_OPEN: only if no probe is in flight (or the in-flight probe has
+  //    been abandoned past CIRCUIT_PROBE_TIMEOUT_MS).
+  // Eligibility is not permission: the dispatcher must still win
+  // tryAcquireDispatch() immediately before calling the provider, which is
+  // what admits EXACTLY ONE probe (A14a).
+  //
+  // Scope (A14c, still open): this state is per process. Each gateway/worker
+  // replica trips and recovers its own breaker from the traffic it sees; it
+  // is not part of the persisted provider state (syncFromStore()).
   public isCircuitAvailable(id: string): boolean {
     const state = this.management.get(id);
     if (!state) return false;
+    const now = Date.now();
 
     if (state.circuitState === 'closed') return true;
-
     if (state.circuitState === 'open') {
-      const openedAt = state.circuitOpenedAt ?? 0;
-      if (Date.now() - openedAt >= CIRCUIT_COOLDOWN_MS) {
-        state.circuitState = 'half_open';
-        return true;
-      }
-      return false;
+      return now - (state.circuitOpenedAt ?? 0) >= CIRCUIT_COOLDOWN_MS;
     }
+    return !this.probeInFlight(state, now);
+  }
 
-    // half_open: allow the in-flight probe.
+  private probeInFlight(state: ManagementState, now: number): boolean {
+    return state.halfOpenProbeAt !== null && now - state.halfOpenProbeAt < CIRCUIT_PROBE_TIMEOUT_MS;
+  }
+
+  /**
+   * Claims the right to send ONE request to this provider right now, called
+   * by the dispatcher immediately before the provider call (gap register
+   * A14a). CLOSED: always granted. OPEN past its cooldown: transitions to
+   * HALF_OPEN and grants the single recovery probe. HALF_OPEN: granted only
+   * when no probe is in flight. Every other caller is refused and must route
+   * elsewhere — nothing was sent. The probe is resolved by recordTraffic()
+   * (success → CLOSED, failure → OPEN) or handed back by releaseDispatch().
+   */
+  public tryAcquireDispatch(id: string): boolean {
+    const state = this.management.get(id);
+    if (!state) return false;
+    const now = Date.now();
+
+    if (state.circuitState === 'closed') return true;
+    if (state.circuitState === 'open') {
+      if (now - (state.circuitOpenedAt ?? 0) < CIRCUIT_COOLDOWN_MS) return false;
+      state.circuitState = 'half_open';
+      state.halfOpenProbeAt = now;
+      return true;
+    }
+    if (this.probeInFlight(state, now)) return false;
+    state.halfOpenProbeAt = now;
     return true;
+  }
+
+  /**
+   * Hands back a dispatch claimed by tryAcquireDispatch() whose call ended
+   * WITHOUT telling us anything about the provider's health (a definite
+   * pre-send refusal: missing input, not configured, ...). A HALF_OPEN probe
+   * slot is freed for the next request; nothing is recorded.
+   */
+  public releaseDispatch(id: string): void {
+    const state = this.management.get(id);
+    if (state && state.circuitState === 'half_open') state.halfOpenProbeAt = null;
   }
 
   // Combines the admin-controlled online/offline/maintenance status with
   // circuit breaker availability — this is the single check routing should
   // use to decide whether a provider is eligible for a request right now.
+  // A provider whose persisted secrets failed to decrypt is withheld too:
+  // routing it would silently use env-var (or simulated) credentials instead
+  // of the ones an operator stored (gap register D13).
   public isProviderAvailable(id: string): boolean {
     const provider = this.providers.get(id);
     if (!provider || provider.config.status !== 'online') return false;
+    if (this.management.get(id)?.secretsLoadError) return false;
     return this.isCircuitAvailable(id);
   }
 
@@ -658,6 +856,7 @@ export class ProviderRegistry {
         state.circuitState = 'closed';
         state.consecutiveFailures = 0;
         state.circuitOpenedAt = null;
+        state.halfOpenProbeAt = null;
       }
     }
 
@@ -719,6 +918,7 @@ export class ProviderRegistry {
         state.circuitState = 'closed';
         state.consecutiveFailures = 0;
         state.circuitOpenedAt = null;
+        state.halfOpenProbeAt = null;
       }
     }
     if (updates.latencyMin !== undefined) {
@@ -754,10 +954,19 @@ export class ProviderRegistry {
   // SECRETS (metadata only — plaintext is never exposed)
   // ----------------------------------------------------
 
+  // Gap register D13/E14: this used to show the first 6 AND last 4
+  // characters — the ENTIRE value of any secret of 10 characters or fewer,
+  // and 10 characters of every longer one ('sk_test_123' → 'sk_tes…_123').
+  // Now: at most a quarter of the value, capped at 4 characters, from the
+  // front only, followed by a fixed-width mask that also hides the length.
+  // A secret of 3 characters or fewer shows nothing at all.
+  public static maskSecret(value: string): string {
+    const visible = Math.min(SECRET_MASK_MAX_VISIBLE, Math.floor(value.length / 4));
+    return `${value.slice(0, visible)}${'•'.repeat(SECRET_MASK_WIDTH)}`;
+  }
+
   private maskSecret(value: string): string {
-    const visible = value.slice(0, Math.min(6, Math.max(0, value.length - 4)));
-    const tail = value.slice(-4);
-    return `${visible}${'•'.repeat(10)}${tail}`;
+    return ProviderRegistry.maskSecret(value);
   }
 
   public getSecrets(id: string): ProviderSecretMeta[] | null {
@@ -846,6 +1055,285 @@ export class ProviderRegistry {
   }
 
   // ----------------------------------------------------
+  // PERSISTED STATE: LOAD / CONVERGE / WRITE (gap register E12, Phase 15)
+  // ----------------------------------------------------
+  // The store (Postgres) is the source of truth for provider configuration
+  // and secrets. Every process:
+  //  - loads it at startup, AWAITED before serving traffic (syncFromStore);
+  //  - re-syncs periodically, applying any version newer than its own, so
+  //    every gateway/worker replica converges on an admin change within one
+  //    refresh interval (see ProviderStateSync in ./state-sync.ts);
+  //  - writes through it (mutatePersisted): an admin change is reported as
+  //    applied only once it is durably stored, and a lost compare-and-set
+  //    race or a failed write leaves this process's state as it was.
+
+  /** The admin-controlled configuration of one provider, as persisted. */
+  public exportManagementForPersistence(id: string): PersistableProviderManagement | null {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return null;
+    const c = provider.config;
+    return {
+      status: c.status,
+      weight: c.weight,
+      latencyMin: c.latencyMin,
+      latencyMax: c.latencyMax,
+      ...(c.transactionFeePercent !== undefined ? { transactionFeePercent: c.transactionFeePercent } : {}),
+      ...(c.transactionFeeFlat !== undefined ? { transactionFeeFlat: c.transactionFeeFlat } : {}),
+      ...(c.messageCost !== undefined ? { messageCost: c.messageCost } : {}),
+      environment: state.environment,
+      countries: [...state.countries],
+      currencies: [...state.currencies],
+      capabilities: [...state.capabilities],
+      priority: state.priority,
+      routingRules: state.routingRules.map((r) => ({ ...r })),
+    };
+  }
+
+  /** The persisted versions this process currently holds (0 = none). */
+  public getPersistedVersions(id: string): { management: number; secrets: number } | null {
+    const state = this.management.get(id);
+    return state ? { management: state.managementVersion, secrets: state.secretsVersion } : null;
+  }
+
+  /** Providers currently withheld from routing because their persisted secrets failed to decrypt. */
+  public getSecretLoadFailures(): Array<{ slug: string; version: number; error: string }> {
+    const out: Array<{ slug: string; version: number; error: string }> = [];
+    for (const [slug, state] of this.management) {
+      if (state.secretsLoadError) out.push({ slug, ...state.secretsLoadError });
+    }
+    return out;
+  }
+
+  // Applies a persisted configuration onto this process's state. Fields are
+  // copied individually and type-checked — a malformed stored value keeps
+  // the current one rather than poisoning routing. A transition to 'online'
+  // resets the circuit (the same operator-override semantics as
+  // updateManagement), unless this is a rollback of our own failed write.
+  private applyManagement(id: string, doc: unknown, opts: { resetCircuitOnOnline: boolean }): void {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state || !doc || typeof doc !== 'object') return;
+    const m = doc as Partial<PersistableProviderManagement>;
+    const c = provider.config;
+    const wasOnline = c.status === 'online';
+
+    if (m.status === 'online' || m.status === 'offline' || m.status === 'maintenance') c.status = m.status;
+    if (isFiniteNumber(m.weight)) c.weight = m.weight;
+    if (isFiniteNumber(m.latencyMin)) c.latencyMin = m.latencyMin;
+    if (isFiniteNumber(m.latencyMax)) c.latencyMax = m.latencyMax;
+    if (isFiniteNumber(m.transactionFeePercent)) c.transactionFeePercent = m.transactionFeePercent;
+    if (isFiniteNumber(m.transactionFeeFlat)) c.transactionFeeFlat = m.transactionFeeFlat;
+    if (isFiniteNumber(m.messageCost)) c.messageCost = m.messageCost;
+    if (m.environment === 'live' || m.environment === 'test') state.environment = m.environment;
+    if (isStringArray(m.countries)) state.countries = [...m.countries];
+    if (isStringArray(m.currencies)) state.currencies = [...m.currencies];
+    if (isStringArray(m.capabilities)) state.capabilities = [...m.capabilities];
+    if (isFiniteNumber(m.priority)) state.priority = m.priority;
+    if (Array.isArray(m.routingRules)) {
+      state.routingRules = m.routingRules
+        .filter((r) => r && typeof r.id === 'string' && typeof r.match === 'string' && typeof r.target === 'string')
+        .map((r) => ({ ...r, enabled: r.enabled !== false }));
+    }
+
+    if (opts.resetCircuitOnOnline && !wasOnline && c.status === 'online') {
+      state.circuitState = 'closed';
+      state.consecutiveFailures = 0;
+      state.circuitOpenedAt = null;
+      state.halfOpenProbeAt = null;
+    }
+  }
+
+  // Authoritative replace of this provider's secrets (unlike hydrateSecrets,
+  // which never clobbers): the persisted set IS the truth once loaded.
+  private replaceSecrets(id: string, secrets: PersistableProviderSecret[]): void {
+    const state = this.management.get(id);
+    if (!state) return;
+    state.secrets = secrets
+      .filter((s) => s && typeof s.field === 'string' && typeof s.value === 'string')
+      .map((s) => ({
+        meta: {
+          id: typeof s.id === 'string' && s.id ? s.id : newSecretId(),
+          field: s.field,
+          label: typeof s.label === 'string' ? s.label : s.field,
+          masked: this.maskSecret(s.value),
+          lastUpdated: typeof s.lastUpdated === 'string' ? s.lastUpdated : new Date().toISOString(),
+        },
+        value: s.value,
+      }));
+    this.syncSecrets(id);
+  }
+
+  // The full secrets set INCLUDING the metadata every replica must share
+  // (id, lastUpdated) — what is encrypted and persisted.
+  private exportSecretsWithMeta(id: string): PersistableProviderSecret[] {
+    const state = this.management.get(id);
+    if (!state) return [];
+    return state.secrets.map((s) => ({
+      field: s.meta.field,
+      label: s.meta.label,
+      value: s.value,
+      id: s.meta.id,
+      lastUpdated: s.meta.lastUpdated,
+    }));
+  }
+
+  // Applies one persisted row's newer parts. Secrets that fail to decrypt
+  // are NOT applied (and the provider is withheld from routing); the error
+  // is reported, never swallowed.
+  private applyPersistedRow(
+    row: PersistedProviderState,
+    kinds: { management: boolean; secrets: boolean },
+    report: ProviderStateSyncReport,
+  ): void {
+    const state = this.management.get(row.slug);
+    if (!state) return;
+
+    if (kinds.management && row.management && typeof row.management === 'object' && row.managementVersion > state.managementVersion) {
+      this.applyManagement(row.slug, row.management, { resetCircuitOnOnline: true });
+      state.managementVersion = row.managementVersion;
+      report.managementApplied.push(row.slug);
+    }
+
+    if (kinds.secrets && row.secretsVersion > state.secretsVersion) {
+      try {
+        const secrets = row.readSecrets();
+        if (!Array.isArray(secrets)) throw new Error('persisted secrets are not a list');
+        this.replaceSecrets(row.slug, secrets);
+        state.secretsVersion = row.secretsVersion;
+        state.secretsLoadError = null;
+        report.secretsApplied.push(row.slug);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        // Reported once per failing version, but the provider stays
+        // withheld (and listed by getSecretLoadFailures()) until it loads.
+        if (state.secretsLoadError?.version !== row.secretsVersion) {
+          report.secretFailures.push({ slug: row.slug, version: row.secretsVersion, error });
+        }
+        state.secretsLoadError = { version: row.secretsVersion, error };
+      }
+    }
+  }
+
+  /**
+   * Loads every provider's persisted state and applies whatever is newer
+   * than what this process holds. Called (awaited) at startup and then
+   * periodically. Rejects only if the store itself fails; per-provider
+   * decrypt failures are returned in the report.
+   */
+  public async syncFromStore(store: ProviderStateStore): Promise<ProviderStateSyncReport> {
+    const report: ProviderStateSyncReport = { managementApplied: [], secretsApplied: [], secretFailures: [] };
+    const rows = await store.loadAll();
+    for (const row of rows) {
+      this.applyPersistedRow(row, { management: true, secrets: true }, report);
+    }
+    return report;
+  }
+
+  /**
+   * Applies an admin change THROUGH the store (gap register E12):
+   *  1. re-read this provider's persisted state and converge on it;
+   *  2. apply `mutate` locally (returning null = nothing to change / not
+   *     found — nothing is written);
+   *  3. compare-and-set the resulting full state against the version read in
+   *     step 1. On success this process adopts the new version and the
+   *     change is live. If another writer got there first, the local change
+   *     is rolled back and the whole sequence retried on top of theirs; if
+   *     the write fails (store unreachable, SECRET_ENCRYPTION_KEY missing,
+   *     ...) the local change is rolled back and the error rethrown — so a
+   *     caller never reports an unpersisted change as applied.
+   * Writes to the same provider are serialized within this process.
+   */
+  public async mutatePersisted<T>(
+    store: ProviderStateStore,
+    id: string,
+    kind: 'management' | 'secrets',
+    mutate: () => T | null,
+  ): Promise<T | null> {
+    const previous = this.writeChains.get(id) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(() => this.mutatePersistedNow(store, id, kind, mutate));
+    const chain = run.catch(() => undefined);
+    this.writeChains.set(id, chain);
+    try {
+      return await run;
+    } finally {
+      if (this.writeChains.get(id) === chain) this.writeChains.delete(id);
+    }
+  }
+
+  private async mutatePersistedNow<T>(
+    store: ProviderStateStore,
+    id: string,
+    kind: 'management' | 'secrets',
+    mutate: () => T | null,
+  ): Promise<T | null> {
+    const provider = this.providers.get(id);
+    const state = this.management.get(id);
+    if (!provider || !state) return null;
+
+    for (let attempt = 1; attempt <= PERSISTED_WRITE_ATTEMPTS; attempt++) {
+      const row = await store.load(id);
+      if (row) {
+        const report: ProviderStateSyncReport = { managementApplied: [], secretsApplied: [], secretFailures: [] };
+        this.applyPersistedRow(row, { management: kind === 'management', secrets: kind === 'secrets' }, report);
+        // Never overwrite persisted secrets this process cannot read: the
+        // full-set write below would destroy them.
+        if (kind === 'secrets' && state.secretsLoadError) {
+          throw new Error(
+            `Persisted secrets for provider '${id}' cannot be decrypted (${state.secretsLoadError.error}) — refusing to overwrite them.`,
+          );
+        }
+      }
+
+      const expectedVersion = kind === 'management' ? state.managementVersion : state.secretsVersion;
+      const before = kind === 'management' ? this.exportManagementForPersistence(id)! : this.exportSecretsWithMeta(id);
+      const rollback = () => {
+        if (kind === 'management') {
+          this.applyManagement(id, before as PersistableProviderManagement, { resetCircuitOnOnline: false });
+          state.managementVersion = expectedVersion;
+        } else {
+          this.replaceSecrets(id, before as PersistableProviderSecret[]);
+          state.secretsVersion = expectedVersion;
+        }
+      };
+
+      const result = mutate();
+      if (result === null) return null;
+
+      let write: ProviderStateWriteResult;
+      try {
+        write = kind === 'management'
+          ? await store.saveManagement({
+              slug: id,
+              name: provider.config.name,
+              category: provider.config.category,
+              management: this.exportManagementForPersistence(id)!,
+              expectedVersion,
+            })
+          : await store.saveSecrets({
+              slug: id,
+              name: provider.config.name,
+              category: provider.config.category,
+              secrets: this.exportSecretsWithMeta(id),
+              expectedVersion,
+            });
+      } catch (err) {
+        rollback();
+        throw err;
+      }
+
+      if (write.saved) {
+        if (kind === 'management') state.managementVersion = write.version;
+        else state.secretsVersion = write.version;
+        return result;
+      }
+      // Lost the race: undo, then re-read their version and re-apply ours on top.
+      rollback();
+    }
+    throw new ProviderStateConflictError(id, kind);
+  }
+
+  // ----------------------------------------------------
   // ROUTING RULES
   // ----------------------------------------------------
 
@@ -908,6 +1396,7 @@ export class ProviderRegistry {
       if (state.circuitState === 'half_open') {
         state.circuitState = 'closed';
         state.circuitOpenedAt = null;
+        state.halfOpenProbeAt = null;
       }
     } else {
       state.errorRate = Math.min(100, Math.round((state.errorRate * 0.9 + 10) * 10) / 10);
@@ -917,6 +1406,7 @@ export class ProviderRegistry {
         // Recovery probe failed — back to OPEN, restart the cooldown.
         state.circuitState = 'open';
         state.circuitOpenedAt = Date.now();
+        state.halfOpenProbeAt = null;
       } else if (state.circuitState === 'closed' && state.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD) {
         state.circuitState = 'open';
         state.circuitOpenedAt = Date.now();

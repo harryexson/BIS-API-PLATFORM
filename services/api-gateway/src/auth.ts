@@ -3,6 +3,7 @@ import {
   ApplicationRegistry,
   applicationRepository,
   apiKeyRepository,
+  currentDeploymentTier,
 } from '@company/database';
 import {
   RateLimiterMemory,
@@ -133,7 +134,12 @@ export class AuthService {
         return { ok: false, error: 'Authentication service unavailable' };
       }
       try {
-        const res = await this.registry.authenticateApplication(raw);
+        // Gap register C9: the key must belong to THIS deployment's tier.
+        // Production routes only to 'live' providers with real credentials,
+        // so a 'test' key is refused there (and a 'live' key is refused by
+        // any non-production deployment). Previously no environment was
+        // passed and the registry's check never ran.
+        const res = await this.registry.authenticateApplication(raw, currentDeploymentTier());
         if (!res.authenticated || !res.application) {
           return { ok: false, error: res.error || 'Invalid API key' };
         }

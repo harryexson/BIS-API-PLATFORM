@@ -59,7 +59,13 @@ export async function createPartiallyMigratedTestDatabase(
   adminUrl: string,
   lastIdx: number,
   prefix = 'bis_test_up',
-): Promise<{ client: ReturnType<typeof postgres>; migrateRest(): Promise<void>; drop(): Promise<void> }> {
+): Promise<{
+  client: ReturnType<typeof postgres>;
+  /** A drizzle handle over the same database (Phase 15: lets a repository/store run its real SQL against the upgraded schema). */
+  db: PostgresJsDatabase<typeof schema>;
+  migrateRest(): Promise<void>;
+  drop(): Promise<void>;
+}> {
   const { cpSync, mkdtempSync, readFileSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const migrations = path.resolve(__dirname, '../../drizzle');
@@ -79,6 +85,7 @@ export async function createPartiallyMigratedTestDatabase(
   await migrate(drizzle(client), { migrationsFolder: dir });
   return {
     client,
+    db: drizzle(client, { schema }),
     async migrateRest() {
       await migrate(drizzle(client), { migrationsFolder: migrations });
     },

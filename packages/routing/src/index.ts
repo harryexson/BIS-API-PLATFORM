@@ -198,6 +198,22 @@ export class PaymentOverrideIncapableError extends Error {
   }
 }
 
+/**
+ * Phase 15 (gap register A14a): the provider's circuit is HALF_OPEN with its
+ * single recovery probe already in flight (or it re-opened since it was
+ * selected) — this request was NOT sent to it. Definite, so payment and
+ * messaging cascades move on to the next candidate, and it is never
+ * recorded as a provider failure.
+ */
+export class ProviderCircuitOpenError extends Error {
+  readonly code = 'provider_circuit_open';
+  readonly ambiguous = false;
+  constructor(readonly providerId: string) {
+    super(`Provider '${providerId}' is not accepting traffic right now (circuit breaker recovery probe in flight) — not sent.`);
+    this.name = 'ProviderCircuitOpenError';
+  }
+}
+
 /** Phase 8: the sender-level STOP lookup failed — the send is aborted, never cascaded. */
 class SenderConsentLookupError extends Error {
   constructor(message: string) {
@@ -237,6 +253,49 @@ export class RoutingEngine {
   constructor() {
     this.registry = ProviderRegistry.getInstance();
     this.conversationManager = new ConversationManager();
+  }
+
+  /**
+   * Phase 15 (gap register A14a/A14d): the ONE place a provider is actually
+   * called, so the circuit breaker sees every real attempt — including each
+   * one that failed earlier in a failover cascade. (Previously only the
+   * gateway's observe() of the FINAL event recorded anything: a provider
+   * that failed mid-cascade never had a failure recorded, a thrown routing
+   * failure was charged to `providerOverride || 'failed_route'` instead of
+   * the provider that failed, and worker-dispatched calls were never
+   * recorded at all.)
+   *
+   *  - The dispatch is claimed first (tryAcquireDispatch): this is what
+   *    admits exactly one HALF_OPEN recovery probe. A refused claim throws
+   *    ProviderCircuitOpenError — nothing was sent.
+   *  - Outcome recorded: an event counts as a success only if
+   *    status === 'success' (unchanged from observe()'s classification); a
+   *    timeout or an ambiguous thrown error is a failure. A DEFINITE thrown
+   *    error (nothing was sent: missing input, not configured, ...) says
+   *    nothing about the provider's health — not recorded, and a probe
+   *    slot is handed back (releaseDispatch).
+   */
+  private async dispatch(
+    provider: BaseProvider,
+    call: (options: ProviderCallOptions) => Promise<TransactionEvent>,
+  ): Promise<TransactionEvent> {
+    const id = provider.config.id;
+    if (!this.registry.tryAcquireDispatch(id)) throw new ProviderCircuitOpenError(id);
+    let event: TransactionEvent;
+    try {
+      event = await withProviderTimeout(call);
+    } catch (err) {
+      if (err instanceof ProviderTimeoutError) {
+        this.registry.recordTraffic(id, false, PROVIDER_TIMEOUT_MS);
+      } else if (isAmbiguousProviderError(err)) {
+        this.registry.recordTraffic(id, false, 0);
+      } else {
+        this.registry.releaseDispatch(id);
+      }
+      throw err;
+    }
+    this.registry.recordTraffic(id, event.status === 'success', event.latency ?? 0);
+    return event;
   }
 
   // Capability-based payment routing — selects providers by capabilities/currency
@@ -423,7 +482,7 @@ export class RoutingEngine {
       try {
         // Bounded, and genuinely cancelling: on timeout the adapter's
         // in-flight request and any internal retries are aborted (E6).
-        event = await withProviderTimeout((options) => currentProvider!.processRequest(appId, payload, currentReason, options));
+        event = await this.dispatch(currentProvider, (options) => currentProvider!.processRequest(appId, payload, currentReason, options));
       } catch (err: any) {
         if (err instanceof ProviderTimeoutError || isAmbiguousProviderError(err)) {
           // Phase 6 (gap register D4): the provider's own id was never
@@ -836,7 +895,7 @@ export class RoutingEngine {
           throw new ConsentBlockedError(address, channel);
         }
         // P1: Wrap provider call with timeout to prevent hung requests
-        const event = await withProviderTimeout((options) => currentProvider!.processRequest(appId, sendPayload, currentReason, options));
+        const event = await this.dispatch(currentProvider, (options) => currentProvider!.processRequest(appId, sendPayload, currentReason, options));
         // P2-8: Record conversation after successful delivery — on the
         // business number it was sent from (Phase 8), on the channel it was
         // actually sent on (Phase 10).
@@ -946,7 +1005,8 @@ export class RoutingEngine {
     }
 
     // P1: Wrap provider call with timeout to prevent hung requests
-    return await withProviderTimeout(
+    return await this.dispatch(
+      selectedProvider,
       (options) => selectedProvider!.processRequest(appId, payload, reason, options),
     );
   }

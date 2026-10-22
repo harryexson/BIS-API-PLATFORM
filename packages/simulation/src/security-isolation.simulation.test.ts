@@ -49,7 +49,11 @@ const OTHER_AUTH = { authorization: 'Bearer ' + OTHER_API_KEY, 'x-tenant-id': OT
 // a 429). It now runs with a real admin token and a real, small limit.
 const ADMIN_TOKEN = 'sec-iso-admin-' + randomBytes(8).toString('hex');
 const RATE_LIMIT = 60;
-const ENV_KEYS = ['ADMIN_API_TOKEN', 'RATE_LIMIT_MAX_REQUESTS'];
+// SECRET_ENCRYPTION_KEY: Phase 15 (gap register D13) — an admin secret write
+// is persisted before it is acknowledged, and refused (503) without a key;
+// suite M stores a probe secret, so the key is configured here.
+const SECRET_KEY = 'sec-iso-secret-key-' + randomBytes(16).toString('hex');
+const ENV_KEYS = ['ADMIN_API_TOKEN', 'RATE_LIMIT_MAX_REQUESTS', 'SECRET_ENCRYPTION_KEY'];
 const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 // Distinct loopback source addresses (all of 127/8 is loopback on Linux), so
 // test N's bursts are charged to their own per-IP buckets, not to 127.0.0.1
@@ -64,7 +68,7 @@ beforeAll(async () => {
   clearDb();
   seedReachChurch();
   runtime = await createSimulation({
-    env: { ADMIN_API_TOKEN: ADMIN_TOKEN, RATE_LIMIT_MAX_REQUESTS: String(RATE_LIMIT) },
+    env: { ADMIN_API_TOKEN: ADMIN_TOKEN, RATE_LIMIT_MAX_REQUESTS: String(RATE_LIMIT), SECRET_ENCRYPTION_KEY: SECRET_KEY },
   });
 }, 30_000);
 

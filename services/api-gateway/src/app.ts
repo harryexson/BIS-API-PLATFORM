@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
-import { ProviderRegistry } from '@company/providers';
+import { ProviderRegistry, ProviderStateSync, ProviderStateConflictError } from '@company/providers';
 import {
   RoutingEngine,
   ConsentBlockedError,
@@ -51,9 +51,8 @@ import {
   customerNoteRepository,
   supportTicketRepository,
   ticketCommentRepository,
-  ensureProviderRow,
-  persistProviderSecrets,
-  loadAllProviderSecrets,
+  providerStateStore,
+  SecretEncryptionKeyMissingError,
   webhookEventRepository,
   outboxEventRepository,
   paymentOutcomeFromEvent,
@@ -611,8 +610,15 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // Records a gateway operation against the observability metrics + logs it.
+//
+// Phase 15 (gap register A14d): observe() no longer feeds the circuit
+// breaker. RoutingEngine.dispatch() records every real provider attempt
+// (including each one that failed earlier in a failover cascade) — here,
+// only the FINAL event of a request is visible, and a thrown routing failure
+// carries `providerOverride || 'failed_route'`, not the provider that
+// failed. Direct adapter calls outside the engine (refunds) record their own
+// outcome via recordTrafficResult().
 function observe(event: TransactionEvent) {
-  recordTrafficResult(event.providerId, event.status, event.latency);
   setContextField('providerId', event.providerId);
   setContextField('applicationId', event.appId);
 
@@ -768,60 +774,112 @@ eventBus.subscribe((event) => {
   });
 });
 
-// P0: Provider secrets added through the admin console previously lived
-// only in ProviderRegistry's in-memory Map — a secret survived until the
-// next restart, then silently reverted to whatever the process.env
-// fallback provided (or nothing). Read back every already-persisted
-// provider's secrets into the registry once at startup, and persist the
-// full current set after every admin add/delete (see the
-// /api/dashboard/providers/:id/secrets routes below).
-//
-// Fire-and-forget and non-blocking — server startup must not wait on a DB
-// round trip, and a provider with no persisted secrets yet (or
-// SECRET_ENCRYPTION_KEY unset, e.g. most non-production environments) is
-// expected, not an error: the adapter's process.env fallback still works
-// exactly as before this existed.
-async function hydrateProviderSecretsFromDb(): Promise<void> {
-  try {
-    const snapshot = await loadAllProviderSecrets();
-    for (const [slug, secrets] of Object.entries(snapshot)) {
-      registry.hydrateSecrets(slug, secrets);
+// Phase 15 (gap register E12/D13): provider configuration AND secrets are
+// persisted (provider_configs, via @company/database's providerStateStore)
+// and the database is the source of truth:
+//  - loaded at startup and AWAITED before any /v1 traffic is served
+//    (index.ts awaits it before listening; the gate below covers any other
+//    entry point). This replaces a fire-and-forget secrets-only hydration
+//    that let the first requests after a restart run on env-var or
+//    simulated credentials and on code-default routing configuration;
+//  - re-synced every PROVIDER_STATE_REFRESH_MS (default 5s), so an admin
+//    change made through ANY gateway replica reaches every gateway and
+//    worker replica within one interval;
+//  - admin writes go through it (mutatePersisted below): a change is
+//    reported as applied only once it is stored.
+// A provider whose persisted secrets cannot be decrypted is reported
+// loudly (error log + metric + /ready degraded) and withheld from routing —
+// never silently run on other credentials.
+const PROVIDER_STATE_REFRESH_MS = Number(process.env.PROVIDER_STATE_REFRESH_MS) || 5_000;
+const providerStateSync = new ProviderStateSync(registry, providerStateStore, {
+  intervalMs: PROVIDER_STATE_REFRESH_MS,
+  onReport(report) {
+    for (const failure of report.secretFailures) {
+      metrics.increment('providerSecretDecryptFailures');
+      logger.error('persisted provider secrets could not be decrypted — provider withheld from routing', {
+        operation: 'provider_state_sync',
+        providerId: failure.slug,
+        errorCode: 'PROVIDER_SECRETS_DECRYPT_FAILED',
+        status: 'failed',
+        error: failure.error,
+      });
     }
-  } catch (err) {
-    logger.warn('provider secrets hydration failed — adapters still work via env-var fallback', {
-      operation: 'startup',
-      errorCode: 'PROVIDER_SECRETS_HYDRATE_FAILED',
+  },
+  onError(err) {
+    logger.error('provider state load failed', {
+      operation: 'provider_state_sync',
+      errorCode: 'PROVIDER_STATE_LOAD_FAILED',
       status: 'failed',
       error: err instanceof Error ? err.message : String(err),
     });
-  }
+  },
+}).start();
+
+/**
+ * Resolves once the startup load of persisted provider state has finished
+ * (successfully or not — see providerStateStatus()). index.ts awaits it
+ * before listening.
+ */
+export const providerStateReady: Promise<void> = providerStateSync.initialLoad;
+
+export function providerStateStatus() {
+  return providerStateSync.status();
 }
-void hydrateProviderSecretsFromDb();
 
-// Encrypts and stores the provider's full current secrets set — called
-// fire-and-forget after every successful addSecret()/deleteSecret() below.
-// Never blocks or fails the HTTP response: the in-memory registry (what
-// every real adapter call actually reads) is already correct the moment
-// addSecret()/deleteSecret() returns; this only affects whether that state
-// survives the *next* restart, not the current request.
-function persistProviderSecretsAsync(id: string): void {
-  const secrets = registry.exportSecretsForPersistence(id);
-  if (secrets === null) return;
-  const config = registry.getAllConfigs().find((c) => c.id === id);
-  if (!config) return;
+// Exposed so tests can force an immediate re-sync instead of waiting on the
+// refresh interval. Not used by any production code path.
+export function syncProviderStateForTests(): Promise<void> {
+  return providerStateSync.syncOnce();
+}
 
-  (async () => {
-    await ensureProviderRow({ slug: id, name: config.name, category: config.category });
-    await persistProviderSecrets(id, secrets);
-  })().catch((err) => {
-    logger.warn('provider secrets persistence failed — in-memory state is still correct', {
-      operation: 'provider_secrets_persist',
+// Never serve provider traffic on configuration that was not loaded. In
+// production a failed startup load keeps /v1 at 503 until a later re-sync
+// succeeds; outside production (local dev without a database) the
+// code-default configuration is still usable, as before.
+app.use('/v1', async (_req: Request, res: Response, next: NextFunction) => {
+  await providerStateReady;
+  if (!providerStateSync.status().loaded && process.env.NODE_ENV === 'production') {
+    return res.status(503).json({ error: 'Provider configuration is not loaded yet', code: 'provider_state_unavailable' });
+  }
+  next();
+});
+
+// Applies an admin change to provider configuration/secrets THROUGH the
+// store and answers the request: 404 when the provider/item does not exist,
+// 409 when concurrent writers kept winning, 503 when the change could not
+// be persisted (store unreachable, SECRET_ENCRYPTION_KEY missing) — and in
+// both failure cases nothing was changed anywhere.
+async function persistProviderChange<T>(
+  res: Response,
+  id: string,
+  kind: 'management' | 'secrets',
+  mutate: () => T | null,
+): Promise<{ ok: true; result: T } | { ok: false }> {
+  try {
+    const result = await registry.mutatePersisted(providerStateStore, id, kind, mutate);
+    if (result === null) {
+      res.status(404).json({ error: `Provider '${id}' or the referenced item was not found` });
+      return { ok: false };
+    }
+    return { ok: true, result };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error('provider change not persisted — not applied', {
+      operation: kind === 'secrets' ? 'provider_secrets_persist' : 'provider_management_persist',
       providerId: id,
-      errorCode: 'PROVIDER_SECRETS_PERSIST_FAILED',
+      errorCode: err instanceof SecretEncryptionKeyMissingError ? 'SECRET_ENCRYPTION_KEY_MISSING' : 'PROVIDER_STATE_PERSIST_FAILED',
       status: 'failed',
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
     });
-  });
+    if (err instanceof ProviderStateConflictError) {
+      res.status(409).json({ error: err.message, code: err.code });
+    } else if (err instanceof SecretEncryptionKeyMissingError) {
+      res.status(503).json({ error: err.message, code: err.code });
+    } else {
+      res.status(503).json({ error: `Provider change was not persisted and has not been applied: ${message}`, code: 'provider_state_persist_failed' });
+    }
+    return { ok: false };
+  }
 }
 
 // ----------------------------------------------------
@@ -1169,8 +1227,11 @@ app.get('/ready', async (req: Request, res: Response) => {
   const rlInfo = auth.getRateLimiterInfo();
   deps.rateLimiter = rlInfo.storeBacked ? 'redis' : 'in-memory';
 
-  // Provider registry is in-memory — always "ready" if process is up
-  deps.providers = 'ready';
+  // Phase 15: provider configuration/secrets come from the database —
+  // 'ready' only once loaded, 'degraded' while any provider's persisted
+  // secrets cannot be decrypted (that provider is withheld from routing).
+  const providerState = providerStateSync.status();
+  deps.providers = !providerState.loaded ? 'not-loaded' : providerState.secretFailures.length > 0 ? 'degraded' : 'ready';
 
   const allHealthy = Object.values(deps).every(
     (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis',
@@ -1681,6 +1742,7 @@ app.post('/refunds', mw.rateLimit, mw.apiKey, resolveTenantContext, asyncHandler
     );
 
     eventBus.emit(refundEvent);
+    recordTrafficResult(refundEvent.providerId, refundEvent.status, refundEvent.latency);
     observe(refundEvent);
 
     const refund = {
@@ -3309,14 +3371,16 @@ app.get('/api/dashboard/providers', (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());
 });
 
-app.patch('/api/dashboard/providers/:id', requireAdmin, (req: Request, res: Response) => {
+// Phase 15 (E12): every write below goes through the database
+// (persistProviderChange) and reaches every replica — it is no longer a
+// mutation of this one process's memory.
+app.patch('/api/dashboard/providers/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const updates = req.body;
+  const updates = req.body || {};
 
-  const updatedConfig = registry.updateProviderConfig(id, updates);
-  if (!updatedConfig) {
-    return res.status(404).json({ error: `Provider '${id}' not found` });
-  }
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.updateProviderConfig(id, updates));
+  if (!persisted.ok) return;
+  const updatedConfig = persisted.result;
 
   const sseMsg = {
     id: 'config_' + Date.now(),
@@ -3334,7 +3398,7 @@ app.patch('/api/dashboard/providers/:id', requireAdmin, (req: Request, res: Resp
   eventBus.emit(sseMsg);
 
   return res.json(updatedConfig);
-});
+}));
 
 // ----------------------------------------------------
 // PROVIDER MANAGEMENT SURFACE
@@ -3348,13 +3412,12 @@ app.get('/api/dashboard/providers/:id/management', requireAdmin, (req: Request, 
   return res.json(view);
 });
 
-app.patch('/api/dashboard/providers/:id/management', requireAdmin, (req: Request, res: Response) => {
-  const updated = registry.updateManagement(req.params.id, req.body || {});
-  if (!updated) {
-    return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
-  }
-  return res.json(updated);
-});
+app.patch('/api/dashboard/providers/:id/management', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id;
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.updateManagement(id, req.body || {}));
+  if (!persisted.ok) return;
+  return res.json(persisted.result);
+}));
 
 app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
   const secrets = registry.getSecrets(req.params.id);
@@ -3364,27 +3427,27 @@ app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res
   return res.json(secrets);
 });
 
-app.post('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
+// Gap register D13: a secret write used to answer 201 and persist in the
+// background — silently not at all when SECRET_ENCRYPTION_KEY was unset.
+// Now it is answered only after the encrypted set is stored (503, and no
+// change anywhere, otherwise).
+app.post('/api/dashboard/providers/:id/secrets', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { field, label, value } = req.body || {};
   if (!field || !label || !value) {
     return res.status(400).json({ error: 'Missing parameters: field, label, and value are required' });
   }
-  const meta = registry.addSecret(req.params.id, { field, label, value });
-  if (!meta) {
-    return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
-  }
-  persistProviderSecretsAsync(req.params.id);
-  return res.status(201).json(meta);
-});
+  const id = req.params.id;
+  const persisted = await persistProviderChange(res, id, 'secrets', () => registry.addSecret(id, { field, label, value }));
+  if (!persisted.ok) return;
+  return res.status(201).json(persisted.result);
+}));
 
-app.delete('/api/dashboard/providers/:id/secrets/:secretId', requireAdmin, (req: Request, res: Response) => {
-  const removed = registry.deleteSecret(req.params.id, req.params.secretId);
-  if (!removed) {
-    return res.status(404).json({ error: `Secret '${req.params.secretId}' not found for provider '${req.params.id}'` });
-  }
-  persistProviderSecretsAsync(req.params.id);
+app.delete('/api/dashboard/providers/:id/secrets/:secretId', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const { id, secretId } = req.params;
+  const persisted = await persistProviderChange(res, id, 'secrets', () => (registry.deleteSecret(id, secretId) ? true : null));
+  if (!persisted.ok) return;
   return res.json({ success: true });
-});
+}));
 
 app.get('/api/dashboard/providers/:id/routing', requireAdmin, (req: Request, res: Response) => {
   const rules = registry.getRoutingRules(req.params.id);
@@ -3394,38 +3457,38 @@ app.get('/api/dashboard/providers/:id/routing', requireAdmin, (req: Request, res
   return res.json(rules);
 });
 
-app.post('/api/dashboard/providers/:id/routing', requireAdmin, (req: Request, res: Response) => {
+app.post('/api/dashboard/providers/:id/routing', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { match, target, description, enabled } = req.body || {};
   if (!match || !target) {
     return res.status(400).json({ error: 'Missing parameters: match and target are required' });
   }
-  const rule = registry.addRoutingRule(req.params.id, {
+  const id = req.params.id;
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.addRoutingRule(id, {
     match,
     target,
     description,
     enabled: enabled !== false
+  }));
+  if (!persisted.ok) return;
+  return res.status(201).json(persisted.result);
+}));
+
+app.patch('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const { id, ruleId } = req.params;
+  const persisted = await persistProviderChange(res, id, 'management', () => {
+    const rule = registry.updateRoutingRule(id, ruleId, req.body || {});
+    return rule ? { ...rule } : null;
   });
-  if (!rule) {
-    return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
-  }
-  return res.status(201).json(rule);
-});
+  if (!persisted.ok) return;
+  return res.json(persisted.result);
+}));
 
-app.patch('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, (req: Request, res: Response) => {
-  const updated = registry.updateRoutingRule(req.params.id, req.params.ruleId, req.body || {});
-  if (!updated) {
-    return res.status(404).json({ error: `Routing rule '${req.params.ruleId}' not found for provider '${req.params.id}'` });
-  }
-  return res.json(updated);
-});
-
-app.delete('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, (req: Request, res: Response) => {
-  const removed = registry.deleteRoutingRule(req.params.id, req.params.ruleId);
-  if (!removed) {
-    return res.status(404).json({ error: `Routing rule '${req.params.ruleId}' not found for provider '${req.params.id}'` });
-  }
+app.delete('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const { id, ruleId } = req.params;
+  const persisted = await persistProviderChange(res, id, 'management', () => (registry.deleteRoutingRule(id, ruleId) ? true : null));
+  if (!persisted.ok) return;
   return res.json({ success: true });
-});
+}));
 
 app.post('/api/dashboard/providers/:id/health-check', requireAdmin, async (req: Request, res: Response) => {
   try {
