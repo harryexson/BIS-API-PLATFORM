@@ -7,6 +7,7 @@ import {
   unique,
 } from 'drizzle-orm/pg-core';
 import { messagingProfiles } from './messaging-profiles';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * A conversation is ONE customer talking to ONE owner (application → tenant
@@ -43,14 +44,23 @@ import { messagingProfiles } from './messaging-profiles';
  *   status            → status
  *   last_activity_at  → last_message_at (name kept to avoid a breaking rename)
  *
- * Unique key: (phone_number, business_number, app_id, tenant_id, supplier_id)
- * with NULLS NOT DISTINCT. The same customer can legitimately hold
+ * Unique key: (phone_number, business_number, app_id, tenant_id, supplier_id,
+ * channel) with NULLS NOT DISTINCT. The same customer can legitimately hold
  * simultaneous active conversations with different tenants on the SAME
  * shared number (tenant differs), with two hotels of one STAYSCAPE tenant on
- * the same number (supplier differs), or with one tenant on two different
- * numbers (business number differs) — and every one of those is a distinct
- * row. Provider and channel are deliberately NOT in the key: a provider
- * failover or a channel re-detection must not fork the thread.
+ * the same number (supplier differs), with one tenant on two different
+ * numbers (business number differs), or with one owner over SMS and over
+ * WhatsApp on the same number (channel differs) — and every one of those is
+ * a distinct row. Provider is deliberately NOT in the key: a provider
+ * failover within a channel must not fork the thread.
+ *
+ * Phase 16 (gap register D16): channel was added to the key. Phase 8 left
+ * it out so that "a channel re-detection" would not fork a thread, but Phase
+ * 10 made the channel explicit and continuity channel-scoped (routing reuses
+ * only a thread on the channel being sent on). Without channel in the key an
+ * SMS thread and a WhatsApp thread of one owner on one number were a single
+ * row whose channel/provider flipped with every send, so the SMS thread
+ * Phase 10's continuity looks for no longer existed after any WhatsApp send.
  */
 export const conversations = pgTable(
   'conversations',
@@ -61,8 +71,9 @@ export const conversations = pgTable(
     appId: text('app_id').notNull(),
     // P0 FIX: tenantId is now required for multi-tenant conversation isolation.
     // Within the same appId, different tenants must not share conversation state.
-    // Apps that don't use tenants should pass 'default' as tenantId.
-    tenantId: text('tenant_id').notNull().default('default'),
+    // Phase 16: no DB default — an omitted tenant is a NOT NULL error, never
+    // a silent 'default'.
+    tenantId: text('tenant_id').notNull(),
     supplierId: text('supplier_id'),
     messagingProfileId: uuid('messaging_profile_id').references(() => messagingProfiles.id, {
       onDelete: 'set null',
@@ -93,8 +104,9 @@ export const conversations = pgTable(
     // represent one customer talking to two tenants on two different
     // numbers, nor to two suppliers of one tenant).
     unique('uq_conversations_owner')
-      .on(t.phoneNumber, t.businessNumber, t.appId, t.tenantId, t.supplierId)
+      .on(t.phoneNumber, t.businessNumber, t.appId, t.tenantId, t.supplierId, t.channel)
       .nullsNotDistinct(),
+    tenantIdNonBlank('conversations', t.tenantId),
   ],
 );
 

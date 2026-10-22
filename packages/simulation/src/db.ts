@@ -54,6 +54,12 @@ const MESSAGING_PROFILE_SENDER_TYPES = new Set(['phone', '10dlc', 'tollfree', 's
 export interface EventRow {
   id: string;
   appId: string;
+  /**
+   * events.tenant_id (Phase 16): 'default' when the writer omits it (the
+   * column default), NULL when it passes null. Optional only so existing
+   * hand-built EventRow literals in tests keep compiling.
+   */
+  tenantId?: string | null;
   category: string;
   providerId: string | null;
   status: string | null;
@@ -924,9 +930,17 @@ function normalizeRow(data: Record<string, unknown>): EventRow {
       throw new Error('new row for relation "events" violates check constraint "chk_events_channel_fallback_reason" (simulated)');
     }
   }
+  // Phase 16: mirrors events.tenant_id — the column default 'default' when
+  // the writer omits it, NULL when it passes null — and migration 0021's
+  // chk_events_tenant_id_nonblank.
+  const tenantId = data.tenantId === undefined ? 'default' : data.tenantId === null ? null : String(data.tenantId);
+  if (tenantId !== null && tenantId.trim() === '') {
+    throw new Error('new row for relation "events" violates check constraint "chk_events_tenant_id_nonblank" (simulated)');
+  }
   return {
     id: `evt_${randomUUID().slice(0, 12)}`,
     appId: String(data.appId ?? 'system'),
+    tenantId,
     category: String(data.category ?? 'event'),
     providerId: data.providerId != null ? String(data.providerId) : null,
     status: data.status != null ? String(data.status) : null,
@@ -1565,8 +1579,14 @@ export function installDatabaseMock(): Record<string, unknown> {
         const phone = normalizeMessagingAddress(phoneNumber);
         const businessNumber = normalizeMessagingAddress(data.businessNumber ?? '') || null;
         const supplierId = data.supplierId || null;
+        // Phase 16: the channel is part of the ownership key
+        // (uq_conversations_owner), exactly as in the real repository.
         const sameOwner = (c: ConversationRow) =>
-          c.phoneNumber === phone && c.appId === appId && c.tenantId === data.tenantId && (c.supplierId ?? null) === supplierId;
+          c.phoneNumber === phone &&
+          c.appId === appId &&
+          c.tenantId === data.tenantId &&
+          (c.supplierId ?? null) === supplierId &&
+          c.channel === data.channel;
         let existing = dbState.conversations.find((c) => sameOwner(c) && (c.businessNumber ?? null) === businessNumber);
         if (!existing && businessNumber) {
           // Legacy adoption (see the real repository).
@@ -1580,7 +1600,6 @@ export function installDatabaseMock(): Record<string, unknown> {
         };
         if (existing) {
           existing.providerId = data.providerId;
-          existing.channel = data.channel;
           existing.status = 'active';
           existing.lastMessageAt = new Date();
           existing.updatedAt = new Date();
@@ -2314,7 +2333,8 @@ export function installDatabaseMock(): Record<string, unknown> {
           }
           const prior = dbState.events.find((e) => e.idempotencyKey === input.idempotencyKey);
           if (prior) return { inserted: false, eventId: prior.id, transactionUpdated: false };
-          const row = normalizeRow({ ...input.event, idempotencyKey: input.idempotencyKey });
+          // The real CTE writes COALESCE(tenantId, 'default').
+          const row = normalizeRow({ ...input.event, tenantId: input.event.tenantId ?? 'default', idempotencyKey: input.idempotencyKey });
           dbState.events.push(row);
           let transactionUpdated = false;
           const ts = input.transactionStatus;

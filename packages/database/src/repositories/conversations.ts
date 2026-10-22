@@ -104,7 +104,7 @@ export const conversationRepository = {
 
   /**
    * Record activity on the conversation identified by its full ownership
-   * key (customer, business number, app, tenant, supplier).
+   * key (customer, business number, app, tenant, supplier, channel).
    *
    * Single-statement INSERT ... ON CONFLICT DO UPDATE on uq_conversations_owner
    * (gap register A15: this used to be select-then-insert, so two concurrent
@@ -115,6 +115,11 @@ export const conversationRepository = {
    * that row is stamped with the number instead of forking a second thread.
    * This is the only way a legacy row ever acquires a number — by the
    * owner's own outbound send on it, never by a guess.
+   *
+   * Phase 16 (gap register D16): the channel is part of the key, so an SMS
+   * and a WhatsApp thread of one owner on one number are two rows, and a
+   * legacy row is adopted only by a send on its OWN channel. A provider
+   * failover within a channel still updates the same row.
    */
   async upsert(
     phoneNumber: string,
@@ -140,7 +145,6 @@ export const conversationRepository = {
           .set({
             businessNumber,
             providerId: data.providerId,
-            channel: data.channel,
             lastMessageAt: now,
             updatedAt: now,
             ...optional,
@@ -151,12 +155,14 @@ export const conversationRepository = {
               eq(conversations.appId, appId),
               eq(conversations.tenantId, data.tenantId),
               supplierId ? eq(conversations.supplierId, supplierId) : isNull(conversations.supplierId),
+              eq(conversations.channel, data.channel),
               isNull(conversations.businessNumber),
               sql`NOT EXISTS (
                 SELECT 1 FROM ${conversations} AS c2
                 WHERE c2.phone_number = ${customer} AND c2.app_id = ${appId}
                   AND c2.tenant_id = ${data.tenantId}
                   AND c2.supplier_id IS NOT DISTINCT FROM ${supplierId}
+                  AND c2.channel = ${data.channel}
                   AND c2.business_number = ${businessNumber}
               )`,
             ),
@@ -189,10 +195,10 @@ export const conversationRepository = {
           conversations.appId,
           conversations.tenantId,
           conversations.supplierId,
+          conversations.channel,
         ],
         set: {
           providerId: data.providerId,
-          channel: data.channel,
           lastMessageAt: now,
           updatedAt: now,
           ...optional,

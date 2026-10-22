@@ -34,6 +34,10 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
     try {
       await eventRepository.create({
         appId: event.appId,
+        // Phase 16 (gap register D14/D16): the tenant goes in the column,
+        // not only in the payload — omitting it stored every tenant's
+        // messaging event as tenant 'default'.
+        ...(tenantId ? { tenantId } : {}),
         category: 'messaging',
         providerId: event.providerId,
         status: event.status,

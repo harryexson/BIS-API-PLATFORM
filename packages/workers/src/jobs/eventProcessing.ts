@@ -6,6 +6,10 @@ import { EventRecord } from '@company/database';
 export function toEventRecord(payload: any, category: string): EventRecord {
   return {
     appId: payload.appId || 'system',
+    // Phase 16 (gap register D14/D16): the event's own tenant (Phase 7 put
+    // it on every TransactionEvent) — previously dropped, so the row fell
+    // back to the column default 'default'. Absent = a platform-level event.
+    ...(typeof payload.tenantId === 'string' && payload.tenantId ? { tenantId: payload.tenantId } : {}),
     category,
     providerId: payload.providerId || payload.provider || null,
     status: payload.status || 'success',

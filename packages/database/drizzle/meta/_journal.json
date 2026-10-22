@@ -148,6 +148,13 @@
       "when": 1792600000000,
       "tag": "0020_provider_management_persistence",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1792700000000,
+      "tag": "0021_database_integrity",
+      "breakpoints": true
     }
   ]
 }

@@ -6,6 +6,7 @@ import {
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * Master plan Phase 39 (STOP/START/HELP consent management). Tracks the
@@ -19,9 +20,10 @@ export const consentRecords = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull(),
-    // Matches the loose text tenantId convention used by conversations —
-    // apps that don't use tenants pass 'default'.
-    tenantId: text('tenant_id').notNull().default('default'),
+    // Matches the loose text tenantId convention used by conversations.
+    // Phase 16: no DB default — every writer passes the verified tenant
+    // explicitly; an omitted tenant is a NOT NULL error, never 'default'.
+    tenantId: text('tenant_id').notNull(),
     recipient: text('recipient').notNull(), // phone number or email
     channel: text('channel').notNull(), // 'sms' | 'whatsapp' | 'email' | 'voice' | ...
     status: text('status').notNull(), // 'opted_in' | 'opted_out' | 'unknown'
@@ -45,6 +47,7 @@ export const consentRecords = pgTable(
       t.tenantId,
       t.channel,
     ),
+    tenantIdNonBlank('consent_records', t.tenantId),
   ],
 );
 

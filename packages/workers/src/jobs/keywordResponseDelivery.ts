@@ -61,6 +61,7 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
         try {
           await eventRepository.create({
             appId,
+            ...(tenantId ? { tenantId } : {}),
             category: 'messaging',
             providerId: providerId ?? null,
             status: 'failed',
@@ -84,6 +85,8 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
     try {
       await eventRepository.create({
         appId,
+        // Phase 16: the conversation's tenant in the column (D14/D16).
+        ...(tenantId ? { tenantId } : {}),
         category: 'messaging',
         providerId: event.providerId,
         status: event.status,

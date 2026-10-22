@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, numeric, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * A checkout session lets a business create a hosted, single-use payment
@@ -12,7 +13,7 @@ export const checkoutSessions = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     token: text('token').notNull(),
     appId: text('app_id').notNull(),
-    tenantId: text('tenant_id').notNull().default('default'),
+    tenantId: text('tenant_id').notNull(),
     amount: numeric('amount').notNull(),
     currency: text('currency').notNull(),
     status: text('status').notNull().default('pending'),
@@ -27,6 +28,7 @@ export const checkoutSessions = pgTable(
     uniqueIndex('idx_checkout_sessions_token').on(t.token),
     index('idx_checkout_sessions_app_id').on(t.appId),
     index('idx_checkout_sessions_status').on(t.status),
+    tenantIdNonBlank('checkout_sessions', t.tenantId),
   ],
 );
 

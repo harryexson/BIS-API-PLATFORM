@@ -114,7 +114,10 @@ describe.skipIf(!ADMIN_URL)('Phase 8 — conversation ownership on real Postgres
       expect(old_idx).toBe(0);
       const [{ def }] = await client`
         SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'uq_conversations_owner'`;
-      expect(def).toBe('UNIQUE NULLS NOT DISTINCT (phone_number, business_number, app_id, tenant_id, supplier_id)');
+      // The key as of the FULL chain: Phase 16's migration 0021 added
+      // channel to the 0017 key (gap register D16) — still no old key, still
+      // NULLS NOT DISTINCT.
+      expect(def).toBe('UNIQUE NULLS NOT DISTINCT (phone_number, business_number, app_id, tenant_id, supplier_id, channel)');
     });
 
     it('the ownership key: same customer on one shared number with two tenants / two suppliers = distinct rows; a duplicate owner (incl. NULLs) is rejected', async () => {

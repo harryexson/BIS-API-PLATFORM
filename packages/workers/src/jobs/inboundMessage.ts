@@ -279,6 +279,9 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
     try {
       await eventRepository.create({
         appId,
+        // Phase 16 (gap register D14/D16): the attributed owner's tenant in
+        // the column, not only in the payload.
+        tenantId,
         category: 'inbound',
         providerId,
         status: 'success',

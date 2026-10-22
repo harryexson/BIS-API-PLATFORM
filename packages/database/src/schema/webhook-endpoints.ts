@@ -7,6 +7,7 @@ import {
   jsonb,
   index,
 } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * Registration record for an outbound platform webhook (a developer's own
@@ -30,7 +31,7 @@ export const webhookEndpoints = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull(),
-    tenantId: text('tenant_id').notNull().default('default'),
+    tenantId: text('tenant_id').notNull(),
     url: text('url').notNull(),
     // AES-256-GCM (packages/database/src/crypto.ts), same shape as
     // provider_configs' secret columns. Unlike a provider credential this
@@ -57,6 +58,7 @@ export const webhookEndpoints = pgTable(
     index('idx_webhook_endpoints_app').on(t.appId),
     index('idx_webhook_endpoints_tenant').on(t.tenantId),
     index('idx_webhook_endpoints_active').on(t.active),
+    tenantIdNonBlank('webhook_endpoints', t.tenantId),
   ],
 );
 

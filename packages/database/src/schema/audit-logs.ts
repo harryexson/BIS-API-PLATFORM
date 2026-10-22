@@ -12,9 +12,16 @@ export const auditLogs = pgTable(
   'audit_logs',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    // NULL = a platform-level entry (today the only writer is the
+    // reconciliation job, resource 'system'). Phase 16 (gap register D16):
+    // ON DELETE RESTRICT, not SET NULL — hard-deleting an application used
+    // to silently strip the attribution from its whole audit trail. No code
+    // path deletes applications (applicationRepository.delete has no
+    // callers; events.app_id already blocks it for any app with events), so
+    // retire an application by status, never by DELETE.
     applicationId: uuid('application_id').references(
       () => applications.id,
-      { onDelete: 'set null' },
+      { onDelete: 'restrict' },
     ),
     userId: uuid('user_id').references(() => users.id, {
       onDelete: 'set null',

@@ -11,6 +11,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { applications } from './applications';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 // P0: appId here is the application's slug (e.g. 'reach-church'), not its
 // UUID primary key — every caller resolves it that way (see
@@ -28,6 +29,12 @@ export const events = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull().references(() => applications.slug),
+    // Nullable with a 'default' fallback BY DESIGN: platform-level events
+    // (app_id 'system' / 'webhook', an inbound message held because its
+    // owner is ambiguous) belong to no tenant. Phase 16 (gap register
+    // D14/D16): every writer that KNOWS the tenant now sets this column —
+    // before, they all put the tenant only inside `payload`, so every
+    // tenant's messaging/inbound/keyword events were stored as 'default'.
     tenantId: text('tenant_id').default('default'),
     category: text('category').notNull(),
     providerId: text('provider_id'),
@@ -71,6 +78,7 @@ export const events = pgTable(
       'chk_events_channel_fallback_reason',
       sql`${t.requestedChannel} IS NULL OR ${t.selectedChannel} IS NULL OR (${t.requestedChannel} = ${t.selectedChannel} AND ${t.fallbackReason} IS NULL) OR (${t.requestedChannel} <> ${t.selectedChannel} AND ${t.fallbackReason} IS NOT NULL AND length(btrim(${t.fallbackReason})) > 0)`,
     ),
+    tenantIdNonBlank('events', t.tenantId),
   ],
 );
 

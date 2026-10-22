@@ -118,8 +118,11 @@ describe.skipIf(!ADMIN_URL)('Phase 6 — payment state machine on real Postgres'
   // -------------------------------------------------------------------------
   describe('migration 0016', () => {
     it('chk_transactions_status rejects a status outside the state machine (23514), accepts every state in it', async () => {
+      // tenant_id is explicit: since Phase 16 (migration 0021) it has no
+      // silent 'default', so omitting it would fail NOT NULL before the
+      // status CHECK this test is about is ever evaluated.
       const err = await main.client`
-        INSERT INTO transactions (app_id, provider_id, status, amount, currency) VALUES ('a', 'stripe', 'succeeded_maybe', 1, 'USD')`.then(
+        INSERT INTO transactions (app_id, tenant_id, provider_id, status, amount, currency) VALUES ('a', 't', 'stripe', 'succeeded_maybe', 1, 'USD')`.then(
         () => null,
         (e: { code?: string; constraint_name?: string }) => e,
       );

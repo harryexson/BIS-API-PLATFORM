@@ -55,10 +55,10 @@ describe.skipIf(!ADMIN_URL)('Phase 8 — shared phone numbers: conversation owne
       ...parties,
       async eventsFor(customer) {
         const rows = await database.client`
-          SELECT app_id, decision_reason, payload FROM events
+          SELECT app_id, tenant_id, decision_reason, payload FROM events
           WHERE category = 'inbound' AND payload->>'sender' = ${customer}
           ORDER BY created_at`;
-        return rows.map((r) => ({ appId: r.app_id as string, decisionReason: r.decision_reason as string | null, payload: r.payload }));
+        return rows.map((r) => ({ appId: r.app_id as string, tenantId: r.tenant_id as string | null, decisionReason: r.decision_reason as string | null, payload: r.payload }));
       },
       startWorker: () => runtime.makeWorker({ store: runtime.gatewayStore, keys: runtime.gatewayKeys }),
     };

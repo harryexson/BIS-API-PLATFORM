@@ -34,7 +34,7 @@ describe('Phase 8 — shared phone numbers: conversation ownership (in-memory do
       async eventsFor(customer) {
         return dbState.events
           .filter((e) => e.category === 'inbound' && (e.payload as any)?.sender === customer)
-          .map((e) => ({ appId: e.appId, decisionReason: e.decisionReason, payload: e.payload as any }));
+          .map((e) => ({ appId: e.appId, tenantId: e.tenantId ?? null, decisionReason: e.decisionReason, payload: e.payload as any }));
       },
       startWorker: () => runtime.makeWorker({ store: runtime.gatewayStore, keys: runtime.gatewayKeys }),
     };
