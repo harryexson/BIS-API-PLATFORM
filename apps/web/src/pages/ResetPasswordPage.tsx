@@ -1,6 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
 import { CheckCircle2, XCircle, Lock } from 'lucide-react';
 import AccountLayout from './AccountLayout';
+import { apiUrl } from '../api';
 
 const MIN_PASSWORD_LENGTH = 8; // mirrors packages/database/src/auth-registry.ts's MIN_PASSWORD_LENGTH
 
@@ -30,7 +31,7 @@ export default function ResetPasswordPage() {
     setError(null);
     setStatus('submitting');
     try {
-      const res = await fetch('/v1/api/auth/reset-password', {
+      const res = await fetch(apiUrl('/v1/api/auth/reset-password'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token, password }),

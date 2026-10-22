@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { MailCheck } from 'lucide-react';
 import AccountLayout from './AccountLayout';
+import { apiUrl } from '../api';
 
 // Entry form for POST /v1/api/auth/request-password-reset — the emailed
 // link it triggers lands on ResetPasswordPage.tsx.
@@ -14,7 +15,7 @@ export default function ForgotPasswordPage() {
     e.preventDefault();
     setSubmitting(true);
     try {
-      const res = await fetch('/v1/api/auth/request-password-reset', {
+      const res = await fetch(apiUrl('/v1/api/auth/request-password-reset'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),

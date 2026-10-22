@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { CheckCircle2, XCircle, Loader2 } from 'lucide-react';
 import AccountLayout from './AccountLayout';
+import { apiUrl } from '../api';
 
 type Status = 'verifying' | 'success' | 'error' | 'missing-token';
 
@@ -18,7 +19,7 @@ export default function VerifyEmailPage() {
       setStatus('missing-token');
       return;
     }
-    fetch('/v1/api/auth/verify-email', {
+    fetch(apiUrl('/v1/api/auth/verify-email'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token }),

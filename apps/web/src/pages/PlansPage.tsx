@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Check, Loader2 } from 'lucide-react';
 import AppLayout from '../AppLayout';
 import { useAuth, authFetch } from '../auth';
+import { apiUrl } from '../api';
 
 interface PlanRecord {
   id: string;
@@ -39,7 +40,7 @@ export default function PlansPage() {
   const load = useCallback(async () => {
     if (!token) return;
     const [plansRes, subRes] = await Promise.all([
-      fetch('/v1/api/billing/plans'),
+      fetch(apiUrl('/v1/api/billing/plans')),
       authFetch(token, '/v1/api/billing/subscription'),
     ]);
     const plansBody = await plansRes.json();
