@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { apiUrl } from './api';
 
 // Session auth for /v1/api/auth/* + /v1/api/billing/* — the fuller
 // customer-lifecycle auth system (email verification, password reset,
@@ -64,7 +65,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   const fetchMe = useCallback(async (sessionToken: string): Promise<AccountUser | null> => {
-    const res = await fetch('/v1/api/auth/me', {
+    const res = await fetch(apiUrl('/v1/api/auth/me'), {
       headers: { Authorization: `Bearer ${sessionToken}` },
     });
     if (!res.ok) return null;
@@ -91,7 +92,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = useCallback<AuthState['login']>(
     async (input) => {
       try {
-        const res = await fetch('/v1/api/auth/login', {
+        const res = await fetch(apiUrl('/v1/api/auth/login'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(input),
@@ -112,7 +113,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signup = useCallback<AuthState['signup']>(
     async (input) => {
       try {
-        const res = await fetch('/v1/api/auth/signup', {
+        const res = await fetch(apiUrl('/v1/api/auth/signup'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(input),
@@ -134,7 +135,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(() => {
     if (token) {
-      fetch('/v1/api/auth/logout', {
+      fetch(apiUrl('/v1/api/auth/logout'), {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => undefined);
@@ -166,7 +167,7 @@ export function useAuth(): AuthState {
 
 /** Fetch wrapper that attaches the session token; 401 logs out and reloads. */
 export async function authFetch(token: string, path: string, init?: RequestInit): Promise<Response> {
-  const res = await fetch(path, {
+  const res = await fetch(apiUrl(path), {
     ...init,
     headers: {
       ...(init?.headers || {}),
