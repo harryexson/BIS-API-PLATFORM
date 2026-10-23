@@ -5,7 +5,7 @@ dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
 
 import { createServer } from 'node:http';
 import { ProviderRegistry, ProviderStateSync } from '@company/providers';
-import { providerStateStore } from '@company/database';
+import { providerStateStore, checkDatabaseHealth } from '@company/database';
 import { RoutingEngine } from '@company/routing';
 import { EventBus } from '@company/events';
 import {
@@ -17,6 +17,7 @@ import {
   RateLimiter,
   registerAllProcessors,
 } from '@company/workers';
+import { createWorkerReadiness } from './readiness';
 
 async function main(): Promise<void> {
   const config = createWorkerConfig();
@@ -138,6 +139,15 @@ async function main(): Promise<void> {
   }, config.reconciliationIntervalMs);
 
   // P3-2: Worker health check HTTP server
+  // Phase 19 (B13): /ready checks what the worker needs to do its job.
+  const readiness = createWorkerReadiness({
+    manager,
+    store,
+    redisUrl: config.redisUrl,
+    providerState: () => providerStateSync.status(),
+    eventBus,
+    checkDatabase: checkDatabaseHealth,
+  });
   const HEALTH_PORT = Number(process.env.WORKER_HEALTH_PORT) || 3002;
   const healthServer = createServer((req, res) => {
     if (req.url === '/health') {
@@ -151,14 +161,21 @@ async function main(): Promise<void> {
         timestamp: new Date().toISOString(),
       }));
     } else if (req.url === '/ready') {
-      const ready = manager.isRunning();
-      res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: ready ? 'ready' : 'not-ready',
-        service: 'worker',
-        running: manager.isRunning(),
-        timestamp: new Date().toISOString(),
-      }));
+      readiness().then(
+        ({ httpStatus, body }) => {
+          res.writeHead(httpStatus, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        },
+        (err) => {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            status: 'not-ready',
+            service: 'worker',
+            error: err instanceof Error ? err.message : String(err),
+            timestamp: new Date().toISOString(),
+          }));
+        },
+      );
     } else {
       res.writeHead(404);
       res.end();

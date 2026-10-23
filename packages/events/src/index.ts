@@ -52,6 +52,7 @@ export class EventBus {
   private redisClient: any = null;
   private subClient: any = null;
   private redisReady = false;
+  private redisConfigured = false;
   private channelHandlers = new Map<string, Set<(msg: string) => void>>();
 
   private constructor() {
@@ -67,7 +68,11 @@ export class EventBus {
 
   private initRedis(): void {
     const redisUrl = process.env.REDIS_URL;
-    if (!redisUrl) return;
+    // 'memory' is createStore()'s explicit single-process sentinel
+    // (@company/workers) — not a Redis host. Phase 19: honour it here too, so
+    // that mode isn't reported (by /ready) as a Redis that never connects.
+    if (!redisUrl || redisUrl === 'memory') return;
+    this.redisConfigured = true;
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
@@ -116,6 +121,19 @@ export class EventBus {
     } catch {
       // ioredis not available — stay in-memory mode
     }
+  }
+
+  /**
+   * Phase 19 (gap register B13/C6): the cross-process publish connection's
+   * ACTUAL state, for /ready. Read from the ioredis client's own status
+   * ('ready' = commands can be sent) rather than `redisReady`, which is set
+   * on socket connect (before the ready check) and only cleared on 'error'.
+   * Says nothing about whether any other process is subscribed to the
+   * channel (gap register PHASE7-01: none is).
+   */
+  public getRedisStatus(): 'not-configured' | 'connected' | 'disconnected' {
+    if (!this.redisConfigured) return 'not-configured';
+    return this.redisClient?.status === 'ready' ? 'connected' : 'disconnected';
   }
 
   public subscribe(listener: EventListener): () => void {

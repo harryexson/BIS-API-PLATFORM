@@ -307,6 +307,12 @@ export interface DbState {
   failTransactionWrites: boolean;
   /** Fault injection: every webhook_events / webhook_event_consumers call throws (DB outage). */
   failWebhookEventStore: boolean;
+  /**
+   * Phase 19: what checkDatabaseHealth() grades the database as, e.g.
+   * 'degraded' = reachable but slow (200ms-1s). Unset = 'healthy' (or
+   * 'unhealthy' while failEventWrites is on, as before).
+   */
+  simulatedDbHealth?: 'healthy' | 'degraded' | 'unhealthy';
   /** Phase 4: durable inbound-webhook receipts, UNIQUE (providerId, providerEventId). */
   webhookEvents: WebhookEventRow[];
   webhookEventConsumers: WebhookEventConsumerRow[];
@@ -722,6 +728,7 @@ export function clearDb(): void {
   dbState.failIdempotencyStore = false;
   dbState.failTransactionWrites = false;
   dbState.failWebhookEventStore = false;
+  dbState.simulatedDbHealth = undefined;
   dbState.webhookEvents = [];
   dbState.webhookEventConsumers = [];
   dbState.outboxEvents = [];
@@ -3468,6 +3475,10 @@ export function installDatabaseMock(): Record<string, unknown> {
     checkDatabaseHealth: async () => {
       if (dbState.failEventWrites) {
         return { status: 'unhealthy', latencyMs: 1, details: { error: 'simulated down' } };
+      }
+      if (dbState.simulatedDbHealth) {
+        const latencyMs = { healthy: 5, degraded: 450, unhealthy: 1500 }[dbState.simulatedDbHealth];
+        return { status: dbState.simulatedDbHealth, latencyMs, details: {} };
       }
       return { status: 'healthy', latencyMs: 5, details: {} };
     },

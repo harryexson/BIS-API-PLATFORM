@@ -70,7 +70,11 @@ function createRateLimiter(opts: { windowMs: number; max: number }, keyPrefix = 
     duration: Math.ceil(opts.windowMs / 1000),
   });
 
-  if (redisUrl) {
+  // 'memory' is createStore()'s explicit single-process sentinel
+  // (@company/workers), not a Redis host — Phase 19: treat it as "no Redis"
+  // here too instead of connecting to a host named "memory".
+  const redisConfigured = Boolean(redisUrl) && redisUrl !== 'memory';
+  if (redisUrl && redisConfigured) {
     try {
       const client = redisClient(redisUrl);
       const limiter = new RateLimiterRedis({
@@ -80,7 +84,7 @@ function createRateLimiter(opts: { windowMs: number; max: number }, keyPrefix = 
         duration: Math.ceil(opts.windowMs / 1000),
         insuranceLimiter: memoryFallback,
       });
-      return { type: 'redis' as const, limiter };
+      return { type: 'redis' as const, limiter, client: client as { status?: string }, redisConfigured: true };
     } catch {
       // ioredis not installed or Redis unreachable — use in-memory
     }
@@ -88,6 +92,8 @@ function createRateLimiter(opts: { windowMs: number; max: number }, keyPrefix = 
   return {
     type: 'memory' as const,
     limiter: memoryFallback,
+    client: null,
+    redisConfigured,
   };
 }
 
@@ -178,10 +184,22 @@ export class AuthService {
     }
   }
 
-  getRateLimiterInfo(): { type: string; storeBacked: boolean } {
+  /**
+   * Phase 19 (gap register B13 / PHASE14-01 residual): `storeBacked` is true
+   * only while the shared Redis connection is actually usable. It used to be
+   * `type === 'redis'` — true whenever REDIS_URL was set, even while every
+   * consume() was silently falling through to this process's in-memory
+   * insurance limiter (a per-replica limit, not the configured cluster-wide
+   * one).
+   */
+  getRateLimiterInfo(): { type: string; storeBacked: boolean; redisConfigured: boolean; connection: string } {
+    const { type, client, redisConfigured } = this.rateLimiter;
+    const connection = client ? client.status ?? 'unknown' : 'none';
     return {
-      type: this.rateLimiter.type,
-      storeBacked: this.rateLimiter.type === 'redis',
+      type,
+      storeBacked: type === 'redis' && connection === 'ready',
+      redisConfigured,
+      connection,
     };
   }
 }

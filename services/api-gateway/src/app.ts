@@ -102,6 +102,17 @@ import {
   ingestWebhook,
   runDurableWebhookConsumer,
   WebhookConsumerBusyError,
+  ReadinessGate,
+  probeQueueStore,
+  probeDatabase,
+  probeEventBus,
+  probeProviderState,
+  probeSecrets,
+  missingSecrets,
+  readinessUp,
+  readinessDown,
+  readinessFailed,
+  type ProbeResult,
   type KVStore,
   type Keys,
   type WorkerConfig,
@@ -1224,36 +1235,62 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
+// Phase 19 (gap register B13/C6): /ready reports what this instance can
+// actually do, not what it was configured to do. It used to count an
+// in-memory rate limiter as healthy (and report 'redis' whenever REDIS_URL
+// was merely set), and never looked at the job queue's real backing store,
+// the EventBus connection or the required secrets — so an instance whose
+// queue had silently fallen back to a per-process MemoryStore (jobs never
+// reach the worker) still took traffic. See packages/workers/src/readiness.ts
+// for the up/down/failed model and the grace period for transient blips.
+const GATEWAY_REQUIRED_SECRETS = ['ADMIN_API_TOKEN', 'PORTAL_JWT_SECRET', 'WEBHOOK_HMAC_SECRET', 'SECRET_ENCRYPTION_KEY'] as const;
+const readinessGate = new ReadinessGate();
+
+function probeRateLimiter(): ProbeResult {
+  const info = auth.getRateLimiterInfo();
+  if (info.type === 'redis') return info.storeBacked ? readinessUp('redis') : readinessDown('redis-disconnected');
+  // REDIS_URL set but the Redis limiter could not even be created (ioredis
+  // missing): every request is limited per replica, permanently.
+  if (info.redisConfigured) return readinessFailed('in-memory-fallback');
+  return readinessUp('in-memory');
+}
+
 app.get('/ready', async (req: Request, res: Response) => {
-  const deps: Record<string, string> = {};
+  const production = process.env.NODE_ENV === 'production';
+  const probes: Record<string, ProbeResult> = {};
 
-  // P2-5: Check database connectivity
-  try {
-    const dbHealth = await checkDatabaseHealth();
-    deps.database = dbHealth.status;
-  } catch {
-    deps.database = 'unreachable';
-  }
+  // P2-5: database connectivity
+  probes.database = await probeDatabase(checkDatabaseHealth);
 
-  // P2-4: Report rate limiter backend
-  const rlInfo = auth.getRateLimiterInfo();
-  deps.rateLimiter = rlInfo.storeBacked ? 'redis' : 'in-memory';
+  // P2-4: rate limiter — Redis only counts while actually connected
+  probes.rateLimiter = probeRateLimiter();
 
   // Phase 15: provider configuration/secrets come from the database —
   // 'ready' only once loaded, 'degraded' while any provider's persisted
   // secrets cannot be decrypted (that provider is withheld from routing).
-  const providerState = providerStateSync.status();
-  deps.providers = !providerState.loaded ? 'not-loaded' : providerState.secretFailures.length > 0 ? 'degraded' : 'ready';
+  probes.providers = probeProviderState(providerStateSync.status());
 
-  const allHealthy = Object.values(deps).every(
-    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis',
-  );
-  const status = allHealthy ? 'ready' : 'degraded';
+  // The queue webhooks/inbound messages are handed to the worker through.
+  try {
+    const { store, config } = await getGatewayQueue();
+    probes.queue = probeQueueStore(store, config.redisUrl, production);
+  } catch {
+    probes.queue = readinessFailed('unavailable');
+  }
 
-  res.status(allHealthy ? 200 : 503).json({
-    status,
+  probes.eventBus = probeEventBus(eventBus.getRedisStatus());
+
+  const missing = missingSecrets(GATEWAY_REQUIRED_SECRETS);
+  probes.secrets = probeSecrets(missing, production);
+
+  const report = readinessGate.evaluate(probes);
+  res.status(report.ready ? 200 : 503).json({
+    status: report.ready ? 'ready' : 'degraded',
     service: 'api-gateway',
-    dependencies: deps,
+    dependencies: report.dependencies,
+    failing: report.failing,
+    degraded: report.degraded,
+    ...(missing.length > 0 ? { missingSecrets: missing } : {}),
     timestamp: new Date().toISOString()
   });
 });
