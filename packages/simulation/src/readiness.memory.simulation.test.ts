@@ -15,7 +15,7 @@ import { MemoryStore } from '@company/workers';
  * ready in production (a per-process queue can't reach the worker).
  */
 
-const ENV_KEYS = ['REDIS_URL', 'NODE_ENV', 'ADMIN_API_TOKEN', 'PORTAL_JWT_SECRET', 'SECRET_ENCRYPTION_KEY'];
+const ENV_KEYS = ['REDIS_URL', 'NODE_ENV', 'ADMIN_API_TOKEN', 'ADMIN_API_CREDENTIALS', 'PORTAL_JWT_SECRET', 'SECRET_ENCRYPTION_KEY'];
 const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
 describe('gateway /ready in explicit single-process mode (REDIS_URL=memory)', () => {
@@ -27,7 +27,10 @@ describe('gateway /ready in explicit single-process mode (REDIS_URL=memory)', ()
     runtime = await createSimulation({
       env: {
         REDIS_URL: 'memory',
-        ADMIN_API_TOKEN: 'p19m-admin-token',
+        // Phase 20-21 (C7): a named admin credential — production no longer
+        // accepts the shared ADMIN_API_TOKEN, and this suite asserts that in
+        // production ONLY the queue fails readiness.
+        ADMIN_API_CREDENTIALS: 'p19m-admin:' + 'a'.repeat(64),
         PORTAL_JWT_SECRET: 'p19m-portal-jwt-secret',
         SECRET_ENCRYPTION_KEY: 'p19m-secret-encryption-key-0123456789',
       },

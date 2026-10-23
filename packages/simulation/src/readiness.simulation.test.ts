@@ -110,7 +110,10 @@ describe('gateway /ready with Redis configured but unreachable (simulation)', ()
     expect(prod.status).toBe(503);
     expect(prod.body.dependencies.secrets).toBe('missing');
     expect(prod.body.failing).toContain('secrets');
-    expect(prod.body.missingSecrets).toEqual(['PORTAL_JWT_SECRET']);
+    // Phase 20-21 (C7): this suite configures only the legacy shared
+    // ADMIN_API_TOKEN, which production no longer accepts — so production
+    // also reports the named admin credentials as missing.
+    expect(prod.body.missingSecrets).toEqual(['ADMIN_API_CREDENTIALS', 'PORTAL_JWT_SECRET']);
     // No secret VALUE is ever echoed, only names.
     expect(JSON.stringify(prod.body)).not.toContain('p19-');
   });

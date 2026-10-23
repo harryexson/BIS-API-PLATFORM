@@ -18,6 +18,20 @@ export interface AuthOptions {
    * public routes — portal login & signup, checkout pay.
    */
   authRateLimit?: { windowMs: number; max: number };
+  /**
+   * Phase 20-21 (gap register PHASE14-06 / C7): a DEDICATED per-IP counter
+   * of FAILED admin-token attempts (a wrong x-admin-token), separate from
+   * the general per-IP budget above. `max` failures inside `windowMs` lock
+   * that address out of admin auth for the rest of the window.
+   */
+  adminAuthFailureLimit?: { windowMs: number; max: number };
+}
+
+/** What the dedicated failed-admin-attempt counter says about one caller. */
+export interface AdminAuthLockState {
+  locked: boolean;
+  failures: number;
+  retryAfterMs: number;
 }
 
 type AuthResult = { ok: boolean; appId?: string; error?: string };
@@ -101,7 +115,9 @@ export class AuthService {
   private registry: ApplicationRegistry | null = null;
   private rateLimiter: ReturnType<typeof createRateLimiter>;
   private authRateLimiter: ReturnType<typeof createRateLimiter>;
+  private adminFailureLimiter: ReturnType<typeof createRateLimiter>;
   private rate: { windowMs: number; max: number };
+  readonly adminFailure: { windowMs: number; max: number };
 
   constructor(private opts: AuthOptions = {}) {
     this.rate = opts.rateLimit || { windowMs: 60_000, max: 100 };
@@ -110,6 +126,10 @@ export class AuthService {
       opts.authRateLimit || { windowMs: 15 * 60_000, max: 20 },
       `${RATE_LIMIT_KEY_PREFIX}-auth`,
     );
+    this.adminFailure = opts.adminAuthFailureLimit || { windowMs: 15 * 60_000, max: 10 };
+    // Same Redis (and therefore shared by every replica) as the other
+    // limiters, own key namespace: `<prefix>-admin-fail:ip:<address>`.
+    this.adminFailureLimiter = createRateLimiter(this.adminFailure, `${RATE_LIMIT_KEY_PREFIX}-admin-fail`);
     try {
       this.registry = new ApplicationRegistry(applicationRepository, apiKeyRepository);
     } catch {
@@ -175,6 +195,58 @@ export class AuthService {
     }
   }
 
+  /**
+   * Phase 20-21: is this caller locked out of admin auth by its own FAILED
+   * attempts? Read-only (a get, not a consume): successful and token-less
+   * requests never count. Checked BEFORE any token is compared, so a
+   * locked-out caller can't use the gateway as an oracle even with the
+   * correct token.
+   */
+  async adminAuthLockState(ip: string): Promise<AdminAuthLockState> {
+    try {
+      const res = await this.adminFailureLimiter.limiter.get(`ip:${ip}`);
+      const failures = res?.consumedPoints ?? 0;
+      return {
+        locked: failures >= this.adminFailure.max,
+        failures,
+        retryAfterMs: res?.msBeforeNext ?? 0,
+      };
+    } catch {
+      // The Redis limiter falls back to its in-memory insurance limiter on a
+      // store error; a get that still fails is treated as "no failures yet"
+      // — the general per-IP budget keeps bounding the caller meanwhile.
+      return { locked: false, failures: 0, retryAfterMs: 0 };
+    }
+  }
+
+  /**
+   * Phase 20-21: count one FAILED admin-token attempt against the caller.
+   * `locked` is true once this attempt went past the allowed failures —
+   * atomic in the store (one consume), so a concurrent burst of wrong
+   * guesses gets exactly `max` rejections-by-token-check and nothing more.
+   */
+  async recordAdminAuthFailure(ip: string): Promise<AdminAuthLockState> {
+    try {
+      const res = await this.adminFailureLimiter.limiter.consume(`ip:${ip}`);
+      return { locked: false, failures: res.consumedPoints, retryAfterMs: res.msBeforeNext };
+    } catch (rejRes: any) {
+      if (rejRes instanceof Error) {
+        // A store error, not a rejection: fail closed for this attempt.
+        return { locked: true, failures: this.adminFailure.max, retryAfterMs: this.adminFailure.windowMs };
+      }
+      return { locked: true, failures: rejRes?.consumedPoints ?? this.adminFailure.max, retryAfterMs: rejRes?.msBeforeNext ?? 0 };
+    }
+  }
+
+  /** Phase 20-21: a successful admin authentication clears that caller's failure count. */
+  async clearAdminAuthFailures(ip: string): Promise<void> {
+    try {
+      await this.adminFailureLimiter.limiter.delete(`ip:${ip}`);
+    } catch {
+      // Best effort: a stale count only makes the lockout stricter.
+    }
+  }
+
   /** Give back one point consumed on the general budget (see createMiddleware's rateLimit). */
   async rateRefund(key: string): Promise<void> {
     try {
@@ -209,7 +281,7 @@ export class AuthService {
  * change per request by editing a header. (Behind a reverse proxy this is
  * the proxy's address unless Express `trust proxy` is configured.)
  */
-function clientIp(req: Request): string {
+export function clientIp(req: Request): string {
   return req.ip || req.socket?.remoteAddress || 'unknown';
 }
 

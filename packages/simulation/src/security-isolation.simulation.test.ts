@@ -419,8 +419,13 @@ describe('N) Admin endpoints now have rate limiting (FIXED)', () => {
         }),
       ),
     );
-    expect(statuses.filter((s) => s === 403).length).toBe(RATE_LIMIT);
-    expect(statuses.filter((s) => s === 429).length).toBe(200 - RATE_LIMIT);
+    // Phase 20-21 (PHASE14-06): wrong-token guesses now also hit the
+    // DEDICATED failed-admin-attempt counter (ADMIN_AUTH_MAX_FAILURES,
+    // default 10 per 15 min) — far stricter than the general per-IP budget
+    // (RATE_LIMIT = 60) this assertion used to measure. Exactly 10 guesses
+    // are evaluated (403), every other one is refused (429).
+    expect(statuses.filter((s) => s === 403).length).toBe(10);
+    expect(statuses.filter((s) => s === 429).length).toBe(200 - 10);
   });
 });
 

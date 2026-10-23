@@ -27,7 +27,12 @@ import {
   parseProviderConfigUpdate,
   parseProviderManagementUpdate,
 } from '@company/schemas';
-import { AuthService, createMiddleware } from './auth';
+import { AuthService, createMiddleware, clientIp } from './auth';
+import {
+  loadAdminCredentials,
+  ADMIN_TOKEN_QUERY_PARAMS,
+  type AdminIdentity,
+} from './admin-auth';
 import {
   TenantRegistry,
   tenantRepository,
@@ -71,6 +76,7 @@ import {
   supplierRepository,
   SupplierScope,
   inboundMessageHoldRepository,
+  auditLogRepository,
   type InboundMessageHold,
   keywordCommandRepository,
   keywordCommandDispatchRepository,
@@ -612,6 +618,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
         tenantId,
         ...(supplierId ? { supplierId } : {}),
       };
+      // Phase 20-21 (C7): the authenticated administrator, on admin routes.
+      const adminId = (req as AdminRequest).admin?.id;
+      if (adminId) logFields.adminId = adminId;
       if (!verified) {
         const claimedTenant = req.header('x-tenant-id');
         if (claimedTenant) logFields.unverifiedTenantHeader = claimedTenant.slice(0, 64);
@@ -680,6 +689,12 @@ const auth = new AuthService({
   authRateLimit: {
     windowMs: Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60_000,
     max: Number(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) || 20,
+  },
+  // Phase 20-21 (PHASE14-06): dedicated per-IP counter of FAILED admin-token
+  // attempts — separate from, and much stricter than, the general budget.
+  adminAuthFailureLimit: {
+    windowMs: Number(process.env.ADMIN_AUTH_FAILURE_WINDOW_MS) || 15 * 60_000,
+    max: Number(process.env.ADMIN_AUTH_MAX_FAILURES) || 10,
   },
 });
 const mw = createMiddleware(auth);
@@ -1017,35 +1032,320 @@ async function resolveTenantContext(req: Request, res: Response, next: NextFunct
 }
 
 // ----------------------------------------------------
-// ADMIN AUTHORIZATION
+// ADMIN AUTHORIZATION (Phase 20-21, gap register C7 / PHASE14-06)
 // ----------------------------------------------------
-// Mutating provider-management endpoints require an admin token.
-// Token is provided via the `x-admin-token` header.
-// In production, ADMIN_API_TOKEN must be explicitly set.
-const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+// Every /api/dashboard/* and /api/observability/* route is admin-only (the
+// blanket guard below; the per-route requireAdmin calls are kept for
+// readability and are no-ops once the guard has authenticated a request).
+//
+//   - Credential transport: the `x-admin-token` HEADER only. A token in the
+//     query string (?token= — the old EventSource/SSE fallback) is refused
+//     with 400 and never even evaluated: URLs end up in proxy/access logs,
+//     browser history and Referer headers.
+//   - Identity: each administrator has their own named credential
+//     (ADMIN_API_CREDENTIALS — see admin-auth.ts), compared in constant time.
+//     The shared ADMIN_API_TOKEN is accepted outside production only.
+//   - Failed attempts: a DEDICATED per-IP counter of wrong tokens
+//     (ADMIN_AUTH_MAX_FAILURES per ADMIN_AUTH_FAILURE_WINDOW_MS, default 10
+//     per 15 min), separate from the general per-IP budget; once exceeded,
+//     that address gets 429 for every admin request — even with a correct
+//     token, so a locked-out caller learns nothing.
+//   - Audit: every authenticated admin request is written to audit_logs
+//     (actor_type 'admin', actor_id = credential id) BEFORE the handler runs
+//     and completed with its outcome afterwards; a mutating request whose
+//     audit row cannot be written is refused (503) — no unattributed change.
+//     Denied attempts (wrong token / token in query / lockout) are audited
+//     as admin.auth.* rows without an actor.
 const isProduction = process.env.NODE_ENV === 'production';
-if (!ADMIN_API_TOKEN && isProduction) {
-  logger.error('ADMIN_API_TOKEN is not set in production — admin endpoints are INSECURE', {
+const adminCredentials = loadAdminCredentials(process.env);
+for (const error of adminCredentials.errors) {
+  logger.error(`ADMIN_API_CREDENTIALS: ${error}`, { operation: 'startup', errorCode: 'ADMIN_CREDENTIAL_INVALID', status: 'failed' });
+}
+for (const warning of adminCredentials.warnings) {
+  logger.warn(warning, { operation: 'startup', errorCode: 'ADMIN_CREDENTIAL_WARNING', status: 'degraded' });
+}
+if (adminCredentials.set.usableCount(isProduction) === 0 && isProduction) {
+  logger.error('no usable admin credentials in production (ADMIN_API_CREDENTIALS) — admin endpoints answer 503', {
     operation: 'startup',
     errorCode: 'MISSING_ADMIN_TOKEN',
     status: 'failed',
   });
 }
 
-function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  // EventSource (used for /api/dashboard/stream) can't set custom headers, so
-  // that one route needs a query-param fallback — the standard pattern for
-  // authenticating SSE connections in browsers.
-  const token = req.header('x-admin-token') || (req.query.token as string | undefined);
-  if (!ADMIN_API_TOKEN) {
-    // P0: Never bypass admin auth — require token in ALL environments
+/** True while this process can authenticate at least one admin in the CURRENT environment. */
+function adminAuthConfigured(): boolean {
+  return adminCredentials.set.usableCount(process.env.NODE_ENV === 'production') > 0;
+}
+
+type AdminRequest = Request & { admin?: AdminIdentity; adminAuditId?: string | null };
+
+/** The authenticated administrator. Throws on a route that is not behind requireAdmin (a programming error). */
+function adminIdentity(req: Request): AdminIdentity {
+  const admin = (req as AdminRequest).admin;
+  if (!admin) throw new Error('adminIdentity() used on a route without admin authentication');
+  return admin;
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function adminAuditBase(req: Request) {
+  return {
+    applicationId: null,
+    userId: null,
+    actorType: 'admin' as const,
+    ipAddress: clientIp(req),
+    userAgent: (req.header('user-agent') || '').slice(0, 512) || null,
+  };
+}
+
+/** The request path without its query string (stable whether or not a router has re-based req.path). */
+function adminRequestPath(req: Request): string {
+  return (req.originalUrl || req.url).split('?')[0];
+}
+
+/**
+ * The matched route pattern ("/api/dashboard/providers/:id" — every admin
+ * route is registered on `app` with its full path), else the raw path
+ * (e.g. an unknown path under /api/dashboard).
+ */
+function adminRoutePattern(req: Request): string {
+  const routePath = (req as Request & { route?: { path?: unknown } }).route?.path;
+  return typeof routePath === 'string' ? routePath : adminRequestPath(req);
+}
+
+function adminAuditDetails(req: Request, extra: Record<string, unknown>): string {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? Object.keys(req.body) : [];
+  return JSON.stringify({
+    method: req.method,
+    path: adminRequestPath(req),
+    requestId: getContext().requestId,
+    // Field NAMES only — admin bodies carry provider secrets.
+    ...(body.length > 0 ? { bodyFields: body.slice(0, 50) } : {}),
+    ...extra,
+  });
+}
+
+/** Best-effort audit row for a DENIED admin attempt (never throws). */
+function auditAdminDenied(req: Request, action: string, reason: string, statusCode: number | null) {
+  auditLogRepository
+    .create({
+      ...adminAuditBase(req),
+      actorId: null,
+      action,
+      resource: 'admin_auth',
+      resourceId: null,
+      outcome: action === 'admin.auth.locked' ? 'locked' : 'denied',
+      statusCode,
+      details: adminAuditDetails(req, {
+        reason,
+        ...(action === 'admin.auth.locked' ? { maxFailures: auth.adminFailure.max, windowMs: auth.adminFailure.windowMs } : {}),
+      }),
+    })
+    .catch((err: unknown) => {
+      metrics.increment('adminAuditWriteFailures');
+      logger.error('admin audit write failed', {
+        operation: 'admin-audit',
+        errorCode: 'ADMIN_AUDIT_WRITE_FAILED',
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+}
+
+function adminOutcome(res: Response): string {
+  if (!res.writableFinished) return res.headersSent && res.statusCode < 400 ? 'stream_closed' : 'aborted';
+  if (res.statusCode >= 500) return 'server_error';
+  if (res.statusCode >= 400) return 'client_error';
+  return 'success';
+}
+
+/**
+ * Writes the 'started' audit row for an authenticated admin request and
+ * arranges for it to be completed with the outcome. Returns false (and has
+ * answered 503) when a MUTATING request could not be audited.
+ */
+async function beginAdminAudit(req: Request, res: Response, admin: AdminIdentity): Promise<boolean> {
+  const started = Date.now();
+  const mutating = MUTATING_METHODS.has(req.method);
+  let auditId: string | null = null;
+  try {
+    const row = await auditLogRepository.create({
+      ...adminAuditBase(req),
+      actorId: admin.id,
+      action: `${req.method} ${adminRequestPath(req)}`,
+      resource: 'admin_api',
+      resourceId: null,
+      outcome: 'started',
+      statusCode: null,
+      details: adminAuditDetails(req, {}),
+    });
+    auditId = row.id;
+  } catch (err) {
+    metrics.increment('adminAuditWriteFailures');
+    logger.error('admin audit write failed', {
+      operation: 'admin-audit',
+      errorCode: 'ADMIN_AUDIT_WRITE_FAILED',
+      status: 'failed',
+      adminId: admin.id,
+      method: req.method,
+      path: adminRequestPath(req),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    if (mutating) {
+      res.status(503).json({
+        error: { code: 'admin_audit_unavailable', message: 'The admin audit log could not be written, so this change was NOT made. Retry shortly.' },
+      });
+      return false;
+    }
+  }
+  (req as AdminRequest).adminAuditId = auditId;
+
+  let completed = false;
+  const complete = () => {
+    if (completed) return;
+    completed = true;
+    const pattern = adminRoutePattern(req);
+    const outcome = adminOutcome(res);
+    const statusCode = res.headersSent ? res.statusCode : null;
+    logger.info('admin action', {
+      operation: 'admin-audit',
+      status: outcome,
+      adminId: admin.id,
+      method: req.method,
+      route: pattern,
+      statusCode,
+    });
+    if (!auditId) return;
+    const id = auditId;
+    auditLogRepository
+      .completeAdminAction(id, {
+        // The pattern, not the raw path, once the route has matched — so
+        // "every PATCH of any provider" is one action value.
+        action: `${req.method} ${pattern}`,
+        outcome,
+        statusCode,
+        details: adminAuditDetails(req, {
+          route: pattern,
+          params: req.params,
+          durationMs: Date.now() - started,
+        }),
+      })
+      .catch((err: unknown) => {
+        metrics.increment('adminAuditWriteFailures');
+        logger.error('admin audit completion failed', {
+          operation: 'admin-audit',
+          errorCode: 'ADMIN_AUDIT_WRITE_FAILED',
+          status: 'failed',
+          adminId: admin.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  };
+  res.on('finish', complete);
+  res.on('close', complete);
+  return true;
+}
+
+function adminDenied(res: Response, status: number, code: string, message: string) {
+  return res.status(status).json({ error: message, code });
+}
+
+async function requireAdminImpl(req: Request, res: Response, next: NextFunction) {
+  const areq = req as AdminRequest;
+  if (areq.admin) return next(); // already authenticated (blanket guard, then the route's own requireAdmin)
+
+  // 1. Never accept — or even evaluate — a credential from the URL.
+  const queryParam = ADMIN_TOKEN_QUERY_PARAMS.find((k) => req.query[k] !== undefined);
+  if (queryParam) {
+    metrics.increment('adminAuthQueryTokenRejected');
+    logger.warn('admin token sent in the query string — refused', {
+      operation: 'admin-auth',
+      errorCode: 'ADMIN_TOKEN_IN_QUERY',
+      status: 'failed',
+      path: adminRequestPath(req),
+      ip: clientIp(req),
+    });
+    auditAdminDenied(req, 'admin.auth.denied', 'token_in_query_string', 400);
+    return res.status(400).json({
+      error: 'Admin credentials must be sent in the x-admin-token header, never in the URL',
+      code: 'admin_token_in_query',
+    });
+  }
+
+  if (!adminAuthConfigured()) {
+    // P0: Never bypass admin auth — require a credential in ALL environments
     return res.status(503).json({ error: 'Admin access not configured' });
   }
-  if (!token || token !== ADMIN_API_TOKEN) {
-    return res.status(403).json({ error: 'Forbidden: administrator authorization required' });
+
+  // 2. Dedicated failed-attempt lockout, checked BEFORE any comparison.
+  const ip = clientIp(req);
+  const lock = await auth.adminAuthLockState(ip);
+  if (lock.locked) {
+    metrics.increment('adminAuthLockedRejections');
+    logger.warn('admin auth refused: address locked out after repeated failed attempts', {
+      operation: 'admin-auth',
+      errorCode: 'ADMIN_AUTH_LOCKED',
+      status: 'failed',
+      ip,
+      failures: lock.failures,
+    });
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(lock.retryAfterMs / 1000))));
+    return adminDenied(res, 429, 'admin_auth_locked', 'Too many failed admin authentication attempts from this address');
   }
+
+  // 3. Header-only, constant-time, per-identity.
+  const token = req.header('x-admin-token');
+  if (!token) {
+    return adminDenied(res, 403, 'admin_auth_required', 'Forbidden: administrator authorization required');
+  }
+  const admin = adminCredentials.set.verify(token, process.env.NODE_ENV === 'production');
+  if (!admin) {
+    const after = await auth.recordAdminAuthFailure(ip);
+    metrics.increment('adminAuthFailures');
+    logger.warn('admin auth failed: invalid admin token', {
+      operation: 'admin-auth',
+      errorCode: 'ADMIN_AUTH_INVALID',
+      status: 'failed',
+      ip,
+      failures: after.failures,
+      path: adminRequestPath(req),
+    });
+    if (after.locked) {
+      // Past the limit inside a concurrent burst: not evaluated, not audited
+      // again (the attempt that reached the limit wrote the lockout row).
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil(after.retryAfterMs / 1000))));
+      return adminDenied(res, 429, 'admin_auth_locked', 'Too many failed admin authentication attempts from this address');
+    }
+    auditAdminDenied(req, 'admin.auth.denied', 'invalid_token', 403);
+    if (after.failures >= auth.adminFailure.max) {
+      // This attempt used up the address's allowance: it is locked out from
+      // now until the window ends. One row per lockout, not per refused request.
+      logger.warn('admin auth lockout started for address', {
+        operation: 'admin-auth',
+        errorCode: 'ADMIN_AUTH_LOCKOUT_STARTED',
+        status: 'failed',
+        ip,
+        failures: after.failures,
+      });
+      auditAdminDenied(req, 'admin.auth.locked', 'too_many_failed_attempts', null);
+    }
+    return adminDenied(res, 403, 'admin_auth_invalid', 'Forbidden: administrator authorization required');
+  }
+  if (lock.failures > 0) await auth.clearAdminAuthFailures(ip);
+
+  areq.admin = admin;
+  if (!(await beginAdminAudit(req, res, admin))) return;
   return next();
 }
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  requireAdminImpl(req, res, next).catch(next);
+}
+
+// Blanket guard: nothing under these prefixes is reachable without admin
+// auth — including GET /api/dashboard/providers, which used to have none
+// (C7's compounding finding), and any route added here in the future.
+app.use(['/api/dashboard', '/api/observability'], requireAdmin);
 
 // ----------------------------------------------------
 // DEVELOPER PORTAL AUTHORIZATION
@@ -1243,7 +1543,11 @@ app.get('/health', (req: Request, res: Response) => {
 // queue had silently fallen back to a per-process MemoryStore (jobs never
 // reach the worker) still took traffic. See packages/workers/src/readiness.ts
 // for the up/down/failed model and the grace period for transient blips.
-const GATEWAY_REQUIRED_SECRETS = ['ADMIN_API_TOKEN', 'PORTAL_JWT_SECRET', 'WEBHOOK_HMAC_SECRET', 'SECRET_ENCRYPTION_KEY'] as const;
+// Phase 20-21 (C7): the admin credential requirement is "at least one admin
+// credential usable in THIS environment" (adminAuthConfigured) rather than a
+// plain env-var presence check — in production the shared ADMIN_API_TOKEN no
+// longer counts, and a set-but-malformed ADMIN_API_CREDENTIALS is missing.
+const GATEWAY_REQUIRED_SECRETS = ['PORTAL_JWT_SECRET', 'WEBHOOK_HMAC_SECRET', 'SECRET_ENCRYPTION_KEY'] as const;
 const readinessGate = new ReadinessGate();
 
 function probeRateLimiter(): ProbeResult {
@@ -1280,7 +1584,7 @@ app.get('/ready', async (req: Request, res: Response) => {
 
   probes.eventBus = probeEventBus(eventBus.getRedisStatus());
 
-  const missing = missingSecrets(GATEWAY_REQUIRED_SECRETS);
+  const missing = [...(adminAuthConfigured() ? [] : ['ADMIN_API_CREDENTIALS']), ...missingSecrets(GATEWAY_REQUIRED_SECRETS)];
   probes.secrets = probeSecrets(missing, production);
 
   const report = readinessGate.evaluate(probes);
@@ -2328,11 +2632,11 @@ app.get('/api/dashboard/applications/:appId/keyword-commands', requireAdmin, asy
 
 app.put('/api/dashboard/applications/:appId/keyword-commands/:keyword', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
-  // The admin token carries no identity (gap register C7): the operator
-  // names themselves, recorded verbatim on the row.
-  if (typeof body.updatedBy !== 'string' || body.updatedBy.trim() === '' || body.updatedBy.length > 200) {
-    return invalidRequest(res, 'updatedBy', 'updatedBy is required, at most 200 characters');
-  }
+  // Phase 20-21 (gap register C7): the row is attributed to the
+  // AUTHENTICATED administrator. `updatedBy` used to be required free text
+  // from the body (the shared admin token carried no identity); a body
+  // value is now ignored.
+  const admin = adminIdentity(req);
   try {
     const row = await keywordCommandRepository.upsert(
       req.params.appId,
@@ -2346,12 +2650,13 @@ app.put('/api/dashboard/applications/:appId/keyword-commands/:keyword', requireA
         workflowId: body.workflowId,
         enabled: body.enabled,
       },
-      `operator:${body.updatedBy.trim()}`,
+      `operator:${admin.id}`,
     );
     logger.warn('application-wide keyword command configured', {
       operation: 'keyword-command-upsert',
       status: 'success',
       applicationId: req.params.appId,
+      adminId: admin.id,
     });
     return res.json(keywordCommandView(row));
   } catch (err) {
@@ -2544,10 +2849,13 @@ app.get('/api/dashboard/customers/:id', requireAdmin, asyncHandler(async (req: R
   return res.json(customer);
 }));
 
+// Phase 20-21 (gap register C18 / C7): a note's / comment's author is the
+// AUTHENTICATED administrator — a client-supplied `authorName` (which let
+// anyone holding the shared token write as anyone) is ignored.
 app.post('/api/dashboard/customers/:id/notes', requireAdmin, async (req: Request, res: Response) => {
-  const { body, authorName } = req.body || {};
+  const { body } = req.body || {};
   try {
-    const note = await crmRegistry.addNote(req.params.id, authorName, body);
+    const note = await crmRegistry.addNote(req.params.id, adminIdentity(req).id, body);
     return res.status(201).json(note);
   } catch (err: any) {
     return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add note' });
@@ -2590,9 +2898,9 @@ app.patch('/api/dashboard/tickets/:id', requireAdmin, async (req: Request, res: 
 });
 
 app.post('/api/dashboard/tickets/:id/comments', requireAdmin, async (req: Request, res: Response) => {
-  const { body, authorName } = req.body || {};
+  const { body } = req.body || {};
   try {
-    const comment = await crmRegistry.addTicketComment(req.params.id, authorName, body);
+    const comment = await crmRegistry.addTicketComment(req.params.id, adminIdentity(req).id, body);
     return res.status(201).json(comment);
   } catch (err: any) {
     return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add comment' });
@@ -3423,17 +3731,17 @@ export function getWebhookDeliveryForTests() {
 // ----------------------------------------------------
 // DASHBOARD MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
-// Every mutating/sensitive route below already has its own requireAdmin
-// (ADMIN_API_TOKEN via x-admin-token, checked further up in this file) —
-// there used to also be a blanket app.use('/api/dashboard', mw.admin) here
-// checking a second, incompatible mechanism (PLATFORM_ADMIN_KEY via
-// x-admin-key/authorization). Since it ran first in the middleware chain,
-// it rejected every request — including to the intentionally-public
-// GET /providers below — before requireAdmin ever got a chance, no matter
-// what admin token was supplied. Removed along with the now-fully-dead
-// checkAdmin()/adminKey/mw.admin (see auth.ts).
-
-app.get('/api/dashboard/providers', (req: Request, res: Response) => {
+// Every route below is behind the blanket admin guard registered with
+// requireAdmin further up in this file (and names requireAdmin itself).
+// (There used to also be a blanket app.use('/api/dashboard', mw.admin)
+// checking a second, incompatible mechanism — PLATFORM_ADMIN_KEY — which
+// rejected every request; removed along with checkAdmin()/mw.admin.)
+//
+// Phase 20-21 (gap register C7, compounding finding): GET /providers used to
+// be deliberately PUBLIC — it returned every provider's fee configuration,
+// routing rules, error rates and live/configured status to anyone. It is
+// admin-only like every other dashboard route.
+app.get('/api/dashboard/providers', requireAdmin, (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());
 });
 
@@ -3638,7 +3946,7 @@ app.post('/api/dashboard/outbox/dead/replay', requireAdmin, asyncHandler(async (
     eventType: typeof body.eventType === 'string' ? body.eventType : undefined,
     limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
   });
-  logger.warn('outbox dead letters replayed by operator', { operation: 'outbox-replay', status: 'success', count: rows.length });
+  logger.warn('outbox dead letters replayed by operator', { operation: 'outbox-replay', status: 'success', count: rows.length, adminId: adminIdentity(req).id });
   return res.json({ replayed: rows.length, ids: rows.map((r) => r.id) });
 }));
 
@@ -3649,7 +3957,7 @@ app.post('/api/dashboard/outbox/:id/replay', requireAdmin, asyncHandler(async (r
   }
   const replayed = await outboxEventRepository.replayDead(id);
   if (replayed) {
-    logger.warn('outbox dead letter replayed by operator', { operation: 'outbox-replay', status: 'success' });
+    logger.warn('outbox dead letter replayed by operator', { operation: 'outbox-replay', status: 'success', adminId: adminIdentity(req).id });
     return res.json({ replayed: true, event: replayed });
   }
   const current = await outboxEventRepository.findById(id);
@@ -3710,7 +4018,7 @@ app.get('/api/dashboard/payments/reconciliation', requireAdmin, asyncHandler(asy
 app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
   if (!UUID_PATTERN.test(id)) return res.status(400).json({ error: 'invalid payment transaction id' });
-  const body = (req.body ?? {}) as { status?: unknown; providerTransactionId?: unknown; note?: unknown; resolvedBy?: unknown };
+  const body = (req.body ?? {}) as { status?: unknown; providerTransactionId?: unknown; note?: unknown };
   const status = body.status;
   if (status !== 'success' && status !== 'failed' && status !== 'cancelled') {
     return invalidRequest(res, 'status', "status must be one of 'success', 'failed', 'cancelled' (the outcome verified with the provider)");
@@ -3718,11 +4026,12 @@ app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asy
   if (typeof body.note !== 'string' || body.note.trim() === '' || body.note.length > 2000) {
     return invalidRequest(res, 'note', 'note is required (how the outcome was verified), at most 2000 characters');
   }
-  // The admin token carries no identity (gap register C7), so the operator
-  // names themselves; recorded verbatim for the audit trail.
-  if (typeof body.resolvedBy !== 'string' || body.resolvedBy.trim() === '' || body.resolvedBy.length > 200) {
-    return invalidRequest(res, 'resolvedBy', 'resolvedBy is required, at most 200 characters');
-  }
+  // Phase 20-21 (gap register PHASE6-03 / C7): resolvedBy is the
+  // AUTHENTICATED administrator. It used to be free text from the body (the
+  // shared admin token carried no identity), so a financial reconciliation
+  // decision could be recorded under any name; a body `resolvedBy` is now
+  // ignored.
+  const resolvedBy = adminIdentity(req).id;
   const providerTransactionId = body.providerTransactionId;
   if (providerTransactionId !== undefined && (typeof providerTransactionId !== 'string' || providerTransactionId === '' || providerTransactionId.length > 255)) {
     return invalidRequest(res, 'providerTransactionId', 'providerTransactionId must be a non-empty string of at most 255 characters');
@@ -3733,7 +4042,7 @@ app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asy
     fillProviderTransactionId: typeof providerTransactionId === 'string' ? providerTransactionId : undefined,
     resolution: {
       source: 'operator',
-      resolvedBy: body.resolvedBy.trim(),
+      resolvedBy,
       note: body.note.trim(),
       resolvedStatus: status,
       providerTransactionId: providerTransactionId ?? null,
@@ -3752,6 +4061,7 @@ app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asy
     status: 'success',
     paymentTransactionId: id,
     resolvedStatus: status,
+    adminId: resolvedBy,
   });
   return res.json({ resolved: true, transaction: reconciliationView(result.transaction) });
 }));
@@ -3802,30 +4112,26 @@ app.get('/api/dashboard/inbound-holds', requireAdmin, asyncHandler(async (req: R
   return res.json({ counts, data: rows.map(inboundHoldView) });
 }));
 
-function operatorMeta(res: Response, body: { note?: unknown; resolvedBy?: unknown }): { note: string; resolvedBy: string } | null {
+function operatorMeta(req: Request, res: Response, body: { note?: unknown }): { note: string; resolvedBy: string } | null {
   if (typeof body.note !== 'string' || body.note.trim() === '' || body.note.length > 2000) {
     invalidRequest(res, 'note', 'note is required (how the owner was established), at most 2000 characters');
     return null;
   }
-  // The admin token carries no identity (gap register C7), so the operator
-  // names themselves; recorded verbatim for the audit trail.
-  if (typeof body.resolvedBy !== 'string' || body.resolvedBy.trim() === '' || body.resolvedBy.length > 200) {
-    invalidRequest(res, 'resolvedBy', 'resolvedBy is required, at most 200 characters');
-    return null;
-  }
-  return { note: body.note.trim(), resolvedBy: body.resolvedBy.trim() };
+  // Phase 20-21 (gap register C7): resolvedBy is the AUTHENTICATED
+  // administrator — it used to be self-declared free text from the body.
+  return { note: body.note.trim(), resolvedBy: adminIdentity(req).id };
 }
 
 app.post('/api/dashboard/inbound-holds/:id/resolve', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
   if (!UUID_PATTERN.test(id)) return res.status(400).json({ error: 'invalid hold id' });
-  const body = (req.body ?? {}) as { appId?: unknown; tenantId?: unknown; supplierId?: unknown; note?: unknown; resolvedBy?: unknown };
+  const body = (req.body ?? {}) as { appId?: unknown; tenantId?: unknown; supplierId?: unknown; note?: unknown };
   if (typeof body.appId !== 'string' || body.appId === '') return invalidRequest(res, 'appId', 'appId is required');
   if (typeof body.tenantId !== 'string' || body.tenantId === '') return invalidRequest(res, 'tenantId', 'tenantId is required');
   if (body.supplierId !== undefined && body.supplierId !== null && typeof body.supplierId !== 'string') {
     return invalidRequest(res, 'supplierId', 'supplierId must be a string or null');
   }
-  const meta = operatorMeta(res, body);
+  const meta = operatorMeta(req, res, body);
   if (!meta) return;
   const result = await inboundMessageHoldRepository.resolve(
     id,
@@ -3853,6 +4159,7 @@ app.post('/api/dashboard/inbound-holds/:id/resolve', requireAdmin, asyncHandler(
     holdId: id,
     applicationId: body.appId,
     tenantId: body.tenantId,
+    adminId: meta.resolvedBy,
   });
   return res.json({ resolved: true, hold: inboundHoldView(result.hold) });
 }));
@@ -3860,17 +4167,50 @@ app.post('/api/dashboard/inbound-holds/:id/resolve', requireAdmin, asyncHandler(
 app.post('/api/dashboard/inbound-holds/:id/discard', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
   if (!UUID_PATTERN.test(id)) return res.status(400).json({ error: 'invalid hold id' });
-  const meta = operatorMeta(res, (req.body ?? {}) as { note?: unknown; resolvedBy?: unknown });
+  const meta = operatorMeta(req, res, (req.body ?? {}) as { note?: unknown });
   if (!meta) return;
   const row = await inboundMessageHoldRepository.discard(id, meta);
   if (!row) return res.status(409).json({ discarded: false, error: 'hold not found or not pending' });
   return res.json({ discarded: true, hold: inboundHoldView(row) });
 }));
 
-// Confirms an admin token without performing any mutation.
+// Confirms an admin token without performing any mutation, and says whose it is.
 app.get('/api/dashboard/admin/verify', requireAdmin, (req: Request, res: Response) => {
-  return res.json({ ok: true, role: 'admin' });
+  const admin = adminIdentity(req);
+  return res.json({ ok: true, role: 'admin', adminId: admin.id, legacySharedToken: admin.legacy });
 });
+
+// Phase 20-21 (gap register C7): the platform-level admin audit trail — who
+// did what, when, with what outcome. Only actor_type 'admin' rows with no
+// application (never any application's own audit rows).
+app.get('/api/dashboard/admin/audit-logs', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const limit = Number(req.query.limit);
+  const rows = await auditLogRepository.listAdminActions({
+    actorId: typeof req.query.actorId === 'string' ? req.query.actorId : undefined,
+    action: typeof req.query.action === 'string' ? req.query.action : undefined,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+  });
+  return res.json({
+    data: rows.map((r) => ({
+      id: r.id,
+      actorType: r.actorType,
+      actorId: r.actorId,
+      action: r.action,
+      resource: r.resource,
+      outcome: r.outcome,
+      statusCode: r.statusCode,
+      details: (() => {
+        try {
+          return r.details ? JSON.parse(r.details) : null;
+        } catch {
+          return r.details;
+        }
+      })(),
+      ipAddress: r.ipAddress,
+      createdAt: r.createdAt,
+    })),
+  });
+}));
 
 // ----------------------------------------------------
 // OBSERVABILITY ENDPOINTS
@@ -3931,6 +4271,12 @@ app.get('/api/dashboard/metrics', requireAdmin, (req: Request, res: Response) =>
   });
 });
 
+// Phase 20-21 (C7): authenticated like every other admin route — x-admin-token
+// HEADER only. The old `?token=` query fallback (for the browser EventSource
+// API, which cannot set headers) is gone: the admin console now reads this
+// stream with fetch() + a ReadableStream, which can. The connection is
+// audited when it opens (outcome 'started') and completed when it closes
+// ('stream_closed'), attributed to the admin who opened it.
 app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',

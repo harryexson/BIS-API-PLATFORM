@@ -88,6 +88,13 @@ export interface AuditLogRow {
   applicationId?: string | null;
   userId?: string | null;
   details: string | null;
+  /** Phase 20-21 (C7): who, for platform-level admin rows. */
+  actorType?: string | null;
+  actorId?: string | null;
+  outcome?: string | null;
+  statusCode?: number | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
   createdAt: Date;
 }
 
@@ -1128,10 +1135,40 @@ export function installDatabaseMock(): Record<string, unknown> {
           applicationId: data.applicationId != null ? String(data.applicationId) : null,
           userId: data.userId != null ? String(data.userId) : null,
           details: data.details != null ? String(data.details) : null,
+          actorType: data.actorType != null ? String(data.actorType) : null,
+          actorId: data.actorId != null ? String(data.actorId) : null,
+          outcome: data.outcome != null ? String(data.outcome) : null,
+          statusCode: typeof data.statusCode === 'number' ? data.statusCode : null,
+          ipAddress: data.ipAddress != null ? String(data.ipAddress) : null,
+          userAgent: data.userAgent != null ? String(data.userAgent) : null,
           createdAt: new Date(),
         };
         dbState.auditLogs.push(row);
         return row;
+      },
+      // Phase 20-21 — mirrors repositories/audit-logs.ts (single UPDATE,
+      // platform-level admin rows only).
+      async completeAdminAction(id: string, result: { outcome: string; statusCode: number | null; action?: string; details?: string | null }) {
+        if (dbState.failAuditWrites) {
+          throw new Error('database unavailable (simulated): connection refused');
+        }
+        const row = dbState.auditLogs.find((a) => a.id === id && a.actorType === 'admin' && !a.applicationId);
+        if (!row) return undefined;
+        if (result.action !== undefined) row.action = result.action;
+        row.outcome = result.outcome;
+        row.statusCode = result.statusCode;
+        if (result.details !== undefined) row.details = result.details;
+        return { ...row };
+      },
+      async listAdminActions(opts: { actorId?: string; action?: string; limit?: number } = {}) {
+        return dbState.auditLogs
+          .filter((a) => a.actorType === 'admin' && !a.applicationId)
+          .filter((a) => !opts.actorId || a.actorId === opts.actorId)
+          .filter((a) => !opts.action || a.action === opts.action)
+          .slice()
+          .reverse()
+          .slice(0, Math.min(Math.max(opts.limit ?? 100, 1), 500))
+          .map((a) => ({ ...a }));
       },
       async count(): Promise<number> {
         return dbState.auditLogs.length;

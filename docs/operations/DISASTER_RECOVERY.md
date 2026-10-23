@@ -469,7 +469,7 @@ Each recovery scenario was simulated by:
 | `PLATFORM_ADMIN_KEY` | CRITICAL | Password manager |
 | `WEBHOOK_HMAC_SECRET` | CRITICAL | Password manager |
 | `REDIS_URL` | HIGH | Password manager |
-| `ADMIN_API_TOKEN` | HIGH | Password manager |
+| `ADMIN_API_CREDENTIALS` (named admin token hashes; each admin keeps their own plaintext token) | HIGH | Password manager |
 | `STRIPE_SECRET_KEY` | HIGH | Stripe dashboard |
 | `NMI_API_KEY` | HIGH | NMI dashboard |
 | `FLUTTERWAVE_SECRET_KEY` | HIGH | Flutterwave dashboard |

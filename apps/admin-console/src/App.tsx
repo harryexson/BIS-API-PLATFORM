@@ -38,11 +38,15 @@ export const App: React.FC = () => {
   const [sseConnected, setSseConnected] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Phase 20-21 (gap register C7): /api/dashboard/providers is admin-only
+  // now (it used to be public and exposed every provider's fees, routing
+  // rules and error rates to anyone).
   const fetchProviders = async () => {
+    if (!isAdmin) return;
     try {
-      const res = await fetch('/api/dashboard/providers');
+      const res = await fetch('/api/dashboard/providers', { headers: { 'x-admin-token': token || '' } });
       const data = await res.json();
-      if (Array.isArray(data)) setProviders(data);
+      if (res.ok && Array.isArray(data)) setProviders(data);
     } catch (err) {
       console.error('Failed to fetch provider registry configs:', err);
     }
@@ -153,40 +157,93 @@ export const App: React.FC = () => {
     }
   };
 
-  // Establish SSE Connection
+  // Establish the live event stream.
+  //
+  // Phase 20-21 (gap register C7): the gateway accepts the admin token ONLY
+  // in the x-admin-token header — never in the URL (it used to travel as
+  // ?token=..., i.e. into proxy/access logs and browser history, because the
+  // EventSource API cannot set headers). The stream is therefore read with
+  // fetch() + a ReadableStream, which can send the header, and parsed as
+  // server-sent events by hand. Reconnects with a short backoff.
   useEffect(() => {
     fetchProviders();
     fetchLogs();
     fetchMetrics();
 
-    // Only requires admin, and EventSource can't set custom headers, so the
-    // token travels via query string instead (see requireAdmin's fallback
-    // in services/api-gateway/src/app.ts — the standard pattern for
-    // authenticating SSE connections from a browser).
     if (!isAdmin) return;
-    const eventSource = new EventSource(`/api/dashboard/stream?token=${encodeURIComponent(token || '')}`);
+    const controller = new AbortController();
+    let metricsTimer: ReturnType<typeof setTimeout> | null = null;
+    // One /metrics refresh per burst of events, not one admin request (and
+    // one admin audit row) per event.
+    const scheduleMetrics = () => {
+      if (metricsTimer) return;
+      metricsTimer = setTimeout(() => {
+        metricsTimer = null;
+        fetchMetrics();
+      }, 2000);
+    };
 
-    eventSource.onopen = () => setSseConnected(true);
-    eventSource.onerror = () => setSseConnected(false);
-
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    const handleData = (raw: string) => {
+      const data = JSON.parse(raw);
       if (data.type === 'connected') return;
-
       const newEvent = data as TransactionEvent;
-
       if (newEvent.appId === 'system-dashboard') {
         fetchProviders();
         return;
       }
-
       setLogs((prev) => [newEvent, ...prev.slice(0, 99)]);
       setLastEvent(newEvent);
-      fetchMetrics();
+      scheduleMetrics();
     };
 
+    const connect = async () => {
+      while (!controller.signal.aborted) {
+        try {
+          const res = await fetch('/api/dashboard/stream', {
+            headers: { 'x-admin-token': token || '', Accept: 'text/event-stream' },
+            signal: controller.signal,
+          });
+          if (!res.ok || !res.body) throw new Error(`stream refused: ${res.status}`);
+          setSseConnected(true);
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let sep: number;
+            while ((sep = buffer.indexOf('\n\n')) !== -1) {
+              const frame = buffer.slice(0, sep);
+              buffer = buffer.slice(sep + 2);
+              const payload = frame
+                .split('\n')
+                .filter((line) => line.startsWith('data:'))
+                .map((line) => line.slice(5).trimStart())
+                .join('\n');
+              if (payload) {
+                try {
+                  handleData(payload);
+                } catch (err) {
+                  console.error('Malformed stream event:', err);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          console.error('Live stream disconnected:', err);
+        }
+        setSseConnected(false);
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    };
+    connect();
+
     return () => {
-      eventSource.close();
+      controller.abort();
+      if (metricsTimer) clearTimeout(metricsTimer);
+      setSseConnected(false);
     };
   }, [isAdmin, token]);
 
