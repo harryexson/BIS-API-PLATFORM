@@ -13,6 +13,7 @@ import {
   senderOptOutRepository,
   normalizeMessagingAddress,
 } from '@company/database';
+import { logger } from '@company/observability';
 import { ConversationManager, ConversationContext, type ConversationSenderInfo } from './conversation';
 import { findMatchingRule, type RoutingContext } from './rules';
 import { computeProviderScore, rankByScore, weightedRandomSelect, type ScorableCandidate } from './scoring';
@@ -617,8 +618,9 @@ export class RoutingEngine {
     // consistent with ConversationManager's existing best-effort pattern
     // in this same routing layer — a DB hiccup shouldn't take down all
     // outbound messaging. This is a real tradeoff (a genuinely opted-out
-    // recipient could receive a message during a DB outage) surfaced via
-    // console.error rather than swallowed silently; hardening it to
+    // recipient could receive a message during a DB outage) surfaced via a
+    // structured error log (Phase 22: through the logger's redaction, and
+    // without the recipient's address) rather than swallowed silently; hardening it to
     // fail-closed is a documented follow-up (gap register A7), not done here.
     // Phase 9: the ONE message a recipient may receive after opting out is
     // the confirmation of that opt-out (CTIA). Internal-only option, never
@@ -629,7 +631,15 @@ export class RoutingEngine {
       try {
         optedOut = await consentRecordRepository.isOptedOut(appId, tenantId, recipient, requestedChannel);
       } catch (err: any) {
-        console.error(`[routing] consent lookup failed for ${recipient} — failing open (send proceeds): ${err.message}`);
+        logger.error('consent lookup failed — failing open (send proceeds)', {
+          operation: 'routing-consent-check',
+          applicationId: appId,
+          tenantId,
+          channel: requestedChannel,
+          errorCode: 'CONSENT_LOOKUP_FAILED',
+          status: 'failed_open',
+          error: err,
+        });
       }
     }
     if (optedOut) {
@@ -953,7 +963,15 @@ export class RoutingEngine {
       // register A7, still open): without the registry the number is only
       // known from the adapter itself. The sender-level STOP check below
       // still fails CLOSED whenever a number IS known.
-      console.error(`[routing] messaging-profile lookup failed for ${appId}/${tenantId} via ${providerId}: ${err?.message}`);
+      logger.error('messaging-profile lookup failed — sender resolved from the adapter only', {
+        operation: 'routing-sender-resolution',
+        applicationId: appId,
+        tenantId,
+        providerId,
+        errorCode: 'MESSAGING_PROFILE_LOOKUP_FAILED',
+        status: 'failed_open',
+        error: err,
+      });
     }
     const usable = profiles.filter((p) => !p.supplierId || p.supplierId === supplierId);
     if (adapterSender) {

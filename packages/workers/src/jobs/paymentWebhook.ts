@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
@@ -83,9 +84,11 @@ export function createPaymentWebhookProcessor(deps: JobDeps): JobProcessor {
     } else {
       // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
       // Processing unverified webhooks is a security vulnerability.
-      console.error(
-        '[payment_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
-      );
+      logger.error('rejecting webhook — WEBHOOK_HMAC_SECRET not configured, cannot verify authenticity', {
+        operation: 'payment_webhook',
+        errorCode: 'WEBHOOK_HMAC_NOT_CONFIGURED',
+        status: 'rejected',
+      });
       throw new Error('payment_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
@@ -217,14 +220,24 @@ async function processPaymentWebhook(
           : undefined,
     });
   } catch (err) {
-    console.error('[payment_webhook] Neon write failed — failing job for retry', err);
+    logger.error('payment webhook database write failed — failing job for retry', {
+      operation: 'payment_webhook',
+      errorCode: 'DB_WRITE_FAILED',
+      status: 'failed',
+      error: err,
+    });
     throw new Error('payment_webhook: database write failed — retrying');
   }
   if (persisted.inserted && newStatus && providerTxId && !persisted.transactionUpdated) {
     // Not an error: no transaction carries this provider id yet, or the
     // transition is not allowed from its current status (e.g. a late
     // 'succeeded' after 'refunded').
-    console.warn(`[payment_webhook] transaction for ${String(providerTxId)} not moved to '${newStatus}' (absent or transition not allowed)`);
+    logger.warn('payment webhook did not move a transaction (absent or transition not allowed)', {
+      operation: 'payment_webhook',
+      status: 'not_applied',
+      providerTransactionId: String(providerTxId),
+      toStatus: newStatus,
+    });
   }
 
   // Emit normalized event to EventBus for downstream pipeline (receipt, outbox, etc.)

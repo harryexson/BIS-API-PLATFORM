@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, JobType } from '../types';
 import { JobDeps } from './deps';
 import { JobQueue } from '../queue';
@@ -57,7 +58,12 @@ export function createReconciliationProcessor(
           resolvePaymentReconciliationConfig(deps.config.paymentReconciliation),
         );
       } catch (err) {
-        console.error('[reconciliation] payment reconciliation failed', err);
+        logger.error('payment reconciliation failed', {
+          operation: 'reconciliation',
+          errorCode: 'PAYMENT_RECONCILIATION_FAILED',
+          status: 'failed',
+          error: err,
+        });
         payments = { error: err instanceof Error ? err.message : String(err) };
       }
 
@@ -77,7 +83,12 @@ export function createReconciliationProcessor(
           details: JSON.stringify(report),
         });
       } catch (err) {
-        console.error('[reconciliation] Neon write failed', err);
+        logger.error('reconciliation report write failed', {
+          operation: 'reconciliation',
+          errorCode: 'DB_WRITE_FAILED',
+          status: 'failed',
+          error: err,
+        });
       }
 
       await deps.eventBus.emit({
@@ -95,7 +106,7 @@ export function createReconciliationProcessor(
       });
     });
     if (!outcome.acquired) {
-      console.warn('[reconciliation] skipped: another reconciliation run holds the lock');
+      logger.warn('reconciliation skipped: another reconciliation run holds the lock', { operation: 'reconciliation', status: 'skipped' });
     }
   };
 }

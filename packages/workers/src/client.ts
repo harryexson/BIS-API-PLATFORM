@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { KVStore } from './store';
 import { MemoryStore } from './store.memory';
 import { RedisStore } from './store.redis';
@@ -7,7 +8,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 export interface CreateStoreOptions {
   /** How long to wait for the initial Redis connection before falling back. */
   connectTimeoutMs?: number;
-  /** Where the fallback warning goes (defaults to console.warn). */
+  /** Where the fallback warning goes (defaults to a structured logger.warn). */
   warn?: (message: string) => void;
 }
 
@@ -48,19 +49,26 @@ export async function createStore(redisUrl?: string, opts: CreateStoreOptions = 
   const envTimeout = Number(process.env.REDIS_CONNECT_TIMEOUT_MS);
   const timeoutMs =
     opts.connectTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : DEFAULT_CONNECT_TIMEOUT_MS);
-  const warn = opts.warn ?? ((m: string) => console.warn(m));
-
   const store = new RedisStore(url);
   try {
     await store.waitUntilReady(timeoutMs);
     await store.ping();
     return store;
   } catch (err) {
-    warn(
-      `[workers] Redis unavailable at ${redactUrl(url)} (${err instanceof Error ? err.message : String(err)}) — ` +
-        'falling back to in-memory store (ephemeral, per-process: jobs will NOT reach other processes and are lost on restart). ' +
-        'Redis is required for production durability.',
-    );
+    const fallback =
+      'falling back to in-memory store (ephemeral, per-process: jobs will NOT reach other processes and are lost on restart). ' +
+      'Redis is required for production durability.';
+    if (opts.warn) {
+      opts.warn(`[workers] Redis unavailable at ${redactUrl(url)} (${err instanceof Error ? err.message : String(err)}) — ${fallback}`);
+    } else {
+      logger.warn(`Redis unavailable — ${fallback}`, {
+        operation: 'create-store',
+        errorCode: 'REDIS_UNAVAILABLE',
+        status: 'degraded',
+        redisUrl: redactUrl(url),
+        error: err,
+      });
+    }
     await store.quit?.();
     return new MemoryStore();
   }

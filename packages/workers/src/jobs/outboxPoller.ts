@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, WorkerConfig } from '../types';
 import { JobDeps } from './deps';
 import {
@@ -172,14 +173,31 @@ export async function runOutboxPollOnce(
     result.rescued = rescue.requeued.length;
     result.rescuedToDead = rescue.deadLettered.length;
     if (rescue.requeued.length > 0) {
-      console.warn(`[outbox_poller] requeued ${rescue.requeued.length} outbox events whose claim went stale`);
+      logger.warn('requeued outbox events whose claim went stale', {
+        operation: 'outbox_poller',
+        status: 'rescued',
+        requeued: rescue.requeued.length,
+      });
     }
     for (const dead of rescue.deadLettered) {
-      console.error(`[outbox_poller] DEAD-LETTERED outbox event ${dead.id} (${dead.eventType}) after ${dead.attempts} attempts: ${dead.error}`);
+      logger.error('outbox event dead-lettered', {
+        operation: 'outbox_poller',
+        errorCode: 'OUTBOX_DEAD_LETTERED',
+        status: 'dead',
+        outboxEventId: dead.id,
+        eventType: dead.eventType,
+        attempts: dead.attempts,
+        error: dead.error,
+      });
     }
   } catch (err) {
     // Not fatal: stale rows stay `processing` and are rescued next poll.
-    console.error('[outbox_poller] stale-claim rescue failed', err);
+    logger.error('outbox stale-claim rescue failed', {
+      operation: 'outbox_poller',
+      errorCode: 'OUTBOX_RESCUE_FAILED',
+      status: 'failed',
+      error: err,
+    });
   }
 
   // A failure here throws out of the poll; nothing was claimed, so nothing is lost.
@@ -193,7 +211,13 @@ export async function runOutboxPollOnce(
     } catch (err) {
       // Unknown whether we still own it; don't dispatch. If we do, the claim
       // goes stale and the row is rescued.
-      console.error(`[outbox_poller] could not renew claim on outbox event ${row.id}`, err);
+      logger.error('could not renew claim on outbox event — not dispatching', {
+        operation: 'outbox_poller',
+        errorCode: 'OUTBOX_CLAIM_RENEW_FAILED',
+        status: 'failed',
+        outboxEventId: row.id,
+        error: err,
+      });
       continue;
     }
     if (!owned) {
@@ -208,16 +232,38 @@ export async function runOutboxPollOnce(
         const next = await store.fail(row.id, row.claimToken, errText(err), policy);
         if (next === 'dead') {
           result.deadLettered++;
-          console.error(`[outbox_poller] DEAD-LETTERED outbox event ${row.id} (${row.eventType}) after ${row.attempts} attempts: ${errText(err)}`);
+          logger.error('outbox event dead-lettered', {
+            operation: 'outbox_poller',
+            errorCode: 'OUTBOX_DEAD_LETTERED',
+            status: 'dead',
+            outboxEventId: row.id,
+            eventType: row.eventType,
+            attempts: row.attempts,
+            error: err,
+          });
         } else if (next === 'pending') {
           result.retried++;
-          console.warn(`[outbox_poller] outbox event ${row.id} attempt ${row.attempts} failed, will retry: ${errText(err)}`);
+          logger.warn('outbox event dispatch failed — will retry', {
+            operation: 'outbox_poller',
+            errorCode: 'OUTBOX_DISPATCH_FAILED',
+            status: 'retrying',
+            outboxEventId: row.id,
+            eventType: row.eventType,
+            attempts: row.attempts,
+            error: err,
+          });
         } else {
           result.lostClaim++;
         }
       } catch (failErr) {
         // Row stays `processing`; the stale-claim rescue returns it to pending.
-        console.error(`[outbox_poller] could not record failure of outbox event ${row.id}`, failErr);
+        logger.error('could not record outbox dispatch failure — the stale-claim rescue will return it to pending', {
+          operation: 'outbox_poller',
+          errorCode: 'OUTBOX_FAIL_UNRECORDED',
+          status: 'failed',
+          outboxEventId: row.id,
+          error: failErr,
+        });
       }
       continue;
     }
@@ -229,14 +275,22 @@ export async function runOutboxPollOnce(
         // Our claim lapsed during dispatch and someone else may re-dispatch:
         // the downstream must de-duplicate on the event id (= row id).
         result.lostClaim++;
-        console.warn(`[outbox_poller] dispatched outbox event ${row.id} but its claim had been lost — downstream may see it again (same id)`);
+        logger.warn('dispatched outbox event but its claim had been lost — downstream may see it again (same id)', {
+          operation: 'outbox_poller',
+          errorCode: 'OUTBOX_CLAIM_LOST',
+          status: 'lost_claim',
+          outboxEventId: row.id,
+        });
       }
     } catch (err) {
       result.completionUnrecorded++;
-      console.error(
-        `[outbox_poller] dispatched outbox event ${row.id} but could not record completion — it will be re-dispatched (same id) after the stale window`,
-        err,
-      );
+      logger.error('dispatched outbox event but could not record completion — it will be re-dispatched (same id) after the stale window', {
+        operation: 'outbox_poller',
+        errorCode: 'OUTBOX_COMPLETION_UNRECORDED',
+        status: 'failed',
+        outboxEventId: row.id,
+        error: err,
+      });
     }
   }
   return result;

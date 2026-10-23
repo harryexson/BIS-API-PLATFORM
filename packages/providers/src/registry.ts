@@ -10,6 +10,7 @@ import {
   HealthCheckSummary,
 } from '@company/schemas';
 import { randomUUID } from 'crypto';
+import { logger } from '@company/observability';
 import { BaseProvider } from './base';
 
 import { StripeProvider } from './adapters/payments/stripe';
@@ -253,10 +254,15 @@ export class ProviderRegistry {
     for (const [id, provider] of this.providers) {
       const state = this.management.get(id);
       if (state?.environment === 'live' && !provider.isConfigured()) {
-        console.warn(
-          `[providers] '${id}' is registered as environment: 'live' but has no real credentials configured — ` +
-          `every request will silently fall back to simulated processing until an admin adds its secret(s) ` +
-          `(POST /api/dashboard/providers/${id}/secrets) or the matching env var(s) are set.`,
+        logger.warn(
+          "live provider has no real credentials configured — every request will fall back to simulated processing " +
+            'until an admin adds its secret(s) (POST /api/dashboard/providers/:id/secrets) or the matching env var(s) are set',
+          {
+            operation: 'provider-registry',
+            providerId: id,
+            errorCode: 'LIVE_PROVIDER_UNCONFIGURED',
+            status: 'degraded',
+          },
         );
       }
     }

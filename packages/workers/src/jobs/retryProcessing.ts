@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, JobType } from '../types';
 import { JobDeps } from './deps';
 import { JobQueue } from '../queue';
@@ -44,8 +45,6 @@ export function createRetryProcessingProcessor(
       }
     }
 
-    console.log(
-      `[retry_processing] reprocessed=${reprocessed} permanent=${permanent}`,
-    );
+    logger.info('dead-letter retry pass completed', { operation: 'retry_processing', status: 'completed', reprocessed, permanent });
   };
 }

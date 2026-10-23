@@ -1,5 +1,6 @@
 import { eq, and, asc, desc, isNull, inArray, sql, type SQL } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
+import { logger } from '@company/observability';
 import { getDb } from '../connection';
 import { transactions, type Transaction, type NewTransaction } from '../schema';
 // Payment status machine (states, transition graph) lives in a DB-free module
@@ -399,7 +400,14 @@ export const transactionRepository = {
     const result = await paymentAttempts.transitionStatus(id, status);
     if (result.outcome === 'not_found') return undefined;
     if (result.outcome === 'rejected') {
-      console.warn(`[transactions] Ignoring invalid transition: ${result.currentStatus} → ${status} for tx ${id}`);
+      logger.warn('transaction status transition not allowed — ignored', {
+        operation: 'transaction-update-status',
+        errorCode: 'INVALID_STATUS_TRANSITION',
+        status: 'ignored',
+        transactionId: id,
+        fromStatus: result.currentStatus,
+        toStatus: status,
+      });
     }
     return result.transaction;
   },

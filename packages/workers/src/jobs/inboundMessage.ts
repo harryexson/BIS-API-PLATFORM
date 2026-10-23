@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
 import type { JobQueue } from '../queue';
@@ -173,9 +174,14 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
         });
       }
 
-      console.log(
-        `[inbound_message] Keyword "${inbound.content.trim()}" handled for ${inbound.senderPhone}: ${keywordResult.action}${keywordResult.command ? ` (${keywordResult.command.keyword}, ${keywordResult.command.mode})` : ''}`,
-      );
+      logger.info('inbound keyword handled', {
+        operation: 'inbound_message',
+        status: keywordResult.action,
+        applicationId: appId,
+        tenantId,
+        conversationId,
+        ...(keywordResult.command ? { command: keywordResult.command.keyword, commandMode: keywordResult.command.mode } : {}),
+      });
 
       // --- App-specific command → generic dispatch to the owning application ---
       if (keywordResult.command?.mode === 'dispatch') {
@@ -299,7 +305,12 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
         },
       });
     } catch (err) {
-      console.error('[inbound_message] Neon write failed — failing job for retry', err);
+      logger.error('inbound message database write failed — failing job for retry', {
+        operation: 'inbound_message',
+        errorCode: 'DB_WRITE_FAILED',
+        status: 'failed',
+        error: err,
+      });
       throw new Error('inbound_message: database write failed — retrying');
     }
 
@@ -377,9 +388,15 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
       await inboundMessageHoldRepository.markSenderOptOutApplied(row.id);
     }
 
-    console.warn(
-      `[inbound_message] HELD ${row.id} (${args.reason}${keyword ? `, keyword ${keyword}` : ''}) from ${args.inbound.senderPhone} to ${args.businessNumber ?? '<no destination>'} via ${args.providerId}: ${args.explanation}`,
-    );
+    logger.warn('inbound message held for operator attribution', {
+      operation: 'inbound_message',
+      status: 'held',
+      holdId: row.id,
+      reason: args.reason,
+      ...(keyword ? { keyword } : {}),
+      providerId: args.providerId,
+      explanation: args.explanation,
+    });
 
     // Platform-level operator signal. Deliberately carries NO content, NO
     // candidate identities and NO tenantId — it is not addressed to any
@@ -424,12 +441,17 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
   async function deliverResolvedHold(jobId: string, holdId: string): Promise<void> {
     const row = await inboundMessageHoldRepository.findById(holdId);
     if (!row) {
-      console.warn(`[inbound_message] hold ${holdId} not found — nothing to deliver`);
+      logger.warn('inbound hold not found — nothing to deliver', { operation: 'inbound_message', status: 'skipped', holdId });
       return;
     }
     if (row.status !== 'resolved' || !row.resolvedAppId || !row.resolvedTenantId) {
       // pending (not yet attributed), discarded, or already delivered.
-      console.warn(`[inbound_message] hold ${holdId} is '${row.status}' — not delivering`);
+      logger.warn('inbound hold is not deliverable — not delivering', {
+        operation: 'inbound_message',
+        status: 'skipped',
+        holdId,
+        holdStatus: row.status,
+      });
       return;
     }
     // The owner comes from the hold ROW (written by the admin route, which
@@ -487,7 +509,11 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
     if (!inbound.senderPhone) {
       // No From at all: not a customer message (e.g. a payment provider's
       // webhook, which also reaches this job — gap register A15).
-      console.warn(`[inbound_message] No sender in webhook from ${providerId} — not a customer message, ignoring`);
+      logger.warn('no sender in inbound webhook — not a customer message, ignoring', {
+        operation: 'inbound_message',
+        status: 'ignored',
+        providerId,
+      });
       return;
     }
 
@@ -527,7 +553,13 @@ export function createInboundMessageProcessor(deps: JobDeps, queue?: JobQueue): 
     if (inbound.messageType !== 'message') {
       // A provider status callback / delivery receipt is not customer
       // content and carries nothing to quarantine (unchanged behaviour).
-      console.warn(`[inbound_message] ${inbound.messageType} from ${providerId} not attributable (${resolution.reason}) — ignoring`);
+      logger.warn('inbound non-message callback not attributable — ignoring', {
+        operation: 'inbound_message',
+        status: 'ignored',
+        providerId,
+        messageType: inbound.messageType,
+        reason: resolution.reason,
+      });
       return;
     }
 

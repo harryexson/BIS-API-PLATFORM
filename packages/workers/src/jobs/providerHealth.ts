@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
 import { providerHealthRepository, providerRepository } from '@company/database';
@@ -36,7 +37,13 @@ export function createProviderHealthProcessor(deps: JobDeps): JobProcessor {
             });
           } catch (err) {
             // P1: Fail on DB error so health check data is not silently lost
-            console.error('[provider_health] Neon write failed — failing job for retry', err);
+            logger.error('provider health write failed — failing job for retry', {
+              operation: 'provider_health',
+              providerId: cfg.id,
+              errorCode: 'DB_WRITE_FAILED',
+              status: 'failed',
+              error: err,
+            });
             throw new Error('provider_health: database write failed — retrying');
           }
         }
@@ -48,7 +55,11 @@ export function createProviderHealthProcessor(deps: JobDeps): JobProcessor {
         });
       }, { waitMs: PROVIDER_HEALTH_LOCK_WAIT_MS });
       if (!outcome.acquired) {
-        console.warn(`[provider_health] skipped ${cfg.id}: another health check holds the provider lock`);
+        logger.warn('provider health check skipped: another health check holds the provider lock', {
+          operation: 'provider_health',
+          providerId: cfg.id,
+          status: 'skipped',
+        });
       }
     }
   };

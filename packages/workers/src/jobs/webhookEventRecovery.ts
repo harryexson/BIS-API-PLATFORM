@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { webhookEventRepository } from '@company/database';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
@@ -22,7 +23,12 @@ export function createWebhookEventRecoveryProcessor(deps: JobDeps, queue: JobQue
       { staleAfterMs: deps.config.webhookStaleEnqueueMs },
     );
     if (recovered > 0 || failed > 0) {
-      console.warn(`[webhook_event_recovery] re-enqueued ${recovered} stranded webhook event(s), ${failed} failed (will retry next sweep)`);
+      logger.warn('re-enqueued stranded webhook events (failures retry next sweep)', {
+        operation: 'webhook_event_recovery',
+        status: failed > 0 ? 'partial' : 'recovered',
+        recovered,
+        failed,
+      });
     }
   };
 }

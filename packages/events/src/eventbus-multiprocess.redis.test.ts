@@ -79,7 +79,10 @@ describe.skipIf(!redisAvailable)('PHASE7-01: EventBus cross-process delivery (se
       await control.subscribe('bis:events');
       control.on('message', (_ch, msg) => seenByControl.push(JSON.parse(msg).id));
 
-      const [emitted] = await runPeer(['emit', eventId], redis.url);
+      // Phase 22: the peer's stdout also carries the EventBus's structured
+      // JSON log lines (e.g. "event bus Redis connected"), so pick the
+      // result line by its shape rather than by position.
+      const emitted = (await runPeer(['emit', eventId], redis.url)).find((l) => 'emitted' in l);
       expect(emitted.emitted).toBe(eventId);
       expect(emitted.pid).not.toBe(gatewayPid);
       expect(emitted.pid).not.toBe(process.pid);

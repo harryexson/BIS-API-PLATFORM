@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
@@ -37,7 +38,12 @@ export function createEventProcessingProcessor(deps: JobDeps): JobProcessor {
     } catch (err) {
       // P1: Fail the job on DB error so it can be retried — previously this
       // was silently swallowed and the job was marked complete.
-      console.error('[event_processing] Neon write failed — failing job for retry', err);
+      logger.error('event write failed — failing job for retry', {
+        operation: 'event_processing',
+        errorCode: 'DB_WRITE_FAILED',
+        status: 'failed',
+        error: err,
+      });
       throw new Error('event_processing: database write failed — retrying');
     }
     await deps.eventBus.emit(job.payload as any);

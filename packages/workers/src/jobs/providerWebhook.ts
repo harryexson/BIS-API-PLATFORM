@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { Job, JobProcessor } from '../types';
 import { JobDeps } from './deps';
@@ -37,9 +38,11 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
       }
     } else {
       // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
-      console.error(
-        '[provider_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
-      );
+      logger.error('rejecting webhook — WEBHOOK_HMAC_SECRET not configured, cannot verify authenticity', {
+        operation: 'provider_webhook',
+        errorCode: 'WEBHOOK_HMAC_NOT_CONFIGURED',
+        status: 'rejected',
+      });
       throw new Error('provider_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
@@ -118,7 +121,12 @@ async function processProviderWebhook(job: Job, deps: JobDeps, store: WebhookEve
   } catch (err) {
     // P0: Fail the job on DB error so it can be retried — previously this
     // was silently swallowed and the job was marked complete.
-    console.error('[provider_webhook] Neon write failed — failing job for retry', err);
+    logger.error('provider webhook database write failed — failing job for retry', {
+      operation: 'provider_webhook',
+      errorCode: 'DB_WRITE_FAILED',
+      status: 'failed',
+      error: err,
+    });
     throw new Error('provider_webhook: database write failed — retrying');
   }
 

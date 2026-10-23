@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, JobType } from '../types';
 import { JobDeps } from './deps';
 import { JobQueue } from '../queue';
@@ -23,10 +24,15 @@ export function createWebhookJobPollerProcessor(
     try {
       const rescued = await webhookJobRepository.rescueStuck(10);
       if (rescued > 0) {
-        console.warn(`[webhook_job_poller] Rescued ${rescued} stuck webhook jobs`);
+        logger.warn('rescued stuck webhook jobs', { operation: 'webhook_job_poller', status: 'rescued', rescued });
       }
     } catch (err) {
-      console.error('[webhook_job_poller] Failed to rescue stuck jobs', err);
+      logger.error('failed to rescue stuck webhook jobs', {
+        operation: 'webhook_job_poller',
+        errorCode: 'WEBHOOK_JOB_RESCUE_FAILED',
+        status: 'failed',
+        error: err,
+      });
     }
 
     const jobs = await webhookJobRepository.claimBatch(10);
@@ -36,7 +42,13 @@ export function createWebhookJobPollerProcessor(
         await queue.enqueue(row.jobType as JobType, row.payload as Record<string, unknown>);
         await webhookJobRepository.complete(row.id);
       } catch (err) {
-        console.error(`[webhook_job_poller] Failed to bridge webhook job ${row.id}`, err);
+        logger.error('failed to bridge webhook job', {
+          operation: 'webhook_job_poller',
+          errorCode: 'WEBHOOK_JOB_BRIDGE_FAILED',
+          status: 'failed',
+          webhookJobId: row.id,
+          error: err,
+        });
         await webhookJobRepository.fail(row.id, String(err));
       }
     }

@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { KVStore } from './store';
 import { Keys } from './keys';
 import { Job, JobType, JobProcessor, WorkerConfig, WorkerContext } from './types';
@@ -55,7 +56,7 @@ export class WorkerManager {
     try {
       const rescued = await this.queue.rescueStuckJobs(staleThresholdMs);
       if (rescued > 0) {
-        console.log(`[worker] rescued ${rescued} orphaned processing job(s) on startup`);
+        logger.info('rescued orphaned processing jobs on startup', { operation: 'worker-startup', status: 'rescued', rescued });
       }
     } catch {
       // Store may be unavailable — skip rescue, worker loop will handle errors

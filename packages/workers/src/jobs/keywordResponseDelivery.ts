@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, WorkerContext } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
@@ -57,7 +58,12 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
       );
     } catch (err: any) {
       if (err?.name === 'ConsentBlockedError') {
-        console.warn(`[keyword_response_delivery] reply to ${senderPhone} not sent: recipient is opted out (${keywordName || keyword})`);
+        logger.warn('keyword reply not sent: recipient is opted out', {
+          operation: 'keyword_response_delivery',
+          status: 'suppressed',
+          keyword: keywordName || keyword,
+          conversationId,
+        });
         try {
           await eventRepository.create({
             appId,
@@ -75,7 +81,13 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
         }
         return;
       }
-      console.error('[keyword_response_delivery] Failed to send response', err);
+      logger.error('keyword reply send failed — failing job for retry', {
+        operation: 'keyword_response_delivery',
+        errorCode: 'KEYWORD_REPLY_SEND_FAILED',
+        status: 'failed',
+        conversationId,
+        error: err,
+      });
       throw new Error('keyword_response_delivery: send failed — retrying');
     }
 
@@ -99,7 +111,13 @@ export function createKeywordResponseDeliveryProcessor(deps: JobDeps): JobProces
         ...channelDecisionColumns(event),
       });
     } catch (err) {
-      console.error('[keyword_response_delivery] reply sent but its audit event could not be written', err);
+      logger.error('keyword reply sent but its audit event could not be written', {
+        operation: 'keyword_response_delivery',
+        errorCode: 'DB_WRITE_FAILED',
+        status: 'failed',
+        conversationId,
+        error: err,
+      });
     }
 
     // Emit for monitoring (Phase 7: scoped to the conversation's tenant)

@@ -12,6 +12,7 @@
     "drizzle:check": "drizzle-kit check"
   },
   "dependencies": {
+    "@company/observability": "*",
     "@neondatabase/serverless": "^0.10.0",
     "drizzle-orm": "^0.45.2",
     "ws": "^8.18.0"

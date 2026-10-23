@@ -18,13 +18,20 @@ let server: Server | undefined;
 providerStateReady.then(() => {
   const state = providerStateStatus();
   if (!state.loaded) {
-    console.error(`[providers] persisted provider state NOT loaded at startup (${state.lastError}) — retrying in the background`);
+    logger.error('persisted provider state NOT loaded at startup — retrying in the background', {
+      operation: 'startup',
+      errorCode: 'PROVIDER_STATE_LOAD_FAILED',
+      status: 'degraded',
+      error: state.lastError,
+    });
   }
   server = app.listen(PORT, () => {
-    console.log(`===============================================`);
-    console.log(`BIS-API-PLATFORM GATEWAY RUNNING ON PORT ${PORT}`);
-    console.log(`Server-Sent Events stream: http://localhost:${PORT}/api/dashboard/stream`);
-    console.log(`===============================================`);
+    logger.info('BIS-API-PLATFORM gateway running', {
+      operation: 'startup',
+      status: 'running',
+      port: Number(PORT),
+      sseStreamUrl: `http://localhost:${PORT}/api/dashboard/stream`,
+    });
   });
 });
 
@@ -33,18 +40,22 @@ let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log('Gateway shutting down...');
+  logger.info('gateway shutting down', { operation: 'shutdown', status: 'draining' });
 
   // Stop accepting new connections
   if (!server) process.exit(0);
   server.close(() => {
-    console.log('Gateway stopped.');
+    logger.info('gateway stopped', { operation: 'shutdown', status: 'stopped' });
     process.exit(0);
   });
 
   // Force kill after 30s
   setTimeout(() => {
-    console.error('Gateway forced shutdown after timeout');
+    logger.error('gateway forced shutdown after timeout', {
+      operation: 'shutdown',
+      errorCode: 'SHUTDOWN_TIMEOUT',
+      status: 'failed',
+    });
     process.exit(1);
   }, 30_000).unref();
 };
