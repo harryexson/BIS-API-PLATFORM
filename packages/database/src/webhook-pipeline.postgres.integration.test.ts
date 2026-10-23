@@ -30,7 +30,7 @@ import {
   type JobDeps,
 } from '@company/workers';
 import { EventBus } from '@company/events';
-import { redisAvailable, startTestRedis, type TestRedis } from '../../workers/src/test-utils/redis-server';
+import { freePort, redisAvailable, startTestRedis, type TestRedis } from '../../workers/src/test-utils/redis-server';
 
 /**
  * Phase 4 end-to-end proof of the 10-step webhook pipeline's durable half
@@ -405,4 +405,63 @@ describe.skipIf(!ADMIN_URL)('Phase 4 — webhook pipeline end-to-end (real Postg
     expect(outcome.kind).toBe('persist_failed'); // gateway answers 503
     expect(enqueued).toBe(0);
   });
+
+  // Phase 25 (DISASTER_RECOVERY.md §4.4, "Redis data loss"): the jobs of an
+  // ALREADY-ACKNOWLEDGED webhook are lost with Redis. The provider will not
+  // resend (it got 200; a redelivery is a duplicate), so recovery must come
+  // from webhook_events: once the row has sat enqueued-but-unconsumed for
+  // WEBHOOK_STALE_ENQUEUE_MS (default 10 min) the sweeper re-enqueues the
+  // durable consumers — payment_webhook and provider_webhook, never
+  // inbound_message. With a redis-server binary this kills and restarts a
+  // real server (no persistence) under a live RedisStore; otherwise a fresh
+  // MemoryStore stands in for the emptied Redis.
+  it('Redis data loss after a webhook was acknowledged: provider redelivery is a duplicate; the sweeper re-enqueues the durable consumers once the row is stale', async () => {
+    const keys = createKeys(`p25-loss-${randomBytes(3).toString('hex')}`);
+    const ownRedis = redisAvailable && !process.env.TEST_REDIS_URL;
+    const port = ownRedis ? await freePort() : 0;
+    let lossRedis: TestRedis | undefined = ownRedis ? await startTestRedis({ port }) : undefined;
+    let store: KVStore = lossRedis ? await createStore(lossRedis.url) : new MemoryStore();
+    stores.push(store);
+    let queue = new JobQueue(store, keys, config);
+    const enqueue = (t: Parameters<JobQueue['enqueue']>[0], p: Parameters<JobQueue['enqueue']>[1]) => queue.enqueue(t, p);
+    try {
+      const first = await ingestWebhook({ store: repo, enqueue }, delivery('evt_p25_redis_loss'));
+      expect(first.kind).toBe('accepted'); // the gateway answers 200 on this
+      const row = (await repo.findByProviderEvent('stripe', 'evt_p25_redis_loss'))!;
+      for (const type of ['inbound_message', 'payment_webhook', 'provider_webhook'] as const) {
+        expect(await jobsFor(queue, store, keys, type, row.id)).toHaveLength(1);
+      }
+
+      // Redis crashes without persistence and comes back empty.
+      if (lossRedis) {
+        expect(store).toBeInstanceOf(RedisStore);
+        await lossRedis.stop();
+        lossRedis = await startTestRedis({ port });
+        await waitFor(async () => (store as RedisStore).isConnected(), 'RedisStore reconnected to the restarted server', 30_000);
+      } else {
+        store = new MemoryStore();
+        queue = new JobQueue(store, keys, config);
+      }
+      for (const type of ['inbound_message', 'payment_webhook', 'provider_webhook'] as const) {
+        expect(await jobsFor(queue, store, keys, type, row.id)).toHaveLength(0);
+      }
+
+      // The provider's redelivery (if it ever sent one) re-enqueues nothing.
+      expect((await ingestWebhook({ store: repo, enqueue }, delivery('evt_p25_redis_loss'))).kind).toBe('duplicate');
+      expect(await jobsFor(queue, store, keys, 'payment_webhook', row.id)).toHaveLength(0);
+
+      // The sweeper with the default stale window: too early, nothing yet.
+      await recoverStrandedWebhookEvents(repo, enqueue);
+      expect(await jobsFor(queue, store, keys, 'payment_webhook', row.id)).toHaveLength(0);
+
+      // Once WEBHOOK_STALE_ENQUEUE_MS has elapsed (staleAfterMs 0 stands in for it).
+      const swept = await recoverStrandedWebhookEvents(repo, enqueue, { staleAfterMs: 0 });
+      expect(swept.recovered).toBeGreaterThanOrEqual(1);
+      expect(await jobsFor(queue, store, keys, 'payment_webhook', row.id)).toHaveLength(1);
+      expect(await jobsFor(queue, store, keys, 'provider_webhook', row.id)).toHaveLength(1);
+      expect(await jobsFor(queue, store, keys, 'inbound_message', row.id)).toHaveLength(0);
+    } finally {
+      await lossRedis?.stop();
+    }
+  }, 60_000);
 });
