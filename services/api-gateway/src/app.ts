@@ -1021,6 +1021,15 @@ function buildAccountLink(path: string, token: string): string {
   return `${base}${path}?token=${encodeURIComponent(token)}`;
 }
 
+// Gap register C13/F4: whether to surface verify/reset tokens directly in
+// the response body (for environments with no real inbox to check).
+// Deliberately an explicit opt-in flag, never `NODE_ENV !== 'production'` —
+// a missing/misconfigured NODE_ENV in a real deployment must not be able to
+// silently turn this leak on.
+function allowDebugAuthTokens(): boolean {
+  return process.env.ALLOW_DEBUG_AUTH_TOKENS === 'true';
+}
+
 // Fire-and-forget email sends for account flows — a failed/unconfigured
 // send must never block signup, verification-resend, or a password-reset
 // request. Errors are logged, not thrown.
@@ -1714,12 +1723,15 @@ app.post('/v1/api/auth/signup', async (req: Request, res: Response) => {
       user: result.user,
       application: result.application,
       apiKey: result.apiKey,
-      // The token is also surfaced directly outside production, in
+      // The token is also surfaced directly when explicitly opted into, in
       // addition to the real send above — keeps signup/verification
       // testable end to end without depending on a real inbox, and gives
       // a fallback if RESEND_API_KEY isn't configured in a dev/staging
-      // environment.
-      ...(process.env.NODE_ENV !== 'production'
+      // environment. Gated on an explicit flag rather than `NODE_ENV !==
+      // 'production'`: a missing/misconfigured NODE_ENV must never be able
+      // to turn this security-sensitive leak on by accident (gap register
+      // C13/F4).
+      ...(allowDebugAuthTokens()
         ? { emailVerificationToken: result.emailVerificationToken }
         : {}),
     });
@@ -1778,7 +1790,7 @@ app.post('/v1/api/auth/resend-verification', requireSession, asyncHandler(async 
   sendAccountEmail('verify', user.email, token);
   return res.json({
     message: 'Verification email requested',
-    ...(process.env.NODE_ENV !== 'production' ? { emailVerificationToken: token } : {}),
+    ...(allowDebugAuthTokens() ? { emailVerificationToken: token } : {}),
   });
 }));
 
@@ -1790,7 +1802,7 @@ app.post('/v1/api/auth/request-password-reset', asyncHandler(async (req: Request
   // Always a generic success — never reveal whether the account exists.
   return res.json({
     message: 'If an account exists for this email, a password reset link has been sent.',
-    ...(process.env.NODE_ENV !== 'production' && result ? { passwordResetToken: result.token } : {}),
+    ...(allowDebugAuthTokens() && result ? { passwordResetToken: result.token } : {}),
   });
 }));
 
