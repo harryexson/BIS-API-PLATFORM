@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc --noEmit",
-    "start": "node dist/index.js",
+    "start": "exec node --import tsx src/index.ts",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
@@ -21,7 +21,8 @@
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
-    "rate-limiter-flexible": "^11.2.0"
+    "rate-limiter-flexible": "^11.2.0",
+    "tsx": "^4.23.12"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",

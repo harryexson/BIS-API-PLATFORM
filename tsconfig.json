@@ -22,6 +22,6 @@
       "@company/workers": ["packages/workers/src/index.ts"]
     }
   },
-  "include": ["packages/**/*.ts", "services/**/*.ts"],
+  "include": ["packages/**/*.ts", "services/**/*.ts", "scripts/**/*.ts"],
   "exclude": ["node_modules", "dist", "apps"]
 }

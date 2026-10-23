@@ -36,7 +36,7 @@ jobs:
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
           ref: ${{ github.sha }}
-          check-regexp: 'Lint|Type check|Unit tests|Integration tests|Build|Security audit|Migration validation'
+          check-regexp: 'Lint|Type check|Unit tests|Integration tests|Build|Service boot smoke|Security audit|Migration validation'
           wait-interval: 30
           allowed-conclusions: success
         env:

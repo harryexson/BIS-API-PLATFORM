@@ -279,7 +279,9 @@ export class AuthService {
 /**
  * The caller's network address: the only rate-limit identity a caller can't
  * change per request by editing a header. (Behind a reverse proxy this is
- * the proxy's address unless Express `trust proxy` is configured.)
+ * the proxy's address unless TRUST_PROXY names that proxy's exact hop count
+ * or address — see trust-proxy.ts; X-Forwarded-For entries written by the
+ * client itself are never trusted.)
  */
 export function clientIp(req: Request): string {
   return req.ip || req.socket?.remoteAddress || 'unknown';

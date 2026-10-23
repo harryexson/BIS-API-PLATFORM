@@ -28,6 +28,7 @@ import {
   parseProviderManagementUpdate,
 } from '@company/schemas';
 import { AuthService, createMiddleware, clientIp } from './auth';
+import { parseTrustProxy } from './trust-proxy';
 import {
   loadAdminCredentials,
   ADMIN_TOKEN_QUERY_PARAMS,
@@ -505,6 +506,27 @@ function paymentConflictResource(prior: PaymentTransactionRow) {
 }
 
 const app = express();
+
+// Phase 23-24 (PHASE14-03 / PHASE20-02): which proxies may set req.ip via
+// X-Forwarded-For — an explicit hop count or proxy address list from
+// TRUST_PROXY, never a blanket `true` (see trust-proxy.ts). Set before any
+// middleware reads req.ip.
+const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+app.set('trust proxy', trustProxy.setting);
+if (trustProxy.error) {
+  logger.error('TRUST_PROXY refused — per-IP rate limits and the admin lockout key on the TCP peer address', {
+    operation: 'startup',
+    errorCode: 'TRUST_PROXY_INVALID',
+    status: 'degraded',
+    error: trustProxy.error,
+  });
+} else {
+  logger.info('client address resolution configured', {
+    operation: 'startup',
+    status: 'configured',
+    trustProxy: trustProxy.description,
+  });
+}
 
 // P1-1: Restrict CORS to configured origins
 const allowedOrigins = process.env.CORS_ORIGINS

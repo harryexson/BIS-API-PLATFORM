@@ -37,13 +37,16 @@ The platform requires a robust CI/CD pipeline that enforces code quality, securi
 |------|---------|------|
 | Lint | Code style and quality | ESLint + typescript-eslint |
 | Type Check | Type safety | TypeScript strict mode |
-| Unit Tests | Logic correctness | Vitest |
-| Integration Tests | Component integration | Vitest (separate config) |
+| Unit Tests | Logic correctness | Vitest (+ `redis-server` binary, so Redis-gated suites run; a skipped Redis-gated test fails the job) |
+| Integration Tests | Component integration | Vitest (separate config) against a real PostgreSQL 16 service container via `TEST_POSTGRES_URL`; a skipped Postgres-gated test fails the job |
 | Build | Compilation verification | TypeScript + Vite |
+| Service boot smoke | Each service actually starts with its production start command | `scripts/service-boot-smoke.ts` (real Redis container; `/health`, `/ready`, clean SIGTERM exit) |
 | Security | Dependency vulnerabilities | npm audit |
 | Migration Check | Schema drift detection | drizzle-kit check |
 
 **Final gate**: The `ci-gate` job requires all gates to pass. This is the required check for branch protection.
+
+**Amendment (Phase 23-24 remediation)**: "Build" is a type-check (`tsc --noEmit`) and never proved a service can start; the `Service boot smoke` gate was added after `"start": "node dist/index.js"` (a file no script produced) passed every gate and crashed the live deployment. Likewise the integration gate never set `TEST_POSTGRES_URL`, so every real-Postgres suite skipped itself on every run; it now provides PostgreSQL 16 and treats a skip of a gated test as a failure (`scripts/assert-gated-tests-ran.ts`).
 
 ### Deployment Pipeline
 
