@@ -70,7 +70,8 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, RefundRequest } from 
  *   PAYPAL_CLIENT_SECRET — from the same app credentials
  */
 export class PayPalProvider extends BaseProvider {
-  private cachedToken: { token: string; expiresAtMs: number } | undefined;
+  // Keyed by host (E11): a sandbox token is never reused against the live host after an environment change.
+  private cachedToken: { token: string; expiresAtMs: number; host: string } | undefined;
 
   constructor(config: ProviderConfig) {
     super(config);
@@ -96,7 +97,7 @@ export class PayPalProvider extends BaseProvider {
   // pattern airwallex.ts uses for its own login step.
   private async getAccessToken(): Promise<string> {
     const now = Date.now();
-    if (this.cachedToken && this.cachedToken.expiresAtMs - now > 60_000) {
+    if (this.cachedToken && this.cachedToken.host === this.baseUrl && this.cachedToken.expiresAtMs - now > 60_000) {
       return this.cachedToken.token;
     }
 
@@ -117,7 +118,7 @@ export class PayPalProvider extends BaseProvider {
     }
 
     const expiresAtMs = now + (Number(res.body.expires_in) || 9 * 60 * 60) * 1000;
-    this.cachedToken = { token: res.body.access_token, expiresAtMs };
+    this.cachedToken = { token: res.body.access_token, expiresAtMs, host: this.baseUrl };
     return res.body.access_token;
   }
 

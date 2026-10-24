@@ -12,6 +12,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { conversations } from './conversations';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * Phase 9 (gap register A13) — tenant-configurable inbound keyword commands.
@@ -92,6 +93,7 @@ export const keywordCommands = pgTable(
       'chk_keyword_commands_reply_text',
       sql`NOT ${t.enabled} OR ${t.action} <> 'reply' OR ${t.responseText} IS NOT NULL`,
     ),
+    tenantIdNonBlank('keyword_commands', t.tenantId),
   ],
 );
 
@@ -135,6 +137,7 @@ export const keywordCommandDispatches = pgTable(
     uniqueIndex('idx_keyword_dispatches_dedupe_key').on(t.dedupeKey),
     index('idx_keyword_dispatches_owner_status').on(t.appId, t.tenantId, t.status),
     check('chk_keyword_dispatches_status', sql`${t.status} IN ('pending', 'acknowledged')`),
+    tenantIdNonBlank('keyword_command_dispatches', t.tenantId),
   ],
 );
 

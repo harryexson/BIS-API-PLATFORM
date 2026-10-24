@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, JobType } from '../types';
 import { JobDeps } from './deps';
 import { JobQueue } from '../queue';
@@ -32,7 +33,11 @@ export function createReconciliationProcessor(
     const owner = `reconciliation_${Math.random().toString(36).slice(2, 8)}`;
     const ttl = deps.config.retry.maxDelayMs;
 
-    await deps.lock.withLock('reconciliation', owner, ttl, async () => {
+    // B15: reconciliation is a periodic singleton sweep (every replica
+    // enqueues one). If another run holds the lock it is doing this exact
+    // work right now — skip cleanly instead of throwing, which used to fail
+    // the job into retries and eventually the dead-letter list.
+    const outcome = await deps.lock.tryWithLock('reconciliation', owner, ttl, async () => {
       const eventsByCategory = await eventRepository.countByCategory('system').catch(() => ({}));
       const totalEvents = Object.values(eventsByCategory).reduce((a, b) => a + b, 0);
 
@@ -53,7 +58,12 @@ export function createReconciliationProcessor(
           resolvePaymentReconciliationConfig(deps.config.paymentReconciliation),
         );
       } catch (err) {
-        console.error('[reconciliation] payment reconciliation failed', err);
+        logger.error('payment reconciliation failed', {
+          operation: 'reconciliation',
+          errorCode: 'PAYMENT_RECONCILIATION_FAILED',
+          status: 'failed',
+          error: err,
+        });
         payments = { error: err instanceof Error ? err.message : String(err) };
       }
 
@@ -73,7 +83,12 @@ export function createReconciliationProcessor(
           details: JSON.stringify(report),
         });
       } catch (err) {
-        console.error('[reconciliation] Neon write failed', err);
+        logger.error('reconciliation report write failed', {
+          operation: 'reconciliation',
+          errorCode: 'DB_WRITE_FAILED',
+          status: 'failed',
+          error: err,
+        });
       }
 
       await deps.eventBus.emit({
@@ -90,5 +105,8 @@ export function createReconciliationProcessor(
         response: null,
       });
     });
+    if (!outcome.acquired) {
+      logger.warn('reconciliation skipped: another reconciliation run holds the lock', { operation: 'reconciliation', status: 'skipped' });
+    }
   };
 }

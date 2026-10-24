@@ -159,7 +159,10 @@ describe('Phase 6 — UNKNOWN outcome → reconciliation, through the real gatew
     expect((await runtime.post(url, { status: 'success', note: 'x', resolvedBy: 'ops' })).status).toBe(403);
     expect((await runtime.post(url, { status: 'refunded', note: 'x', resolvedBy: 'ops' }, ADMIN)).status).toBe(400);
     expect((await runtime.post(url, { status: 'success', resolvedBy: 'ops' }, ADMIN)).status).toBe(400);
-    expect((await runtime.post(url, { status: 'success', note: 'x' }, ADMIN)).status).toBe(400);
+    // Phase 20-21 (PHASE6-03 / C7): a missing body `resolvedBy` used to be a
+    // 400 — the shared admin token carried no identity, so the operator had
+    // to name themselves. resolvedBy is now the AUTHENTICATED admin, so it is
+    // no longer a request field (the self-declared one below is ignored).
     expect((await runtime.post('/api/dashboard/payments/reconciliation/not-a-uuid/resolve', { status: 'success', note: 'x', resolvedBy: 'ops' }, ADMIN)).status).toBe(400);
     expect((await runtime.post(`/api/dashboard/payments/reconciliation/${crypto.randomUUID()}/resolve`, { status: 'success', note: 'x', resolvedBy: 'ops' }, ADMIN)).status).toBe(404);
 
@@ -172,7 +175,11 @@ describe('Phase 6 — UNKNOWN outcome → reconciliation, through the real gatew
     const row = dbState.transactions.find((t) => t.id === paymentId)!;
     expect(row.status).toBe('success');
     expect(row.providerTransactionId).toBe('pi_found_in_dashboard');
-    expect(row.reconciliationResolution).toMatchObject({ source: 'operator', resolvedBy: 'ops@reach', resolvedStatus: 'success' });
+    // The body claimed resolvedBy 'ops@reach'; the record names the admin
+    // credential that actually made the request (this suite boots with the
+    // legacy ADMIN_API_TOKEN, whose identity is 'legacy-admin-token').
+    expect(row.reconciliationResolution).toMatchObject({ source: 'operator', resolvedBy: 'legacy-admin-token', resolvedStatus: 'success' });
+    expect(JSON.stringify(row.reconciliationResolution)).not.toContain('ops@reach');
 
     const again = await runtime.post(url, { status: 'failed', note: 'oops', resolvedBy: 'ops' }, ADMIN);
     expect(again.status).toBe(409);

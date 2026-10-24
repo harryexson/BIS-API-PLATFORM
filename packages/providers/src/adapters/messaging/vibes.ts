@@ -105,6 +105,8 @@ export class VibesProvider extends BaseProvider {
     // established pattern in adapters/payments/stripe.ts and the other
     // real adapters in this directory.
     if (!this.username || !this.password) {
+      // Phase 26 (gap register E2 messaging side / E3): never fabricate a delivered message in production.
+      this.refuseSimulatedFallbackInProduction({ missingCredentials: [...(this.username ? [] : ['VIBES_USERNAME']), ...(this.password ? [] : ['VIBES_PASSWORD'])] });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 

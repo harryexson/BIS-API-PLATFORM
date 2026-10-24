@@ -27,6 +27,11 @@ import {
 // DB-free outbox consumer policy, shared verbatim with the real repository —
 // outboxPoller.ts does real arithmetic with these (e.g. staleAfterMs defaults).
 import { DEFAULT_OUTBOX_RETRY_POLICY, DEFAULT_OUTBOX_STALE_AFTER_MS } from '../../database/src/outbox-policy';
+// DB-free deployment-tier logic and persisted-provider-state error types
+// (Phase 15), shared verbatim with the real package so the gateway's
+// instanceof checks and the C9 key/tier rule behave identically here.
+import { currentDeploymentTier as realCurrentDeploymentTier, environmentTier } from '../../database/src/environment-tier';
+import { SecretEncryptionKeyMissingError, ProviderSecretsDecryptError } from '../../database/src/provider-state-errors';
 // DB-free supplier ownership chain (Phase 7, F3.8), shared verbatim with the
 // real package — the mock injects its own in-memory repositories into it.
 import { SupplierScope, isUuid } from '../../database/src/supplier-scope';
@@ -49,6 +54,12 @@ const MESSAGING_PROFILE_SENDER_TYPES = new Set(['phone', '10dlc', 'tollfree', 's
 export interface EventRow {
   id: string;
   appId: string;
+  /**
+   * events.tenant_id (Phase 16): 'default' when the writer omits it (the
+   * column default), NULL when it passes null. Optional only so existing
+   * hand-built EventRow literals in tests keep compiling.
+   */
+  tenantId?: string | null;
   category: string;
   providerId: string | null;
   status: string | null;
@@ -77,6 +88,13 @@ export interface AuditLogRow {
   applicationId?: string | null;
   userId?: string | null;
   details: string | null;
+  /** Phase 20-21 (C7): who, for platform-level admin rows. */
+  actorType?: string | null;
+  actorId?: string | null;
+  outcome?: string | null;
+  statusCode?: number | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
   createdAt: Date;
 }
 
@@ -296,6 +314,12 @@ export interface DbState {
   failTransactionWrites: boolean;
   /** Fault injection: every webhook_events / webhook_event_consumers call throws (DB outage). */
   failWebhookEventStore: boolean;
+  /**
+   * Phase 19: what checkDatabaseHealth() grades the database as, e.g.
+   * 'degraded' = reachable but slow (200ms-1s). Unset = 'healthy' (or
+   * 'unhealthy' while failEventWrites is on, as before).
+   */
+  simulatedDbHealth?: 'healthy' | 'degraded' | 'unhealthy';
   /** Phase 4: durable inbound-webhook receipts, UNIQUE (providerId, providerEventId). */
   webhookEvents: WebhookEventRow[];
   webhookEventConsumers: WebhookEventConsumerRow[];
@@ -381,6 +405,10 @@ export interface ProviderConfigRow {
   encryptedSecret: string | null;
   secretIv: string | null;
   secretTag: string | null;
+  // Phase 15 (E12): persisted provider configuration + CAS versions.
+  managementConfig?: Record<string, unknown> | null;
+  managementVersion?: number;
+  secretsVersion?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -707,6 +735,7 @@ export function clearDb(): void {
   dbState.failIdempotencyStore = false;
   dbState.failTransactionWrites = false;
   dbState.failWebhookEventStore = false;
+  dbState.simulatedDbHealth = undefined;
   dbState.webhookEvents = [];
   dbState.webhookEventConsumers = [];
   dbState.outboxEvents = [];
@@ -915,9 +944,17 @@ function normalizeRow(data: Record<string, unknown>): EventRow {
       throw new Error('new row for relation "events" violates check constraint "chk_events_channel_fallback_reason" (simulated)');
     }
   }
+  // Phase 16: mirrors events.tenant_id — the column default 'default' when
+  // the writer omits it, NULL when it passes null — and migration 0021's
+  // chk_events_tenant_id_nonblank.
+  const tenantId = data.tenantId === undefined ? 'default' : data.tenantId === null ? null : String(data.tenantId);
+  if (tenantId !== null && tenantId.trim() === '') {
+    throw new Error('new row for relation "events" violates check constraint "chk_events_tenant_id_nonblank" (simulated)');
+  }
   return {
     id: `evt_${randomUUID().slice(0, 12)}`,
     appId: String(data.appId ?? 'system'),
+    tenantId,
     category: String(data.category ?? 'event'),
     providerId: data.providerId != null ? String(data.providerId) : null,
     status: data.status != null ? String(data.status) : null,
@@ -1098,10 +1135,40 @@ export function installDatabaseMock(): Record<string, unknown> {
           applicationId: data.applicationId != null ? String(data.applicationId) : null,
           userId: data.userId != null ? String(data.userId) : null,
           details: data.details != null ? String(data.details) : null,
+          actorType: data.actorType != null ? String(data.actorType) : null,
+          actorId: data.actorId != null ? String(data.actorId) : null,
+          outcome: data.outcome != null ? String(data.outcome) : null,
+          statusCode: typeof data.statusCode === 'number' ? data.statusCode : null,
+          ipAddress: data.ipAddress != null ? String(data.ipAddress) : null,
+          userAgent: data.userAgent != null ? String(data.userAgent) : null,
           createdAt: new Date(),
         };
         dbState.auditLogs.push(row);
         return row;
+      },
+      // Phase 20-21 — mirrors repositories/audit-logs.ts (single UPDATE,
+      // platform-level admin rows only).
+      async completeAdminAction(id: string, result: { outcome: string; statusCode: number | null; action?: string; details?: string | null }) {
+        if (dbState.failAuditWrites) {
+          throw new Error('database unavailable (simulated): connection refused');
+        }
+        const row = dbState.auditLogs.find((a) => a.id === id && a.actorType === 'admin' && !a.applicationId);
+        if (!row) return undefined;
+        if (result.action !== undefined) row.action = result.action;
+        row.outcome = result.outcome;
+        row.statusCode = result.statusCode;
+        if (result.details !== undefined) row.details = result.details;
+        return { ...row };
+      },
+      async listAdminActions(opts: { actorId?: string; action?: string; limit?: number } = {}) {
+        return dbState.auditLogs
+          .filter((a) => a.actorType === 'admin' && !a.applicationId)
+          .filter((a) => !opts.actorId || a.actorId === opts.actorId)
+          .filter((a) => !opts.action || a.action === opts.action)
+          .slice()
+          .reverse()
+          .slice(0, Math.min(Math.max(opts.limit ?? 100, 1), 500))
+          .map((a) => ({ ...a }));
       },
       async count(): Promise<number> {
         return dbState.auditLogs.length;
@@ -1163,7 +1230,9 @@ export function installDatabaseMock(): Record<string, unknown> {
         return dbState.apiKeys.filter((k) => k.applicationId === applicationId);
       },
       async create(data: Record<string, unknown>) {
-        const row = { id: `key_${randomUUID().slice(0, 8)}`, keyHash: String(data.keyHash), applicationId: String(data.applicationId), environment: 'development', revokedAt: null, expiresAt: null };
+        // Same default as the real column (application_api_keys.environment DEFAULT 'test');
+        // the caller's environment is honoured — it is what C9's tier check reads.
+        const row = { id: `key_${randomUUID().slice(0, 8)}`, keyHash: String(data.keyHash), applicationId: String(data.applicationId), environment: typeof data.environment === 'string' ? data.environment : 'test', revokedAt: null, expiresAt: null };
         dbState.apiKeys.push(row);
         return row;
       },
@@ -1554,8 +1623,14 @@ export function installDatabaseMock(): Record<string, unknown> {
         const phone = normalizeMessagingAddress(phoneNumber);
         const businessNumber = normalizeMessagingAddress(data.businessNumber ?? '') || null;
         const supplierId = data.supplierId || null;
+        // Phase 16: the channel is part of the ownership key
+        // (uq_conversations_owner), exactly as in the real repository.
         const sameOwner = (c: ConversationRow) =>
-          c.phoneNumber === phone && c.appId === appId && c.tenantId === data.tenantId && (c.supplierId ?? null) === supplierId;
+          c.phoneNumber === phone &&
+          c.appId === appId &&
+          c.tenantId === data.tenantId &&
+          (c.supplierId ?? null) === supplierId &&
+          c.channel === data.channel;
         let existing = dbState.conversations.find((c) => sameOwner(c) && (c.businessNumber ?? null) === businessNumber);
         if (!existing && businessNumber) {
           // Legacy adoption (see the real repository).
@@ -1569,7 +1644,6 @@ export function installDatabaseMock(): Record<string, unknown> {
         };
         if (existing) {
           existing.providerId = data.providerId;
-          existing.channel = data.channel;
           existing.status = 'active';
           existing.lastMessageAt = new Date();
           existing.updatedAt = new Date();
@@ -2303,7 +2377,8 @@ export function installDatabaseMock(): Record<string, unknown> {
           }
           const prior = dbState.events.find((e) => e.idempotencyKey === input.idempotencyKey);
           if (prior) return { inserted: false, eventId: prior.id, transactionUpdated: false };
-          const row = normalizeRow({ ...input.event, idempotencyKey: input.idempotencyKey });
+          // The real CTE writes COALESCE(tenantId, 'default').
+          const row = normalizeRow({ ...input.event, tenantId: input.event.tenantId ?? 'default', idempotencyKey: input.idempotencyKey });
           dbState.events.push(row);
           let transactionUpdated = false;
           const ts = input.transactionStatus;
@@ -2687,7 +2762,7 @@ export function installDatabaseMock(): Record<string, unknown> {
           apiKey: { id: apiKeyRow.id, raw, hash, prefix, environment: apiKeyRow.environment },
         };
       }
-      async authenticateApplication(rawKey: string, _environment?: string) {
+      async authenticateApplication(rawKey: string, environment?: string) {
         if (!rawKey || rawKey.length === 0) {
           return { authenticated: false, error: 'API key is required' };
         }
@@ -2696,6 +2771,10 @@ export function installDatabaseMock(): Record<string, unknown> {
         if (key.revokedAt) return { authenticated: false, error: 'API key has been revoked' };
         if (key.expiresAt && new Date(key.expiresAt) < new Date()) {
           return { authenticated: false, error: 'API key has expired' };
+        }
+        // Mirrors the real ApplicationRegistry (gap register C9): compared by tier.
+        if (environment && environmentTier(key.environment) !== environmentTier(environment)) {
+          return { authenticated: false, error: `API key is not valid for "${environment}" environment` };
         }
         const application = dbState.applications.find((a) => a.id === key.applicationId);
         if (!application) return { authenticated: false, error: 'Application not found for this API key' };
@@ -3315,9 +3394,10 @@ export function installDatabaseMock(): Record<string, unknown> {
     hashPassword,
     verifyPassword,
     generateApiKey,
-    currentDeploymentTier(): 'live' | 'test' {
-      return process.env.NODE_ENV === 'production' ? 'live' : 'test';
-    },
+    currentDeploymentTier: realCurrentDeploymentTier,
+    environmentTier,
+    SecretEncryptionKeyMissingError,
+    ProviderSecretsDecryptError,
     async ensureProviderRow(input: { slug: string; name: string; category: string }): Promise<string> {
       const existing = dbState.providers.find((p) => p.slug === input.slug);
       if (existing) {
@@ -3337,61 +3417,105 @@ export function installDatabaseMock(): Record<string, unknown> {
       dbState.providers.push(row);
       return row.id;
     },
-    async persistProviderSecrets(
-      slug: string,
-      secrets: { field: string; label: string; value: string }[],
-    ): Promise<void> {
-      if (!process.env.SECRET_ENCRYPTION_KEY) return;
-      const provider = dbState.providers.find((p) => p.slug === slug);
-      if (!provider) return;
-
-      const environment = process.env.NODE_ENV === 'production' ? 'live' : 'test';
-      const payload: EncryptedPayload = encryptSecret(JSON.stringify(secrets));
-      const existing = dbState.providerConfigs.find(
-        (c) => c.providerId === provider.id && c.environment === environment,
-      );
-      if (existing) {
-        existing.encryptedSecret = payload.encrypted;
-        existing.secretIv = payload.iv;
-        existing.secretTag = payload.tag;
-        existing.updatedAt = new Date();
-      } else {
-        dbState.providerConfigs.push({
-          id: `pcfg_${randomUUID().slice(0, 8)}`,
-          providerId: provider.id,
-          environment,
-          encryptedSecret: payload.encrypted,
-          secretIv: payload.iv,
-          secretTag: payload.tag,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        });
-      }
-    },
-    async loadAllProviderSecrets(): Promise<Record<string, { field: string; label: string; value: string }[]>> {
-      if (!process.env.SECRET_ENCRYPTION_KEY) return {};
-      const environment = process.env.NODE_ENV === 'production' ? 'live' : 'test';
-      const snapshot: Record<string, { field: string; label: string; value: string }[]> = {};
-
-      for (const provider of dbState.providers) {
-        const config = dbState.providerConfigs.find(
-          (c) => c.providerId === provider.id && c.environment === environment,
-        );
-        if (!config?.encryptedSecret || !config.secretIv || !config.secretTag) continue;
-        try {
-          const json = decryptSecret({ encrypted: config.encryptedSecret, iv: config.secretIv, tag: config.secretTag });
-          const parsed = JSON.parse(json);
-          if (Array.isArray(parsed)) snapshot[provider.slug] = parsed;
-        } catch {
-          // Same as the real implementation: skip a row that fails to
-          // decrypt rather than blocking every other provider's secrets.
+    // Phase 15 (E12/D13): mirrors packages/database/src/provider-secrets.ts's
+    // createProviderStateStore against dbState — same compare-and-set
+    // semantics as its single-statement INSERT ... ON CONFLICT DO UPDATE ...
+    // WHERE <version> = <expected>, same refusal to persist without
+    // SECRET_ENCRYPTION_KEY, same throw-on-undecryptable read, and the real
+    // encryptSecret/decryptSecret.
+    providerStateStore: (() => {
+      const tier = () => realCurrentDeploymentTier();
+      const providerIdFor = (slug: string, name: string, category: string): string => {
+        const existing = dbState.providers.find((p) => p.slug === slug);
+        if (existing) {
+          existing.name = name;
+          existing.category = category;
+          existing.updatedAt = new Date();
+          return existing.id;
         }
-      }
-      return snapshot;
-    },
+        const row: ProviderRow = { id: `prov_${randomUUID().slice(0, 8)}`, slug, name, category, createdAt: new Date(), updatedAt: new Date() };
+        dbState.providers.push(row);
+        return row.id;
+      };
+      const toState = (provider: ProviderRow, c: ProviderConfigRow) => ({
+        slug: provider.slug,
+        managementVersion: c.managementVersion ?? 0,
+        management: c.managementConfig ? structuredClone(c.managementConfig) : null,
+        secretsVersion: c.secretsVersion ?? 0,
+        readSecrets(): { field: string; label: string; value: string }[] {
+          if ((c.secretsVersion ?? 0) === 0 && !c.encryptedSecret) return [];
+          if (!c.encryptedSecret || !c.secretIv || !c.secretTag) {
+            throw new ProviderSecretsDecryptError(provider.slug, new Error('encrypted secrets row is incomplete'));
+          }
+          if (!process.env.SECRET_ENCRYPTION_KEY) throw new SecretEncryptionKeyMissingError('decrypt');
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(decryptSecret({ encrypted: c.encryptedSecret, iv: c.secretIv, tag: c.secretTag }));
+          } catch (err) {
+            throw new ProviderSecretsDecryptError(provider.slug, err);
+          }
+          if (!Array.isArray(parsed)) throw new ProviderSecretsDecryptError(provider.slug, new Error('decrypted payload is not a list'));
+          return parsed;
+        },
+      });
+      const rowsFor = (slug?: string) =>
+        dbState.providerConfigs
+          .filter((c) => c.environment === tier())
+          .map((c) => ({ c, provider: dbState.providers.find((p) => p.id === c.providerId) }))
+          .filter((x): x is { c: ProviderConfigRow; provider: ProviderRow } => !!x.provider && (!slug || x.provider.slug === slug));
+      const upsert = (providerId: string, expectedVersion: number, kind: 'management' | 'secrets', apply: (row: ProviderConfigRow) => void) => {
+        const versionKey = kind === 'management' ? 'managementVersion' : 'secretsVersion';
+        let row = dbState.providerConfigs.find((c) => c.providerId === providerId && c.environment === tier());
+        if (!row) {
+          row = {
+            id: `pcfg_${randomUUID().slice(0, 8)}`, providerId, environment: tier(),
+            encryptedSecret: null, secretIv: null, secretTag: null,
+            managementConfig: null, managementVersion: 0, secretsVersion: 0,
+            createdAt: new Date(), updatedAt: new Date(),
+          };
+          apply(row);
+          row[versionKey] = expectedVersion + 1;
+          dbState.providerConfigs.push(row);
+          return { saved: true as const, version: row[versionKey]! };
+        }
+        if ((row[versionKey] ?? 0) !== expectedVersion) return { saved: false as const };
+        apply(row);
+        row[versionKey] = (row[versionKey] ?? 0) + 1;
+        row.updatedAt = new Date();
+        return { saved: true as const, version: row[versionKey]! };
+      };
+      return {
+        async loadAll() {
+          return rowsFor().map(({ provider, c }) => toState(provider, c));
+        },
+        async load(slug: string) {
+          const found = rowsFor(slug)[0];
+          return found ? toState(found.provider, found.c) : null;
+        },
+        async saveManagement(input: { slug: string; name: string; category: string; management: object; expectedVersion: number }) {
+          const providerId = providerIdFor(input.slug, input.name, input.category);
+          const doc = structuredClone(input.management) as Record<string, unknown>;
+          return upsert(providerId, input.expectedVersion, 'management', (row) => { row.managementConfig = doc; });
+        },
+        async saveSecrets(input: { slug: string; name: string; category: string; secrets: { field: string; label: string; value: string }[]; expectedVersion: number }) {
+          if (!process.env.SECRET_ENCRYPTION_KEY) throw new SecretEncryptionKeyMissingError('persist');
+          const payload: EncryptedPayload = encryptSecret(JSON.stringify(input.secrets));
+          const providerId = providerIdFor(input.slug, input.name, input.category);
+          return upsert(providerId, input.expectedVersion, 'secrets', (row) => {
+            row.encryptedSecret = payload.encrypted;
+            row.secretIv = payload.iv;
+            row.secretTag = payload.tag;
+          });
+        },
+      };
+    })(),
     checkDatabaseHealth: async () => {
       if (dbState.failEventWrites) {
         return { status: 'unhealthy', latencyMs: 1, details: { error: 'simulated down' } };
+      }
+      if (dbState.simulatedDbHealth) {
+        const latencyMs = { healthy: 5, degraded: 450, unhealthy: 1500 }[dbState.simulatedDbHealth];
+        return { status: dbState.simulatedDbHealth, latencyMs, details: {} };
       }
       return { status: 'healthy', latencyMs: 5, details: {} };
     },

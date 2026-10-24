@@ -104,6 +104,100 @@ SMTP_USER=...
 SMTP_PASS=...
 ```
 
+### 2a. Railway Service Configuration (api-gateway, worker) — Phase 23-24
+
+The values below are what the code in this repository expects. Railway's
+dashboard settings are NOT in this repository (Railway "Config as Code"
+`railway.json` is deprecated and cannot be adopted by new services), so each
+item must be checked on the live service by someone with Railway access.
+
+**Start strategy (decided in Phase 23-24).** Both services run their
+TypeScript sources directly with an in-process transpile-only loader:
+
+```
+"start": "exec node --import tsx src/index.ts"
+```
+
+- Why not a compiled `dist/`: every workspace package (`@company/database`,
+  `@company/providers`, ...) is consumed as TypeScript source (`"main":
+  "src/index.ts"`). A plain `tsc` emit of a service produces
+  `dist/services/<svc>/src/index.js` whose `require('@company/...')` still
+  resolves to `.ts` files Node cannot load, so a real compiled artifact would
+  mean either compiling and re-pointing every package or adding a bundler —
+  an architecture change. The previous `"start": "node dist/index.js"` with
+  `"build": "tsc --noEmit"` pointed at a file nothing ever produced and is the
+  MODULE_NOT_FOUND crash the live deployment hit on every boot.
+- `start` no longer depends on `build` having run, so the two can't drift
+  apart again — and the live Railway build command (below) never runs
+  `build` anyway.
+- Type safety is not lost: transpile-only skips type checking at runtime, but
+  CI's `Type check` gate and Railway's own build command (`type-check`) both
+  type-check before anything starts. Startup cost measured locally: `/health`
+  answers ~1–2 s after start.
+- `tsx` is a runtime **dependency** of both services (not a devDependency),
+  so a production install that prunes devDependencies still has it.
+- `exec` matters: npm runs scripts via `sh -c`, and without `exec` a SIGTERM
+  sent to `npm` (the process Railway's start command makes PID 1) killed npm
+  and the shell but never reached the Node process — graceful shutdown never
+  ran. With `exec`, npm forwards SIGTERM straight to the service.
+
+**Settings to verify on each Railway service** (observed on the live
+api-gateway service on 2026-10-23 where noted):
+
+| Setting | api-gateway | worker |
+|---|---|---|
+| Build command | `npm install && npm run type-check -w services/api-gateway` (observed, correct as-is) | `npm install && npm run type-check -w services/worker` |
+| Start command | `npm run start -w services/api-gateway` (observed, correct as-is) | `npm run start -w services/worker` |
+| Healthcheck path | `/ready` (observed) | `/ready`, with `WORKER_HEALTH_PORT` equal to the port Railway probes (Railway probes `PORT`, so set both to the same value, e.g. `3002`) |
+| Draining time (`RAILWAY_DEPLOYMENT_DRAINING_SECONDS`) | ≥ 35 (Railway default is **0** = SIGKILL immediately; the gateway drains for up to 30 s) | ≥ 35 (the worker's shutdown waits up to 30 s) |
+| Wait for CI (GitHub autodeploy) | **enabled** — Railway deploys straight from the GitHub repository, bypassing `.github/workflows/deploy.yml` (whose deploy steps are placeholders); only this setting makes a Railway deploy wait for the CI workflow, including the `Service boot smoke` gate | same |
+| `TRUST_PROXY` | `1` — see below | n/a (no per-IP logic) |
+| Required variables | `NODE_ENV=production`, `DATABASE_URL`, `REDIS_URL`, `PORTAL_JWT_SECRET`, `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY`, `ADMIN_API_CREDENTIALS`, `CORS_ORIGINS` | `NODE_ENV=production`, `DATABASE_URL`, `REDIS_URL`, `WEBHOOK_HMAC_SECRET`, `SECRET_ENCRYPTION_KEY` |
+
+Observed on 2026-10-23: the live api-gateway service had no `DATABASE_URL`,
+`REDIS_URL`, `PORTAL_JWT_SECRET` or `ADMIN_API_CREDENTIALS` variables. With
+those missing, the gateway now boots but `/ready` answers 503 (database,
+provider state, admin credentials), so Railway's deploy-time healthcheck on
+`/ready` will keep failing the deployment until they are set. In production
+the worker refuses to start at all without a reachable database.
+
+**`TRUST_PROXY` (PHASE14-03 / PHASE20-02).** Per-IP rate limits and the admin
+lockout key on `req.ip`. Unset, `req.ip` is the TCP peer — behind Railway's
+edge that is the edge's address for every caller, so all callers share one
+bucket and 10 wrong admin-token guesses from anyone lock out every admin.
+`TRUST_PROXY=1` trusts exactly one proxy hop: `req.ip` becomes the right-most
+`X-Forwarded-For` entry (the one the edge appends), and anything a client
+writes to the left of it is ignored. `true`/`*`/`0.0.0.0/0` are refused at boot
+(error log `TRUST_PROXY_INVALID`, trust stays off), because blanket trust lets
+any client pick its own `req.ip`. Accepted forms: a hop count `1`–`10`, or a
+comma list of proxy IPs/CIDRs (`loopback`, `linklocal`, `uniquelocal` allowed).
+
+Railway documents `X-Real-IP` as its client-IP header; it does not document
+the exact `X-Forwarded-For` behaviour of its edge. Before relying on
+`TRUST_PROXY=1`, verify it once on the live service: send
+`curl -H 'X-Forwarded-For: 203.0.113.9' https://<gateway-domain>/health` and
+confirm the gateway's `request received` log line shows your real address in
+`ip`, not `203.0.113.9`. If it shows `203.0.113.9`, the edge is passing client
+headers through unmodified — unset `TRUST_PROXY` again.
+
+**Restarts (PHASE19-03).** Railway's healthcheck runs only at deploy time
+(<https://docs.railway.com/deployments/healthchecks>); it never restarts a
+running instance, and the restart policy acts only when the process exits. A
+running instance whose queue fell back to memory at boot therefore reports
+`/ready` 503 indefinitely and is NOT recovered by the platform. Until the
+service itself acts on that (retrying Redis, or exiting so the restart policy
+restarts it), recover it with a manual restart and alert on the readiness
+signal. What Railway's `/ready` healthcheck does give: a NEW deployment that
+comes up in that state never receives traffic.
+
+**Logs (PHASE22-04).** Both services write one JSON object per line to
+stdout, which Railway captures natively and parses as structured logs —
+no log shipper is needed for day-to-day operation. Retention is Railway's
+plan window (7 days Hobby, 30 days Pro, up to 90 days Enterprise); longer
+retention (e.g. for audit or incident review) requires forwarding to an
+external aggregator, which is a separate decision. `GET
+/api/observability/logs` is only a 200-entry per-process ring buffer.
+
 ### 3. Webhook Registration (Per Provider)
 
 After deploying the webhook service, register endpoints with each provider:
@@ -213,9 +307,10 @@ Every PR must pass all of the following gates before merge:
 |------|---------|-------------|
 | Lint | `npm run lint` | ESLint with TypeScript rules |
 | Type Check | `npm run type-check` | TypeScript compiler (strict mode) |
-| Unit Tests | `npm test` | Vitest unit test suite |
-| Integration Tests | `npm run test:integration` | Vitest integration tests |
-| Build | `npm run build:all` | Build all workspaces |
+| Unit Tests | `npm test` | Vitest suite, with the `redis-server` binary installed so Redis-gated suites run; fails if any of them is skipped |
+| Integration Tests | `npm run test:integration` | Vitest integration suites against a real PostgreSQL 16 service container (`TEST_POSTGRES_URL`); fails if any Postgres-gated test is skipped |
+| Build | `npm run build:all` | Type-checks the services, builds the apps |
+| Service Boot Smoke | `npx tsx scripts/service-boot-smoke.ts <svc>` | Starts each service with its real `npm run start -w services/<svc>` against a real Redis; requires `/health` 200, a `/ready` report failing only on the (unreachable in CI) database, and a clean exit on SIGTERM |
 | Security Audit | `npm audit --audit-level=high` | Dependency vulnerability scan |
 | Migration Check | `npm run drizzle:check` | Validate schema matches code |
 

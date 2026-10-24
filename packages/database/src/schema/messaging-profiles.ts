@@ -6,6 +6,7 @@ import {
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * Master plan Phase 40/41 (A2P/10DLC compliance model). A MessagingProfile
@@ -26,7 +27,7 @@ export const messagingProfiles = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull(),
-    tenantId: text('tenant_id').notNull().default('default'),
+    tenantId: text('tenant_id').notNull(),
     country: text('country').notNull(), // ISO 3166-1 alpha-2, e.g. 'US', 'MW'
     senderType: text('sender_type').notNull(), // 'phone' | '10dlc' | 'tollfree' | 'shortcode' | 'alphanumeric'
     sender: text('sender').notNull(), // the actual number/code/alphanumeric ID
@@ -60,6 +61,7 @@ export const messagingProfiles = pgTable(
       t.sender,
       t.provider,
     ),
+    tenantIdNonBlank('messaging_profiles', t.tenantId),
   ],
 );
 

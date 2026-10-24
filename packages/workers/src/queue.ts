@@ -2,6 +2,7 @@ import { KVStore } from './store';
 import { Keys } from './keys';
 import { Job, JobType, JobPayload, EnqueueOptions, WorkerConfig, newJobId } from './types';
 import { computeBackoff } from './backoff';
+import { IdempotencyStore } from './idempotency';
 
 /**
  * Thrown by JobQueue.enqueue() when a job type's ready+delayed depth is
@@ -18,11 +19,15 @@ export class QueueBackpressureError extends Error {
 }
 
 export class JobQueue {
+  private idempotency: IdempotencyStore;
+
   constructor(
     private store: KVStore,
     private keys: Keys,
     private config: WorkerConfig,
-  ) {}
+  ) {
+    this.idempotency = new IdempotencyStore(store, keys, config.idempotencyTtlMs);
+  }
 
   async enqueue(
     type: JobType,
@@ -108,16 +113,31 @@ export class JobQueue {
     return job;
   }
 
-  async promoteDelayed(type: JobType): Promise<void> {
+  /**
+   * Moves due jobs from the delayed set to the ready list.
+   *
+   * B7 FIX: called concurrently by every worker loop (dequeue on an empty
+   * ready list) and by each replica's sweep timer, so several promoters can
+   * read the same `due` ids. ZREM is the claim: Redis executes it
+   * atomically, so for a given id exactly one caller gets 1 back and only
+   * that caller pushes it. Previously the return value was ignored and every
+   * promoter pushed the id, so two workers then ran the same job
+   * concurrently (probe2-A). Returns how many jobs THIS call promoted.
+   */
+  async promoteDelayed(type: JobType): Promise<number> {
     const now = Date.now();
     const due = await this.store.zrangebyscore(this.keys.delayed(type), 0, now);
-    if (due.length === 0) return;
+    if (due.length === 0) return 0;
 
+    let promoted = 0;
     for (const id of due) {
-      await this.store.zrem(this.keys.delayed(type), id);
+      const claimed = await this.store.zrem(this.keys.delayed(type), id);
+      if (claimed !== 1) continue; // another promoter already moved it
       await this.store.rpush(this.keys.ready(type), id);
+      promoted++;
     }
-    await this.store.publish(this.keys.notify(type), 'promoted');
+    if (promoted > 0) await this.store.publish(this.keys.notify(type), 'promoted');
+    return promoted;
   }
 
   async complete(job: Job): Promise<void> {
@@ -199,6 +219,16 @@ export class JobQueue {
 
       const staleMs = Date.now() - job.updatedAt;
       if (staleMs < staleThresholdMs) continue;
+
+      // B6 FIX: the crashed attempt never released its idempotency claim,
+      // so the rescued job would otherwise find it `processing` and be
+      // marked completed without running. Rescuing the job means its
+      // previous attempt is judged dead, so release that attempt's claim —
+      // only if this job owns it (a claim held by another job sharing the
+      // key is left alone).
+      if (job.idempotencyKey) {
+        await this.idempotency.releaseAbandonedClaim(job.idempotencyKey, job.id);
+      }
 
       job.status = 'pending';
       job.runAt = Date.now();

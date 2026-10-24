@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
-import { ProviderRegistry } from '@company/providers';
+import { ProviderRegistry, ProviderStateSync, ProviderStateConflictError } from '@company/providers';
 import {
   RoutingEngine,
   ConsentBlockedError,
@@ -14,8 +14,26 @@ import {
   MESSAGE_CHANNELS,
 } from '@company/routing';
 import { EventBus, WebhookDelivery } from '@company/events';
-import { TransactionEvent, TransactionStatusResponse, ProviderCapabilityMatch, type MessageChannel, type MessageChannelPolicy } from '@company/schemas';
-import { AuthService, createMiddleware } from './auth';
+import {
+  TransactionEvent,
+  TransactionStatusResponse,
+  ProviderCapabilityMatch,
+  type MessageChannel,
+  type MessageChannelPolicy,
+  parseMoneyAmount,
+  parseCurrencyCode,
+  parseMessageRecipient,
+  parseMessageContent,
+  parseProviderConfigUpdate,
+  parseProviderManagementUpdate,
+} from '@company/schemas';
+import { AuthService, createMiddleware, clientIp } from './auth';
+import { parseTrustProxy } from './trust-proxy';
+import {
+  loadAdminCredentials,
+  ADMIN_TOKEN_QUERY_PARAMS,
+  type AdminIdentity,
+} from './admin-auth';
 import {
   TenantRegistry,
   tenantRepository,
@@ -51,15 +69,15 @@ import {
   customerNoteRepository,
   supportTicketRepository,
   ticketCommentRepository,
-  ensureProviderRow,
-  persistProviderSecrets,
-  loadAllProviderSecrets,
+  providerStateStore,
+  SecretEncryptionKeyMissingError,
   webhookEventRepository,
   outboxEventRepository,
   paymentOutcomeFromEvent,
   supplierRepository,
   SupplierScope,
   inboundMessageHoldRepository,
+  auditLogRepository,
   type InboundMessageHold,
   keywordCommandRepository,
   keywordCommandDispatchRepository,
@@ -91,6 +109,17 @@ import {
   ingestWebhook,
   runDurableWebhookConsumer,
   WebhookConsumerBusyError,
+  ReadinessGate,
+  probeQueueStore,
+  probeDatabase,
+  probeEventBus,
+  probeProviderState,
+  probeSecrets,
+  missingSecrets,
+  readinessUp,
+  readinessDown,
+  readinessFailed,
+  type ProbeResult,
   type KVStore,
   type Keys,
   type WorkerConfig,
@@ -478,6 +507,27 @@ function paymentConflictResource(prior: PaymentTransactionRow) {
 
 const app = express();
 
+// Phase 23-24 (PHASE14-03 / PHASE20-02): which proxies may set req.ip via
+// X-Forwarded-For — an explicit hop count or proxy address list from
+// TRUST_PROXY, never a blanket `true` (see trust-proxy.ts). Set before any
+// middleware reads req.ip.
+const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+app.set('trust proxy', trustProxy.setting);
+if (trustProxy.error) {
+  logger.error('TRUST_PROXY refused — per-IP rate limits and the admin lockout key on the TCP peer address', {
+    operation: 'startup',
+    errorCode: 'TRUST_PROXY_INVALID',
+    status: 'degraded',
+    error: trustProxy.error,
+  });
+} else {
+  logger.info('client address resolution configured', {
+    operation: 'startup',
+    status: 'configured',
+    trustProxy: trustProxy.description,
+  });
+}
+
 // P1-1: Restrict CORS to configured origins
 const allowedOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
@@ -590,6 +640,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
         tenantId,
         ...(supplierId ? { supplierId } : {}),
       };
+      // Phase 20-21 (C7): the authenticated administrator, on admin routes.
+      const adminId = (req as AdminRequest).admin?.id;
+      if (adminId) logFields.adminId = adminId;
       if (!verified) {
         const claimedTenant = req.header('x-tenant-id');
         if (claimedTenant) logFields.unverifiedTenantHeader = claimedTenant.slice(0, 64);
@@ -611,8 +664,15 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // Records a gateway operation against the observability metrics + logs it.
+//
+// Phase 15 (gap register A14d): observe() no longer feeds the circuit
+// breaker. RoutingEngine.dispatch() records every real provider attempt
+// (including each one that failed earlier in a failover cascade) — here,
+// only the FINAL event of a request is visible, and a thrown routing failure
+// carries `providerOverride || 'failed_route'`, not the provider that
+// failed. Direct adapter calls outside the engine (refunds) record their own
+// outcome via recordTrafficResult().
 function observe(event: TransactionEvent) {
-  recordTrafficResult(event.providerId, event.status, event.latency);
   setContextField('providerId', event.providerId);
   setContextField('applicationId', event.appId);
 
@@ -647,13 +707,28 @@ const auth = new AuthService({
     windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000,
     max: Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
   },
+  // Phase 14 (C15): strict per-IP budget for login / signup / checkout pay.
+  authRateLimit: {
+    windowMs: Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60_000,
+    max: Number(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) || 20,
+  },
+  // Phase 20-21 (PHASE14-06): dedicated per-IP counter of FAILED admin-token
+  // attempts — separate from, and much stricter than, the general budget.
+  adminAuthFailureLimit: {
+    windowMs: Number(process.env.ADMIN_AUTH_FAILURE_WINDOW_MS) || 15 * 60_000,
+    max: Number(process.env.ADMIN_AUTH_MAX_FAILURES) || 10,
+  },
 });
 const mw = createMiddleware(auth);
 
+// Phase 14 (C14): per-application once the API key really authenticates,
+// otherwise per caller IP — never keyed on the raw, attacker-chosen key string.
 app.use('/v1/api', mw.rateLimit);
-// P0: Rate-limit admin endpoints to prevent brute-force attacks
-app.use('/api/dashboard', mw.rateLimit);
-app.use('/api/observability', mw.rateLimit);
+// P0: Rate-limit admin endpoints to prevent brute-force attacks.
+// Phase 14 (C14): by caller IP only — admin auth is x-admin-token, so an
+// x-api-key header must not be able to mint a fresh bucket per guess.
+app.use('/api/dashboard', mw.ipRateLimit);
+app.use('/api/observability', mw.ipRateLimit);
 
 // P1-1: Request timeout middleware — prevents hung provider calls from holding connections.
 // A payment timeout must not automatically mean retry; ambiguous outcomes are reconciled via webhook.
@@ -759,60 +834,112 @@ eventBus.subscribe((event) => {
   });
 });
 
-// P0: Provider secrets added through the admin console previously lived
-// only in ProviderRegistry's in-memory Map — a secret survived until the
-// next restart, then silently reverted to whatever the process.env
-// fallback provided (or nothing). Read back every already-persisted
-// provider's secrets into the registry once at startup, and persist the
-// full current set after every admin add/delete (see the
-// /api/dashboard/providers/:id/secrets routes below).
-//
-// Fire-and-forget and non-blocking — server startup must not wait on a DB
-// round trip, and a provider with no persisted secrets yet (or
-// SECRET_ENCRYPTION_KEY unset, e.g. most non-production environments) is
-// expected, not an error: the adapter's process.env fallback still works
-// exactly as before this existed.
-async function hydrateProviderSecretsFromDb(): Promise<void> {
-  try {
-    const snapshot = await loadAllProviderSecrets();
-    for (const [slug, secrets] of Object.entries(snapshot)) {
-      registry.hydrateSecrets(slug, secrets);
+// Phase 15 (gap register E12/D13): provider configuration AND secrets are
+// persisted (provider_configs, via @company/database's providerStateStore)
+// and the database is the source of truth:
+//  - loaded at startup and AWAITED before any /v1 traffic is served
+//    (index.ts awaits it before listening; the gate below covers any other
+//    entry point). This replaces a fire-and-forget secrets-only hydration
+//    that let the first requests after a restart run on env-var or
+//    simulated credentials and on code-default routing configuration;
+//  - re-synced every PROVIDER_STATE_REFRESH_MS (default 5s), so an admin
+//    change made through ANY gateway replica reaches every gateway and
+//    worker replica within one interval;
+//  - admin writes go through it (mutatePersisted below): a change is
+//    reported as applied only once it is stored.
+// A provider whose persisted secrets cannot be decrypted is reported
+// loudly (error log + metric + /ready degraded) and withheld from routing —
+// never silently run on other credentials.
+const PROVIDER_STATE_REFRESH_MS = Number(process.env.PROVIDER_STATE_REFRESH_MS) || 5_000;
+const providerStateSync = new ProviderStateSync(registry, providerStateStore, {
+  intervalMs: PROVIDER_STATE_REFRESH_MS,
+  onReport(report) {
+    for (const failure of report.secretFailures) {
+      metrics.increment('providerSecretDecryptFailures');
+      logger.error('persisted provider secrets could not be decrypted — provider withheld from routing', {
+        operation: 'provider_state_sync',
+        providerId: failure.slug,
+        errorCode: 'PROVIDER_SECRETS_DECRYPT_FAILED',
+        status: 'failed',
+        error: failure.error,
+      });
     }
-  } catch (err) {
-    logger.warn('provider secrets hydration failed — adapters still work via env-var fallback', {
-      operation: 'startup',
-      errorCode: 'PROVIDER_SECRETS_HYDRATE_FAILED',
+  },
+  onError(err) {
+    logger.error('provider state load failed', {
+      operation: 'provider_state_sync',
+      errorCode: 'PROVIDER_STATE_LOAD_FAILED',
       status: 'failed',
       error: err instanceof Error ? err.message : String(err),
     });
-  }
+  },
+}).start();
+
+/**
+ * Resolves once the startup load of persisted provider state has finished
+ * (successfully or not — see providerStateStatus()). index.ts awaits it
+ * before listening.
+ */
+export const providerStateReady: Promise<void> = providerStateSync.initialLoad;
+
+export function providerStateStatus() {
+  return providerStateSync.status();
 }
-void hydrateProviderSecretsFromDb();
 
-// Encrypts and stores the provider's full current secrets set — called
-// fire-and-forget after every successful addSecret()/deleteSecret() below.
-// Never blocks or fails the HTTP response: the in-memory registry (what
-// every real adapter call actually reads) is already correct the moment
-// addSecret()/deleteSecret() returns; this only affects whether that state
-// survives the *next* restart, not the current request.
-function persistProviderSecretsAsync(id: string): void {
-  const secrets = registry.exportSecretsForPersistence(id);
-  if (secrets === null) return;
-  const config = registry.getAllConfigs().find((c) => c.id === id);
-  if (!config) return;
+// Exposed so tests can force an immediate re-sync instead of waiting on the
+// refresh interval. Not used by any production code path.
+export function syncProviderStateForTests(): Promise<void> {
+  return providerStateSync.syncOnce();
+}
 
-  (async () => {
-    await ensureProviderRow({ slug: id, name: config.name, category: config.category });
-    await persistProviderSecrets(id, secrets);
-  })().catch((err) => {
-    logger.warn('provider secrets persistence failed — in-memory state is still correct', {
-      operation: 'provider_secrets_persist',
+// Never serve provider traffic on configuration that was not loaded. In
+// production a failed startup load keeps /v1 at 503 until a later re-sync
+// succeeds; outside production (local dev without a database) the
+// code-default configuration is still usable, as before.
+app.use('/v1', async (_req: Request, res: Response, next: NextFunction) => {
+  await providerStateReady;
+  if (!providerStateSync.status().loaded && process.env.NODE_ENV === 'production') {
+    return res.status(503).json({ error: 'Provider configuration is not loaded yet', code: 'provider_state_unavailable' });
+  }
+  next();
+});
+
+// Applies an admin change to provider configuration/secrets THROUGH the
+// store and answers the request: 404 when the provider/item does not exist,
+// 409 when concurrent writers kept winning, 503 when the change could not
+// be persisted (store unreachable, SECRET_ENCRYPTION_KEY missing) — and in
+// both failure cases nothing was changed anywhere.
+async function persistProviderChange<T>(
+  res: Response,
+  id: string,
+  kind: 'management' | 'secrets',
+  mutate: () => T | null,
+): Promise<{ ok: true; result: T } | { ok: false }> {
+  try {
+    const result = await registry.mutatePersisted(providerStateStore, id, kind, mutate);
+    if (result === null) {
+      res.status(404).json({ error: `Provider '${id}' or the referenced item was not found` });
+      return { ok: false };
+    }
+    return { ok: true, result };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error('provider change not persisted — not applied', {
+      operation: kind === 'secrets' ? 'provider_secrets_persist' : 'provider_management_persist',
       providerId: id,
-      errorCode: 'PROVIDER_SECRETS_PERSIST_FAILED',
+      errorCode: err instanceof SecretEncryptionKeyMissingError ? 'SECRET_ENCRYPTION_KEY_MISSING' : 'PROVIDER_STATE_PERSIST_FAILED',
       status: 'failed',
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
     });
-  });
+    if (err instanceof ProviderStateConflictError) {
+      res.status(409).json({ error: err.message, code: err.code });
+    } else if (err instanceof SecretEncryptionKeyMissingError) {
+      res.status(503).json({ error: err.message, code: err.code });
+    } else {
+      res.status(503).json({ error: `Provider change was not persisted and has not been applied: ${message}`, code: 'provider_state_persist_failed' });
+    }
+    return { ok: false };
+  }
 }
 
 // ----------------------------------------------------
@@ -927,35 +1054,320 @@ async function resolveTenantContext(req: Request, res: Response, next: NextFunct
 }
 
 // ----------------------------------------------------
-// ADMIN AUTHORIZATION
+// ADMIN AUTHORIZATION (Phase 20-21, gap register C7 / PHASE14-06)
 // ----------------------------------------------------
-// Mutating provider-management endpoints require an admin token.
-// Token is provided via the `x-admin-token` header.
-// In production, ADMIN_API_TOKEN must be explicitly set.
-const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+// Every /api/dashboard/* and /api/observability/* route is admin-only (the
+// blanket guard below; the per-route requireAdmin calls are kept for
+// readability and are no-ops once the guard has authenticated a request).
+//
+//   - Credential transport: the `x-admin-token` HEADER only. A token in the
+//     query string (?token= — the old EventSource/SSE fallback) is refused
+//     with 400 and never even evaluated: URLs end up in proxy/access logs,
+//     browser history and Referer headers.
+//   - Identity: each administrator has their own named credential
+//     (ADMIN_API_CREDENTIALS — see admin-auth.ts), compared in constant time.
+//     The shared ADMIN_API_TOKEN is accepted outside production only.
+//   - Failed attempts: a DEDICATED per-IP counter of wrong tokens
+//     (ADMIN_AUTH_MAX_FAILURES per ADMIN_AUTH_FAILURE_WINDOW_MS, default 10
+//     per 15 min), separate from the general per-IP budget; once exceeded,
+//     that address gets 429 for every admin request — even with a correct
+//     token, so a locked-out caller learns nothing.
+//   - Audit: every authenticated admin request is written to audit_logs
+//     (actor_type 'admin', actor_id = credential id) BEFORE the handler runs
+//     and completed with its outcome afterwards; a mutating request whose
+//     audit row cannot be written is refused (503) — no unattributed change.
+//     Denied attempts (wrong token / token in query / lockout) are audited
+//     as admin.auth.* rows without an actor.
 const isProduction = process.env.NODE_ENV === 'production';
-if (!ADMIN_API_TOKEN && isProduction) {
-  logger.error('ADMIN_API_TOKEN is not set in production — admin endpoints are INSECURE', {
+const adminCredentials = loadAdminCredentials(process.env);
+for (const error of adminCredentials.errors) {
+  logger.error(`ADMIN_API_CREDENTIALS: ${error}`, { operation: 'startup', errorCode: 'ADMIN_CREDENTIAL_INVALID', status: 'failed' });
+}
+for (const warning of adminCredentials.warnings) {
+  logger.warn(warning, { operation: 'startup', errorCode: 'ADMIN_CREDENTIAL_WARNING', status: 'degraded' });
+}
+if (adminCredentials.set.usableCount(isProduction) === 0 && isProduction) {
+  logger.error('no usable admin credentials in production (ADMIN_API_CREDENTIALS) — admin endpoints answer 503', {
     operation: 'startup',
     errorCode: 'MISSING_ADMIN_TOKEN',
     status: 'failed',
   });
 }
 
-function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  // EventSource (used for /api/dashboard/stream) can't set custom headers, so
-  // that one route needs a query-param fallback — the standard pattern for
-  // authenticating SSE connections in browsers.
-  const token = req.header('x-admin-token') || (req.query.token as string | undefined);
-  if (!ADMIN_API_TOKEN) {
-    // P0: Never bypass admin auth — require token in ALL environments
+/** True while this process can authenticate at least one admin in the CURRENT environment. */
+function adminAuthConfigured(): boolean {
+  return adminCredentials.set.usableCount(process.env.NODE_ENV === 'production') > 0;
+}
+
+type AdminRequest = Request & { admin?: AdminIdentity; adminAuditId?: string | null };
+
+/** The authenticated administrator. Throws on a route that is not behind requireAdmin (a programming error). */
+function adminIdentity(req: Request): AdminIdentity {
+  const admin = (req as AdminRequest).admin;
+  if (!admin) throw new Error('adminIdentity() used on a route without admin authentication');
+  return admin;
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function adminAuditBase(req: Request) {
+  return {
+    applicationId: null,
+    userId: null,
+    actorType: 'admin' as const,
+    ipAddress: clientIp(req),
+    userAgent: (req.header('user-agent') || '').slice(0, 512) || null,
+  };
+}
+
+/** The request path without its query string (stable whether or not a router has re-based req.path). */
+function adminRequestPath(req: Request): string {
+  return (req.originalUrl || req.url).split('?')[0];
+}
+
+/**
+ * The matched route pattern ("/api/dashboard/providers/:id" — every admin
+ * route is registered on `app` with its full path), else the raw path
+ * (e.g. an unknown path under /api/dashboard).
+ */
+function adminRoutePattern(req: Request): string {
+  const routePath = (req as Request & { route?: { path?: unknown } }).route?.path;
+  return typeof routePath === 'string' ? routePath : adminRequestPath(req);
+}
+
+function adminAuditDetails(req: Request, extra: Record<string, unknown>): string {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? Object.keys(req.body) : [];
+  return JSON.stringify({
+    method: req.method,
+    path: adminRequestPath(req),
+    requestId: getContext().requestId,
+    // Field NAMES only — admin bodies carry provider secrets.
+    ...(body.length > 0 ? { bodyFields: body.slice(0, 50) } : {}),
+    ...extra,
+  });
+}
+
+/** Best-effort audit row for a DENIED admin attempt (never throws). */
+function auditAdminDenied(req: Request, action: string, reason: string, statusCode: number | null) {
+  auditLogRepository
+    .create({
+      ...adminAuditBase(req),
+      actorId: null,
+      action,
+      resource: 'admin_auth',
+      resourceId: null,
+      outcome: action === 'admin.auth.locked' ? 'locked' : 'denied',
+      statusCode,
+      details: adminAuditDetails(req, {
+        reason,
+        ...(action === 'admin.auth.locked' ? { maxFailures: auth.adminFailure.max, windowMs: auth.adminFailure.windowMs } : {}),
+      }),
+    })
+    .catch((err: unknown) => {
+      metrics.increment('adminAuditWriteFailures');
+      logger.error('admin audit write failed', {
+        operation: 'admin-audit',
+        errorCode: 'ADMIN_AUDIT_WRITE_FAILED',
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+}
+
+function adminOutcome(res: Response): string {
+  if (!res.writableFinished) return res.headersSent && res.statusCode < 400 ? 'stream_closed' : 'aborted';
+  if (res.statusCode >= 500) return 'server_error';
+  if (res.statusCode >= 400) return 'client_error';
+  return 'success';
+}
+
+/**
+ * Writes the 'started' audit row for an authenticated admin request and
+ * arranges for it to be completed with the outcome. Returns false (and has
+ * answered 503) when a MUTATING request could not be audited.
+ */
+async function beginAdminAudit(req: Request, res: Response, admin: AdminIdentity): Promise<boolean> {
+  const started = Date.now();
+  const mutating = MUTATING_METHODS.has(req.method);
+  let auditId: string | null = null;
+  try {
+    const row = await auditLogRepository.create({
+      ...adminAuditBase(req),
+      actorId: admin.id,
+      action: `${req.method} ${adminRequestPath(req)}`,
+      resource: 'admin_api',
+      resourceId: null,
+      outcome: 'started',
+      statusCode: null,
+      details: adminAuditDetails(req, {}),
+    });
+    auditId = row.id;
+  } catch (err) {
+    metrics.increment('adminAuditWriteFailures');
+    logger.error('admin audit write failed', {
+      operation: 'admin-audit',
+      errorCode: 'ADMIN_AUDIT_WRITE_FAILED',
+      status: 'failed',
+      adminId: admin.id,
+      method: req.method,
+      path: adminRequestPath(req),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    if (mutating) {
+      res.status(503).json({
+        error: { code: 'admin_audit_unavailable', message: 'The admin audit log could not be written, so this change was NOT made. Retry shortly.' },
+      });
+      return false;
+    }
+  }
+  (req as AdminRequest).adminAuditId = auditId;
+
+  let completed = false;
+  const complete = () => {
+    if (completed) return;
+    completed = true;
+    const pattern = adminRoutePattern(req);
+    const outcome = adminOutcome(res);
+    const statusCode = res.headersSent ? res.statusCode : null;
+    logger.info('admin action', {
+      operation: 'admin-audit',
+      status: outcome,
+      adminId: admin.id,
+      method: req.method,
+      route: pattern,
+      statusCode,
+    });
+    if (!auditId) return;
+    const id = auditId;
+    auditLogRepository
+      .completeAdminAction(id, {
+        // The pattern, not the raw path, once the route has matched — so
+        // "every PATCH of any provider" is one action value.
+        action: `${req.method} ${pattern}`,
+        outcome,
+        statusCode,
+        details: adminAuditDetails(req, {
+          route: pattern,
+          params: req.params,
+          durationMs: Date.now() - started,
+        }),
+      })
+      .catch((err: unknown) => {
+        metrics.increment('adminAuditWriteFailures');
+        logger.error('admin audit completion failed', {
+          operation: 'admin-audit',
+          errorCode: 'ADMIN_AUDIT_WRITE_FAILED',
+          status: 'failed',
+          adminId: admin.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  };
+  res.on('finish', complete);
+  res.on('close', complete);
+  return true;
+}
+
+function adminDenied(res: Response, status: number, code: string, message: string) {
+  return res.status(status).json({ error: message, code });
+}
+
+async function requireAdminImpl(req: Request, res: Response, next: NextFunction) {
+  const areq = req as AdminRequest;
+  if (areq.admin) return next(); // already authenticated (blanket guard, then the route's own requireAdmin)
+
+  // 1. Never accept — or even evaluate — a credential from the URL.
+  const queryParam = ADMIN_TOKEN_QUERY_PARAMS.find((k) => req.query[k] !== undefined);
+  if (queryParam) {
+    metrics.increment('adminAuthQueryTokenRejected');
+    logger.warn('admin token sent in the query string — refused', {
+      operation: 'admin-auth',
+      errorCode: 'ADMIN_TOKEN_IN_QUERY',
+      status: 'failed',
+      path: adminRequestPath(req),
+      ip: clientIp(req),
+    });
+    auditAdminDenied(req, 'admin.auth.denied', 'token_in_query_string', 400);
+    return res.status(400).json({
+      error: 'Admin credentials must be sent in the x-admin-token header, never in the URL',
+      code: 'admin_token_in_query',
+    });
+  }
+
+  if (!adminAuthConfigured()) {
+    // P0: Never bypass admin auth — require a credential in ALL environments
     return res.status(503).json({ error: 'Admin access not configured' });
   }
-  if (!token || token !== ADMIN_API_TOKEN) {
-    return res.status(403).json({ error: 'Forbidden: administrator authorization required' });
+
+  // 2. Dedicated failed-attempt lockout, checked BEFORE any comparison.
+  const ip = clientIp(req);
+  const lock = await auth.adminAuthLockState(ip);
+  if (lock.locked) {
+    metrics.increment('adminAuthLockedRejections');
+    logger.warn('admin auth refused: address locked out after repeated failed attempts', {
+      operation: 'admin-auth',
+      errorCode: 'ADMIN_AUTH_LOCKED',
+      status: 'failed',
+      ip,
+      failures: lock.failures,
+    });
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(lock.retryAfterMs / 1000))));
+    return adminDenied(res, 429, 'admin_auth_locked', 'Too many failed admin authentication attempts from this address');
   }
+
+  // 3. Header-only, constant-time, per-identity.
+  const token = req.header('x-admin-token');
+  if (!token) {
+    return adminDenied(res, 403, 'admin_auth_required', 'Forbidden: administrator authorization required');
+  }
+  const admin = adminCredentials.set.verify(token, process.env.NODE_ENV === 'production');
+  if (!admin) {
+    const after = await auth.recordAdminAuthFailure(ip);
+    metrics.increment('adminAuthFailures');
+    logger.warn('admin auth failed: invalid admin token', {
+      operation: 'admin-auth',
+      errorCode: 'ADMIN_AUTH_INVALID',
+      status: 'failed',
+      ip,
+      failures: after.failures,
+      path: adminRequestPath(req),
+    });
+    if (after.locked) {
+      // Past the limit inside a concurrent burst: not evaluated, not audited
+      // again (the attempt that reached the limit wrote the lockout row).
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil(after.retryAfterMs / 1000))));
+      return adminDenied(res, 429, 'admin_auth_locked', 'Too many failed admin authentication attempts from this address');
+    }
+    auditAdminDenied(req, 'admin.auth.denied', 'invalid_token', 403);
+    if (after.failures >= auth.adminFailure.max) {
+      // This attempt used up the address's allowance: it is locked out from
+      // now until the window ends. One row per lockout, not per refused request.
+      logger.warn('admin auth lockout started for address', {
+        operation: 'admin-auth',
+        errorCode: 'ADMIN_AUTH_LOCKOUT_STARTED',
+        status: 'failed',
+        ip,
+        failures: after.failures,
+      });
+      auditAdminDenied(req, 'admin.auth.locked', 'too_many_failed_attempts', null);
+    }
+    return adminDenied(res, 403, 'admin_auth_invalid', 'Forbidden: administrator authorization required');
+  }
+  if (lock.failures > 0) await auth.clearAdminAuthFailures(ip);
+
+  areq.admin = admin;
+  if (!(await beginAdminAudit(req, res, admin))) return;
   return next();
 }
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  requireAdminImpl(req, res, next).catch(next);
+}
+
+// Blanket guard: nothing under these prefixes is reachable without admin
+// auth — including GET /api/dashboard/providers, which used to have none
+// (C7's compounding finding), and any route added here in the future.
+app.use(['/api/dashboard', '/api/observability'], requireAdmin);
 
 // ----------------------------------------------------
 // DEVELOPER PORTAL AUTHORIZATION
@@ -1145,33 +1557,66 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
-app.get('/ready', async (req: Request, res: Response) => {
-  const deps: Record<string, string> = {};
+// Phase 19 (gap register B13/C6): /ready reports what this instance can
+// actually do, not what it was configured to do. It used to count an
+// in-memory rate limiter as healthy (and report 'redis' whenever REDIS_URL
+// was merely set), and never looked at the job queue's real backing store,
+// the EventBus connection or the required secrets — so an instance whose
+// queue had silently fallen back to a per-process MemoryStore (jobs never
+// reach the worker) still took traffic. See packages/workers/src/readiness.ts
+// for the up/down/failed model and the grace period for transient blips.
+// Phase 20-21 (C7): the admin credential requirement is "at least one admin
+// credential usable in THIS environment" (adminAuthConfigured) rather than a
+// plain env-var presence check — in production the shared ADMIN_API_TOKEN no
+// longer counts, and a set-but-malformed ADMIN_API_CREDENTIALS is missing.
+const GATEWAY_REQUIRED_SECRETS = ['PORTAL_JWT_SECRET', 'WEBHOOK_HMAC_SECRET', 'SECRET_ENCRYPTION_KEY'] as const;
+const readinessGate = new ReadinessGate();
 
-  // P2-5: Check database connectivity
+function probeRateLimiter(): ProbeResult {
+  const info = auth.getRateLimiterInfo();
+  if (info.type === 'redis') return info.storeBacked ? readinessUp('redis') : readinessDown('redis-disconnected');
+  // REDIS_URL set but the Redis limiter could not even be created (ioredis
+  // missing): every request is limited per replica, permanently.
+  if (info.redisConfigured) return readinessFailed('in-memory-fallback');
+  return readinessUp('in-memory');
+}
+
+app.get('/ready', async (req: Request, res: Response) => {
+  const production = process.env.NODE_ENV === 'production';
+  const probes: Record<string, ProbeResult> = {};
+
+  // P2-5: database connectivity
+  probes.database = await probeDatabase(checkDatabaseHealth);
+
+  // P2-4: rate limiter — Redis only counts while actually connected
+  probes.rateLimiter = probeRateLimiter();
+
+  // Phase 15: provider configuration/secrets come from the database —
+  // 'ready' only once loaded, 'degraded' while any provider's persisted
+  // secrets cannot be decrypted (that provider is withheld from routing).
+  probes.providers = probeProviderState(providerStateSync.status());
+
+  // The queue webhooks/inbound messages are handed to the worker through.
   try {
-    const dbHealth = await checkDatabaseHealth();
-    deps.database = dbHealth.status;
+    const { store, config } = await getGatewayQueue();
+    probes.queue = probeQueueStore(store, config.redisUrl, production);
   } catch {
-    deps.database = 'unreachable';
+    probes.queue = readinessFailed('unavailable');
   }
 
-  // P2-4: Report rate limiter backend
-  const rlInfo = auth.getRateLimiterInfo();
-  deps.rateLimiter = rlInfo.storeBacked ? 'redis' : 'in-memory';
+  probes.eventBus = probeEventBus(eventBus.getRedisStatus());
 
-  // Provider registry is in-memory — always "ready" if process is up
-  deps.providers = 'ready';
+  const missing = [...(adminAuthConfigured() ? [] : ['ADMIN_API_CREDENTIALS']), ...missingSecrets(GATEWAY_REQUIRED_SECRETS)];
+  probes.secrets = probeSecrets(missing, production);
 
-  const allHealthy = Object.values(deps).every(
-    (v) => v === 'healthy' || v === 'ready' || v === 'in-memory' || v === 'redis',
-  );
-  const status = allHealthy ? 'ready' : 'degraded';
-
-  res.status(allHealthy ? 200 : 503).json({
-    status,
+  const report = readinessGate.evaluate(probes);
+  res.status(report.ready ? 200 : 503).json({
+    status: report.ready ? 'ready' : 'degraded',
     service: 'api-gateway',
-    dependencies: deps,
+    dependencies: report.dependencies,
+    failing: report.failing,
+    degraded: report.degraded,
+    ...(missing.length > 0 ? { missingSecrets: missing } : {}),
     timestamp: new Date().toISOString()
   });
 });
@@ -1204,11 +1649,15 @@ app.post('/v1/api/gateway/payment', mw.apiKey, resolveTenantContext, asyncHandle
     return invalidRequest(res, 'idempotency_key', `Idempotency-Key must be a string of at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`);
   }
   const idempotencyKey: string | undefined = typeof rawIdempotencyKey === 'string' && rawIdempotencyKey !== '' ? rawIdempotencyKey : undefined;
-  // The amount is now written to the transactions row BEFORE routing, so a
-  // non-numeric/non-positive amount must be a 400 here, not a database error.
-  if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-    return invalidRequest(res, 'amount', 'amount must be a positive number');
-  }
+  // The amount is written to the transactions row BEFORE routing, and it is
+  // in MAJOR currency units (49.99 = USD 49.99; each adapter converts to its
+  // provider's wire format). Phase 17-18 (C10): this used to be only
+  // `Number(amount) > 0`, which let `true` (→ 1), `[5]`, "0x10" (→ 16) and
+  // sub-cent values like 49.999999 through to a provider.
+  const amountCheck = parseMoneyAmount(amount);
+  if (!amountCheck.ok) return invalidRequest(res, amountCheck.field, amountCheck.message);
+  const currencyCheck = parseCurrencyCode(currency, { required: false });
+  if (!currencyCheck.ok) return invalidRequest(res, currencyCheck.field, currencyCheck.message);
 
   // paymentToken / country / metadata used to be silently dropped here, so
   // every card adapter fell back to a fabricated "success" (gap register
@@ -1397,9 +1846,16 @@ app.post('/v1/api/gateway/messaging', mw.apiKey, resolveTenantContext, async (re
   // P0: Use the authenticated (link-verified) tenant, NOT the request body
   const { tenantId, supplierId } = authContext(req);
 
-  if (!appId || !recipient || !content) {
+  if (!appId) {
     return res.status(400).json({ error: 'Missing required parameters: appId, recipient, and content are required' });
   }
+  // Phase 17-18 (C10): recipient/content used to be checked for presence
+  // only — a number, a non-address string or a whitespace body went straight
+  // to a provider.
+  const recipientCheck = parseMessageRecipient(recipient);
+  if (!recipientCheck.ok) return invalidRequest(res, recipientCheck.field, recipientCheck.message);
+  const contentCheck = parseMessageContent(content);
+  if (!contentCheck.ok) return invalidRequest(res, contentCheck.field, contentCheck.message);
   // Phase 10: explicit channel + opt-in channel-switch policy (see
   // parseMessagingChannelFields). Absent channel = legacy inferred default.
   const channelFields = parseMessagingChannelFields(req.body ?? {});
@@ -1564,7 +2020,8 @@ app.get('/v1/api/gateway/transaction/:id', mw.apiKey, resolveTenantContext, (req
 });
 
 // POST /refunds — refund a previously captured payment. See docs/openapi.yaml.
-app.post('/refunds', mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
+// Phase 14 (C15): rate limited like /v1/api (it isn't under that mount).
+app.post('/refunds', mw.rateLimit, mw.apiKey, resolveTenantContext, asyncHandler(async (req: Request, res: Response) => {
   const appId = (req as Request & { appId?: string }).appId;
   const refundScope = authContext(req);
   const { tenantId } = refundScope;
@@ -1671,6 +2128,7 @@ app.post('/refunds', mw.apiKey, resolveTenantContext, asyncHandler(async (req: R
     );
 
     eventBus.emit(refundEvent);
+    recordTrafficResult(refundEvent.providerId, refundEvent.status, refundEvent.latency);
     observe(refundEvent);
 
     const refund = {
@@ -2196,11 +2654,11 @@ app.get('/api/dashboard/applications/:appId/keyword-commands', requireAdmin, asy
 
 app.put('/api/dashboard/applications/:appId/keyword-commands/:keyword', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
-  // The admin token carries no identity (gap register C7): the operator
-  // names themselves, recorded verbatim on the row.
-  if (typeof body.updatedBy !== 'string' || body.updatedBy.trim() === '' || body.updatedBy.length > 200) {
-    return invalidRequest(res, 'updatedBy', 'updatedBy is required, at most 200 characters');
-  }
+  // Phase 20-21 (gap register C7): the row is attributed to the
+  // AUTHENTICATED administrator. `updatedBy` used to be required free text
+  // from the body (the shared admin token carried no identity); a body
+  // value is now ignored.
+  const admin = adminIdentity(req);
   try {
     const row = await keywordCommandRepository.upsert(
       req.params.appId,
@@ -2214,12 +2672,13 @@ app.put('/api/dashboard/applications/:appId/keyword-commands/:keyword', requireA
         workflowId: body.workflowId,
         enabled: body.enabled,
       },
-      `operator:${body.updatedBy.trim()}`,
+      `operator:${admin.id}`,
     );
     logger.warn('application-wide keyword command configured', {
       operation: 'keyword-command-upsert',
       status: 'success',
       applicationId: req.params.appId,
+      adminId: admin.id,
     });
     return res.json(keywordCommandView(row));
   } catch (err) {
@@ -2412,10 +2871,13 @@ app.get('/api/dashboard/customers/:id', requireAdmin, asyncHandler(async (req: R
   return res.json(customer);
 }));
 
+// Phase 20-21 (gap register C18 / C7): a note's / comment's author is the
+// AUTHENTICATED administrator — a client-supplied `authorName` (which let
+// anyone holding the shared token write as anyone) is ignored.
 app.post('/api/dashboard/customers/:id/notes', requireAdmin, async (req: Request, res: Response) => {
-  const { body, authorName } = req.body || {};
+  const { body } = req.body || {};
   try {
-    const note = await crmRegistry.addNote(req.params.id, authorName, body);
+    const note = await crmRegistry.addNote(req.params.id, adminIdentity(req).id, body);
     return res.status(201).json(note);
   } catch (err: any) {
     return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add note' });
@@ -2458,9 +2920,9 @@ app.patch('/api/dashboard/tickets/:id', requireAdmin, async (req: Request, res: 
 });
 
 app.post('/api/dashboard/tickets/:id/comments', requireAdmin, async (req: Request, res: Response) => {
-  const { body, authorName } = req.body || {};
+  const { body } = req.body || {};
   try {
-    const comment = await crmRegistry.addTicketComment(req.params.id, authorName, body);
+    const comment = await crmRegistry.addTicketComment(req.params.id, adminIdentity(req).id, body);
     return res.status(201).json(comment);
   } catch (err: any) {
     return res.status(err instanceof CrmError ? 400 : 500).json({ error: err.message || 'Failed to add comment' });
@@ -2523,9 +2985,11 @@ app.post('/api/dashboard/playground/dispatch', requireAdmin, async (req: Request
       const { amount, currency, paymentMethod, providerOverride, phoneNumber } = fields;
       const extras = parsePaymentExtras(fields);
       if (!extras.ok) return invalidRequest(res, extras.field, extras.message);
-      if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
-        return invalidRequest(res, 'amount', 'amount must be a positive number');
-      }
+      // Same money validation as the public route (Phase 17-18, C10).
+      const amountCheck = parseMoneyAmount(amount);
+      if (!amountCheck.ok) return invalidRequest(res, amountCheck.field, amountCheck.message);
+      const currencyCheck = parseCurrencyCode(currency, { required: false });
+      if (!currencyCheck.ok) return invalidRequest(res, currencyCheck.field, currencyCheck.message);
       const idempotencyKey = typeof fields.idempotencyKey === 'string' && fields.idempotencyKey ? fields.idempotencyKey : undefined;
       // Same rule as the public route: a durable transaction row (and its id,
       // the provider idempotency identity's payment_transaction_id) exists
@@ -2647,7 +3111,8 @@ function slugify(input: string): string {
     .slice(0, 60) || 'app';
 }
 
-app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
+// Phase 14 (C15): strict per-IP budget against signup abuse.
+app.post('/v1/portal/auth/signup', mw.authRateLimit, async (req: Request, res: Response) => {
   const { companyName, email, password } = req.body;
   if (!companyName || !email || !password) {
     return res.status(400).json({ error: 'companyName, email, and password are required' });
@@ -2719,7 +3184,8 @@ app.post('/v1/portal/auth/signup', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/v1/portal/auth/login', async (req: Request, res: Response) => {
+// Phase 14 (C15): strict per-IP budget against password brute force.
+app.post('/v1/portal/auth/login', mw.authRateLimit, async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required' });
@@ -2830,16 +3296,20 @@ app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, a
   if (!appId) {
     return res.status(400).json({ error: 'Missing parameter: appId is required' });
   }
-  if (!amount || !currency) {
-    return res.status(400).json({ error: 'amount and currency are required' });
-  }
+  // Phase 17-18 (C10): this was only `!amount || !currency`, so "-5", "abc"
+  // or 49.999 created a session that /pay would later try to charge. Same
+  // MAJOR-unit, 2-decimal rule as the payment route.
+  const amountCheck = parseMoneyAmount(amount);
+  if (!amountCheck.ok) return invalidRequest(res, amountCheck.field, amountCheck.message);
+  const currencyCheck = parseCurrencyCode(currency, { required: true });
+  if (!currencyCheck.ok) return invalidRequest(res, currencyCheck.field, currencyCheck.message);
 
   const token = randomUUID().replace(/-/g, '');
   const session = await checkoutSessionRepository.create({
     token,
     appId,
     tenantId,
-    amount: String(amount),
+    amount: String(amountCheck.value),
     currency,
     successUrl: successUrl || null,
     cancelUrl: cancelUrl || null,
@@ -2858,7 +3328,8 @@ app.post('/v1/api/gateway/checkout-sessions', mw.apiKey, resolveTenantContext, a
 // Public — no API key. The session token is itself the capability: it's
 // single-use, expiring, and scoped to exactly the amount/currency/app it
 // was created for, so the browser never needs the application's secret key.
-app.get('/v1/checkout/sessions/:token', async (req: Request, res: Response) => {
+// Phase 14 (C15): per-IP budget against session-token enumeration.
+app.get('/v1/checkout/sessions/:token', mw.ipRateLimit, async (req: Request, res: Response) => {
   await checkoutSessionRepository.markExpiredIfPast(req.params.token);
   const session = await checkoutSessionRepository.findByToken(req.params.token);
   if (!session) {
@@ -2874,7 +3345,8 @@ app.get('/v1/checkout/sessions/:token', async (req: Request, res: Response) => {
   });
 });
 
-app.post('/v1/checkout/sessions/:token/pay', async (req: Request, res: Response) => {
+// Phase 14 (C15): strict per-IP budget — this route charges cards (card testing).
+app.post('/v1/checkout/sessions/:token/pay', mw.authRateLimit, async (req: Request, res: Response) => {
   await checkoutSessionRepository.markExpiredIfPast(req.params.token);
   const session = await checkoutSessionRepository.findByToken(req.params.token);
   if (!session) {
@@ -3026,7 +3498,10 @@ app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Requ
 //
 // The pipeline is now, strictly in order:
 //   1 receive
-//   2 authenticate (HMAC over the exact raw request bytes, timing-safe)
+//   2 authenticate over the exact raw request bytes, timing-safe — the
+//     provider's OWN native signature scheme when its adapter implements one
+//     and its secret is configured (Phase 26, gap register E10), otherwise
+//     the platform's shared WEBHOOK_HMAC_SECRET (x-webhook-signature)
 //   3 validate shape (JSON object with a provider event id)
 //   4 identify provider (must be registered)
 //   5 identify application   6 identify tenant
@@ -3045,7 +3520,12 @@ const MAX_PROVIDER_EVENT_ID_LENGTH = 255;
 
 function extractProviderEventId(body: unknown): string | null {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  const id = (body as Record<string, unknown>).id;
+  // `id` (Stripe, Airwallex, the platform-signed shape), else `event_id` —
+  // the top-level event identity Square and NMI put in their natively-signed
+  // webhook bodies (Phase 26, E10: without it those verified webhooks could
+  // never be accepted at all).
+  const record = body as Record<string, unknown>;
+  const id = record.id !== undefined && record.id !== null ? record.id : record.event_id;
   if (typeof id === 'number' && Number.isFinite(id)) return String(id);
   if (typeof id !== 'string') return null;
   const trimmed = id.trim();
@@ -3123,31 +3603,81 @@ function webhookReject(res: Response, provider: string, status: number, errorCod
   return res.status(status).json({ error });
 }
 
+/** Express request headers → the flat lowercase map verifyProviderWebhookSignature() reads. */
+function webhookHeaderMap(req: Request): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    out[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
+  }
+  return out;
+}
+
 app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Response) => {
   // 1. receive
   const provider = req.params.provider;
   setContextField('providerId', provider);
-  const signature = req.header('x-webhook-signature');
 
   // 2. authenticate
   const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
   if (!webhookSecret) {
+    // Still required when a native scheme verifies the request: the job the
+    // worker consumes is attested with it (see below).
     return webhookReject(res, provider, 503, 'NO_WEBHOOK_SECRET', 'Webhook verification not configured');
-  }
-  if (!signature) {
-    return webhookReject(res, provider, 401, 'MISSING_SIGNATURE', 'Missing webhook signature');
   }
   // Verify over the exact bytes received (express.json's verify hook keeps
   // them on req.rawBody) — a re-serialised JSON.stringify(req.body) can
   // differ from what the sender signed. Falls back only if absent.
   const stashed = (req as Request & { rawBody?: Buffer }).rawBody;
   const rawBody = stashed ? stashed.toString('utf8') : typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-  const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(signature, 'hex');
-  if (!(a.length === b.length && timingSafeEqual(a, b))) {
-    return webhookReject(res, provider, 401, 'INVALID_SIGNATURE', 'Invalid webhook signature');
+
+  // 2a. The provider's OWN signature (Phase 26, gap register E10). The 7
+  // native verifiers (stripe, nmi, flutterwave, paychangu, airwallex, square,
+  // whatsapp) used to be dead code: only the platform's shared secret was
+  // ever checked, so no webhook was ever cryptographically tied to the
+  // provider that supposedly sent it.
+  //   true  → verified by the provider's real scheme.
+  //   false → that provider's native secret IS configured and the request
+  //           failed it: authoritative — rejected, with NO fallback to the
+  //           shared platform secret (otherwise anyone holding that one
+  //           secret could bypass the provider's real protection).
+  //   null  → no native scheme / no native secret configured → the platform
+  //           x-webhook-signature check below, exactly as before.
+  const adapter = registry.getProvider(provider);
+  let nativeVerified: boolean | null = null;
+  if (adapter) {
+    try {
+      nativeVerified = await adapter.verifyProviderWebhookSignature(rawBody, webhookHeaderMap(req));
+    } catch {
+      nativeVerified = false; // a verifier that throws never authenticates anything
+    }
   }
+  if (nativeVerified === false) {
+    return webhookReject(res, provider, 401, 'INVALID_PROVIDER_SIGNATURE', 'Invalid provider webhook signature');
+  }
+
+  let signature: string;
+  if (nativeVerified === true) {
+    // The worker re-verifies every job against WEBHOOK_HMAC_SECRET before
+    // processing it (packages/workers/src/jobs/*Webhook.ts) — that check
+    // guards the queue, not the provider. For a natively-verified webhook
+    // the gateway attests it with the platform secret over the same raw
+    // bytes, AFTER the provider's own signature passed, so the worker
+    // accepts exactly what the gateway authenticated and nothing else.
+    signature = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+  } else {
+    const platformSignature = req.header('x-webhook-signature');
+    if (!platformSignature) {
+      return webhookReject(res, provider, 401, 'MISSING_SIGNATURE', 'Missing webhook signature');
+    }
+    const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(platformSignature, 'hex');
+    if (!(a.length === b.length && timingSafeEqual(a, b))) {
+      return webhookReject(res, provider, 401, 'INVALID_SIGNATURE', 'Invalid webhook signature');
+    }
+    signature = platformSignature;
+  }
+  const verificationMethod: 'native' | 'platform' = nativeVerified === true ? 'native' : 'platform';
 
   // 3. validate shape — the provider event id IS the durable identity; a
   // webhook without one could never be de-duplicated, so it is refused.
@@ -3163,7 +3693,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   }
 
   // 4. identify provider
-  if (!registry.getProvider(provider)) {
+  if (!adapter) {
     return webhookReject(res, provider, 401, 'UNKNOWN_PROVIDER', 'Unknown provider');
   }
 
@@ -3197,7 +3727,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   switch (outcome.kind) {
     case 'accepted':
     case 'recovered': {
-      logger.info('webhook received', { operation: 'webhook', providerId: provider, status: 'success' });
+      logger.info('webhook received', { operation: 'webhook', providerId: provider, status: 'success', verificationMethod });
       // Monitoring only; processing is driven by the enqueued jobs.
       eventBus.emit({
         id: `wh_${Date.now()}_${randomUUID().slice(0, 8)}`,
@@ -3212,7 +3742,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
         payload: req.body,
         response: null,
       });
-      return res.json({ received: true, webhookEventId: outcome.event.id });
+      return res.json({ received: true, webhookEventId: outcome.event.id, verificationMethod });
     }
     case 'duplicate':
       logger.warn('webhook duplicate — already durably recorded, acknowledged without re-enqueue', {
@@ -3281,28 +3811,38 @@ export function getWebhookDeliveryForTests() {
 // ----------------------------------------------------
 // DASHBOARD MANAGEMENT ENDPOINTS
 // ----------------------------------------------------
-// Every mutating/sensitive route below already has its own requireAdmin
-// (ADMIN_API_TOKEN via x-admin-token, checked further up in this file) —
-// there used to also be a blanket app.use('/api/dashboard', mw.admin) here
-// checking a second, incompatible mechanism (PLATFORM_ADMIN_KEY via
-// x-admin-key/authorization). Since it ran first in the middleware chain,
-// it rejected every request — including to the intentionally-public
-// GET /providers below — before requireAdmin ever got a chance, no matter
-// what admin token was supplied. Removed along with the now-fully-dead
-// checkAdmin()/adminKey/mw.admin (see auth.ts).
-
-app.get('/api/dashboard/providers', (req: Request, res: Response) => {
+// Every route below is behind the blanket admin guard registered with
+// requireAdmin further up in this file (and names requireAdmin itself).
+// (There used to also be a blanket app.use('/api/dashboard', mw.admin)
+// checking a second, incompatible mechanism — PLATFORM_ADMIN_KEY — which
+// rejected every request; removed along with checkAdmin()/mw.admin.)
+//
+// Phase 20-21 (gap register C7, compounding finding): GET /providers used to
+// be deliberately PUBLIC — it returned every provider's fee configuration,
+// routing rules, error rates and live/configured status to anyone. It is
+// admin-only like every other dashboard route.
+app.get('/api/dashboard/providers', requireAdmin, (req: Request, res: Response) => {
   return res.json(registry.getAllManagementViews());
 });
 
-app.patch('/api/dashboard/providers/:id', requireAdmin, (req: Request, res: Response) => {
+// Phase 15 (E12): every write below goes through the database
+// (persistProviderChange) and reaches every replica — it is no longer a
+// mutation of this one process's memory.
+app.patch('/api/dashboard/providers/:id', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const updates = req.body;
+  // Phase 17-18 (C10, PHASE15-02/03): this used to spread the RAW body into
+  // the live config — including fields that are not persisted (a name /
+  // category "rename" applied on this replica only) and wrongly-typed ones
+  // that other replicas then loaded differently. Only the persisted,
+  // admin-controlled fields, type- and range-checked, get through; anything
+  // else is a 400 and nothing is changed anywhere.
+  const parsed = parseProviderConfigUpdate(req.body);
+  if (!parsed.ok) return invalidRequest(res, parsed.field, parsed.message);
+  const updates = parsed.value;
 
-  const updatedConfig = registry.updateProviderConfig(id, updates);
-  if (!updatedConfig) {
-    return res.status(404).json({ error: `Provider '${id}' not found` });
-  }
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.updateProviderConfig(id, updates));
+  if (!persisted.ok) return;
+  const updatedConfig = persisted.result;
 
   const sseMsg = {
     id: 'config_' + Date.now(),
@@ -3320,7 +3860,7 @@ app.patch('/api/dashboard/providers/:id', requireAdmin, (req: Request, res: Resp
   eventBus.emit(sseMsg);
 
   return res.json(updatedConfig);
-});
+}));
 
 // ----------------------------------------------------
 // PROVIDER MANAGEMENT SURFACE
@@ -3334,13 +3874,18 @@ app.get('/api/dashboard/providers/:id/management', requireAdmin, (req: Request, 
   return res.json(view);
 });
 
-app.patch('/api/dashboard/providers/:id/management', requireAdmin, (req: Request, res: Response) => {
-  const updated = registry.updateManagement(req.params.id, req.body || {});
-  if (!updated) {
-    return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
-  }
-  return res.json(updated);
-});
+app.patch('/api/dashboard/providers/:id/management', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id;
+  // Phase 17-18 (C10, PHASE15-03): e.g. `currencies: "USD"` used to be
+  // stored as a string here and persisted as ["U","S","D"]. See
+  // parseProviderManagementUpdate.
+  const parsed = parseProviderManagementUpdate(req.body);
+  if (!parsed.ok) return invalidRequest(res, parsed.field, parsed.message);
+  const updates = parsed.value;
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.updateManagement(id, updates));
+  if (!persisted.ok) return;
+  return res.json(persisted.result);
+}));
 
 app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
   const secrets = registry.getSecrets(req.params.id);
@@ -3350,27 +3895,27 @@ app.get('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res
   return res.json(secrets);
 });
 
-app.post('/api/dashboard/providers/:id/secrets', requireAdmin, (req: Request, res: Response) => {
+// Gap register D13: a secret write used to answer 201 and persist in the
+// background — silently not at all when SECRET_ENCRYPTION_KEY was unset.
+// Now it is answered only after the encrypted set is stored (503, and no
+// change anywhere, otherwise).
+app.post('/api/dashboard/providers/:id/secrets', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { field, label, value } = req.body || {};
   if (!field || !label || !value) {
     return res.status(400).json({ error: 'Missing parameters: field, label, and value are required' });
   }
-  const meta = registry.addSecret(req.params.id, { field, label, value });
-  if (!meta) {
-    return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
-  }
-  persistProviderSecretsAsync(req.params.id);
-  return res.status(201).json(meta);
-});
+  const id = req.params.id;
+  const persisted = await persistProviderChange(res, id, 'secrets', () => registry.addSecret(id, { field, label, value }));
+  if (!persisted.ok) return;
+  return res.status(201).json(persisted.result);
+}));
 
-app.delete('/api/dashboard/providers/:id/secrets/:secretId', requireAdmin, (req: Request, res: Response) => {
-  const removed = registry.deleteSecret(req.params.id, req.params.secretId);
-  if (!removed) {
-    return res.status(404).json({ error: `Secret '${req.params.secretId}' not found for provider '${req.params.id}'` });
-  }
-  persistProviderSecretsAsync(req.params.id);
+app.delete('/api/dashboard/providers/:id/secrets/:secretId', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const { id, secretId } = req.params;
+  const persisted = await persistProviderChange(res, id, 'secrets', () => (registry.deleteSecret(id, secretId) ? true : null));
+  if (!persisted.ok) return;
   return res.json({ success: true });
-});
+}));
 
 app.get('/api/dashboard/providers/:id/routing', requireAdmin, (req: Request, res: Response) => {
   const rules = registry.getRoutingRules(req.params.id);
@@ -3380,38 +3925,38 @@ app.get('/api/dashboard/providers/:id/routing', requireAdmin, (req: Request, res
   return res.json(rules);
 });
 
-app.post('/api/dashboard/providers/:id/routing', requireAdmin, (req: Request, res: Response) => {
+app.post('/api/dashboard/providers/:id/routing', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const { match, target, description, enabled } = req.body || {};
   if (!match || !target) {
     return res.status(400).json({ error: 'Missing parameters: match and target are required' });
   }
-  const rule = registry.addRoutingRule(req.params.id, {
+  const id = req.params.id;
+  const persisted = await persistProviderChange(res, id, 'management', () => registry.addRoutingRule(id, {
     match,
     target,
     description,
     enabled: enabled !== false
+  }));
+  if (!persisted.ok) return;
+  return res.status(201).json(persisted.result);
+}));
+
+app.patch('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const { id, ruleId } = req.params;
+  const persisted = await persistProviderChange(res, id, 'management', () => {
+    const rule = registry.updateRoutingRule(id, ruleId, req.body || {});
+    return rule ? { ...rule } : null;
   });
-  if (!rule) {
-    return res.status(404).json({ error: `Provider '${req.params.id}' not found` });
-  }
-  return res.status(201).json(rule);
-});
+  if (!persisted.ok) return;
+  return res.json(persisted.result);
+}));
 
-app.patch('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, (req: Request, res: Response) => {
-  const updated = registry.updateRoutingRule(req.params.id, req.params.ruleId, req.body || {});
-  if (!updated) {
-    return res.status(404).json({ error: `Routing rule '${req.params.ruleId}' not found for provider '${req.params.id}'` });
-  }
-  return res.json(updated);
-});
-
-app.delete('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, (req: Request, res: Response) => {
-  const removed = registry.deleteRoutingRule(req.params.id, req.params.ruleId);
-  if (!removed) {
-    return res.status(404).json({ error: `Routing rule '${req.params.ruleId}' not found for provider '${req.params.id}'` });
-  }
+app.delete('/api/dashboard/providers/:id/routing/:ruleId', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const { id, ruleId } = req.params;
+  const persisted = await persistProviderChange(res, id, 'management', () => (registry.deleteRoutingRule(id, ruleId) ? true : null));
+  if (!persisted.ok) return;
   return res.json({ success: true });
-});
+}));
 
 app.post('/api/dashboard/providers/:id/health-check', requireAdmin, async (req: Request, res: Response) => {
   try {
@@ -3481,7 +4026,7 @@ app.post('/api/dashboard/outbox/dead/replay', requireAdmin, asyncHandler(async (
     eventType: typeof body.eventType === 'string' ? body.eventType : undefined,
     limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
   });
-  logger.warn('outbox dead letters replayed by operator', { operation: 'outbox-replay', status: 'success', count: rows.length });
+  logger.warn('outbox dead letters replayed by operator', { operation: 'outbox-replay', status: 'success', count: rows.length, adminId: adminIdentity(req).id });
   return res.json({ replayed: rows.length, ids: rows.map((r) => r.id) });
 }));
 
@@ -3492,7 +4037,7 @@ app.post('/api/dashboard/outbox/:id/replay', requireAdmin, asyncHandler(async (r
   }
   const replayed = await outboxEventRepository.replayDead(id);
   if (replayed) {
-    logger.warn('outbox dead letter replayed by operator', { operation: 'outbox-replay', status: 'success' });
+    logger.warn('outbox dead letter replayed by operator', { operation: 'outbox-replay', status: 'success', adminId: adminIdentity(req).id });
     return res.json({ replayed: true, event: replayed });
   }
   const current = await outboxEventRepository.findById(id);
@@ -3553,7 +4098,7 @@ app.get('/api/dashboard/payments/reconciliation', requireAdmin, asyncHandler(asy
 app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
   if (!UUID_PATTERN.test(id)) return res.status(400).json({ error: 'invalid payment transaction id' });
-  const body = (req.body ?? {}) as { status?: unknown; providerTransactionId?: unknown; note?: unknown; resolvedBy?: unknown };
+  const body = (req.body ?? {}) as { status?: unknown; providerTransactionId?: unknown; note?: unknown };
   const status = body.status;
   if (status !== 'success' && status !== 'failed' && status !== 'cancelled') {
     return invalidRequest(res, 'status', "status must be one of 'success', 'failed', 'cancelled' (the outcome verified with the provider)");
@@ -3561,11 +4106,12 @@ app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asy
   if (typeof body.note !== 'string' || body.note.trim() === '' || body.note.length > 2000) {
     return invalidRequest(res, 'note', 'note is required (how the outcome was verified), at most 2000 characters');
   }
-  // The admin token carries no identity (gap register C7), so the operator
-  // names themselves; recorded verbatim for the audit trail.
-  if (typeof body.resolvedBy !== 'string' || body.resolvedBy.trim() === '' || body.resolvedBy.length > 200) {
-    return invalidRequest(res, 'resolvedBy', 'resolvedBy is required, at most 200 characters');
-  }
+  // Phase 20-21 (gap register PHASE6-03 / C7): resolvedBy is the
+  // AUTHENTICATED administrator. It used to be free text from the body (the
+  // shared admin token carried no identity), so a financial reconciliation
+  // decision could be recorded under any name; a body `resolvedBy` is now
+  // ignored.
+  const resolvedBy = adminIdentity(req).id;
   const providerTransactionId = body.providerTransactionId;
   if (providerTransactionId !== undefined && (typeof providerTransactionId !== 'string' || providerTransactionId === '' || providerTransactionId.length > 255)) {
     return invalidRequest(res, 'providerTransactionId', 'providerTransactionId must be a non-empty string of at most 255 characters');
@@ -3576,7 +4122,7 @@ app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asy
     fillProviderTransactionId: typeof providerTransactionId === 'string' ? providerTransactionId : undefined,
     resolution: {
       source: 'operator',
-      resolvedBy: body.resolvedBy.trim(),
+      resolvedBy,
       note: body.note.trim(),
       resolvedStatus: status,
       providerTransactionId: providerTransactionId ?? null,
@@ -3595,6 +4141,7 @@ app.post('/api/dashboard/payments/reconciliation/:id/resolve', requireAdmin, asy
     status: 'success',
     paymentTransactionId: id,
     resolvedStatus: status,
+    adminId: resolvedBy,
   });
   return res.json({ resolved: true, transaction: reconciliationView(result.transaction) });
 }));
@@ -3645,30 +4192,26 @@ app.get('/api/dashboard/inbound-holds', requireAdmin, asyncHandler(async (req: R
   return res.json({ counts, data: rows.map(inboundHoldView) });
 }));
 
-function operatorMeta(res: Response, body: { note?: unknown; resolvedBy?: unknown }): { note: string; resolvedBy: string } | null {
+function operatorMeta(req: Request, res: Response, body: { note?: unknown }): { note: string; resolvedBy: string } | null {
   if (typeof body.note !== 'string' || body.note.trim() === '' || body.note.length > 2000) {
     invalidRequest(res, 'note', 'note is required (how the owner was established), at most 2000 characters');
     return null;
   }
-  // The admin token carries no identity (gap register C7), so the operator
-  // names themselves; recorded verbatim for the audit trail.
-  if (typeof body.resolvedBy !== 'string' || body.resolvedBy.trim() === '' || body.resolvedBy.length > 200) {
-    invalidRequest(res, 'resolvedBy', 'resolvedBy is required, at most 200 characters');
-    return null;
-  }
-  return { note: body.note.trim(), resolvedBy: body.resolvedBy.trim() };
+  // Phase 20-21 (gap register C7): resolvedBy is the AUTHENTICATED
+  // administrator — it used to be self-declared free text from the body.
+  return { note: body.note.trim(), resolvedBy: adminIdentity(req).id };
 }
 
 app.post('/api/dashboard/inbound-holds/:id/resolve', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
   if (!UUID_PATTERN.test(id)) return res.status(400).json({ error: 'invalid hold id' });
-  const body = (req.body ?? {}) as { appId?: unknown; tenantId?: unknown; supplierId?: unknown; note?: unknown; resolvedBy?: unknown };
+  const body = (req.body ?? {}) as { appId?: unknown; tenantId?: unknown; supplierId?: unknown; note?: unknown };
   if (typeof body.appId !== 'string' || body.appId === '') return invalidRequest(res, 'appId', 'appId is required');
   if (typeof body.tenantId !== 'string' || body.tenantId === '') return invalidRequest(res, 'tenantId', 'tenantId is required');
   if (body.supplierId !== undefined && body.supplierId !== null && typeof body.supplierId !== 'string') {
     return invalidRequest(res, 'supplierId', 'supplierId must be a string or null');
   }
-  const meta = operatorMeta(res, body);
+  const meta = operatorMeta(req, res, body);
   if (!meta) return;
   const result = await inboundMessageHoldRepository.resolve(
     id,
@@ -3696,6 +4239,7 @@ app.post('/api/dashboard/inbound-holds/:id/resolve', requireAdmin, asyncHandler(
     holdId: id,
     applicationId: body.appId,
     tenantId: body.tenantId,
+    adminId: meta.resolvedBy,
   });
   return res.json({ resolved: true, hold: inboundHoldView(result.hold) });
 }));
@@ -3703,17 +4247,50 @@ app.post('/api/dashboard/inbound-holds/:id/resolve', requireAdmin, asyncHandler(
 app.post('/api/dashboard/inbound-holds/:id/discard', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id;
   if (!UUID_PATTERN.test(id)) return res.status(400).json({ error: 'invalid hold id' });
-  const meta = operatorMeta(res, (req.body ?? {}) as { note?: unknown; resolvedBy?: unknown });
+  const meta = operatorMeta(req, res, (req.body ?? {}) as { note?: unknown });
   if (!meta) return;
   const row = await inboundMessageHoldRepository.discard(id, meta);
   if (!row) return res.status(409).json({ discarded: false, error: 'hold not found or not pending' });
   return res.json({ discarded: true, hold: inboundHoldView(row) });
 }));
 
-// Confirms an admin token without performing any mutation.
+// Confirms an admin token without performing any mutation, and says whose it is.
 app.get('/api/dashboard/admin/verify', requireAdmin, (req: Request, res: Response) => {
-  return res.json({ ok: true, role: 'admin' });
+  const admin = adminIdentity(req);
+  return res.json({ ok: true, role: 'admin', adminId: admin.id, legacySharedToken: admin.legacy });
 });
+
+// Phase 20-21 (gap register C7): the platform-level admin audit trail — who
+// did what, when, with what outcome. Only actor_type 'admin' rows with no
+// application (never any application's own audit rows).
+app.get('/api/dashboard/admin/audit-logs', requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const limit = Number(req.query.limit);
+  const rows = await auditLogRepository.listAdminActions({
+    actorId: typeof req.query.actorId === 'string' ? req.query.actorId : undefined,
+    action: typeof req.query.action === 'string' ? req.query.action : undefined,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+  });
+  return res.json({
+    data: rows.map((r) => ({
+      id: r.id,
+      actorType: r.actorType,
+      actorId: r.actorId,
+      action: r.action,
+      resource: r.resource,
+      outcome: r.outcome,
+      statusCode: r.statusCode,
+      details: (() => {
+        try {
+          return r.details ? JSON.parse(r.details) : null;
+        } catch {
+          return r.details;
+        }
+      })(),
+      ipAddress: r.ipAddress,
+      createdAt: r.createdAt,
+    })),
+  });
+}));
 
 // ----------------------------------------------------
 // OBSERVABILITY ENDPOINTS
@@ -3774,6 +4351,12 @@ app.get('/api/dashboard/metrics', requireAdmin, (req: Request, res: Response) =>
   });
 });
 
+// Phase 20-21 (C7): authenticated like every other admin route — x-admin-token
+// HEADER only. The old `?token=` query fallback (for the browser EventSource
+// API, which cannot set headers) is gone: the admin console now reads this
+// stream with fetch() + a ReadableStream, which can. The connection is
+// audited when it opens (outcome 'started') and completed when it closes
+// ('stream_closed'), attributed to the admin who opened it.
 app.get('/api/dashboard/stream', requireAdmin, (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',

@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
@@ -34,6 +35,10 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
     try {
       await eventRepository.create({
         appId: event.appId,
+        // Phase 16 (gap register D14/D16): the tenant goes in the column,
+        // not only in the payload — omitting it stored every tenant's
+        // messaging event as tenant 'default'.
+        ...(tenantId ? { tenantId } : {}),
         category: 'messaging',
         providerId: event.providerId,
         status: event.status,
@@ -48,7 +53,12 @@ export function createMessageDeliveryProcessor(deps: JobDeps): JobProcessor {
     } catch (err) {
       // P1: Fail the job on DB error so it can be retried — previously this
       // was silently swallowed and the job was marked complete.
-      console.error('[message_delivery] Neon write failed — failing job for retry', err);
+      logger.error('message delivery event write failed — failing job for retry', {
+        operation: 'message_delivery',
+        errorCode: 'DB_WRITE_FAILED',
+        status: 'failed',
+        error: err,
+      });
       throw new Error('message_delivery: database write failed — retrying');
     }
 

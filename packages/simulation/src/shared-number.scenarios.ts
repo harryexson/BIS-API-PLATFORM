@@ -66,7 +66,7 @@ export interface SharedNumberWorld {
   haulpro: Party;
   stayscape: Party & { hotelA: string; hotelB: string };
   /** Every row in `events` whose payload.sender is this customer (any app). */
-  eventsFor(customer: string): Promise<Array<{ appId: string; decisionReason: string | null; payload: any }>>;
+  eventsFor(customer: string): Promise<Array<{ appId: string; tenantId: string | null; decisionReason: string | null; payload: any }>>;
   startWorker(): Promise<WorkerHandle>;
 }
 
@@ -529,6 +529,54 @@ export function registerSharedNumberScenarios(getWorld: () => SharedNumberWorld)
       expect(await consent(w.reach, c)).toBe('opted_out');
       expect(await senderOptOutRepository.find(REACH_DED, c, 'sms')).toBeUndefined();
       expect((await send(w.reach, c, 'still there?', { provider: 'infobip' })).status).toBe(403);
+    });
+  });
+
+  describe('Scenario 6 — Phase 16 (gap register D16): one owner, one number, two channels', () => {
+    it('an SMS thread and a WhatsApp thread of the same owner on the same number are distinct rows; a provider failover within a channel is not', async () => {
+      const c = customer('MW');
+      const owner = { tenantId: w.reach.tenantId, businessNumber: SHARED_MW };
+      const sms = await conversationRepository.upsert(c, w.reach.appSlug, { ...owner, providerId: 'signalhouse', channel: 'sms' });
+      const whatsapp = await conversationRepository.upsert(c, w.reach.appSlug, { ...owner, providerId: 'whatsapp', channel: 'whatsapp' });
+      // Before Phase 16 this was the SAME row, its channel flipped to
+      // 'whatsapp' — the SMS thread Phase 10's channel-scoped continuity
+      // looks for no longer existed.
+      expect(whatsapp.id).not.toBe(sms.id);
+
+      const failover = await conversationRepository.upsert(c, w.reach.appSlug, { ...owner, providerId: 'infobip', channel: 'sms' });
+      expect(failover.id).toBe(sms.id);
+
+      const threads = await conversationRepository.findActiveForOwner(c, { appId: w.reach.appSlug, tenantId: w.reach.tenantId });
+      expect(threads.map((t) => `${t.channel}:${t.providerId}:${t.businessNumber}`).sort()).toEqual([
+        `sms:infobip:${SHARED_MW}`,
+        `whatsapp:whatsapp:${SHARED_MW}`,
+      ]);
+    });
+
+    it('two threads of ONE owner are not mistaken for ambiguity: an inbound reply on the shared number still routes to that owner', async () => {
+      const c = customer('MW');
+      const owner = { tenantId: w.reach.tenantId, businessNumber: SHARED_MW };
+      await conversationRepository.upsert(c, w.reach.appSlug, { ...owner, providerId: 'signalhouse', channel: 'sms' });
+      await conversationRepository.upsert(c, w.reach.appSlug, { ...owner, providerId: 'whatsapp', channel: 'whatsapp' });
+
+      await inbound(c, SHARED_MW, 'Thank you!');
+      expect(await holdsFor(c)).toHaveLength(0);
+      const rows = await w.eventsFor(c);
+      expect(rows.some((r) => String(r.decisionReason).startsWith('inbound_from_') && r.appId === w.reach.appSlug)).toBe(true);
+    });
+
+    it("Phase 16 (D14/D16): inbound and keyword events are stored under the attributed owner's tenant, not 'default'", async () => {
+      const c = customer('MW');
+      await conversationRepository.upsert(c, w.reach.appSlug, { tenantId: w.reach.tenantId, businessNumber: SHARED_MW, providerId: 'signalhouse', channel: 'sms' });
+      await inbound(c, SHARED_MW, 'Hello again');
+      await inbound(c, SHARED_MW, 'HELP');
+      const rows = await w.eventsFor(c);
+      const inboundRow = rows.find((r) => String(r.decisionReason).startsWith('inbound_from_'));
+      const helpRow = rows.find((r) => r.decisionReason === 'keyword_help');
+      expect(inboundRow?.tenantId).toBe(w.reach.tenantId);
+      expect(helpRow?.tenantId).toBe(w.reach.tenantId);
+      // The tenant was always known — it is in the payload; only the column was 'default'.
+      expect(inboundRow?.payload.tenantId).toBe(w.reach.tenantId);
     });
   });
 }

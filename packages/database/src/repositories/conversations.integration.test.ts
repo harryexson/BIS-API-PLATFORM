@@ -73,7 +73,7 @@ describe.skipIf(!hasDb)('Conversation Repository — Integration Tests', () => {
       expect(result.status).toBe('active');
     });
 
-    it('updates existing conversation on re-upsert', async () => {
+    it('updates existing conversation on re-upsert (provider failover on the same channel)', async () => {
       const first = await conversationRepository.upsert(
         testPhone,
         testAppId,
@@ -89,14 +89,35 @@ describe.skipIf(!hasDb)('Conversation Repository — Integration Tests', () => {
         testAppId,
         {
           providerId: 'provider-v2',
-          channel: 'whatsapp',
+          channel: 'sms',
           tenantId: testTenantId,
         },
       );
 
       expect(second.id).toBe(first.id);
       expect(second.providerId).toBe('provider-v2');
-      expect(second.channel).toBe('whatsapp');
+      expect(second.channel).toBe('sms');
+    });
+
+    // Phase 16 (gap register D16): this used to assert that an upsert on
+    // 'whatsapp' returned (and flipped) the SAME row as the 'sms' thread —
+    // the collapse D16 reports. Channel is now part of the ownership key.
+    it('keeps an SMS thread and a WhatsApp thread of the same owner as distinct conversations', async () => {
+      const sms = await conversationRepository.upsert(testPhone, testAppId, {
+        providerId: 'provider-v1',
+        channel: 'sms',
+        tenantId: testTenantId,
+      });
+      const whatsapp = await conversationRepository.upsert(testPhone, testAppId, {
+        providerId: 'provider-wa',
+        channel: 'whatsapp',
+        tenantId: testTenantId,
+      });
+
+      expect(whatsapp.id).not.toBe(sms.id);
+      expect(whatsapp.channel).toBe('whatsapp');
+      const threads = await conversationRepository.findActiveForOwner(testPhone, { appId: testAppId, tenantId: testTenantId });
+      expect(threads.map((t) => t.channel).sort()).toEqual(['sms', 'whatsapp']);
     });
 
     it('creates separate conversations for different tenants', async () => {

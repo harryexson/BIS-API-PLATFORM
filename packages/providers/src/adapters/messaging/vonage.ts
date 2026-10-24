@@ -90,6 +90,8 @@ export class VonageProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.isConfigured()) {
+      // Phase 26 (gap register E2 messaging side / E3): never fabricate a delivered message in production.
+      this.refuseSimulatedFallbackInProduction({ missingCredentials: [...(this.apiKey ? [] : ['VONAGE_API_KEY']), ...(this.apiSecret ? [] : ['VONAGE_API_SECRET']), ...(this.fromNumber ? [] : ['VONAGE_FROM_NUMBER'])] });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 

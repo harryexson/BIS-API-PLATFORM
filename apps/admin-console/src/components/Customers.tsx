@@ -93,7 +93,6 @@ export const Customers: React.FC<CustomersProps> = ({ isAdmin, token }) => {
   const [ticketComments, setTicketComments] = useState<Record<string, TicketComment[]>>({});
   const [expandedTicketId, setExpandedTicketId] = useState<string | null>(null);
 
-  const [noteAuthor, setNoteAuthor] = useState('');
   const [noteBody, setNoteBody] = useState('');
   const [ticketSubject, setTicketSubject] = useState('');
   const [ticketDescription, setTicketDescription] = useState('');
@@ -145,7 +144,9 @@ export const Customers: React.FC<CustomersProps> = ({ isAdmin, token }) => {
     const res = await fetch(`/api/dashboard/customers/${selectedId}/notes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...adminHeaders },
-      body: JSON.stringify({ authorName: noteAuthor || 'Admin', body: noteBody }),
+      // The author is the authenticated administrator (the gateway records
+      // the admin credential's id and ignores any client-supplied name).
+      body: JSON.stringify({ body: noteBody }),
     });
     if (res.ok) {
       setNoteBody('');
@@ -203,7 +204,7 @@ export const Customers: React.FC<CustomersProps> = ({ isAdmin, token }) => {
     const res = await fetch(`/api/dashboard/tickets/${ticketId}/comments`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...adminHeaders },
-      body: JSON.stringify({ authorName: noteAuthor || 'Admin', body }),
+      body: JSON.stringify({ body }),
     });
     if (res.ok) {
       setCommentDrafts((prev) => ({ ...prev, [ticketId]: '' }));
@@ -293,12 +294,6 @@ export const Customers: React.FC<CustomersProps> = ({ isAdmin, token }) => {
               ))}
             </div>
             <div style={{ display: 'flex', gap: '8px' }}>
-              <input
-                placeholder="Your name"
-                value={noteAuthor}
-                onChange={(e) => setNoteAuthor(e.target.value)}
-                style={inputStyle({ maxWidth: '110px' })}
-              />
               <input
                 placeholder="Add a note…"
                 value={noteBody}

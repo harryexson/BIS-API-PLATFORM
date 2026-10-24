@@ -1,4 +1,4 @@
-import { eq, desc } from 'drizzle-orm';
+import { eq, desc, lt } from 'drizzle-orm';
 import { getDb } from '../connection';
 import {
   providerHealth,
@@ -41,14 +41,21 @@ export const providerHealthRepository = {
       .limit(limit);
   },
 
+  /**
+   * Deletes every health check recorded strictly before `days` days ago and
+   * returns how many were removed. Phase 16 (gap register D16): this used
+   * `eq(checkedAt, cutoff)` — a row matched only if its timestamp equalled
+   * the computed cutoff to the microsecond, so in practice nothing was ever
+   * pruned and provider_health grew without bound.
+   */
   async pruneOlderThan(days: number): Promise<number> {
     const db = getDb();
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - days);
     const rows = await db
       .delete(providerHealth)
-      .where(eq(providerHealth.checkedAt, cutoff))
-      .returning();
+      .where(lt(providerHealth.checkedAt, cutoff))
+      .returning({ id: providerHealth.id });
     return rows.length;
   },
 };

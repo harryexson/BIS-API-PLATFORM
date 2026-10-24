@@ -503,7 +503,11 @@ export function registerKeywordCommandScenarios(getWorld: () => KeywordWorld): v
       const joins = (await w.eventsFor(c)).filter((r) => r.decisionReason === 'keyword_join');
       expect(joins.map((r) => r.appId)).toEqual([w.haulpro.appSlug]);
       expect(joins[0].payload.holdId).toBe(startHold.id);
-      expect(String(joins[0].payload.attribution)).toBe('operator:ops@bis');
+      // Phase 20-21 (C7): the attribution names the AUTHENTICATED admin
+      // credential (these suites boot with the legacy ADMIN_API_TOKEN,
+      // identity 'legacy-admin-token'), not the body's self-declared
+      // resolvedBy 'ops@bis' this used to echo.
+      expect(String(joins[0].payload.attribution)).toBe('operator:legacy-admin-token');
       expect(await send(w.haulpro, c, 'Welcome back')).toBe(200);
       expect(await send(w.grace, c, 'Welcome back')).toBe(403);
     });

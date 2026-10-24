@@ -2,7 +2,13 @@ export * from './types';
 export { createKeys, type Keys } from './keys';
 export { createStore, MemoryStore, RedisStore, type KVStore, type CreateStoreOptions } from './client';
 export { computeBackoff } from './backoff';
-export { DistributedLock } from './lock';
+export {
+  DistributedLock,
+  LockNotAcquiredError,
+  DEFAULT_LOCK_WAIT_MS,
+  type LockOutcome,
+  type LockWaitOptions,
+} from './lock';
 export { RateLimiter, type RateLimitResult } from './rateLimit';
 export { IdempotencyStore, type IdempotencyRecord } from './idempotency';
 export { JobQueue, QueueBackpressureError } from './queue';
@@ -28,3 +34,20 @@ export {
   type DurableConsumerResult,
   type EnqueueFn,
 } from './webhookEvents';
+export {
+  ReadinessGate,
+  readinessGraceMsFromEnv,
+  probeQueueStore,
+  probeDatabase,
+  probeEventBus,
+  probeProviderState,
+  probeSecrets,
+  missingSecrets,
+  up as readinessUp,
+  down as readinessDown,
+  failed as readinessFailed,
+  type ProbeResult,
+  type ProbeState,
+  type ReadinessReport,
+  type EventBusRedisStatus,
+} from './readiness';

@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { Job, JobProcessor } from '../types';
 import { JobDeps } from './deps';
@@ -37,9 +38,11 @@ export function createProviderWebhookProcessor(deps: JobDeps): JobProcessor {
       }
     } else {
       // P0: FAIL CLOSED — reject webhooks when HMAC secret is not configured.
-      console.error(
-        '[provider_webhook] REJECTING webhook — WEBHOOK_HMAC_SECRET not configured. Cannot verify authenticity.',
-      );
+      logger.error('rejecting webhook — WEBHOOK_HMAC_SECRET not configured, cannot verify authenticity', {
+        operation: 'provider_webhook',
+        errorCode: 'WEBHOOK_HMAC_NOT_CONFIGURED',
+        status: 'rejected',
+      });
       throw new Error('provider_webhook rejected: WEBHOOK_HMAC_SECRET not configured — cannot verify webhook authenticity');
     }
 
@@ -87,6 +90,10 @@ async function processProviderWebhook(job: Job, deps: JobDeps, store: WebhookEve
   const owner = `webhook_${providerId}_${Math.random().toString(36).slice(2, 8)}`;
   const ttl = deps.config.retry.maxDelayMs;
 
+  // B15: a webhook's status update must not be skipped, so this uses
+  // withLock — which now waits (bounded backoff) for a concurrent health
+  // check to release the lock instead of throwing at once, and only throws
+  // LockNotAcquiredError (→ normal job retry) if it is still held after that.
   await deps.lock.withLock(`provider:${providerId}`, owner, ttl, async () => {
     if (status) {
       deps.registry.updateManagement(providerId, { status });
@@ -114,7 +121,12 @@ async function processProviderWebhook(job: Job, deps: JobDeps, store: WebhookEve
   } catch (err) {
     // P0: Fail the job on DB error so it can be retried — previously this
     // was silently swallowed and the job was marked complete.
-    console.error('[provider_webhook] Neon write failed — failing job for retry', err);
+    logger.error('provider webhook database write failed — failing job for retry', {
+      operation: 'provider_webhook',
+      errorCode: 'DB_WRITE_FAILED',
+      status: 'failed',
+      error: err,
+    });
     throw new Error('provider_webhook: database write failed — retrying');
   }
 

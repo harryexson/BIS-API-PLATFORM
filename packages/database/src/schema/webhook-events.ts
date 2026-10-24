@@ -11,6 +11,7 @@ import {
   primaryKey,
   check,
 } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 export const WEBHOOK_EVENT_STATUSES = ['received', 'processing', 'processed', 'failed'] as const;
 export type WebhookEventStatus = (typeof WEBHOOK_EVENT_STATUSES)[number];
@@ -82,6 +83,7 @@ export const webhookEvents = pgTable(
       'chk_webhook_events_status',
       sql`${t.status} IN ('received', 'processing', 'processed', 'failed')`,
     ),
+    tenantIdNonBlank('webhook_events', t.tenantId),
   ],
 );
 

@@ -39,9 +39,40 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  *
  * Environment variables:
  *   PAWAPAY_API_KEY — Bearer token
+ *
+ * Host (gap register E11): environment 'test' → `api.sandbox.pawapay.io`,
+ * otherwise `api.pawapay.io` (pawaPay's documented sandbox/production base
+ * URLs, checked via WebSearch 2026-10-23; a sandbox token only works on the
+ * sandbox host).
  */
+/**
+ * pawaPay's v2 `amount` (Phase 27): a STRING matching
+ * `^([0]|([1-9][0-9]{0,17}))([.][0-9]{0,3}[1-9])?$` — pawaPay's v2 OpenAPI
+ * schema (docs.pawapay.io/v2/api-reference/openapi_v2.yaml; the same
+ * pattern is in pawaPay's own pawaPay/yango-api-docs spec) says an amount
+ * not matching it is "rejected". The pattern forbids a trailing zero after
+ * the decimal point, so "100.00" and "10.50" are invalid while "100" and
+ * "10.5" are valid. This adapter used to send `amount.toFixed(2)` —
+ * "100.00" for every whole amount — which that schema rejects.
+ *
+ * The major-unit amount is rounded to 2 decimals (no registered pawaPay
+ * currency has more) and trailing zeros / a bare point are stripped.
+ * Whether a provider accepts decimals at all (`decimalsInAmount: NONE |
+ * TWO_PLACES`, per pawaPay's Active Configuration endpoint) is NOT known
+ * here: a fractional amount sent to a NONE provider is rejected by pawaPay
+ * and reported as a definite failure, never fabricated.
+ */
+export function formatPawaPayAmount(amount: number): string {
+  // toFixed(2) always yields "<int>.<2 digits>"; only the fraction is trimmed.
+  const [whole, fraction] = (Math.round(amount * 100) / 100).toFixed(2).split('.');
+  const trimmed = fraction.replace(/0+$/, '');
+  return trimmed ? `${whole}.${trimmed}` : whole;
+}
+
 export class PawaPayProvider extends BaseProvider {
-  private baseUrl = 'https://api.pawapay.io';
+  private get baseUrl(): string {
+    return this.config.environment === 'test' ? 'https://api.sandbox.pawapay.io' : 'https://api.pawapay.io';
+  }
 
   constructor(config: ProviderConfig) {
     super(config);
@@ -107,7 +138,7 @@ export class PawaPayProvider extends BaseProvider {
         },
         body: {
           depositId,
-          amount: amount.toFixed(2),
+          amount: formatPawaPayAmount(amount),
           currency: currency.toUpperCase(),
           payer: {
             type: 'MMO',

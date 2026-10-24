@@ -20,7 +20,17 @@ export {
   type PaymentStatusQueryResult,
   type ProviderReportedPaymentStatus,
 } from './base';
-export { ProviderRegistry, type PersistableProviderSecret } from './registry';
+export {
+  ProviderRegistry,
+  ProviderStateConflictError,
+  type PersistableProviderSecret,
+  type PersistableProviderManagement,
+  type PersistedProviderState,
+  type ProviderStateStore,
+  type ProviderStateWriteResult,
+  type ProviderStateSyncReport,
+} from './registry';
+export { ProviderStateSync } from './state-sync';
 
 export { StripeProvider } from './adapters/payments/stripe';
 export { NMIProvider } from './adapters/payments/nmi';

@@ -67,13 +67,55 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Phase 23-24: the Redis-gated suites (*.redis*.test.ts, readiness,
+      # worker reliability, rate limiting, ...) skip themselves when no
+      # `redis-server` binary is on PATH (packages/workers/src/test-utils/
+      # redis-server.ts → redisAvailable), and the runner image has none — so
+      # they were silently skipped here. They need the BINARY, not a Redis
+      # service container: several spawn their own throwaway server and kill/
+      # restart it to simulate an outage, which TEST_REDIS_URL cannot do
+      # (stop() is a no-op for an external server).
+      - name: Install redis-server (Redis-gated suites spawn their own instances)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends redis-server
+          sudo systemctl stop redis-server || true
+          redis-server --version
+
       - name: Run unit tests
-        run: npm test
+        run: npm test -- --reporter=default --reporter=json --outputFile.json=vitest-unit.json
+
+      - name: Fail if any Redis-gated test was skipped
+        run: npx tsx scripts/assert-gated-tests-ran.ts vitest-unit.json redis
 
   # ─── Gate 4: Integration Tests ───────────────────────────────────────
+  # Phase 23-24: every *.postgres.integration.test.ts suite (18 files / 208
+  # tests, added across the remediation phases) skips itself unless
+  # TEST_POSTGRES_URL points at a real server — and this job never set it, so
+  # CI had never executed any of them. Now: a real PostgreSQL 16 service
+  # container, TEST_POSTGRES_URL pointing at it (an admin URL: each suite
+  # creates and drops its own database, migrated from zero with the real
+  # drizzle migrations — including Phase 16's schema drift guard), the
+  # redis-server binary for the suites that also kill/restart Redis, and a
+  # check that none of those tests was skipped.
   integration-test:
     name: Integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,10 +129,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run integration tests
-        run: npm run test:integration
+      - name: Install redis-server (Postgres suites with a Redis-outage case spawn their own)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends redis-server
+          sudo systemctl stop redis-server || true
+          redis-server --version
+
+      - name: Run integration tests (real PostgreSQL 16 + real Redis)
+        run: npm run test:integration -- --reporter=default --reporter=json --outputFile.json=vitest-integration.json
         env:
+          TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
           DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+
+      - name: Fail if any Postgres-gated test was skipped
+        run: npx tsx scripts/assert-gated-tests-ran.ts vitest-integration.json postgres
 
   # ─── Gate 5: Build ───────────────────────────────────────────────────
   build:
@@ -111,6 +164,82 @@ jobs:
 
       - name: Build all workspaces
         run: npm run build:all
+
+  # ─── Gate 5b: Service boot smoke ─────────────────────────────────────
+  # Phase 23-24: "Build" above only type-checks (`tsc --noEmit`), so it said
+  # nothing about whether a service can START — which is how
+  # `"start": "node dist/index.js"` (a file nothing ever produced) passed every
+  # CI run and then crashed the live Railway deployment with MODULE_NOT_FOUND on
+  # every boot. This job runs what Railway runs — its build command, then the
+  # service's real `npm run start -w services/<svc>` — against a real Redis,
+  # and requires /health 200, a /ready report in which only the database (and
+  # the provider state loaded from it) may be failing, and a clean exit on
+  # SIGTERM (scripts/service-boot-smoke.ts).
+  #
+  # Why the database may fail here: the production database layer is the
+  # neon-http driver only (packages/database/src/connection.ts), which speaks
+  # HTTP to a Neon endpoint and cannot reach a stock PostgreSQL container, so
+  # DATABASE_URL is pinned to an unreachable address. Why the worker runs with
+  # NODE_ENV=development: in production it deliberately refuses to start
+  # without its persisted provider state, which needs that database.
+  boot-smoke:
+    name: Service boot smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://smoke:smoke@127.0.0.1:1/smoke_unreachable
+      REDIS_URL: redis://localhost:6379
+      TRUST_PROXY: "1"
+      SMOKE_ALLOW_FAILING: database,providers
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate throwaway secrets
+        run: |
+          token=$(openssl rand -hex 32)
+          {
+            echo "PORTAL_JWT_SECRET=$(openssl rand -hex 32)"
+            echo "WEBHOOK_HMAC_SECRET=$(openssl rand -hex 32)"
+            echo "SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)"
+            echo "ADMIN_API_CREDENTIALS=ci-smoke:$(printf %s "$token" | sha256sum | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+
+      - name: Railway build command (type-check, as configured on the Railway service)
+        run: |
+          npm run type-check -w services/api-gateway
+          npm run type-check -w services/worker
+
+      - name: Boot api-gateway with its production start command (NODE_ENV=production)
+        run: npx tsx scripts/service-boot-smoke.ts api-gateway
+        env:
+          NODE_ENV: production
+          PORT: "3001"
+
+      - name: Boot worker with its production start command
+        run: npx tsx scripts/service-boot-smoke.ts worker
+        env:
+          NODE_ENV: development
+          WORKER_HEALTH_PORT: "3002"
 
   # ─── Gate 6: Security ────────────────────────────────────────────────
   security:
@@ -163,12 +292,12 @@ jobs:
   ci-gate:
     name: CI gate (all checks)
     if: always()
-    needs: [lint, typecheck, unit-test, integration-test, build, security, migration-check]
+    needs: [lint, typecheck, unit-test, integration-test, build, boot-smoke, security, migration-check]
     runs-on: ubuntu-latest
     steps:
       - name: Check all gates passed
         run: |
-          results=("${{ needs.lint.result }}" "${{ needs.typecheck.result }}" "${{ needs.unit-test.result }}" "${{ needs.integration-test.result }}" "${{ needs.build.result }}" "${{ needs.security.result }}" "${{ needs.migration-check.result }}")
+          results=("${{ needs.lint.result }}" "${{ needs.typecheck.result }}" "${{ needs.unit-test.result }}" "${{ needs.integration-test.result }}" "${{ needs.build.result }}" "${{ needs.boot-smoke.result }}" "${{ needs.security.result }}" "${{ needs.migration-check.result }}")
           for r in "${results[@]}"; do
             if [ "$r" != "success" ]; then
               echo "::error::One or more CI gates failed"

@@ -5,6 +5,7 @@ import type {
   NewApplicationApiKey,
 } from './schema';
 import { hashApiKey, generateApiKey } from './crypto';
+import { environmentTier } from './environment-tier';
 
 // Default lifetime for newly issued/rotated API keys, in days. Configurable
 // so operators can tighten or loosen the default without a code change;
@@ -250,7 +251,12 @@ export class ApplicationRegistry {
       return { authenticated: false, error: 'API key has expired' };
     }
 
-    if (environment && apiKey.environment !== environment) {
+    // Gap register C9: compared by TIER (live vs test), not as raw strings —
+    // keys carry either vocabulary ('live'/'test' from the portal,
+    // 'production'/'development' from createApplication). The gateway passes
+    // its deployment tier, so a test key can never authorize live provider
+    // traffic and a live key never drives a non-production deployment.
+    if (environment && environmentTier(apiKey.environment) !== environmentTier(environment)) {
       return {
         authenticated: false,
         error: `API key is not valid for "${environment}" environment`,

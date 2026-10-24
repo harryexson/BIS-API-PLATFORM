@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
@@ -6,6 +7,10 @@ import { EventRecord } from '@company/database';
 export function toEventRecord(payload: any, category: string): EventRecord {
   return {
     appId: payload.appId || 'system',
+    // Phase 16 (gap register D14/D16): the event's own tenant (Phase 7 put
+    // it on every TransactionEvent) — previously dropped, so the row fell
+    // back to the column default 'default'. Absent = a platform-level event.
+    ...(typeof payload.tenantId === 'string' && payload.tenantId ? { tenantId: payload.tenantId } : {}),
     category,
     providerId: payload.providerId || payload.provider || null,
     status: payload.status || 'success',
@@ -33,7 +38,12 @@ export function createEventProcessingProcessor(deps: JobDeps): JobProcessor {
     } catch (err) {
       // P1: Fail the job on DB error so it can be retried — previously this
       // was silently swallowed and the job was marked complete.
-      console.error('[event_processing] Neon write failed — failing job for retry', err);
+      logger.error('event write failed — failing job for retry', {
+        operation: 'event_processing',
+        errorCode: 'DB_WRITE_FAILED',
+        status: 'failed',
+        error: err,
+      });
       throw new Error('event_processing: database write failed — retrying');
     }
     await deps.eventBus.emit(job.payload as any);

@@ -95,15 +95,21 @@ export {
   type ApplicationLookupForBilling,
 } from './subscription-registry';
 
-// Provider secrets persistence (survives a restart for packages/providers'
-// in-memory ProviderRegistry — see docstring in provider-secrets.ts)
+// Provider state persistence — configuration + encrypted secrets for
+// packages/providers' ProviderRegistry (Phase 15; see provider-secrets.ts)
 export {
   ensureProviderRow,
-  persistProviderSecrets,
-  loadAllProviderSecrets,
+  createProviderStateStore,
+  providerStateStore,
+  SecretEncryptionKeyMissingError,
+  ProviderSecretsDecryptError,
   currentDeploymentTier,
   type PersistableSecret,
+  type ProviderStateRow,
+  type ProviderStateWrite,
+  type ProviderStateStoreImpl,
 } from './provider-secrets';
+export { environmentTier, type DeploymentTier } from './environment-tier';
 
 // CRM Registry (developer/support back office — see docstring in
 // crm-registry.ts)

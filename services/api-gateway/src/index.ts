@@ -3,16 +3,36 @@ import dotenv from 'dotenv';
 
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
 
-import app from './app';
+import type { Server } from 'node:http';
+import app, { providerStateReady, providerStateStatus } from './app';
 import { logger, metrics } from '@company/observability';
 
 const PORT = process.env.PORT || 3001;
 
-const server = app.listen(PORT, () => {
-  console.log(`===============================================`);
-  console.log(`BIS-API-PLATFORM GATEWAY RUNNING ON PORT ${PORT}`);
-  console.log(`Server-Sent Events stream: http://localhost:${PORT}/api/dashboard/stream`);
-  console.log(`===============================================`);
+let server: Server | undefined;
+
+// Phase 15 (gap register E12): do not accept a single request until the
+// persisted provider configuration and secrets have been loaded (the load
+// itself never rejects — on failure /ready and, in production, /v1 answer
+// 503 until a background re-sync succeeds; see app.ts).
+providerStateReady.then(() => {
+  const state = providerStateStatus();
+  if (!state.loaded) {
+    logger.error('persisted provider state NOT loaded at startup — retrying in the background', {
+      operation: 'startup',
+      errorCode: 'PROVIDER_STATE_LOAD_FAILED',
+      status: 'degraded',
+      error: state.lastError,
+    });
+  }
+  server = app.listen(PORT, () => {
+    logger.info('BIS-API-PLATFORM gateway running', {
+      operation: 'startup',
+      status: 'running',
+      port: Number(PORT),
+      sseStreamUrl: `http://localhost:${PORT}/api/dashboard/stream`,
+    });
+  });
 });
 
 // P3-3: Graceful shutdown — drain in-flight requests before closing
@@ -20,17 +40,22 @@ let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log('Gateway shutting down...');
+  logger.info('gateway shutting down', { operation: 'shutdown', status: 'draining' });
 
   // Stop accepting new connections
+  if (!server) process.exit(0);
   server.close(() => {
-    console.log('Gateway stopped.');
+    logger.info('gateway stopped', { operation: 'shutdown', status: 'stopped' });
     process.exit(0);
   });
 
   // Force kill after 30s
   setTimeout(() => {
-    console.error('Gateway forced shutdown after timeout');
+    logger.error('gateway forced shutdown after timeout', {
+      operation: 'shutdown',
+      errorCode: 'SHUTDOWN_TIMEOUT',
+      status: 'failed',
+    });
     process.exit(1);
   }, 30_000).unref();
 };

@@ -173,7 +173,12 @@ describe.skipIf(!ADMIN_URL)('Phase 6 — payment reconciliation job on real Post
       registry,
       routing: {} as JobDeps['routing'],
       eventBus: { emit: async (e: never) => void emitted.push(e) } as unknown as JobDeps['eventBus'],
-      lock: { withLock: async (_k: string, _o: string, _t: number, fn: () => Promise<unknown>) => fn() } as unknown as JobDeps['lock'],
+      // Phase 13 (B15): the reconciliation job now uses tryWithLock (skip if
+      // another run holds the lock) instead of withLock (throw).
+      lock: {
+        withLock: async (_k: string, _o: string, _t: number, fn: () => Promise<unknown>) => fn(),
+        tryWithLock: async (_k: string, _o: string, _t: number, fn: () => Promise<unknown>) => ({ acquired: true, value: await fn() }),
+      } as unknown as JobDeps['lock'],
       rateLimiter: {} as JobDeps['rateLimiter'],
       config: createWorkerConfig(), // defaults: stale 15 min, recheck 5 min, escalate 60 min
       keys: {} as JobDeps['keys'],

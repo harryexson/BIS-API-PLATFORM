@@ -220,6 +220,9 @@ async function audit(ctx: KeywordContext, decisionReason: string, extra: Record<
   try {
     await eventRepository.create({
       appId: ctx.appId,
+      // Phase 16 (gap register D14/D16): tenant in the column, not only in
+      // the payload.
+      ...(ctx.tenantId ? { tenantId: ctx.tenantId } : {}),
       category: 'inbound',
       providerId: ctx.providerId,
       status: 'success',

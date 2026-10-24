@@ -18,10 +18,11 @@ export class RateLimiter {
 
   async limit(scope: string, weight = 1): Promise<RateLimitResult> {
     const key = this.keys.rateLimit(scope);
+    // B14 FIX: incr() arms the TTL only when it creates the key (atomically
+    // in Redis), so this is a fixed window that closes on schedule however
+    // hard callers keep retrying. The extra expire() that used to follow on
+    // count === 1 is gone: it was a second, non-atomic write of the same TTL.
     const count = await this.store.incr(key, this.config.windowMs);
-    if (count === 1) {
-      await this.store.expire(key, this.config.windowMs);
-    }
 
     const limit = this.config.maxRequests;
     const allowed = count <= limit;

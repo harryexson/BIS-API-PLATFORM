@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, timestamp, jsonb, uniqueIndex } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * P0: Platform-level idempotency records.
@@ -31,7 +32,7 @@ export const idempotencyRecords = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull(),
-    tenantId: text('tenant_id').notNull().default('default'),
+    tenantId: text('tenant_id').notNull(),
     operation: text('operation').notNull(),
     idempotencyKey: text('idempotency_key').notNull(),
     requestHash: text('request_hash').notNull().default(''),
@@ -42,6 +43,7 @@ export const idempotencyRecords = pgTable(
   },
   (t) => [
     uniqueIndex('idx_idempotency_composite').on(t.appId, t.tenantId, t.operation, t.idempotencyKey),
+    tenantIdNonBlank('idempotency_records', t.tenantId),
   ],
 );
 

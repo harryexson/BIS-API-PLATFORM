@@ -66,7 +66,11 @@ const CASES: AdapterCase[] = [
   },
   {
     id: 'adyen',
-    secrets: { api_key: 'AQE_x', merchant_account: 'MerchantECOM' },
+    // Phase 26 (E11): Adyen is registered 'live', and the registered
+    // environment now really reaches the adapter — so it needs its live URL
+    // prefix (without one it refuses to call any host, instead of silently
+    // calling checkout-test.adyen.com as it used to).
+    secrets: { api_key: 'AQE_x', merchant_account: 'MerchantECOM', live_url_prefix: 'bisapitest' },
     request: { currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_pm_1' },
     isCharge: (u) => u.endsWith('/v71/payments'),
     // Adyen: HTTP 200 with resultCode 'Refused' and a refusalReason.
@@ -196,6 +200,20 @@ const CASES: AdapterCase[] = [
 
 type ChargeBehaviour = () => Response | Promise<Response>;
 
+/**
+ * Phase 15 (gap register A14d): the router now records EVERY provider
+ * attempt against the provider's circuit breaker (it used to record
+ * nothing — only the gateway's observe() of the final event did). The
+ * cases below deliberately drive many ambiguous/failed outcomes into the
+ * same shared registry, which would trip a provider's breaker and make a
+ * later, unrelated case fall back elsewhere. Each case asserts outcome
+ * classification on a healthy provider, so each starts from a closed
+ * circuit (the same reset routing.test.ts applies after every test).
+ */
+function resetCircuits(registry: ProviderRegistry): void {
+  for (const cfg of registry.getAllConfigs()) registry.updateProviderConfig(cfg.id, { status: 'online' });
+}
+
 describe('Phase 11-12 — ambiguous payment outcomes are never failed over; genuine declines still are (A10/E4)', () => {
   const registry = ProviderRegistry.getInstance();
   const engine = new RoutingEngine();
@@ -243,6 +261,7 @@ describe('Phase 11-12 — ambiguous payment outcomes are never failed over; genu
 
   beforeEach(() => {
     chargeCalls = [];
+    resetCircuits(registry);
   });
 
   afterEach(() => {
@@ -463,6 +482,7 @@ describe('Phase 11-12 — Stripe Radar highest-risk block reverses the Stripe-si
 
   beforeEach(() => {
     calls.length = 0;
+    resetCircuits(registry);
   });
   afterEach(() => {
     registry.getProvider('stripe')!.setSecrets({});

@@ -120,7 +120,9 @@ describe('PawaPayProvider', () => {
       expect(opts.method).toBe('POST');
       expect(opts.headers.Authorization).toBe('Bearer test-key');
       const body = JSON.parse(opts.body);
-      expect(body.amount).toBe('100.00');
+      // Phase 27: pawaPay's v2 schema rejects a trailing decimal zero
+      // ("100.00"); this used to assert exactly that invalid value.
+      expect(body.amount).toBe('100');
       expect(body.currency).toBe('ZMW');
       expect(body.payer.type).toBe('MMO');
       expect(body.payer.accountDetails.phoneNumber).toBe('260971234567');

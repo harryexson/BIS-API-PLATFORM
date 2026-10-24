@@ -1,5 +1,5 @@
 import { TransactionEvent } from '@company/schemas';
-import { metrics } from '@company/observability';
+import { logger, metrics } from '@company/observability';
 
 type EventListener = (event: TransactionEvent) => void;
 
@@ -52,7 +52,10 @@ export class EventBus {
   private redisClient: any = null;
   private subClient: any = null;
   private redisReady = false;
+  private redisConfigured = false;
   private channelHandlers = new Map<string, Set<(msg: string) => void>>();
+  /** Connections whose current outage has already been logged (see initRedis). */
+  private redisErrorLogged = new Set<'publish' | 'subscribe'>();
 
   private constructor() {
     this.initRedis();
@@ -67,7 +70,11 @@ export class EventBus {
 
   private initRedis(): void {
     const redisUrl = process.env.REDIS_URL;
-    if (!redisUrl) return;
+    // 'memory' is createStore()'s explicit single-process sentinel
+    // (@company/workers) — not a Redis host. Phase 19: honour it here too, so
+    // that mode isn't reported (by /ready) as a Redis that never connects.
+    if (!redisUrl || redisUrl === 'memory') return;
+    this.redisConfigured = true;
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
@@ -96,12 +103,22 @@ export class EventBus {
       // Handle reconnection
       this.redisClient.on('connect', () => {
         this.redisReady = true;
-        console.log('[eventbus] Redis connected');
+        logger.info('event bus Redis connected', { operation: 'eventbus-redis', connection: 'publish', status: 'connected' });
       });
 
-      this.redisClient.on('error', () => {
+      // Phase 22 (gap register PHASE19-05): BOTH connections get an 'error'
+      // listener. Without one on the subscriber, ioredis prints a raw
+      // "[ioredis] Unhandled error event" (stack included) to stderr on every
+      // failed reconnect. Each outage is logged ONCE per connection, as a
+      // structured (redacted) entry; the flag re-arms on 'ready'.
+      this.redisClient.on('error', (err: unknown) => {
         this.redisReady = false;
+        this.logRedisError('publish', err);
       });
+      this.redisClient.on('ready', () => this.redisErrorLogged.delete('publish'));
+
+      this.subClient.on('error', (err: unknown) => this.logRedisError('subscribe', err));
+      this.subClient.on('ready', () => this.redisErrorLogged.delete('subscribe'));
 
       this.subClient.on('message', (channel: string, message: string) => {
         const handlers = this.channelHandlers.get(channel);
@@ -116,6 +133,31 @@ export class EventBus {
     } catch {
       // ioredis not available — stay in-memory mode
     }
+  }
+
+  private logRedisError(connection: 'publish' | 'subscribe', err: unknown): void {
+    if (this.redisErrorLogged.has(connection)) return;
+    this.redisErrorLogged.add(connection);
+    logger.error('event bus Redis connection error — retrying in the background', {
+      operation: 'eventbus-redis',
+      connection,
+      errorCode: 'EVENTBUS_REDIS_ERROR',
+      status: 'disconnected',
+      error: err,
+    });
+  }
+
+  /**
+   * Phase 19 (gap register B13/C6): the cross-process publish connection's
+   * ACTUAL state, for /ready. Read from the ioredis client's own status
+   * ('ready' = commands can be sent) rather than `redisReady`, which is set
+   * on socket connect (before the ready check) and only cleared on 'error'.
+   * Says nothing about whether any other process is subscribed to the
+   * channel (gap register PHASE7-01: none is).
+   */
+  public getRedisStatus(): 'not-configured' | 'connected' | 'disconnected' {
+    if (!this.redisConfigured) return 'not-configured';
+    return this.redisClient?.status === 'ready' ? 'connected' : 'disconnected';
   }
 
   public subscribe(listener: EventListener): () => void {
@@ -177,7 +219,13 @@ export class EventBus {
         listener(event);
       } catch (err) {
         metrics.increment('queueFailures');
-        console.error('Error executing event listener:', err);
+        logger.error('event listener threw', {
+          operation: 'eventbus-dispatch',
+          errorCode: 'EVENT_LISTENER_FAILED',
+          status: 'failed',
+          eventId: event.id,
+          error: err,
+        });
       }
     });
   }
@@ -230,7 +278,13 @@ export class EventBus {
         listener(event);
       } catch (err) {
         metrics.increment('queueFailures');
-        console.error('Error executing event listener:', err);
+        logger.error('event listener threw', {
+          operation: 'eventbus-dispatch',
+          errorCode: 'EVENT_LISTENER_FAILED',
+          status: 'failed',
+          eventId: event.id,
+          error: err,
+        });
       }
     });
   }

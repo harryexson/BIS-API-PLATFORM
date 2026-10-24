@@ -1,5 +1,6 @@
 import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from 'drizzle-orm/pg-core';
 import { applications } from './applications';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * P0: Suppliers table — explicit ownership boundary for multi-supplier applications.
@@ -27,7 +28,11 @@ export const suppliers = pgTable(
   },
   (t) => [
     index('idx_suppliers_application_id').on(t.applicationId),
+    // Phase 16 (gap register D15): declared here, and recorded as existing
+    // in every snapshot since 0011, but no migration created it until 0021
+    // — so supplier slugs were never actually unique in a migrated database.
     uniqueIndex('idx_suppliers_application_slug').on(t.applicationId, t.tenantId, t.slug),
+    tenantIdNonBlank('suppliers', t.tenantId),
   ],
 );
 

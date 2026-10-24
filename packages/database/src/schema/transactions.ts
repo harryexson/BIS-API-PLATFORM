@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { pgTable, uuid, text, timestamp, jsonb, numeric, integer, index, uniqueIndex, check } from 'drizzle-orm/pg-core';
+import { tenantIdNonBlank } from './tenant-id-check';
 
 /**
  * P0: Transactions table — the payment state machine.
@@ -32,7 +33,7 @@ export const transactions = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     appId: text('app_id').notNull(),
-    tenantId: text('tenant_id').notNull().default('default'),
+    tenantId: text('tenant_id').notNull(),
     providerId: text('provider_id').notNull(),
     providerTransactionId: text('provider_transaction_id'),
     status: text('status').notNull().default('pending'),
@@ -66,6 +67,7 @@ export const transactions = pgTable(
       'chk_transactions_status',
       sql`${t.status} IN ('processing', 'pending', 'requires_action', 'success', 'failed', 'cancelled', 'partially_refunded', 'refunded', 'unknown', 'requires_reconciliation')`,
     ),
+    tenantIdNonBlank('transactions', t.tenantId),
   ],
 );
 

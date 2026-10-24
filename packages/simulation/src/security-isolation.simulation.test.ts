@@ -33,24 +33,51 @@ import {
   sleep,
   counts,
   findConversation,
+  requestFrom,
   type SimRuntime,
 } from './harness';
+import { randomBytes, randomInt } from 'node:crypto';
 
 console.warn('\n[audit] AUDIT 4 — Adversarial Security & Multi-Tenant Isolation\n');
 
 const AUTH = { authorization: 'Bearer ' + API_KEY, 'x-tenant-id': TENANT_ID };
 const OTHER_AUTH = { authorization: 'Bearer ' + OTHER_API_KEY, 'x-tenant-id': OTHER_TENANT_ID_HAULPRO };
 
+// F10 (Phase 14): this suite used to boot the gateway with NO admin token
+// (so every admin assertion was satisfied by a 503 "not configured") and the
+// harness's 100000-request limit (so the "rate limiting" test could never see
+// a 429). It now runs with a real admin token and a real, small limit.
+const ADMIN_TOKEN = 'sec-iso-admin-' + randomBytes(8).toString('hex');
+const RATE_LIMIT = 60;
+// SECRET_ENCRYPTION_KEY: Phase 15 (gap register D13) — an admin secret write
+// is persisted before it is acknowledged, and refused (503) without a key;
+// suite M stores a probe secret, so the key is configured here.
+const SECRET_KEY = 'sec-iso-secret-key-' + randomBytes(16).toString('hex');
+const ENV_KEYS = ['ADMIN_API_TOKEN', 'RATE_LIMIT_MAX_REQUESTS', 'SECRET_ENCRYPTION_KEY'];
+const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+// Distinct loopback source addresses (all of 127/8 is loopback on Linux), so
+// test N's bursts are charged to their own per-IP buckets, not to 127.0.0.1
+// which every other test in this file uses.
+const LOOPBACK_PREFIX = `127.${randomInt(1, 255)}.${randomInt(1, 255)}`;
+let nextLoopbackHost = 2;
+const freshLoopback = () => `${LOOPBACK_PREFIX}.${nextLoopbackHost++}`;
+
 let runtime: SimRuntime;
 
 beforeAll(async () => {
   clearDb();
   seedReachChurch();
-  runtime = await createSimulation();
+  runtime = await createSimulation({
+    env: { ADMIN_API_TOKEN: ADMIN_TOKEN, RATE_LIMIT_MAX_REQUESTS: String(RATE_LIMIT), SECRET_ENCRYPTION_KEY: SECRET_KEY },
+  });
 }, 30_000);
 
 afterAll(async () => {
   await runtime.close();
+  for (const k of ENV_KEYS) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
+  }
 }, 15_000);
 
 afterEach(() => {
@@ -248,11 +275,15 @@ describe('I) Admin dashboards now require admin auth (FIXED)', () => {
     const metrics = await runtime.get('/api/dashboard/metrics');
     const obs = await runtime.get('/api/observability/logs');
 
-    // P0 FIX: all admin endpoints now require admin auth
-    // 503 when ADMIN_API_TOKEN not configured, 403 when wrong/missing token — both deny access
-    expect([403, 503]).toContain(logs.status);
-    expect([403, 503]).toContain(metrics.status);
-    expect([403, 503]).toContain(obs.status);
+    // P0 FIX: all admin endpoints now require admin auth. ADMIN_API_TOKEN is
+    // configured in this suite (F10), so a missing token is a real 403 — not
+    // the 503 "not configured" this assertion used to also accept.
+    expect(logs.status).toBe(403);
+    expect(metrics.status).toBe(403);
+    expect(obs.status).toBe(403);
+    expect((await runtime.get('/api/dashboard/logs', { 'x-admin-token': 'wrong-' + ADMIN_TOKEN })).status).toBe(403);
+    // ...and the gate really opens for the configured token.
+    expect((await runtime.get('/api/dashboard/logs', { 'x-admin-token': ADMIN_TOKEN })).status).toBe(200);
     console.warn('[FIXED] admin dashboards (logs/metrics/observability) now require admin auth — no cross-tenant event leak');
   });
 });
@@ -325,39 +356,76 @@ describe('L) SSRF surface (control)', () => {
 // ---------------------------------------------------------------------------
 describe('M) Provider secret endpoint (control)', () => {
   it('does not leak a raw provider secret', async () => {
-    const res = await runtime.get('/api/dashboard/providers/stripe/secrets');
-    // 503 when ADMIN_API_TOKEN isn't configured in this environment (it isn't
-    // here), 401/403 when it is but the request lacks/mismatches it — all three
-    // mean the admin gate is doing its job, same as test I) above.
-    if (res.status === 401 || res.status === 403 || res.status === 503) {
-      console.warn('[OK] secret endpoint requires admin auth');
-      expect([401, 403, 503]).toContain(res.status);
-      return;
+    // ADMIN_API_TOKEN is configured in this suite (F10): no token => 403.
+    const denied = await runtime.get('/api/dashboard/providers/stripe/secrets');
+    expect(denied.status).toBe(403);
+    console.warn('[OK] secret endpoint requires admin auth');
+
+    // With the gate open, store a known raw secret (on a probe field no
+    // adapter reads) so there is actually something to leak — previously this
+    // branch was unreachable and the list would have been empty anyway.
+    const admin = { 'x-admin-token': ADMIN_TOKEN };
+    const raw = 'sk_live_p14probe_' + randomBytes(8).toString('hex');
+    const added = await runtime.post('/api/dashboard/providers/stripe/secrets', { field: 'p14MaskProbe', label: 'probe', value: raw }, admin);
+    expect(added.status).toBe(201);
+    const addedMeta = await json(added);
+    try {
+      const res = await runtime.get('/api/dashboard/providers/stripe/secrets', admin);
+      expect(res.status).toBe(200);
+      const body = await json(res);
+      const blob = JSON.stringify(body);
+      expect(blob).toContain('masked');
+      expect(blob).not.toContain(raw);
+      expect(blob).not.toContain('sk_live_');
+      expect(blob).not.toContain('sim-webhook-hmac-secret-0123456789abcdef');
+      console.warn('[OK] provider secret endpoint returns masked values only (no raw secret leakage)');
+    } finally {
+      await runtime.request('DELETE', `/api/dashboard/providers/stripe/secrets/${addedMeta.id}`, { headers: admin });
     }
-    expect(res.status).toBe(200);
-    const body = await json(res);
-    const blob = JSON.stringify(body);
-    expect(blob).toContain('masked');
-    expect(blob).not.toContain('sk_live_');
-    expect(blob).not.toContain('sim-webhook-hmac-secret-0123456789abcdef');
-    console.warn('[OK] provider secret endpoint returns masked values only (no raw secret leakage)');
   });
 });
 
 // ---------------------------------------------------------------------------
 // N) Rate-limit bypass on admin endpoints (FIXED)
 // ---------------------------------------------------------------------------
+// F10 (Phase 14): this used to accept 429 OR 403 OR 503 with "> 0" — met by
+// the 503s alone, since the suite had no admin token and a 100000 limit. It
+// now drives a real burst past the real configured limit and asserts the
+// exact split: RATE_LIMIT requests reach the admin gate (403), the rest are
+// refused by the limiter (429), none are "not configured" (503).
 describe('N) Admin endpoints now have rate limiting (FIXED)', () => {
-  it('rapid admin reads are throttled', async () => {
-    const requests = Array.from({ length: 200 }, () => runtime.get('/api/dashboard/logs'));
-    const responses = await Promise.all(requests);
-    const throttled = responses.filter((r) => r.status === 429).length;
-    const forbidden = responses.filter((r) => r.status === 403).length;
-    const unconfigured = responses.filter((r) => r.status === 503).length;
-    // FIXED: admin endpoints now have rate limiting.
-    // Some requests should be throttled (429), rejected (403), or unconfigured (503).
-    expect(throttled + forbidden + unconfigured).toBeGreaterThan(0);
-    console.warn('[FIXED] admin endpoints now have rate limiting — throttled/rejected excessive requests');
+  it('rapid admin reads from one address are throttled with a real 429 at the configured limit', async () => {
+    const ip = freshLoopback();
+    const statuses = await Promise.all(
+      Array.from({ length: 200 }, () => requestFrom(runtime.baseUrl, ip, 'GET', '/api/dashboard/logs')),
+    );
+    expect(statuses.filter((s) => s === 403).length).toBe(RATE_LIMIT);
+    expect(statuses.filter((s) => s === 429).length).toBe(200 - RATE_LIMIT);
+    expect(statuses.filter((s) => s === 503).length).toBe(0);
+    // Throttled even with the right token — the limiter runs before the gate.
+    expect(await requestFrom(runtime.baseUrl, ip, 'GET', '/api/dashboard/logs', { 'x-admin-token': ADMIN_TOKEN })).toBe(429);
+    // Per caller: a different address still reaches the gate.
+    expect(await requestFrom(runtime.baseUrl, freshLoopback(), 'GET', '/api/dashboard/logs', { 'x-admin-token': ADMIN_TOKEN })).toBe(200);
+    console.warn('[FIXED] admin endpoints now have rate limiting — real 429s past the configured per-IP limit');
+  });
+
+  it('a fresh random x-api-key on every request does not buy a fresh admin bucket (C14)', async () => {
+    const ip = freshLoopback();
+    const statuses = await Promise.all(
+      Array.from({ length: 200 }, () =>
+        requestFrom(runtime.baseUrl, ip, 'GET', '/api/dashboard/admin/verify', {
+          'x-api-key': 'bap_test_' + randomBytes(12).toString('hex'),
+          'x-admin-token': 'guess-' + randomBytes(6).toString('hex'),
+        }),
+      ),
+    );
+    // Phase 20-21 (PHASE14-06): wrong-token guesses now also hit the
+    // DEDICATED failed-admin-attempt counter (ADMIN_AUTH_MAX_FAILURES,
+    // default 10 per 15 min) — far stricter than the general per-IP budget
+    // (RATE_LIMIT = 60) this assertion used to measure. Exactly 10 guesses
+    // are evaluated (403), every other one is refused (429).
+    expect(statuses.filter((s) => s === 403).length).toBe(10);
+    expect(statuses.filter((s) => s === 429).length).toBe(200 - 10);
   });
 });
 

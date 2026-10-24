@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import { JobProcessor, WorkerContext } from '../types';
 import { JobDeps } from './deps';
 import { eventRepository } from '@company/database';
@@ -32,7 +33,7 @@ export function createReceiptPipelineProcessor(deps: JobDeps): JobProcessor {
 
     const recipient = webhookEvent.data?.object?.receipt_email;
     if (!recipient) {
-      console.warn('[receipt_pipeline] No receipt_email in charge.succeeded event — skipping');
+      logger.warn('no receipt_email in charge.succeeded event — skipping', { operation: 'receipt_pipeline', status: 'skipped' });
       return;
     }
 
@@ -64,7 +65,12 @@ export function createReceiptPipelineProcessor(deps: JobDeps): JobProcessor {
         ...channelDecisionColumns(event),
       });
     } catch (err) {
-      console.error('[receipt_pipeline] Receipt delivery failed', err);
+      logger.error('receipt delivery failed — failing job for retry', {
+        operation: 'receipt_pipeline',
+        errorCode: 'RECEIPT_DELIVERY_FAILED',
+        status: 'failed',
+        error: err,
+      });
       throw new Error('receipt_pipeline: delivery failed — retrying');
     }
 

@@ -1,3 +1,4 @@
+import { logger } from '@company/observability';
 import type {
   WebhookEvent,
   WebhookEventClaimInput,
@@ -253,10 +254,10 @@ export async function runDurableWebhookConsumer(
   consumer: string,
   identity: DurableConsumerIdentity,
   work: (event: WebhookEvent) => Promise<void>,
-  opts: { leaseMs?: number; log?: (msg: string) => void } = {},
+  opts: { leaseMs?: number; log?: (message: string, fields: Record<string, unknown>) => void } = {},
 ): Promise<DurableConsumerResult> {
   const leaseMs = opts.leaseMs ?? DEFAULT_WEBHOOK_CONSUMER_LEASE_MS;
-  const log = opts.log ?? ((m: string) => console.warn(m));
+  const log = opts.log ?? ((message: string, fields: Record<string, unknown>) => logger.warn(message, fields));
 
   // 1. Resolve the durable row (DB errors propagate → job retries).
   let event: WebhookEvent | undefined;
@@ -287,7 +288,13 @@ export async function runDurableWebhookConsumer(
   const claim = await store.claimConsumer(event.id, consumer, leaseMs);
   if (!claim.claimed) {
     if (claim.existing?.status === 'processed') {
-      log(`[${consumer}] webhook ${identity.providerId}/${identity.providerEventId} already processed — replay ignored`);
+      log('webhook already processed — replay ignored', {
+        operation: consumer,
+        providerId: identity.providerId,
+        providerEventId: identity.providerEventId,
+        webhookEventId: event.id,
+        status: 'replay',
+      });
       return { outcome: 'replay', webhookEventId: event.id };
     }
     throw new WebhookConsumerBusyError(event.id, consumer);
@@ -300,13 +307,24 @@ export async function runDurableWebhookConsumer(
     const message = err instanceof Error ? err.message : String(err);
     await store.failConsumer(event.id, consumer, claim.consumer.claimToken, message).catch((e: unknown) => {
       // If even this write fails, the lease simply expires and a retry re-claims.
-      log(`[${consumer}] could not record failure for webhook ${event!.id}: ${e instanceof Error ? e.message : String(e)}`);
+      log('could not record webhook consumer failure — the lease will expire and a retry re-claims', {
+        operation: consumer,
+        webhookEventId: event!.id,
+        errorCode: 'WEBHOOK_CONSUMER_FAIL_UNRECORDED',
+        status: 'failed',
+        error: e,
+      });
     });
     throw err;
   }
   const completed = await store.completeConsumer(event.id, consumer, claim.consumer.claimToken);
   if (!completed) {
-    log(`[${consumer}] lost claim on webhook ${event.id} before completion (lease expired and another worker took over)`);
+    log('lost claim on webhook before completion (lease expired and another worker took over)', {
+      operation: consumer,
+      webhookEventId: event.id,
+      errorCode: 'WEBHOOK_CONSUMER_CLAIM_LOST',
+      status: 'lost_claim',
+    });
   }
   return { outcome: 'processed', webhookEventId: event.id };
 }

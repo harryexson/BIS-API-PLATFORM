@@ -4,7 +4,8 @@ import dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
 
 import { createServer } from 'node:http';
-import { ProviderRegistry } from '@company/providers';
+import { ProviderRegistry, ProviderStateSync } from '@company/providers';
+import { providerStateStore, checkDatabaseHealth } from '@company/database';
 import { RoutingEngine } from '@company/routing';
 import { EventBus } from '@company/events';
 import {
@@ -16,6 +17,8 @@ import {
   RateLimiter,
   registerAllProcessors,
 } from '@company/workers';
+import { logger } from '@company/observability';
+import { createWorkerReadiness } from './readiness';
 
 async function main(): Promise<void> {
   const config = createWorkerConfig();
@@ -27,6 +30,40 @@ async function main(): Promise<void> {
 
   const registry = ProviderRegistry.getInstance();
   const routing = new RoutingEngine();
+
+  // Phase 15 (gap register E12): the worker dispatches provider calls too,
+  // so it must route by the same persisted configuration and secrets as the
+  // gateway — previously it never loaded either (not even the secrets the
+  // gateway hydrated) and ran on code defaults + env vars. Loaded before
+  // any job is processed, then kept converged on admin changes.
+  const providerStateSync = new ProviderStateSync(registry, providerStateStore, {
+    intervalMs: Number(process.env.PROVIDER_STATE_REFRESH_MS) || 5_000,
+    onReport(report) {
+      // Same shape as the gateway's provider-state logging (app.ts).
+      for (const f of report.secretFailures) {
+        logger.error('persisted provider secrets could not be decrypted — provider withheld from routing', {
+          operation: 'provider_state_sync',
+          providerId: f.slug,
+          errorCode: 'PROVIDER_SECRETS_DECRYPT_FAILED',
+          status: 'failed',
+          error: f.error,
+        });
+      }
+    },
+    onError(err) {
+      logger.error('provider state load failed', {
+        operation: 'provider_state_sync',
+        errorCode: 'PROVIDER_STATE_LOAD_FAILED',
+        status: 'failed',
+        error: err,
+      });
+    },
+  });
+  await providerStateSync.initialLoad;
+  if (!providerStateSync.status().loaded && process.env.NODE_ENV === 'production') {
+    throw new Error(`persisted provider state could not be loaded: ${providerStateSync.status().lastError}`);
+  }
+  providerStateSync.start();
   const eventBus = EventBus.getInstance();
 
   const lock = new DistributedLock(store, keys);
@@ -41,8 +78,17 @@ async function main(): Promise<void> {
   // P1: Rescue stuck processing jobs from previous crashes before starting
   const rescued = await queue.rescueStuckJobs();
   if (rescued > 0) {
-    console.log(`[reaper] rescued ${rescued} stuck processing jobs`);
+    logger.info('rescued stuck processing jobs', { operation: 'reaper', status: 'rescued', rescued });
   }
+
+  const logEnqueueFailure = (jobType: string) => (err: unknown) =>
+    logger.error('scheduled job enqueue failed', {
+      operation: 'scheduler',
+      jobType,
+      errorCode: 'SCHEDULED_ENQUEUE_FAILED',
+      status: 'failed',
+      error: err,
+    });
 
   await manager.start();
 
@@ -50,9 +96,7 @@ async function main(): Promise<void> {
 
   const enqueueProviderHealth = () => {
     for (const id of providers) {
-      queue.enqueue('provider_health', { providerId: id }).catch((e) =>
-        console.error('[scheduler] provider_health enqueue failed', e),
-      );
+      queue.enqueue('provider_health', { providerId: id }).catch(logEnqueueFailure('provider_health'));
     }
   };
 
@@ -61,7 +105,7 @@ async function main(): Promise<void> {
 
   queue
     .enqueue('retry_processing', {})
-    .catch((e) => console.error('[scheduler] retry_processing enqueue failed', e));
+    .catch(logEnqueueFailure('retry_processing'));
   const retryTimer = setInterval(
     () => queue.enqueue('retry_processing', {}).catch(() => undefined),
     config.retryProcessingIntervalMs,
@@ -69,7 +113,7 @@ async function main(): Promise<void> {
 
   queue
     .enqueue('reconciliation', {})
-    .catch((e) => console.error('[scheduler] reconciliation enqueue failed', e));
+    .catch(logEnqueueFailure('reconciliation'));
   const reconTimer = setInterval(
     () => queue.enqueue('reconciliation', {}).catch(() => undefined),
     config.reconciliationIntervalMs,
@@ -79,7 +123,7 @@ async function main(): Promise<void> {
   // never actually scheduled — they'd sit idle forever without this.
   queue
     .enqueue('outbox_poller', {})
-    .catch((e) => console.error('[scheduler] outbox_poller enqueue failed', e));
+    .catch(logEnqueueFailure('outbox_poller'));
   const outboxTimer = setInterval(
     () => queue.enqueue('outbox_poller', {}).catch(() => undefined),
     config.pollIntervalMs,
@@ -87,7 +131,7 @@ async function main(): Promise<void> {
 
   queue
     .enqueue('webhook_job_poller', {})
-    .catch((e) => console.error('[scheduler] webhook_job_poller enqueue failed', e));
+    .catch(logEnqueueFailure('webhook_job_poller'));
   const webhookJobPollerTimer = setInterval(
     () => queue.enqueue('webhook_job_poller', {}).catch(() => undefined),
     config.pollIntervalMs,
@@ -100,7 +144,7 @@ async function main(): Promise<void> {
   // worker replica can run this safely.
   queue
     .enqueue('webhook_event_recovery', {})
-    .catch((e) => console.error('[scheduler] webhook_event_recovery enqueue failed', e));
+    .catch(logEnqueueFailure('webhook_event_recovery'));
   const webhookRecoveryTimer = setInterval(
     () => queue.enqueue('webhook_event_recovery', {}).catch(() => undefined),
     config.webhookRecoveryIntervalMs ?? 30_000,
@@ -110,11 +154,20 @@ async function main(): Promise<void> {
   const reaperTimer = setInterval(async () => {
     const rescued = await queue.rescueStuckJobs();
     if (rescued > 0) {
-      console.log(`[reaper] rescued ${rescued} stuck processing jobs`);
+      logger.info('rescued stuck processing jobs', { operation: 'reaper', status: 'rescued', rescued });
     }
   }, config.reconciliationIntervalMs);
 
   // P3-2: Worker health check HTTP server
+  // Phase 19 (B13): /ready checks what the worker needs to do its job.
+  const readiness = createWorkerReadiness({
+    manager,
+    store,
+    redisUrl: config.redisUrl,
+    providerState: () => providerStateSync.status(),
+    eventBus,
+    checkDatabase: checkDatabaseHealth,
+  });
   const HEALTH_PORT = Number(process.env.WORKER_HEALTH_PORT) || 3002;
   const healthServer = createServer((req, res) => {
     if (req.url === '/health') {
@@ -128,14 +181,21 @@ async function main(): Promise<void> {
         timestamp: new Date().toISOString(),
       }));
     } else if (req.url === '/ready') {
-      const ready = manager.isRunning();
-      res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: ready ? 'ready' : 'not-ready',
-        service: 'worker',
-        running: manager.isRunning(),
-        timestamp: new Date().toISOString(),
-      }));
+      readiness().then(
+        ({ httpStatus, body }) => {
+          res.writeHead(httpStatus, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        },
+        (err) => {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            status: 'not-ready',
+            service: 'worker',
+            error: err instanceof Error ? err.message : String(err),
+            timestamp: new Date().toISOString(),
+          }));
+        },
+      );
     } else {
       res.writeHead(404);
       res.end();
@@ -143,17 +203,19 @@ async function main(): Promise<void> {
   });
   healthServer.listen(HEALTH_PORT);
 
-  console.log('===============================================');
-  console.log(`BIS WORKERS RUNNING (concurrency=${config.concurrency})`);
-  console.log(`Worker health: http://localhost:${HEALTH_PORT}/health`);
-  console.log('===============================================');
+  logger.info('BIS workers running', {
+    operation: 'startup',
+    status: 'running',
+    concurrency: config.concurrency,
+    healthUrl: `http://localhost:${HEALTH_PORT}/health`,
+  });
 
   // P3-3: Graceful shutdown with drain period
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log('Shutting down workers...');
+    logger.info('shutting down workers', { operation: 'shutdown', status: 'draining' });
 
     // Stop accepting new work
     clearInterval(healthTimer);
@@ -163,6 +225,7 @@ async function main(): Promise<void> {
     clearInterval(outboxTimer);
     clearInterval(webhookJobPollerTimer);
     clearInterval(webhookRecoveryTimer);
+    providerStateSync.stop();
     healthServer.close();
 
     // Drain: wait for in-flight jobs to complete (max 30s)
@@ -173,7 +236,7 @@ async function main(): Promise<void> {
 
     await manager.stop();
     await store.quit?.();
-    console.log('Workers stopped.');
+    logger.info('workers stopped', { operation: 'shutdown', status: 'stopped' });
     process.exit(0);
   };
 
@@ -182,6 +245,11 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('Worker bootstrap failed', err);
+  logger.error('worker bootstrap failed', {
+    operation: 'startup',
+    errorCode: 'WORKER_BOOTSTRAP_FAILED',
+    status: 'failed',
+    error: err,
+  });
   process.exit(1);
 });

@@ -1,5 +1,5 @@
 import { getContext, RequestContext } from './context';
-import { redact } from './redact';
+import { redact, redactText } from './redact';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -22,7 +22,10 @@ class Logger {
     const entry: LogEntry = {
       timestamp: new Date().toISOString(),
       level,
-      message,
+      // Phase 22 (C18): messages are meant to be static text with the
+      // variable data in `fields`, but a message that interpolates a value
+      // (an error message, a URL) must not bypass redaction either.
+      message: redactText(message),
       ...ctx,
       ...redact(fields || {}),
     };

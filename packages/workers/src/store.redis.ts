@@ -9,6 +9,20 @@ else
 end
 `;
 
+// B14 FIX: fixed-window counter. INCR, and set the expiry ONLY when this
+// call created the key (result 1) — or when the key somehow has no expiry at
+// all (PTTL -1, e.g. left behind by a pre-fix INCR whose PEXPIRE never ran),
+// so a counter can never become a permanent block. One script = one atomic
+// step on the server, so concurrent first-increments from different
+// processes cannot each re-arm the window.
+const INCR_FIXED_WINDOW_LUA = `
+local v = redis.call('incr', KEYS[1])
+if v == 1 or redis.call('pttl', KEYS[1]) == -1 then
+  redis.call('pexpire', KEYS[1], ARGV[1])
+end
+return v
+`;
+
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -179,9 +193,9 @@ export class RedisStore implements KVStore {
 
   async incr(key: string, ttlMs?: number): Promise<number> {
     this.assertConnected();
-    const value = await this.client.incr(key);
-    if (ttlMs) await this.client.pexpire(key, ttlMs);
-    return value;
+    if (!ttlMs) return this.client.incr(key);
+    const value = await this.client.eval(INCR_FIXED_WINDOW_LUA, 1, key, String(ttlMs));
+    return Number(value);
   }
 
   async expire(key: string, ttlMs: number): Promise<void> {
