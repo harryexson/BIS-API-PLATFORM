@@ -22,9 +22,18 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  *
  * Environment variables:
  *   CHECKOUT_SECRET_KEY — sk_sbox_... (sandbox) or sk_... (live)
+ *
+ * Host (gap register E11): environment 'test' → the sandbox host
+ * `api.sandbox.checkout.com`; otherwise the production host
+ * `api.checkout.com`. Both are Checkout.com's legacy SHARED hosts — its
+ * current docs (checked via WebSearch, 2026-10-23) move accounts to
+ * merchant-specific `{prefix}.api[.sandbox].checkout.com` hosts; supporting
+ * that prefix is a disclosed follow-up for Phase 27, not done here.
  */
 export class CheckoutComProvider extends BaseProvider {
-  private baseUrl = 'https://api.checkout.com';
+  private get baseUrl(): string {
+    return this.config.environment === 'test' ? 'https://api.sandbox.checkout.com' : 'https://api.checkout.com';
+  }
 
   constructor(config: ProviderConfig) {
     super(config);

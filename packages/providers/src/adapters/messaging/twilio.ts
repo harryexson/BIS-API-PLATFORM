@@ -38,6 +38,11 @@ export class TwilioProvider extends BaseProvider {
     return this.secrets.from_number || process.env.TWILIO_FROM_NUMBER || '';
   }
 
+  // Previously inherited BaseProvider's unconditional `true` (gap register E2).
+  public isConfigured(): boolean {
+    return Boolean(this.accountSid && this.authToken && this.fromNumber);
+  }
+
   async processRequest(appId: string, payload: MessageRequest, decisionReason: string): Promise<TransactionEvent> {
     this.verifyAvailability();
 
@@ -46,6 +51,8 @@ export class TwilioProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.accountSid || !this.authToken || !this.fromNumber) {
+      // Phase 26 (gap register E2 messaging side / E3): never fabricate a delivered message in production.
+      this.refuseSimulatedFallbackInProduction({ missingCredentials: [...(this.accountSid ? [] : ['TWILIO_ACCOUNT_SID']), ...(this.authToken ? [] : ['TWILIO_AUTH_TOKEN']), ...(this.fromNumber ? [] : ['TWILIO_FROM_NUMBER'])] });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 

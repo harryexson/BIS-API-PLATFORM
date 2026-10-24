@@ -70,6 +70,8 @@ export class SinchProvider extends BaseProvider {
     // Matches the established pattern in adapters/payments/stripe.ts and
     // the real infobip.ts/africastalking.ts adapters.
     if (!this.apiToken || !this.servicePlanId) {
+      // Phase 26 (gap register E2 messaging side / E3): never fabricate a delivered message in production.
+      this.refuseSimulatedFallbackInProduction({ missingCredentials: [...(this.apiToken ? [] : ['SINCH_API_TOKEN']), ...(this.servicePlanId ? [] : ['SINCH_SERVICE_PLAN_ID'])] });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 

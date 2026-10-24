@@ -615,6 +615,13 @@ export class ProviderRegistry {
   }) {
     this.providers.set(provider.config.id, provider);
     const id = provider.config.id;
+    // Gap register E11: the environment is written into the adapter's OWN
+    // ProviderConfig (what braintree/paypal/square/africastalking/adyen/
+    // authorizenet/... read to pick their live vs sandbox host), not only
+    // into management state. Previously no config literal above set it, so
+    // every adapter saw `undefined` and resolved to its sandbox host even
+    // when registered — and routed in production as — 'live'.
+    provider.config.environment = managementDefaults.environment;
     // No secrets at registration time — real credentials come from the
     // adapter's own process.env fallback (documented in .env.example) until
     // an admin adds one via addSecret(), which syncs into the adapter's
@@ -854,6 +861,15 @@ export class ProviderRegistry {
       ...updates
     };
 
+    // E11: config.environment (host selection) and management state's
+    // environment (production routing eligibility) must never diverge — a
+    // provider routed as 'live' must also call its live host.
+    const envState = this.management.get(id);
+    if (envState) {
+      if (updates.environment === 'live' || updates.environment === 'test') envState.environment = updates.environment;
+      provider.config.environment = envState.environment;
+    }
+
     // Manually bringing a provider back online resets the circuit — an
     // operator's explicit judgment overrides the automatic breaker.
     if (updates.status === 'online') {
@@ -943,7 +959,11 @@ export class ProviderRegistry {
       provider.config.messageCost = updates.messageCost;
     }
 
-    if (updates.environment !== undefined) state.environment = updates.environment;
+    if (updates.environment !== undefined) {
+      state.environment = updates.environment;
+      // E11: keep the adapter's own config in lock-step (host selection).
+      provider.config.environment = updates.environment;
+    }
     if (updates.countries !== undefined) state.countries = updates.countries;
     if (updates.currencies !== undefined) state.currencies = updates.currencies;
     if (updates.capabilities !== undefined) state.capabilities = updates.capabilities;
@@ -1131,7 +1151,12 @@ export class ProviderRegistry {
     if (isFiniteNumber(m.transactionFeePercent)) c.transactionFeePercent = m.transactionFeePercent;
     if (isFiniteNumber(m.transactionFeeFlat)) c.transactionFeeFlat = m.transactionFeeFlat;
     if (isFiniteNumber(m.messageCost)) c.messageCost = m.messageCost;
-    if (m.environment === 'live' || m.environment === 'test') state.environment = m.environment;
+    if (m.environment === 'live' || m.environment === 'test') {
+      state.environment = m.environment;
+      // E11: the adapter reads its host from its own config, so a persisted
+      // (or rolled-back) environment change must reach it too.
+      c.environment = m.environment;
+    }
     if (isStringArray(m.countries)) state.countries = [...m.countries];
     if (isStringArray(m.currencies)) state.currencies = [...m.currencies];
     if (isStringArray(m.capabilities)) state.capabilities = [...m.capabilities];

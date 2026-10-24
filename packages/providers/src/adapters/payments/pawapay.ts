@@ -39,9 +39,16 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  *
  * Environment variables:
  *   PAWAPAY_API_KEY — Bearer token
+ *
+ * Host (gap register E11): environment 'test' → `api.sandbox.pawapay.io`,
+ * otherwise `api.pawapay.io` (pawaPay's documented sandbox/production base
+ * URLs, checked via WebSearch 2026-10-23; a sandbox token only works on the
+ * sandbox host).
  */
 export class PawaPayProvider extends BaseProvider {
-  private baseUrl = 'https://api.pawapay.io';
+  private get baseUrl(): string {
+    return this.config.environment === 'test' ? 'https://api.sandbox.pawapay.io' : 'https://api.pawapay.io';
+  }
 
   constructor(config: ProviderConfig) {
     super(config);

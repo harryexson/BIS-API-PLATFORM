@@ -78,6 +78,8 @@ export class AfricasTalkingProvider extends BaseProvider {
     // dev/test without real credentials, and every existing test relies
     // on that.
     if (!this.apiKey || !this.username) {
+      // Phase 26 (gap register E2 messaging side / E3): never fabricate a delivered message in production.
+      this.refuseSimulatedFallbackInProduction({ missingCredentials: [...(this.apiKey ? [] : ['AFRICASTALKING_API_KEY']), ...(this.username ? [] : ['AFRICASTALKING_USERNAME'])] });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 

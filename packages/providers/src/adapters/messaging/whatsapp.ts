@@ -115,6 +115,8 @@ export class WhatsAppProvider extends BaseProvider {
     const startTime = Date.now();
 
     if (!this.isConfigured()) {
+      // Phase 26 (gap register E2 messaging side / E3): never fabricate a delivered message in production.
+      this.refuseSimulatedFallbackInProduction({ missingCredentials: [...(this.accessToken ? [] : ['WHATSAPP_ACCESS_TOKEN']), ...(this.phoneNumberId ? [] : ['WHATSAPP_PHONE_NUMBER_ID'])] });
       return this.simulatedProcess(appId, payload, decisionReason);
     }
 

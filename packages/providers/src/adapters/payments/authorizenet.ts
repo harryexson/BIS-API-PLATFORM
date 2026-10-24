@@ -29,7 +29,11 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  * Environment variables:
  *   AUTHORIZENET_LOGIN_ID    — API Login ID
  *   AUTHORIZENET_TRANSACTION_KEY — Transaction Key
- *   AUTHORIZENET_SANDBOX     — 'false' to use the production endpoint (defaults to sandbox)
+ *   AUTHORIZENET_SANDBOX     — legacy: 'false' to use the production endpoint. Only
+ *                              consulted when the adapter's config carries no
+ *                              environment (direct construction); a registry-
+ *                              registered adapter selects its host from its
+ *                              registered environment (gap register E11).
  */
 /** See processRequest: transaction error codes whose outcome is not known. */
 const AUTHNET_AMBIGUOUS_ERROR_CODES = new Set([
@@ -55,7 +59,12 @@ export class AuthorizeNetProvider extends BaseProvider {
   }
 
   private get baseUrl(): string {
-    const sandbox = process.env.AUTHORIZENET_SANDBOX !== 'false';
+    // E11: the registered environment is authoritative — a provider routed
+    // as 'live' must call the production endpoint (it used to call the
+    // sandbox unless a separate env var said otherwise, independently of
+    // what the platform believed it was running as).
+    const env = this.config.environment;
+    const sandbox = env === 'live' ? false : env === 'test' ? true : process.env.AUTHORIZENET_SANDBOX !== 'false';
     return sandbox
       ? 'https://apitest.authorize.net/xml/v1/request.api'
       : 'https://api.authorize.net/xml/v1/request.api';

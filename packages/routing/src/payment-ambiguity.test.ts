@@ -66,7 +66,11 @@ const CASES: AdapterCase[] = [
   },
   {
     id: 'adyen',
-    secrets: { api_key: 'AQE_x', merchant_account: 'MerchantECOM' },
+    // Phase 26 (E11): Adyen is registered 'live', and the registered
+    // environment now really reaches the adapter — so it needs its live URL
+    // prefix (without one it refuses to call any host, instead of silently
+    // calling checkout-test.adyen.com as it used to).
+    secrets: { api_key: 'AQE_x', merchant_account: 'MerchantECOM', live_url_prefix: 'bisapitest' },
     request: { currency: 'USD', paymentMethod: 'card', paymentToken: 'stored_pm_1' },
     isCharge: (u) => u.endsWith('/v71/payments'),
     // Adyen: HTTP 200 with resultCode 'Refused' and a refusalReason.

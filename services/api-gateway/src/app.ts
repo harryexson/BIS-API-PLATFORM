@@ -3498,7 +3498,10 @@ app.get('/v1/api/gateway/providers', mw.apiKey, resolveTenantContext, (req: Requ
 //
 // The pipeline is now, strictly in order:
 //   1 receive
-//   2 authenticate (HMAC over the exact raw request bytes, timing-safe)
+//   2 authenticate over the exact raw request bytes, timing-safe — the
+//     provider's OWN native signature scheme when its adapter implements one
+//     and its secret is configured (Phase 26, gap register E10), otherwise
+//     the platform's shared WEBHOOK_HMAC_SECRET (x-webhook-signature)
 //   3 validate shape (JSON object with a provider event id)
 //   4 identify provider (must be registered)
 //   5 identify application   6 identify tenant
@@ -3517,7 +3520,12 @@ const MAX_PROVIDER_EVENT_ID_LENGTH = 255;
 
 function extractProviderEventId(body: unknown): string | null {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  const id = (body as Record<string, unknown>).id;
+  // `id` (Stripe, Airwallex, the platform-signed shape), else `event_id` —
+  // the top-level event identity Square and NMI put in their natively-signed
+  // webhook bodies (Phase 26, E10: without it those verified webhooks could
+  // never be accepted at all).
+  const record = body as Record<string, unknown>;
+  const id = record.id !== undefined && record.id !== null ? record.id : record.event_id;
   if (typeof id === 'number' && Number.isFinite(id)) return String(id);
   if (typeof id !== 'string') return null;
   const trimmed = id.trim();
@@ -3595,31 +3603,81 @@ function webhookReject(res: Response, provider: string, status: number, errorCod
   return res.status(status).json({ error });
 }
 
+/** Express request headers → the flat lowercase map verifyProviderWebhookSignature() reads. */
+function webhookHeaderMap(req: Request): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    out[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
+  }
+  return out;
+}
+
 app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Response) => {
   // 1. receive
   const provider = req.params.provider;
   setContextField('providerId', provider);
-  const signature = req.header('x-webhook-signature');
 
   // 2. authenticate
   const webhookSecret = process.env.WEBHOOK_HMAC_SECRET;
   if (!webhookSecret) {
+    // Still required when a native scheme verifies the request: the job the
+    // worker consumes is attested with it (see below).
     return webhookReject(res, provider, 503, 'NO_WEBHOOK_SECRET', 'Webhook verification not configured');
-  }
-  if (!signature) {
-    return webhookReject(res, provider, 401, 'MISSING_SIGNATURE', 'Missing webhook signature');
   }
   // Verify over the exact bytes received (express.json's verify hook keeps
   // them on req.rawBody) — a re-serialised JSON.stringify(req.body) can
   // differ from what the sender signed. Falls back only if absent.
   const stashed = (req as Request & { rawBody?: Buffer }).rawBody;
   const rawBody = stashed ? stashed.toString('utf8') : typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-  const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(signature, 'hex');
-  if (!(a.length === b.length && timingSafeEqual(a, b))) {
-    return webhookReject(res, provider, 401, 'INVALID_SIGNATURE', 'Invalid webhook signature');
+
+  // 2a. The provider's OWN signature (Phase 26, gap register E10). The 7
+  // native verifiers (stripe, nmi, flutterwave, paychangu, airwallex, square,
+  // whatsapp) used to be dead code: only the platform's shared secret was
+  // ever checked, so no webhook was ever cryptographically tied to the
+  // provider that supposedly sent it.
+  //   true  → verified by the provider's real scheme.
+  //   false → that provider's native secret IS configured and the request
+  //           failed it: authoritative — rejected, with NO fallback to the
+  //           shared platform secret (otherwise anyone holding that one
+  //           secret could bypass the provider's real protection).
+  //   null  → no native scheme / no native secret configured → the platform
+  //           x-webhook-signature check below, exactly as before.
+  const adapter = registry.getProvider(provider);
+  let nativeVerified: boolean | null = null;
+  if (adapter) {
+    try {
+      nativeVerified = await adapter.verifyProviderWebhookSignature(rawBody, webhookHeaderMap(req));
+    } catch {
+      nativeVerified = false; // a verifier that throws never authenticates anything
+    }
   }
+  if (nativeVerified === false) {
+    return webhookReject(res, provider, 401, 'INVALID_PROVIDER_SIGNATURE', 'Invalid provider webhook signature');
+  }
+
+  let signature: string;
+  if (nativeVerified === true) {
+    // The worker re-verifies every job against WEBHOOK_HMAC_SECRET before
+    // processing it (packages/workers/src/jobs/*Webhook.ts) — that check
+    // guards the queue, not the provider. For a natively-verified webhook
+    // the gateway attests it with the platform secret over the same raw
+    // bytes, AFTER the provider's own signature passed, so the worker
+    // accepts exactly what the gateway authenticated and nothing else.
+    signature = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+  } else {
+    const platformSignature = req.header('x-webhook-signature');
+    if (!platformSignature) {
+      return webhookReject(res, provider, 401, 'MISSING_SIGNATURE', 'Missing webhook signature');
+    }
+    const expected = createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(platformSignature, 'hex');
+    if (!(a.length === b.length && timingSafeEqual(a, b))) {
+      return webhookReject(res, provider, 401, 'INVALID_SIGNATURE', 'Invalid webhook signature');
+    }
+    signature = platformSignature;
+  }
+  const verificationMethod: 'native' | 'platform' = nativeVerified === true ? 'native' : 'platform';
 
   // 3. validate shape — the provider event id IS the durable identity; a
   // webhook without one could never be de-duplicated, so it is refused.
@@ -3635,7 +3693,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   }
 
   // 4. identify provider
-  if (!registry.getProvider(provider)) {
+  if (!adapter) {
     return webhookReject(res, provider, 401, 'UNKNOWN_PROVIDER', 'Unknown provider');
   }
 
@@ -3669,7 +3727,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
   switch (outcome.kind) {
     case 'accepted':
     case 'recovered': {
-      logger.info('webhook received', { operation: 'webhook', providerId: provider, status: 'success' });
+      logger.info('webhook received', { operation: 'webhook', providerId: provider, status: 'success', verificationMethod });
       // Monitoring only; processing is driven by the enqueued jobs.
       eventBus.emit({
         id: `wh_${Date.now()}_${randomUUID().slice(0, 8)}`,
@@ -3684,7 +3742,7 @@ app.post('/v1/api/webhooks/:provider', asyncHandler(async (req: Request, res: Re
         payload: req.body,
         response: null,
       });
-      return res.json({ received: true, webhookEventId: outcome.event.id });
+      return res.json({ received: true, webhookEventId: outcome.event.id, verificationMethod });
     }
     case 'duplicate':
       logger.warn('webhook duplicate — already durably recorded, acknowledged without re-enqueue', {

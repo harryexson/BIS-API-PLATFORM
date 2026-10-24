@@ -24,10 +24,10 @@ import { ProviderConfig, TransactionEvent, PaymentRequest, RefundRequest } from 
  *    there is no way to construct or guess it. Test traffic has a real,
  *    fixed host (`checkout-test.adyen.com`) that needs no prefix. This
  *    adapter reads the prefix from `this.secrets.live_url_prefix` /
- *    `ADYEN_LIVE_URL_PREFIX`; when unset, it calls the real test host
- *    rather than fabricating a live one — the same "fall back to what's
- *    actually configured" rule this package already applies to every
- *    other missing credential.
+ *    `ADYEN_LIVE_URL_PREFIX`. Registered 'live' without a prefix, the
+ *    adapter is NOT configured (no request is made; production refuses) —
+ *    it used to silently call the test host instead (gap register E11).
+ *    Registered 'test', it always calls the test host.
  * 2. **Auth is `X-API-Key`, not a Bearer token** — the one adapter in this
  *    package where that's true.
  *
@@ -124,14 +124,34 @@ export class AdyenProvider extends BaseProvider {
     return this.secrets.live_url_prefix || process.env.ADYEN_LIVE_URL_PREFIX || '';
   }
 
+  /**
+   * Gap register E11: the host follows the REGISTERED environment.
+   *  - 'live' → the merchant's prefixed live host. Without a prefix there is
+   *    NO live host to call, so `liveHostMissing` is true and no request is
+   *    made at all (previously this silently called checkout-test.adyen.com
+   *    while the platform routed the provider as live).
+   *  - 'test' → always checkout-test.adyen.com, even if a prefix is set.
+   *  - no environment (direct construction outside the registry) → the
+   *    legacy rule: a configured prefix means live.
+   */
+  private get useLiveHost(): boolean {
+    const env = this.config.environment;
+    return env === 'live' ? true : env === 'test' ? false : Boolean(this.liveUrlPrefix);
+  }
+
+  /** Registered 'live' but no live URL prefix: there is no correct host to call. */
+  private get liveHostMissing(): boolean {
+    return this.useLiveHost && !this.liveUrlPrefix;
+  }
+
   private get baseUrl(): string {
-    return this.liveUrlPrefix
+    return this.useLiveHost
       ? `https://${this.liveUrlPrefix}-checkout-live.adyenpayments.com/checkout/${this.apiVersion}`
       : `https://checkout-test.adyen.com/${this.apiVersion}`;
   }
 
   public isConfigured(): boolean {
-    return Boolean(this.apiKey && this.merchantAccount);
+    return Boolean(this.apiKey && this.merchantAccount) && !this.liveHostMissing;
   }
 
   /**
@@ -145,7 +165,7 @@ export class AdyenProvider extends BaseProvider {
     const startTime = Date.now();
     const { originalTransactionId, amount = 0, currency = 'USD' } = payload;
 
-    if (!this.apiKey || !this.merchantAccount) {
+    if (!this.apiKey || !this.merchantAccount || this.liveHostMissing) {
       return super.refund(appId, payload, decisionReason);
     }
 
@@ -215,11 +235,12 @@ export class AdyenProvider extends BaseProvider {
     const { amount = 10, currency = 'USD', paymentToken } = payload;
     const startTime = Date.now();
 
-    if (!this.apiKey || !this.merchantAccount || !paymentToken) {
+    if (!this.apiKey || !this.merchantAccount || this.liveHostMissing || !paymentToken) {
       this.refuseSimulatedFallbackInProduction({
         missingCredentials: [
           ...(this.apiKey ? [] : ['ADYEN_API_KEY']),
           ...(this.merchantAccount ? [] : ['ADYEN_MERCHANT_ACCOUNT']),
+          ...(this.liveHostMissing ? ['ADYEN_LIVE_URL_PREFIX'] : []),
         ],
         missingInputs: paymentToken ? [] : ['paymentToken'],
       });

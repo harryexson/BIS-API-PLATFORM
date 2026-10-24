@@ -82,7 +82,10 @@ describe('AirwallexProvider', () => {
       process.env.AIRWALLEX_WEBHOOK_SECRET = 'notification-secret';
       const provider = new AirwallexProvider(makeConfig());
       const rawBody = '{"name":"payment_intent.succeeded"}';
-      const timestamp = '1700000000';
+      // Phase 26: must be a FRESH millisecond timestamp now that a replay
+      // window is enforced (the old fixture, '1700000000', is a seconds
+      // value from Nov 2023 and is correctly rejected as stale — see below).
+      const timestamp = String(Date.now());
       const { createHmac } = await import('crypto');
       const sig = createHmac('sha256', 'notification-secret').update(`${timestamp}${rawBody}`, 'utf8').digest('hex');
 
@@ -96,7 +99,7 @@ describe('AirwallexProvider', () => {
     it('returns false for a tampered body', async () => {
       process.env.AIRWALLEX_WEBHOOK_SECRET = 'notification-secret';
       const provider = new AirwallexProvider(makeConfig());
-      const timestamp = '1700000000';
+      const timestamp = String(Date.now());
       const { createHmac } = await import('crypto');
       const sig = createHmac('sha256', 'notification-secret')
         .update(`${timestamp}{"name":"original"}`, 'utf8')
@@ -107,6 +110,21 @@ describe('AirwallexProvider', () => {
         'x-signature': sig,
       });
       expect(result).toBe(false);
+    });
+
+    it('Phase 26 (E10): returns false for a correctly-signed but STALE delivery (replay window)', async () => {
+      process.env.AIRWALLEX_WEBHOOK_SECRET = 'notification-secret';
+      const provider = new AirwallexProvider(makeConfig());
+      const rawBody = '{"name":"payment_intent.succeeded"}';
+      const { createHmac } = await import('crypto');
+      const sign = (ts: string) => createHmac('sha256', 'notification-secret').update(`${ts}${rawBody}`, 'utf8').digest('hex');
+
+      const stale = String(Date.now() - 6 * 60_000);
+      expect(await provider.verifyProviderWebhookSignature(rawBody, { 'x-timestamp': stale, 'x-signature': sign(stale) })).toBe(false);
+      const future = String(Date.now() + 6 * 60_000);
+      expect(await provider.verifyProviderWebhookSignature(rawBody, { 'x-timestamp': future, 'x-signature': sign(future) })).toBe(false);
+      const fresh = String(Date.now() - 60_000);
+      expect(await provider.verifyProviderWebhookSignature(rawBody, { 'x-timestamp': fresh, 'x-signature': sign(fresh) })).toBe(true);
     });
 
     it('returns false when a header is missing', async () => {

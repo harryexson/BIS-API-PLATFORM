@@ -48,9 +48,18 @@ import { ProviderConfig, TransactionEvent, PaymentRequest } from '@company/schem
  *     (each webhook subscription has its own, per Airwallex's docs), used
  *     only by verifyProviderWebhookSignature() below.
  */
+/** Webhook x-timestamp freshness window (see verifyProviderWebhookSignature). */
+const AIRWALLEX_WEBHOOK_TOLERANCE_MS = 5 * 60_000;
+
 export class AirwallexProvider extends BaseProvider {
-  private baseUrl = 'https://api.airwallex.com';
-  private cachedToken: { token: string; expiresAtMs: number } | undefined;
+  // Host (gap register E11): environment 'test' → Airwallex's demo
+  // environment `api-demo.airwallex.com`, otherwise production
+  // `api.airwallex.com` (checked via WebSearch, 2026-10-23).
+  private get baseUrl(): string {
+    return this.config.environment === 'test' ? 'https://api-demo.airwallex.com' : 'https://api.airwallex.com';
+  }
+  // Keyed by host: a token issued by one environment is never reused on the other.
+  private cachedToken: { token: string; expiresAtMs: number; host: string } | undefined;
 
   constructor(config: ProviderConfig) {
     super(config);
@@ -77,6 +86,15 @@ export class AirwallexProvider extends BaseProvider {
    * verified via WebSearch, 2026-09-17: HMAC-SHA256 of
    * `x-timestamp + raw_body` (concatenated directly, no separator),
    * keyed by the notification URL's own secret, hex-encoded.
+   *
+   * Replay window (Phase 26, gap register E10): `x-timestamp` is
+   * milliseconds since the epoch (Airwallex docs, checked via WebSearch
+   * 2026-10-23), and Airwallex tells receivers to reject events outside
+   * their tolerance but publishes no number — 5 minutes is used here, the
+   * same window Stripe documents. Previously any captured, validly-signed
+   * delivery verified forever. (An exact replay of a FRESH delivery is
+   * additionally absorbed by the gateway's durable (provider, event id)
+   * de-duplication.)
    */
   public async verifyProviderWebhookSignature(
     rawBody: string,
@@ -89,6 +107,10 @@ export class AirwallexProvider extends BaseProvider {
     const signature = headers['x-signature'];
     if (!timestamp || !signature) return false;
 
+    if (!/^\d+$/.test(timestamp)) return false;
+    const ageMs = Math.abs(Date.now() - Number(timestamp));
+    if (!Number.isFinite(ageMs) || ageMs > AIRWALLEX_WEBHOOK_TOLERANCE_MS) return false;
+
     const { createHmac, timingSafeEqual } = await import('crypto');
     const expected = createHmac('sha256', secret).update(`${timestamp}${rawBody}`, 'utf8').digest('hex');
     const a = Buffer.from(expected, 'hex');
@@ -100,7 +122,7 @@ export class AirwallexProvider extends BaseProvider {
   // Airwallex's own guidance against calling /login on every request.
   private async getAccessToken(): Promise<string> {
     const now = Date.now();
-    if (this.cachedToken && this.cachedToken.expiresAtMs - now > 60_000) {
+    if (this.cachedToken && this.cachedToken.host === this.baseUrl && this.cachedToken.expiresAtMs - now > 60_000) {
       return this.cachedToken.token;
     }
 
@@ -119,7 +141,7 @@ export class AirwallexProvider extends BaseProvider {
     }
 
     const expiresAtMs = res.body.expires_at ? Date.parse(res.body.expires_at) : now + 25 * 60_000;
-    this.cachedToken = { token: res.body.token, expiresAtMs };
+    this.cachedToken = { token: res.body.token, expiresAtMs, host: this.baseUrl };
     return res.body.token;
   }
 
