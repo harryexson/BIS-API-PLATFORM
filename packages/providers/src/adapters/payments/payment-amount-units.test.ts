@@ -9,7 +9,9 @@ import { AuthorizeNetProvider } from './authorizenet';
 // adapter.processRequest), and each adapter converts it to its provider's
 // own wire format. The other ten adapters already pin that conversion in
 // their own tests (stripe/adyen/square: 10 → 1000 minor units;
-// braintree/nmi/paypal: 10 → "10.00"; pawapay: 100 → "100.00";
+// braintree/nmi/paypal: 10 → "10.00"; pawapay: 100 → "100" (Phase 27:
+// pawaPay's v2 amount pattern forbids trailing decimal zeros, so it is no
+// longer "100.00");
 // flutterwave/paychangu/airwallex: decimal passed as-is). These three had no
 // test of the amount they actually send; this pins it for the same
 // major-unit input, 49.99, over the real HTTP path (fetch stubbed).

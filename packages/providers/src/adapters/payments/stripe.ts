@@ -112,6 +112,17 @@ export class StripeProvider extends BaseProvider {
    * signed payload is `"${timestamp}.${rawBody}"`, HMAC-SHA256'd with the
    * endpoint's signing secret. Stripe documents rejecting signatures more
    * than 300 seconds old as replay protection, applied here too.
+   *
+   * Phase 27 (closes gap register PHASE26-04): the header can carry SEVERAL
+   * `v1=` values. Stripe's "Verify webhook signatures manually" docs: "You
+   * can have multiple signatures with the same scheme-secret pair when you
+   * roll an endpoint's secret … Stripe generates one signature for each
+   * secret", and step 4 says to compare "the signature (or signatures)" in
+   * the header. The parser used to keep only the LAST `v1`, so during a
+   * secret roll a genuine event could be rejected depending on which
+   * secret's signature Stripe happened to list last. Every `v1` is now
+   * checked; non-`v1` schemes (e.g. the test-only `v0`) are still ignored,
+   * as the same page requires to prevent downgrade attacks.
    */
   public async verifyProviderWebhookSignature(
     rawBody: string,
@@ -123,23 +134,34 @@ export class StripeProvider extends BaseProvider {
     const header = headers['stripe-signature'];
     if (!header) return false;
 
-    const parts: Record<string, string> = {};
+    let timestamp: string | undefined;
+    const v1Signatures: string[] = [];
     for (const part of header.split(',')) {
-      const [key, value] = part.split('=');
-      if (key && value) parts[key] = value;
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      const key = part.slice(0, eq).trim();
+      const value = part.slice(eq + 1).trim();
+      if (!value) continue;
+      if (key === 't') timestamp = value;
+      else if (key === 'v1') v1Signatures.push(value);
     }
-    const timestamp = parts.t;
-    const v1 = parts.v1;
-    if (!timestamp || !v1) return false;
+    if (!timestamp || v1Signatures.length === 0) return false;
 
     const ageSeconds = Math.abs(Date.now() / 1000 - Number(timestamp));
     if (!Number.isFinite(ageSeconds) || ageSeconds > 300) return false;
 
     const { createHmac, timingSafeEqual } = await import('crypto');
-    const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex');
-    const a = Buffer.from(expected, 'hex');
-    const b = Buffer.from(v1, 'hex');
-    return a.length === b.length && timingSafeEqual(a, b);
+    const expected = Buffer.from(
+      createHmac('sha256', secret).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex'),
+      'hex',
+    );
+    let matched = false;
+    for (const candidate of v1Signatures) {
+      const b = Buffer.from(candidate, 'hex');
+      // No early exit: every candidate is compared in constant time.
+      if (b.length === expected.length && timingSafeEqual(expected, b)) matched = true;
+    }
+    return matched;
   }
 
   /**

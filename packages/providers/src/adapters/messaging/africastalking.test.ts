@@ -92,10 +92,13 @@ describe('AfricasTalkingProvider', () => {
       const [url, opts] = fetchSpy.mock.calls[0];
       expect(url).toBe('https://api.africastalking.com/version1/messaging');
       expect(opts.headers.apiKey).toBe('test-key-456');
-      const body = JSON.parse(opts.body);
-      expect(body.username).toBe('testuser');
-      expect(body.to).toBe('+254700000001');
-      expect(body.message).toBe('Hello Kenya');
+      // Phase 27: form-urlencoded, as Africa's Talking's official SDKs send
+      // it (this used to JSON.parse a JSON body).
+      expect(opts.headers['Content-Type']).toBe('application/x-www-form-urlencoded');
+      const body = new URLSearchParams(opts.body);
+      expect(body.get('username')).toBe('testuser');
+      expect(body.get('to')).toBe('+254700000001');
+      expect(body.get('message')).toBe('Hello Kenya');
 
       expect(event.status).toBe('success');
       expect(event.id).toBe('ATPid_real1');

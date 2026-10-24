@@ -16,7 +16,23 @@ import { ProviderConfig, TransactionEvent, MessageRequest } from '@company/schem
  *   TWILIO_ACCOUNT_SID — AC...
  *   TWILIO_AUTH_TOKEN  — Auth token
  *   TWILIO_FROM_NUMBER — E.164 sender number (or messaging service SID)
+ *
+ * Phase 27: Twilio's Message resource takes a Messaging Service SID in its
+ * own `MessagingServiceSid` parameter, not in `From` — `From` is "the
+ * sender's Twilio phone number (in E.164 format), alphanumeric sender ID,
+ * Wireless SIM, short code, or channel address", and is "required if
+ * MessagingServiceSid is not passed" (Twilio's own SDK reference text,
+ * twilio-csharp MessageResource.cs / twilio-node message.ts). This adapter
+ * used to put whatever TWILIO_FROM_NUMBER held into `From` (and, for
+ * WhatsApp, `whatsapp:MG...`), so the Messaging-Service configuration this
+ * file itself documents could never have worked. A value shaped like a
+ * Messaging Service SID (`MG` + 32 hex) is now sent as MessagingServiceSid
+ * with no `From`, letting Twilio pick a sender from the service's pool —
+ * which also means the actual sending number is not known here, so
+ * getSenderAddress() reports it as unknown rather than returning the SID.
  */
+const MESSAGING_SERVICE_SID = /^MG[0-9a-fA-F]{32}$/;
+
 export class TwilioProvider extends BaseProvider {
   constructor(config: ProviderConfig) {
     super(config);
@@ -31,6 +47,7 @@ export class TwilioProvider extends BaseProvider {
   }
 
   public getSenderAddress(): string | undefined {
+    if (MESSAGING_SERVICE_SID.test(this.fromNumber)) return undefined;
     return this.fromNumber || undefined;
   }
 
@@ -57,11 +74,13 @@ export class TwilioProvider extends BaseProvider {
     }
 
     try {
-      const form = new URLSearchParams({
-        To: isWhatsApp ? `whatsapp:${recipient}` : recipient,
-        From: isWhatsApp ? `whatsapp:${this.fromNumber}` : this.fromNumber,
-        Body: content,
-      });
+      const form = new URLSearchParams({ To: isWhatsApp ? `whatsapp:${recipient}` : recipient });
+      if (MESSAGING_SERVICE_SID.test(this.fromNumber)) {
+        form.set('MessagingServiceSid', this.fromNumber);
+      } else {
+        form.set('From', isWhatsApp ? `whatsapp:${this.fromNumber}` : this.fromNumber);
+      }
+      form.set('Body', content);
 
       const basicAuth = Buffer.from(`${this.accountSid}:${this.authToken}`).toString('base64');
 

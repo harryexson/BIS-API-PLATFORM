@@ -12,10 +12,14 @@ import { ProviderConfig, TransactionEvent, MessageRequest } from '@company/schem
  * Facts below were verified via web search against Africa's Talking's
  * public documentation on 2026-09-08 — search snippets, not a directly
  * fetched page (this environment's outbound network access is restricted;
- * see docs/IMPLEMENTATION_BASELINE.md §6 item 1). Not yet verified against
- * a live account — no credentials were available in this session. Treat
- * as "built from real, current documentation" rather than "certified
- * against a live sandbox."
+ * see docs/IMPLEMENTATION_BASELINE.md §6 item 1). Phase 27 (2026-10-24)
+ * re-checked the request encoding against Africa's Talking's official
+ * Node and Java SDK sources (form-urlencoded, `apiKey` header) and the
+ * Node/Python/Java SDKs' own test fixtures (a statusCode 101 recipient
+ * reports status `Success`). Not yet
+ * verified against a live account — no credentials were available in this
+ * session. Treat as "built from real, current documentation" rather than
+ * "certified against a live sandbox."
  *
  * Environment variables:
  *   AFRICASTALKING_API_KEY  — sent as the `apiKey` header
@@ -84,19 +88,28 @@ export class AfricasTalkingProvider extends BaseProvider {
     }
 
     try {
+      // Phase 27: POST /version1/messaging takes an
+      // application/x-www-form-urlencoded body (fields username, to,
+      // message, from). Africa's Talking's official SDKs send it that
+      // way — africastalking-node.js lib/sms.js ('Content-Type':
+      // 'application/x-www-form-urlencoded'), africastalking-java
+      // IBulkSMS (@FormUrlEncoded @POST("messaging") with @Field("username"),
+      // @Field("to"), @Field("from"), @Field("message")). This adapter used
+      // to send a JSON body to this path; the only JSON contract Africa's
+      // Talking documents is the separate /version1/messaging/bulk endpoint
+      // with different field names (phoneNumbers[], senderId).
+      const form = new URLSearchParams({ username: this.username, to: recipient, message: content });
+      if ((payload as any).from) form.set('from', String((payload as any).from));
+
       const res = await this.http_request({
         method: 'POST',
         url: `${this.baseUrl}/version1/messaging`,
         headers: {
           apiKey: this.apiKey,
           Accept: 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body: {
-          username: this.username,
-          to: recipient,
-          message: content,
-          ...((payload as any).from ? { from: (payload as any).from } : {}),
-        },
+        body: form.toString(),
       });
 
       const latency = Date.now() - startTime;
